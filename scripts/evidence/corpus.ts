@@ -163,8 +163,11 @@ export const UNSTATED_SUBJECT = "Obsidian";
 const OWNERS = ["Ada", "Ben", "Cara", "Dev", "Eli", "Fay", "Gus", "Hana", "Iris", "Jon"] as const;
 const VENDORS = ["Corvid", "Pellet", "Stratus", "Nimbly", "Ferrox", "Glyph"] as const;
 const REPORTERS = ["Mika", "Osei", "Priya", "Rafael", "Sun", "Tove"] as const;
-/** Lowercase neutral words for detail padding: no names, numbers, IDs, or fact vocabulary. */
-const PAD_WORDS = ["routine", "checkpoint", "buffer", "cursor", "ledger", "segment", "snapshot", "interval", "replica", "queue", "vector", "frame", "lattice", "shard", "margin", "cache", "probe", "drift"] as const;
+/**
+ * Lowercase neutral office words for detail padding: no names, numbers, IDs, or fact vocabulary. Words that read as
+ * life-science terms (replica, vector, probe, drift) made Claude 5.x safety classifiers refuse long corpora.
+ */
+const PAD_WORDS = ["routine", "checkpoint", "buffer", "cursor", "ledger", "segment", "snapshot", "agenda", "folder", "queue", "memo", "column", "header", "outline", "margin", "notebook", "calendar", "draft"] as const;
 
 /**
  * Project history shape, by `index % 4`. Each family adds late correction records after the filler:

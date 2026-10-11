@@ -281,15 +281,27 @@ export interface TurnObservation {
 	readonly assistantMessages: number;
 	/** stopReason of the last finalized assistant message: "aborted" or "error" means the host did not complete the turn. */
 	readonly stopReason: string | null;
+	/** Provider error text of that message when it failed: control characters removed, at most 300 characters. */
+	readonly errorMessage: string | null;
+}
+
+/** Provider error text is diagnostic only; strip control characters and bound it before it reaches the artifact. */
+function boundedError(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const text = value.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim();
+	return text ? text.slice(0, 300) : null;
 }
 
 /**
  * Why a turn did not complete, or null. A host that aborted or failed the turn, or finalized no
  * assistant message, did not answer: the caller records a phase error, never a schema failure.
  */
-export function hostStopReason(observation: Pick<TurnObservation, "assistantMessages" | "stopReason">): string | null {
+export function hostStopReason(observation: Pick<TurnObservation, "assistantMessages" | "stopReason"> & { readonly errorMessage?: string | null }): string | null {
 	if (observation.assistantMessages === 0) return "host produced no assistant message";
-	if (observation.stopReason === "aborted" || observation.stopReason === "error") return `host stopped the turn (stopReason ${observation.stopReason})`;
+	if (observation.stopReason === "aborted" || observation.stopReason === "error") {
+		const detail = observation.errorMessage ? `: ${observation.errorMessage}` : "";
+		return `host stopped the turn (stopReason ${observation.stopReason}${detail})`;
+	}
 	return null;
 }
 
@@ -345,6 +357,7 @@ export function observeTurn(events: readonly Frame[], price: { input: number; ou
 	const usage: UsageRecord[] = [];
 	let assistantMessages = 0;
 	let stopReason: string | null = null;
+	let errorMessage: string | null = null;
 	for (const event of events) {
 		if (event.type !== "message_end") continue;
 		const message = asFrame(event.message);
@@ -352,6 +365,7 @@ export function observeTurn(events: readonly Frame[], price: { input: number; ou
 		if (message.role === "assistant") {
 			assistantMessages++;
 			stopReason = typeof message.stopReason === "string" ? message.stopReason : null;
+			errorMessage = boundedError(message.errorMessage);
 			const text = assistantText(message);
 			if (text.trim()) answer = text;
 			for (const block of Array.isArray(message.content) ? message.content : []) {
@@ -376,7 +390,7 @@ export function observeTurn(events: readonly Frame[], price: { input: number; ou
 			pages.push({ recordId, text: firstText(message) });
 		}
 	}
-	return { answer, zoomCalls, pages, usage, assistantMessages, stopReason };
+	return { answer, zoomCalls, pages, usage, assistantMessages, stopReason, errorMessage };
 }
 
 /**
