@@ -1003,6 +1003,7 @@ function defaultFlags(memory: string): Record<string, string | boolean> {
     "no-optchat-prefetch": true,
     "no-optchat-value-score": true,
     "no-optchat-tool-gate": true,
+    "no-optchat-recall": true,
   };
 }
 
@@ -2181,7 +2182,7 @@ async function lockHeld(ctx: CaseContext): Promise<Evidence> {
     for (const request of requests) {
       assert(!systemText(request.body).includes(SYSTEM_BLOCK), "an inactive session appends no OptChat system block");
       assert(!JSON.stringify(request.body).includes("<chat>"), "an inactive session sends no memory view");
-      assert.deepEqual(toolNames(request.body).filter((name) => ["zoom", "date", "work"].includes(name)), [], "memory tools are absent");
+      assert.deepEqual(toolNames(request.body).filter((name) => ["zoom", "date", "work", "chat_search"].includes(name)), [], "memory tools are absent");
     }
     assert.deepEqual(pairs(mainRows(memory)), [["user", HOLDER_SEED]], "the inactive session never writes to the holder's log");
     return evidence;
@@ -2859,7 +2860,7 @@ async function withFakeHost(
     },
     getFlag: (name: string) => flags[name],
     getAllTools: () => [],
-    getActiveTools: () => ["zoom", "date", "work"],
+    getActiveTools: () => ["zoom", "date", "work", "chat_search"],
     registerTool: (tool: { name: string }) => { registeredTools.push(tool); },
     // Plain zod supports the object/number/int/min/describe builders used here.
     // This fake records tool definitions only; it never exports or executes their
@@ -3112,7 +3113,7 @@ async function fakeChildView(ctx: CaseContext): Promise<Evidence> {
     await durableRows(parent.ctx, 2, "fake child parent durable rows");
 
     const child = await withFakeHost(ctx, childPrompt, { agentKind: "task", artifactManager: artifacts });
-    assert.deepEqual(child.registeredTools, ["zoom", "date", "work"], "a child with the view registers exactly the read-only tools");
+    assert.deepEqual(child.registeredTools, ["zoom", "date", "chat_search", "work"], "a child with the view registers exactly the read-only tools");
 
     await parent.switchSession(other, [user, talk]);
     const stale = await withFakeHost(
@@ -3125,7 +3126,7 @@ async function fakeChildView(ctx: CaseContext): Promise<Evidence> {
       { agentKind: "task", artifactManager: artifacts },
     );
     const fresh = await withFakeHost(ctx, childPrompt, { agentKind: "task", artifactManager: other });
-    assert.deepEqual(fresh.registeredTools, ["zoom", "date", "work"], "the republished view is adopted by the new manager");
+    assert.deepEqual(fresh.registeredTools, ["zoom", "date", "chat_search", "work"], "the republished view is adopted by the new manager");
     return { child: child.registeredTools, stale, fresh: fresh.registeredTools };
   }, { childView: true, artifactManager: artifacts });
 }

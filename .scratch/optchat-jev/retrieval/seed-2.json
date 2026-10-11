@@ -1,0 +1,700 @@
+{
+  "synthetic": true,
+  "disclaimer": "SYNTHETIC: a fake summariser and a fake lexical judge. Measures navigation mechanics on a planted tree, not Jev, real summary quality, or real judgement.",
+  "config": {
+    "seed": 2,
+    "n": 256,
+    "facts": 12
+  },
+  "viewLines": 16,
+  "viewLinesWithTopic": 5,
+  "summarizerPolicy": [
+    "Node budget 256 bytes; view budget 4096 bytes; every leaf and every merge goes through the summariser.",
+    "A summary is one line `topics: <phrases> | themes: <words> |`, padded with dots to 132 bytes. It never contains a digit, so no value survives any level.",
+    "A leaf (one message) keeps the topic phrase it states, whatever its value.",
+    "A merged line covering 2^L messages keeps a child's topic only while L <= that fact's keep (seeded, 1..5). Old facts under coarse view lines are dropped from the view, and only zoom or chat_search can reach them.",
+    "Over the node budget, a merge drops its earliest-listed topics first. Themes: the first 3 vocabulary words, interleaved."
+  ],
+  "countingRules": [
+    "Agent steps: zoom, chat_search, chat_recall calls, budget 24 per probe. A beam is one script step. The prefetch gate adds no step.",
+    "Judge calls: every call to the judge, by any component. Zoom calls: every memory.zoom call, gate and script included.",
+    "Bytes: UTF-8 bytes the agent receives (tool results, the prefetch block, the script's printed output). The view is already in the prompt and is not counted.",
+    "Found: the bytes received contain the fact's value. Probe question: names the topic, never the value."
+  ],
+  "strategies": [
+    {
+      "name": "zoom-only",
+      "policy": "Agent zoom(id,n) one level per call; best-first over view lines and opened children by probe-word overlap, newest on ties; leaves read with zoom(id,1); budget 24 calls.",
+      "found": 5,
+      "probes": 12,
+      "steps": 193,
+      "judgeCalls": 0,
+      "zooms": 193,
+      "bytes": 63251
+    },
+    {
+      "name": "zoom-depth",
+      "policy": "Same best-first policy, but each call opens up to 4 levels at once (zoom depth d = min(4, log2 n)).",
+      "found": 5,
+      "probes": 12,
+      "steps": 181,
+      "judgeCalls": 0,
+      "zooms": 181,
+      "bytes": 92068
+    },
+    {
+      "name": "chat_search",
+      "policy": "chat_search(topic words), newest hits first, following next paging; zoom(id,1) each hit in order until the value appears; budget 24 calls.",
+      "found": 12,
+      "probes": 12,
+      "steps": 24,
+      "judgeCalls": 0,
+      "zooms": 12,
+      "bytes": 8393
+    },
+    {
+      "name": "prefetch",
+      "policy": "prefetchBlock gate (judge = overlap, k=8, min=0.5, one-level zoom, no agent step), then the agent's best-first zooms over the block rows and unopened view lines within budget 24.",
+      "found": 5,
+      "probes": 12,
+      "steps": 188,
+      "judgeCalls": 12,
+      "zooms": 195,
+      "bytes": 64713
+    },
+    {
+      "name": "chat_recall",
+      "policy": "recall() with the overlap judge (min=0.5, viewLines(true) so single messages are candidates); one chat_recall call, no follow-up.",
+      "found": 5,
+      "probes": 12,
+      "steps": 12,
+      "judgeCalls": 37,
+      "zooms": 8,
+      "bytes": 8818
+    },
+    {
+      "name": "beam",
+      "policy": "Codemode beam script (B=2, min P=0.5): judge the view, keep B, zoom each one level, judge children, keep B, repeat to leaves; print the kept leaves. One script step; expansions do not reach the agent.",
+      "found": 5,
+      "probes": 12,
+      "steps": 12,
+      "judgeCalls": 34,
+      "zooms": 30,
+      "bytes": 2883
+    }
+  ],
+  "probes": [
+    {
+      "index": 18,
+      "age": 237,
+      "topic": "billing queue timeout",
+      "keep": 4,
+      "inView": false,
+      "outcomes": {
+        "zoom-only": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 8436
+        },
+        "zoom-depth": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 10213
+        },
+        "chat_search": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 1,
+          "bytes": 727
+        },
+        "prefetch": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 1,
+          "zooms": 24,
+          "bytes": 8436
+        },
+        "chat_recall": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 1,
+          "zooms": 1,
+          "bytes": 556
+        },
+        "beam": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 1,
+          "zooms": 1,
+          "bytes": 324
+        }
+      }
+    },
+    {
+      "index": 38,
+      "age": 217,
+      "topic": "legacy queue shard",
+      "keep": 2,
+      "inView": false,
+      "outcomes": {
+        "zoom-only": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 8039
+        },
+        "zoom-depth": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 11872
+        },
+        "chat_search": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 1,
+          "bytes": 637
+        },
+        "prefetch": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 1,
+          "zooms": 24,
+          "bytes": 8039
+        },
+        "chat_recall": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 1,
+          "zooms": 0,
+          "bytes": 91
+        },
+        "beam": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 1,
+          "zooms": 0,
+          "bytes": 0
+        }
+      }
+    },
+    {
+      "index": 57,
+      "age": 198,
+      "topic": "legacy scheduler version",
+      "keep": 2,
+      "inView": false,
+      "outcomes": {
+        "zoom-only": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 7689
+        },
+        "zoom-depth": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 12931
+        },
+        "chat_search": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 1,
+          "bytes": 640
+        },
+        "prefetch": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 1,
+          "zooms": 24,
+          "bytes": 7689
+        },
+        "chat_recall": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 1,
+          "zooms": 0,
+          "bytes": 91
+        },
+        "beam": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 1,
+          "zooms": 0,
+          "bytes": 0
+        }
+      }
+    },
+    {
+      "index": 66,
+      "age": 189,
+      "topic": "mobile database limit",
+      "keep": 1,
+      "inView": false,
+      "outcomes": {
+        "zoom-only": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 7549
+        },
+        "zoom-depth": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 12560
+        },
+        "chat_search": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 1,
+          "bytes": 728
+        },
+        "prefetch": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 1,
+          "zooms": 24,
+          "bytes": 7549
+        },
+        "chat_recall": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 1,
+          "zooms": 0,
+          "bytes": 91
+        },
+        "beam": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 1,
+          "zooms": 0,
+          "bytes": 0
+        }
+      }
+    },
+    {
+      "index": 106,
+      "age": 149,
+      "topic": "staging proxy quota",
+      "keep": 2,
+      "inView": false,
+      "outcomes": {
+        "zoom-only": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 8436
+        },
+        "zoom-depth": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 10213
+        },
+        "chat_search": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 1,
+          "bytes": 716
+        },
+        "prefetch": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 1,
+          "zooms": 25,
+          "bytes": 8824
+        },
+        "chat_recall": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 1,
+          "zooms": 1,
+          "bytes": 561
+        },
+        "beam": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 2,
+          "zooms": 3,
+          "bytes": 711
+        }
+      }
+    },
+    {
+      "index": 108,
+      "age": 147,
+      "topic": "legacy queue port",
+      "keep": 1,
+      "inView": false,
+      "outcomes": {
+        "zoom-only": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 7956
+        },
+        "zoom-depth": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 11789
+        },
+        "chat_search": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 1,
+          "bytes": 721
+        },
+        "prefetch": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 1,
+          "zooms": 24,
+          "bytes": 7956
+        },
+        "chat_recall": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 1,
+          "zooms": 0,
+          "bytes": 91
+        },
+        "beam": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 1,
+          "zooms": 0,
+          "bytes": 0
+        }
+      }
+    },
+    {
+      "index": 129,
+      "age": 126,
+      "topic": "mobile scheduler port",
+      "keep": 5,
+      "inView": true,
+      "outcomes": {
+        "zoom-only": {
+          "found": true,
+          "steps": 6,
+          "judgeCalls": 0,
+          "zooms": 6,
+          "bytes": 1681
+        },
+        "zoom-depth": {
+          "found": true,
+          "steps": 3,
+          "judgeCalls": 0,
+          "zooms": 3,
+          "bytes": 2794
+        },
+        "chat_search": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 1,
+          "bytes": 629
+        },
+        "prefetch": {
+          "found": true,
+          "steps": 5,
+          "judgeCalls": 1,
+          "zooms": 6,
+          "bytes": 1792
+        },
+        "chat_recall": {
+          "found": true,
+          "steps": 1,
+          "judgeCalls": 6,
+          "zooms": 1,
+          "bytes": 1268
+        },
+        "beam": {
+          "found": true,
+          "steps": 1,
+          "judgeCalls": 6,
+          "zooms": 6,
+          "bytes": 294
+        }
+      }
+    },
+    {
+      "index": 165,
+      "age": 90,
+      "topic": "analytics cache shard",
+      "keep": 5,
+      "inView": true,
+      "outcomes": {
+        "zoom-only": {
+          "found": true,
+          "steps": 6,
+          "judgeCalls": 0,
+          "zooms": 6,
+          "bytes": 1764
+        },
+        "zoom-depth": {
+          "found": true,
+          "steps": 3,
+          "judgeCalls": 0,
+          "zooms": 3,
+          "bytes": 2877
+        },
+        "chat_search": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 1,
+          "bytes": 712
+        },
+        "prefetch": {
+          "found": true,
+          "steps": 5,
+          "judgeCalls": 1,
+          "zooms": 6,
+          "bytes": 1875
+        },
+        "chat_recall": {
+          "found": true,
+          "steps": 1,
+          "judgeCalls": 6,
+          "zooms": 1,
+          "bytes": 1351
+        },
+        "beam": {
+          "found": true,
+          "steps": 1,
+          "judgeCalls": 6,
+          "zooms": 6,
+          "bytes": 377
+        }
+      }
+    },
+    {
+      "index": 185,
+      "age": 70,
+      "topic": "search gateway limit",
+      "keep": 5,
+      "inView": true,
+      "outcomes": {
+        "zoom-only": {
+          "found": true,
+          "steps": 6,
+          "judgeCalls": 0,
+          "zooms": 6,
+          "bytes": 1776
+        },
+        "zoom-depth": {
+          "found": true,
+          "steps": 3,
+          "judgeCalls": 0,
+          "zooms": 3,
+          "bytes": 2889
+        },
+        "chat_search": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 1,
+          "bytes": 722
+        },
+        "prefetch": {
+          "found": true,
+          "steps": 5,
+          "judgeCalls": 1,
+          "zooms": 6,
+          "bytes": 1887
+        },
+        "chat_recall": {
+          "found": true,
+          "steps": 1,
+          "judgeCalls": 6,
+          "zooms": 1,
+          "bytes": 1362
+        },
+        "beam": {
+          "found": true,
+          "steps": 1,
+          "judgeCalls": 6,
+          "zooms": 6,
+          "bytes": 389
+        }
+      }
+    },
+    {
+      "index": 210,
+      "age": 45,
+      "topic": "search bucket version",
+      "keep": 5,
+      "inView": true,
+      "outcomes": {
+        "zoom-only": {
+          "found": true,
+          "steps": 5,
+          "judgeCalls": 0,
+          "zooms": 5,
+          "bytes": 1517
+        },
+        "zoom-depth": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 2,
+          "bytes": 2632
+        },
+        "chat_search": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 1,
+          "bytes": 744
+        },
+        "prefetch": {
+          "found": true,
+          "steps": 4,
+          "judgeCalls": 1,
+          "zooms": 5,
+          "bytes": 1628
+        },
+        "chat_recall": {
+          "found": true,
+          "steps": 1,
+          "judgeCalls": 5,
+          "zooms": 1,
+          "bytes": 1234
+        },
+        "beam": {
+          "found": true,
+          "steps": 1,
+          "judgeCalls": 5,
+          "zooms": 5,
+          "bytes": 409
+        }
+      }
+    },
+    {
+      "index": 222,
+      "age": 33,
+      "topic": "analytics queue limit",
+      "keep": 2,
+      "inView": false,
+      "outcomes": {
+        "zoom-only": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 7752
+        },
+        "zoom-depth": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 0,
+          "zooms": 24,
+          "bytes": 10642
+        },
+        "chat_search": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 1,
+          "bytes": 701
+        },
+        "prefetch": {
+          "found": false,
+          "steps": 24,
+          "judgeCalls": 1,
+          "zooms": 25,
+          "bytes": 8271
+        },
+        "chat_recall": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 6,
+          "zooms": 1,
+          "bytes": 1363
+        },
+        "beam": {
+          "found": false,
+          "steps": 1,
+          "judgeCalls": 2,
+          "zooms": 1,
+          "bytes": 0
+        }
+      }
+    },
+    {
+      "index": 251,
+      "age": 4,
+      "topic": "staging proxy timeout",
+      "keep": 5,
+      "inView": true,
+      "outcomes": {
+        "zoom-only": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 2,
+          "bytes": 656
+        },
+        "zoom-depth": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 2,
+          "bytes": 656
+        },
+        "chat_search": {
+          "found": true,
+          "steps": 2,
+          "judgeCalls": 0,
+          "zooms": 1,
+          "bytes": 716
+        },
+        "prefetch": {
+          "found": true,
+          "steps": 1,
+          "judgeCalls": 1,
+          "zooms": 2,
+          "bytes": 767
+        },
+        "chat_recall": {
+          "found": true,
+          "steps": 1,
+          "judgeCalls": 2,
+          "zooms": 1,
+          "bytes": 759
+        },
+        "beam": {
+          "found": true,
+          "steps": 1,
+          "judgeCalls": 2,
+          "zooms": 2,
+          "bytes": 379
+        }
+      }
+    }
+  ]
+}

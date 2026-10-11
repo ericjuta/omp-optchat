@@ -55,6 +55,7 @@ import { Store, StoreLeaseConflictError, type Kind, type Message } from "./store
 import { boundedGateError, hostJudge, judgeWithin, type JudgeFactory, type NamedJudge } from "./system1/judge.js";
 import { RuleLedger, renderRules, type Rule } from "./system1/ledger.js";
 import { prefetchBlock, PREFETCH_MS } from "./system1/prefetch.js";
+import { recall, registerRecallTool, renderRecall } from "./system1/recall.js";
 import { decideTriage, offeredRules, ruleSentences, triageQuestions, triageState } from "./system1/rules.js";
 import { gateToolCall } from "./system1/tool-gate.js";
 import { valueHint } from "./system1/value.js";
@@ -73,7 +74,7 @@ const HOST_HANDLER_LIMIT_MS = 30_000;
 /** Absolute wall deadline for the main-model fallback after an original compressor refusal: admission, auth, lease and response. */
 const MAIN_FALLBACK_DEADLINE_MS = 30_000;
 const IDLE_POLL_MS = 250;
-const TOOL_NAMES: readonly string[] = ["zoom", "date", "work"];
+const TOOL_NAMES: readonly string[] = ["zoom", "date", "work", "chat_search"];
 /** Host tools whose arguments and results are the model's private thoughts: never logged. */
 const PRIVATE_TOOLS: Record<string, true> = { think: true };
 const SKILL_PROMPT_MESSAGE_TYPE = "skill-prompt";
@@ -585,6 +586,7 @@ class OptChat {
 		try {
 			rules = config.gates.rules ? RuleLedger.open(store.directory) : undefined;
 			this.registerTools();
+			if (config.gates.recall) this.registerRecall();
 		} catch (error) {
 			await store.close();
 			throw error;
@@ -616,10 +618,40 @@ class OptChat {
 			throw new Error(`tool name ${taken.map((tool) => `"${tool.name}"`).join(", ")} is already registered`);
 		}
 		registerMemoryTools(this.pi, {
-			zoom: (id, n, offset) => this.withImages(this.openMemory().zoom(id, n, offset), id, n, offset),
+			zoom: (id, n, offset, depth) => this.withImages(this.openMemory().zoom(id, n, offset, depth), id, n, offset),
 			date: (id) => this.openMemory().date(id),
 			work: (name, offset) => this.workEnvelope(name, offset, Number.POSITIVE_INFINITY),
+			search: (query, options) => this.openMemory().search(query, options),
 		}, UNGUARDED);
+	}
+
+	/** The recall gate's tool: a judge-guided descent from a view line to one stored message. Main sessions only. */
+	private registerRecall(): void {
+		if (this.pi.getAllTools().some((tool) => tool.name === "chat_recall")) {
+			throw new Error('tool name "chat_recall" is already registered');
+		}
+		registerRecallTool(this.pi, (question, current, signal) => this.recallFor(question, current, signal));
+	}
+
+	private async recallFor(question: string, current: ExtensionContext | undefined, signal: AbortSignal | undefined): Promise<string> {
+		const memory = this.openMemory();
+		const config = this.config!;
+		const ctx = current ?? this.ctx;
+		const judge = ctx ? this.judgeOf(ctx, "optchat-recall") : undefined;
+		if (!judge) {
+			this.gateFail("recall", "no judge candidate");
+			throw new Error("chat_recall needs the judge role, which has no usable candidate; use chat_search or zoom");
+		}
+		const outcome = await recall(
+			{
+				viewLines: () => memory.viewLines(true),
+				lineAt: (id, n) => memory.lineAt(id, n),
+				page: (id) => memory.zoom(id, 1, 0),
+			},
+			{ judge, question, min: config.gates.recallMin, signal },
+		);
+		if (outcome.kind === "failed") this.gateFail("recall", outcome.reason);
+		return renderRecall(outcome);
 	}
 
 	/** Child sessions get a frozen read-only snapshot, revoked when this chat shuts down. */
@@ -654,9 +686,9 @@ class OptChat {
 		return {
 			render: memory.render(),
 			upperBound,
-			zoom: (id, n, offset) => {
+			zoom: (id, n, offset, depth) => {
 				within(id, n);
-				return this.withImages(live().zoom(id, n, offset), id, n, offset);
+				return this.withImages(live().zoom(id, n, offset, depth), id, n, offset);
 			},
 			date: (id) => {
 				within(id, 1);
@@ -665,6 +697,10 @@ class OptChat {
 			work: (name, offset) => {
 				live();
 				return this.workEnvelope(name, offset, upperBound);
+			},
+			search: (query, options) => {
+				// Hits come only from messages the snapshot already holds.
+				return live().search(query, { ...options, before: Math.min(options.before ?? upperBound, upperBound) });
 			},
 		};
 	}
@@ -1083,7 +1119,7 @@ class OptChat {
 			const memory = this.requireReady();
 			const active = new Set(this.pi.getActiveTools());
 			if (!TOOL_NAMES.every((name) => active.has(name))) {
-				throw new Refusal("OptChat refused the request: the zoom and date tools are not active in this session.");
+				throw new Refusal(`OptChat refused the request: the ${TOOL_NAMES.join(", ")} tools are not active in this session.`);
 			}
 			let turn = this.turn;
 			if (!turn) {
@@ -1624,10 +1660,10 @@ class OptChat {
 	/** `/optchat status` lines for the System One gates. With every gate off there are none: status matches v0.5.0. */
 	private gateStatus(): string[] {
 		const gates = this.config?.gates;
-		if (!gates || !(gates.rules || gates.prefetch || gates.valueScore || gates.toolGate)) return [];
+		if (!gates || !(gates.rules || gates.prefetch || gates.valueScore || gates.toolGate || gates.recall)) return [];
 		const flag = (on: boolean) => (on ? "on" : "off");
 		const lines = [
-			`System One gates: rules ${flag(gates.rules)}, prefetch ${flag(gates.prefetch)}, value-score ${flag(gates.valueScore)}, tool-gate ${flag(gates.toolGate)}`,
+			`System One gates: rules ${flag(gates.rules)}, prefetch ${flag(gates.prefetch)}, value-score ${flag(gates.valueScore)}, tool-gate ${flag(gates.toolGate)}, recall ${flag(gates.recall)}`,
 		];
 		const judge = this.ctx ? this.judgeOf(this.ctx, "optchat-status") : undefined;
 		const model = (judge as NamedJudge | undefined)?.primaryModel?.();

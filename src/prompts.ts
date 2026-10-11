@@ -89,8 +89,17 @@ are supplied to model calls, never unsummarized placeholders.
 Memory tools, when available on an ordinary turn:
 - zoom(id, n) opens line id+n into its two children, each covering n/2
   messages; n is a power of two and id is a multiple of n.
+- zoom(id, n, depth) opens depth levels at once (at most 4): 2^depth
+  lines, each covering n/2^depth messages; depth is at most log2(n).
 - zoom(id, 1, offset) returns one page of message id's stored text from a
   UTF-8 byte offset; while next is not null, call again with that offset.
+- chat_search(text, kind, limit, before) finds stored messages containing
+  all the words, newest first, with snippets; open a hit with zoom(id, 1).
+  Use it when a summary dropped a name, path, number or error.
+- chat_recall(question), when the recall gate is on, asks a relevance
+  judge to pick a view line and open one half per level down to the
+  message that best answers the question; it returns the path and that
+  message's first page. Check its answer like any summary.
 - date(id) gives the date and time of message id.
 - work(name, offset) pages through a captured subagent or background report,
   by its recorded id, agent id or name; follow next the same way.

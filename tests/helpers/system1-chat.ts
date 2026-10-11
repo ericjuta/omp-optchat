@@ -71,6 +71,8 @@ export function routedJudge(routes: Routes = {}): FakeJudge {
 export interface OpenOptions {
   flags?: Record<string, string | boolean>;
   routes?: Routes;
+  /** A custom judge; default is `routedJudge(routes)`. */
+  judge?: FakeJudge;
   hasUI?: boolean;
   confirm?: (title: string, message: string) => boolean;
   /** Use this compressor server; the default starts one for this harness. */
@@ -83,7 +85,7 @@ export class Harness {
   readonly servers: CompressorServer[] = [];
 
   async open(options: OpenOptions = {}): Promise<{ host: FakeHost; judge: FakeJudge; compressor: CompressorServer }> {
-    const judge = routedJudge(options.routes);
+    const judge = options.judge ?? routedJudge(options.routes);
     const compressor = options.compressor ?? (await startCompressorServer());
     if (!options.compressor) this.servers.push(compressor);
     const host = await openFakeHost(createOptChat({ judge: () => judge }), {
@@ -140,6 +142,7 @@ export const ALL_GATES_OFF = {
   "no-optchat-prefetch": true,
   "no-optchat-value-score": true,
   "no-optchat-tool-gate": true,
+  "no-optchat-recall": true,
 } as const;
 
 export function anthropicModel(): Model<"anthropic-messages"> {

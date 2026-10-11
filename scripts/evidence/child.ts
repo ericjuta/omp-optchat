@@ -216,7 +216,7 @@ export function childTaskText(question: Question): string {
 /** Parent instruction: must delegate the task text verbatim and must not answer or retrieve itself. */
 export function parentPrompt(task: ChildTask): string {
 	return [
-		"Delegate the task between the markers to one subagent with the task tool, exactly once. Pass its text verbatim. Do not answer it yourself, and do not call zoom, date, or work.",
+		"Delegate the task between the markers to one subagent with the task tool, exactly once. Pass its text verbatim. Do not answer it yourself, and do not call zoom, date, work, or chat_search.",
 		"After the subagent finishes, reply with its final answer unchanged.",
 		"<<<TASK",
 		task.task,

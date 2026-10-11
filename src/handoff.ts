@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { MESSAGE_KINDS, type SearchOptions, type SearchResult } from "./memory.js";
 
 /** Stored image bytes and their MIME type; never a path. */
 export interface PageImage {
@@ -26,9 +27,10 @@ export interface WorkEnvelope {
 
 /** Read-only memory access: the main chat's memory and a child's frozen snapshot both satisfy it. */
 export interface MemoryReader {
-	zoom(id: number, n: number, offset: number): PageEnvelope;
+	zoom(id: number, n: number, offset: number, depth: number): PageEnvelope;
 	date(id: number): string;
 	work(name: string, offset: number): WorkEnvelope;
+	search(query: string, options: SearchOptions): SearchResult;
 }
 
 /** A child's frozen snapshot: a detached render and reads bounded to the upper bound. It has no writer. */
@@ -107,9 +109,9 @@ function guarded(view: ChildView, token: { live: boolean }): ChildView {
 	return {
 		render: view.render,
 		upperBound: view.upperBound,
-		zoom: (id, n, offset) => {
+		zoom: (id, n, offset, depth) => {
 			check();
-			return view.zoom(id, n, offset);
+			return view.zoom(id, n, offset, depth);
 		},
 		date: (id) => {
 			check();
@@ -118,6 +120,10 @@ function guarded(view: ChildView, token: { live: boolean }): ChildView {
 		work: (name, offset) => {
 			check();
 			return view.work(name, offset);
+		},
+		search: (query, options) => {
+			check();
+			return view.search(query, options);
 		},
 	};
 }
@@ -137,19 +143,20 @@ function pageResult(page: PageEnvelope, details: Record<string, unknown> = {}) {
 	};
 }
 
-/** Register the zoom, date and work tools over any memory reader; each call is admitted before it reads. */
+/** Register the zoom, date, work and chat_search tools over any memory reader; each call is admitted before it reads. */
 export function registerMemoryTools(pi: ExtensionAPI, reader: MemoryReader, admit: Admission): void {
 	const z = pi.zod;
 	const zoomParams = z.object({
 		id: z.number().int().min(0).describe("First message id of the line"),
 		n: z.number().int().min(1).describe("Messages the line covers (a power of 2)"),
 		offset: z.number().int().min(0).optional().describe("UTF-8 byte offset of the page (n = 1 only; default 0)"),
+		depth: z.number().int().min(1).optional().describe("Levels to open at once (n > 1; default 1, at most 4)"),
 	});
 	pi.registerTool<typeof zoomParams>({
 		name: "zoom",
 		label: "OptChat zoom",
 		description:
-			"Open the line id+n of the view into the two lines of n/2 under it. With n = 1, return one page of message id's stored text from offset; follow details.next until it is null.",
+			"Open the line id+n of the view into the two lines of n/2 under it; with depth d, open the 2^d lines d levels under it at once. With n = 1, return one page of message id's stored text from offset; follow details.next until it is null.",
 		parameters: zoomParams,
 		approval: "read",
 		loadMode: "essential",
@@ -157,7 +164,7 @@ export function registerMemoryTools(pi: ExtensionAPI, reader: MemoryReader, admi
 			admit(current);
 			const offset = params.offset ?? 0;
 			if (params.n > 1 && offset !== 0) throw new Error("offset applies only to zoom with n = 1");
-			return pageResult(reader.zoom(params.id, params.n, offset));
+			return pageResult(reader.zoom(params.id, params.n, offset, params.depth ?? 1));
 		},
 	});
 	const dateParams = z.object({ id: z.number().int().min(0).describe("Message id") });
@@ -171,6 +178,32 @@ export function registerMemoryTools(pi: ExtensionAPI, reader: MemoryReader, admi
 		execute: async (_id, params, _signal, _update, current) => {
 			admit(current);
 			return { content: [{ type: "text", text: reader.date(params.id) }] };
+		},
+	});
+	const searchParams = z.object({
+		text: z.string().min(1).max(200).describe("Words that must all appear in the message, case-insensitive"),
+		kind: z.enum(MESSAGE_KINDS).optional().describe("Only messages of this kind"),
+		limit: z.number().int().min(1).max(50).optional().describe("Hits to return (default 10)"),
+		before: z.number().int().min(0).optional().describe("Only messages with id below this; pass details.next for older hits"),
+	});
+	pi.registerTool<typeof searchParams>({
+		name: "chat_search",
+		label: "OptChat search",
+		description:
+			"Search the stored chat's original messages for words a summary may have dropped; returns message ids with snippets, newest first. Open a hit with zoom(id, 1).",
+		parameters: searchParams,
+		approval: "read",
+		loadMode: "essential",
+		execute: async (_id, params, _signal, _update, current) => {
+			admit(current);
+			const result = reader.search(params.text, { kind: params.kind, limit: params.limit, before: params.before });
+			const header = `[optchat search] ${result.hits.length} hits for "${params.text.replace(/\s+/g, " ").trim()}" (newest first)`;
+			const footer = result.next === null ? "[no older hits]" : `[older hits: before=${result.next}]`;
+			const lines = [header, ...result.hits.map((hit) => `${hit.id}|${hit.kind}|${hit.snippet}`), footer];
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: { hits: result.hits.map((hit) => hit.id), next: result.next },
+			};
 		},
 	});
 	const workParams = z.object({
@@ -226,7 +259,7 @@ export function attachChildView(pi: ExtensionAPI, ctx: ExtensionContext, guide: 
 	registerMemoryTools(pi, view, (current) => {
 		if (!attached(current)) throw new Error("the parent chat view is not attached to this session");
 	});
-	const block = `${guide}\n\n# Parent chat snapshot (read-only; zoom, date and work only)\n\n${view.render}`;
+	const block = `${guide}\n\n# Parent chat snapshot (read-only; zoom, date, work and chat_search only)\n\n${view.render}`;
 	pi.on("before_agent_start", (event, current) =>
 		attached(current) ? { systemPrompt: [...event.systemPrompt, block] } : undefined,
 	);

@@ -115,7 +115,7 @@ export function offCompactionBoundUsd(
 }
 
 /** UTF-8 bytes of the OptChat system block (src/index.ts SYSTEM_BLOCK). Pinned by a test against the source. */
-export const SYSTEM_BLOCK_BYTES = 5659;
+export const SYSTEM_BLOCK_BYTES = 6277;
 
 /** Upper bound on one host's tool schemas: a fixed allowance, since the schema bytes are not observed per run. */
 export const TOOL_SCHEMA_BYTES = 32 * 1024;

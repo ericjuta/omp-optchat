@@ -46,6 +46,43 @@ export interface ViewPart {
   readonly i: number;
 }
 
+/** Every memory tool's name. Their call records are skipped by search; recall is registered on its own. */
+export const MEMORY_TOOL_NAMES = ["zoom", "date", "work", "chat_search", "chat_recall"] as const;
+/** Each search or recall result's text begins with its mark; search skips those results. */
+export const MEMORY_RESULT_MARKS = ["[optchat search]", "[optchat recall]"] as const;
+/** Every stored message kind, in the store's order. */
+export const MESSAGE_KINDS = ["user", "talk", "tool", "echo", "note", "work"] as const satisfies readonly Kind[];
+/** Deepest zoom that opens several levels at once: 2^4 = 16 lines. */
+export const MAX_ZOOM_DEPTH = 4;
+export const SEARCH_QUERY_CHARS = 200;
+export const SEARCH_TERMS = 8;
+export const SEARCH_LIMIT = 10;
+export const SEARCH_MAX_LIMIT = 50;
+/** Bytes of a search snippet before its whitespace is flattened and its cut marks added. */
+const SNIPPET_BYTES = 240;
+/** Bytes of a snippet kept before the first match. */
+const SNIPPET_LEAD_BYTES = 80;
+
+export interface SearchOptions {
+  readonly kind?: Kind;
+  readonly limit?: number;
+  /** Only messages with id below this; a previous result's `next`. */
+  readonly before?: number;
+}
+
+export interface SearchHit {
+  readonly id: number;
+  readonly kind: Kind;
+  readonly date: string;
+  readonly snippet: string;
+}
+
+/** Hits newest first. `next` is the `before` value for older hits, or null when none remain. */
+export interface SearchResult {
+  readonly hits: ReadonlyArray<SearchHit>;
+  readonly next: number | null;
+}
+
 /** Structured zoom result. `next` is the byte offset of the following page, or null. */
 export interface ZoomPage {
   readonly text: string;
@@ -121,6 +158,48 @@ function pack(items: readonly string[], budget: number): string[][] {
 const PLACEHOLDER = "(not summarized yet: zoom it)";
 const PLACEHOLDER_BYTES = utf8Bytes(PLACEHOLDER);
 const flatten = (text: string): string => text.replace(/\r\n|\r|\n/g, " ");
+
+/** The last `budget` UTF-8 bytes of `text`, never starting inside a character. */
+function utf8Suffix(text: string, budget: number): string {
+  // One UTF-16 code unit needs at least one UTF-8 byte.
+  let start = Math.max(0, text.length - budget);
+  const first = text.charCodeAt(start);
+  if (start > 0 && first >= 0xdc00 && first <= 0xdfff) start++;
+  const bytes = Buffer.from(text.slice(start), "utf8");
+  let cut = Math.max(0, bytes.length - budget);
+  while (cut < bytes.length && (bytes[cut]! & 0xc0) === 0x80) cut++;
+  return bytes.subarray(cut).toString("utf8");
+}
+
+/** The index in `text` where position `index` of `text.toLowerCase()` begins. */
+function originalIndex(text: string, lower: string, index: number): number {
+  if (lower.length === text.length) return index;
+  let lowered = 0;
+  for (let i = 0; i < text.length;) {
+    if (lowered >= index) return i;
+    const char = String.fromCodePoint(text.codePointAt(i)!);
+    lowered += char.toLowerCase().length;
+    i += char.length;
+  }
+  return text.length;
+}
+
+/** About SNIPPET_BYTES of `text` around `at`, on one line, with "…" where it was cut. */
+function snippet(text: string, at: number): string {
+  const head = utf8Suffix(text.slice(Math.max(0, at - SNIPPET_LEAD_BYTES), at), SNIPPET_LEAD_BYTES);
+  const tailBudget = SNIPPET_BYTES - utf8Bytes(head);
+  const tail = utf8Prefix(text.slice(at, at + tailBudget), tailBudget);
+  const body = `${head}${tail}`.replace(/\s+/g, " ").trim();
+  return `${at - head.length > 0 ? "…" : ""}${body}${at + tail.length < text.length ? "…" : ""}`;
+}
+
+/** A memory tool's own call record or a search or recall result: never a search hit. */
+function memoryRecord(message: Message): boolean {
+  if (message.kind === "tool") return MEMORY_TOOL_NAMES.some((name) => message.text.startsWith(`${name} {`));
+  if (message.kind === "echo") return MEMORY_RESULT_MARKS.some((mark) => message.text.startsWith(mark));
+  return false;
+}
+
 const chat = (lines: string[]): string => ["<chat>", ...lines, "</chat>"].join("\n");
 
 function samePairs(
@@ -285,11 +364,14 @@ export class Memory {
     return chat(this.view.map((part) => this.renderPart(part)));
   }
 
-  /** Merged view lines (n >= 2) with their summary text, flattened to one line. Level-0 lines are excluded. */
-  viewLines(): Array<{ readonly id: number; readonly n: number; readonly text: string }> {
+  /**
+   * View lines with their summary text, flattened to one line. Merged lines (n >= 2) only, unless `leaves`:
+   * prefetch opens lines one level, which a single message cannot be; recall reads a single message directly.
+   */
+  viewLines(leaves = false): Array<{ readonly id: number; readonly n: number; readonly text: string }> {
     const lines: Array<{ readonly id: number; readonly n: number; readonly text: string }> = [];
     for (const part of this.view) {
-      if (part.l === 0) continue;
+      if (part.l === 0 && !leaves) continue;
       const node = this.node(part);
       if (!node) continue;
       const n = 2 ** part.l;
@@ -298,12 +380,62 @@ export class Memory {
     return lines;
   }
 
+  /** The built line id+n, flattened like `viewLines`; undefined for an invalid address or an unbuilt node. */
+  lineAt(id: number, n: number): { readonly id: number; readonly n: number; readonly text: string } | undefined {
+    const level = Math.log2(n);
+    if (
+      !Number.isSafeInteger(id) || id < 0 ||
+      !Number.isSafeInteger(n) || n <= 0 || !Number.isInteger(level) || 2 ** level !== n ||
+      id % n !== 0 || id > this.store.messages.length - n
+    ) {
+      return undefined;
+    }
+    const node = this.node({ l: level, i: id / n });
+    return node ? { id, n, text: flatten(node.text) } : undefined;
+  }
+
+  /**
+   * Stored messages whose text contains every whitespace-separated term of `query`, case-insensitively,
+   * newest first. Memory tool call records and search/recall results are skipped. Invalid input throws RangeError.
+   */
+  search(query: string, options: SearchOptions = {}): SearchResult {
+    const trimmed = typeof query === "string" ? query.trim() : "";
+    if (trimmed.length === 0 || trimmed.length > SEARCH_QUERY_CHARS) {
+      throw new RangeError(`search text must be 1 to ${SEARCH_QUERY_CHARS} characters`);
+    }
+    const terms = trimmed.toLowerCase().split(/\s+/);
+    if (terms.length > SEARCH_TERMS) throw new RangeError(`search text must have at most ${SEARCH_TERMS} words`);
+    const { kind, limit = SEARCH_LIMIT, before } = options;
+    if (kind !== undefined && !(MESSAGE_KINDS as readonly string[]).includes(kind)) {
+      throw new RangeError(`kind must be one of ${MESSAGE_KINDS.join(", ")}`);
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > SEARCH_MAX_LIMIT) {
+      throw new RangeError(`limit must be an integer from 1 to ${SEARCH_MAX_LIMIT}`);
+    }
+    if (before !== undefined && (!Number.isSafeInteger(before) || before < 0)) {
+      throw new RangeError("before must be a nonnegative safe integer");
+    }
+    const messages = this.store.messages;
+    const hits: SearchHit[] = [];
+    for (let id = Math.min(before ?? messages.length, messages.length) - 1; id >= 0; id--) {
+      const message = messages[id]!;
+      if ((kind !== undefined && message.kind !== kind) || memoryRecord(message)) continue;
+      const lower = message.text.toLowerCase();
+      if (!terms.every((term) => lower.includes(term))) continue;
+      // One match past the limit proves older hits remain.
+      if (hits.length === limit) return { hits, next: hits[hits.length - 1]!.id };
+      const at = originalIndex(message.text, lower, lower.indexOf(terms[0]!));
+      hits.push({ id, kind: message.kind, date: message.date, snippet: snippet(message.text, at) });
+    }
+    return { hits, next: null };
+  }
+
   /**
    * n=1: a bounded page of the message's exact source bytes, with a cursor.
-   * n>1: the two addressed children of the node; offset must be zero.
-   * Invalid addresses throw RangeError.
+   * n>1: the 2^depth lines `depth` levels under the node; offset must be zero and depth at most log2(n).
+   * Invalid addresses and unbuilt lines throw RangeError.
    */
-  zoom(id: number, n: number, offset = 0): ZoomPage {
+  zoom(id: number, n: number, offset = 0, depth = 1): ZoomPage {
     const length = this.store.messages.length;
     const level = Math.log2(n);
     if (
@@ -316,15 +448,21 @@ export class Memory {
     if (!Number.isSafeInteger(offset) || offset < 0) {
       throw new RangeError("offset must be a nonnegative safe integer");
     }
+    if (!Number.isSafeInteger(depth) || depth < 1 || depth > MAX_ZOOM_DEPTH) {
+      throw new RangeError(`depth must be an integer from 1 to ${MAX_ZOOM_DEPTH}`);
+    }
     if (n === 1) {
+      if (depth !== 1) throw new RangeError("depth applies only to zoom with n > 1");
       const page = this.store.readMessagePage(id, offset);
       return { text: page.text, next: page.next, totalBytes: page.totalBytes, offset: page.offset };
     }
     if (offset !== 0) throw new RangeError("offset applies only to single-message zoom");
-    const left = { l: level - 1, i: (id / n) * 2 };
-    const right = { l: level - 1, i: left.i + 1 };
-    if (!this.node(left) || !this.node(right)) throw new RangeError(`No line ${id}+${n}.`);
-    const text = `${this.renderPart(left)}\n${this.renderPart(right)}`;
+    if (depth > level) throw new RangeError(`depth ${depth} exceeds the ${level} levels under line ${id}+${n}`);
+    const width = 2 ** depth;
+    const parts: ViewPart[] = [];
+    for (let k = 0; k < width; k++) parts.push({ l: level - depth, i: (id / n) * width + k });
+    if (parts.some((part) => !this.node(part))) throw new RangeError(`No line ${id}+${n}.`);
+    const text = parts.map((part) => this.renderPart(part)).join("\n");
     return { text, next: null, totalBytes: utf8Bytes(text), offset: 0 };
   }
 

@@ -40,8 +40,16 @@ export interface FakeHostOptions {
   mainModel?: object;
 }
 
+/** A registered tool as the host holds it: only the members a test reads or calls. */
+export interface RegisteredTool {
+  name: string;
+  execute(id: string, input: Record<string, unknown>, signal: AbortSignal | undefined, update: undefined, ctx: ExtensionContext): Promise<{ content: { type: string; text?: string }[] }>;
+}
+
 export interface FakeHost {
   directory: string;
+  /** Every tool OptChat registered, by name. */
+  tools: Map<string, RegisteredTool>;
   notices: Notice[];
   confirms: Confirm[];
   handlers: Map<string, Handler[]>;
@@ -54,6 +62,8 @@ export interface FakeHost {
   user(text: string): HostMessage;
   assistant(text: string, tool?: { id: string; name: string; arguments: Record<string, unknown> }): AssistantMessage;
   toolResult(id: string, name: string, text: string): HostMessage;
+  /** Executes a registered tool the way the host does and returns its text content. */
+  callTool(name: string, input: Record<string, unknown>): Promise<string>;
   shutdown(): Promise<void>;
   /** Shutdown, then remove the directory unless it was supplied. */
   close(): Promise<void>;
@@ -87,6 +97,7 @@ export async function openFakeHost(
   };
   const handlers = new Map<string, Handler[]>();
   const commands: FakeHost["commands"] = new Map();
+  const tools: FakeHost["tools"] = new Map();
   const notices: Notice[] = [];
   const confirms: Confirm[] = [];
   let lastTimestamp = Date.now();
@@ -103,13 +114,16 @@ export async function openFakeHost(
     },
     getFlag: (name: string) => flags[name],
     getAllTools: () => [],
-    getActiveTools: () => ["zoom", "date", "work"],
-    registerTool() {},
+    getActiveTools: () => ["zoom", "date", "work", "chat_search"],
+    registerTool(tool: RegisteredTool) {
+      tools.set(tool.name, tool);
+    },
     zod: zodStub(),
     pi: { getAgentDir: () => directory },
   } as unknown as ExtensionAPI;
   const host: FakeHost = {
     directory,
+    tools,
     notices,
     confirms,
     handlers,
@@ -149,6 +163,12 @@ export async function openFakeHost(
     toolResult: (id, name, text) => ({
       role: "toolResult", toolCallId: id, toolName: name, content: [{ type: "text", text }], isError: false, timestamp: timestamp(),
     }) as HostMessage,
+    async callTool(name, input) {
+      const tool = tools.get(name);
+      if (!tool) throw new Error(`tool ${name} is not registered`);
+      const result = await tool.execute(`call-${name}`, input, undefined, undefined, host.ctx);
+      return result.content.map((part) => part.text ?? "").join("");
+    },
     async shutdown() {
       await host.fire("session_shutdown");
     },

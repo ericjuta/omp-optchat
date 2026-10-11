@@ -20,12 +20,13 @@
 - [Implementation home is omp-optchat](issues/03-runtime-and-model-stack.md): the gates are flags in the omp-optchat OMP extension (TypeScript on Bun), not a standalone app; model roles come from OMP. Closes ticket 03.
 - [Jev through the host judge role](issues/01-jev-api-and-limits.md): the plugin reaches Jev only through `resolveJudge` (the `judge` role), with no provider client. Narrows ticket 01; its remaining items are listed there.
 - [View fold tested in omp-optchat](issues/04-view-fold-prototype.md): omp-optchat's fold and its named tests answer the prototype question; the untested cases move into the plan. Closes ticket 04.
+- [Retrieval primitives](issues/10-codemode-retrieval.md): raw-log text search ships as `chat_search`, judge-guided descent as the recall gate's `chat_recall`, plus `zoom` depth; codemode beam stays in the eval kernel, not the plugin. Synthetic comparison recorded in ticket 10; real-summary and Jev evidence still open. Answers ticket 10 (synthetic).
 - Skills live under `.omp/skills/` (wayfinder, grilling, domain-modeling, research, prototype, execplan). Set by the user's direction; no ticket.
 - The eval harness and the automated research loop are out of scope for the current build. Set by the user's direction; narrows ticket 07 to the current build, and their reference documents remain in `docs/evals/`.
 
 ## Not yet specified
 
-- Search over the raw log (text or embeddings) alongside zoom; whether it belongs in the first build.
+- Embedding search over the raw log, beside the shipped text search (`chat_search`).
 - Where replayed real sessions come from for cost and cache metrics, and how private content is kept out of shared datasets.
 - Subagents: omp-optchat already logs `work` reports and offers opt-in child views (design §4). Still open: whether the demo needs subagents, and whether the tool gate should screen subagent calls, which run in yolo mode.
 - Whether Jev can pre-filter tool noise before the compactor, beyond giving it a hint.

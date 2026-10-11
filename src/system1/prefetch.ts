@@ -1,6 +1,6 @@
 import type { Judge, NoulAnswer, Questions } from "@oh-my-pi/pi-ai";
 import { utf8Prefix } from "../memory.js";
-import { judgeWithin, packByBytes, utf8Length } from "./judge.js";
+import { boundedGateError, judgeWithin, packByBytes, utf8Length } from "./judge.js";
 
 /** The new user text as judged. */
 export const PREFETCH_MESSAGE_BYTES = 4_000;
@@ -32,11 +32,22 @@ export interface PrefetchOptions {
   readonly signal?: AbortSignal;
 }
 
-interface Line {
+/** A merged view line: the messages [id, id + n) and their one-line summary. */
+export interface ViewLine {
   readonly id: number;
   readonly n: number;
   readonly text: string;
-  readonly key: string;
+}
+
+interface ScorePart<L extends ViewLine> {
+  readonly scored: ReadonlyArray<{ readonly line: L; readonly p: number }>;
+  readonly failure?: string;
+}
+
+/** Each scored line's probability, and one bounded error per request that failed or was never sent. */
+export interface LineScores<L extends ViewLine> {
+  readonly scored: ReadonlyArray<{ readonly line: L; readonly p: number }>;
+  readonly failures: readonly string[];
 }
 
 /** Runs `run` over `items` with at most `limit` in flight, keeping results in item order. */
@@ -53,20 +64,47 @@ async function pool<T, R>(items: readonly T[], limit: number, run: (item: T) => 
   return results;
 }
 
-/** One request's line probabilities; a failed request contributes none. */
-async function judgeChunk(judge: Judge, message: string, chunk: readonly Line[], signal: AbortSignal, ms: number): Promise<Array<{ line: Line; p: number }>> {
-  const lines: Record<string, string> = {};
-  const questions: Questions = {};
-  for (const line of chunk) {
-    lines[line.key] = line.text;
-    questions[line.key] = { type: "noul", instructions: `Line ${line.key} holds information needed to answer the message` };
-  }
-  try {
-    const result = await judgeWithin(judge, { state: { message, lines }, questions }, ms, signal);
-    return chunk.map((line) => ({ line, p: (result.answers[line.key] as NoulAnswer).noul }));
-  } catch {
-    return [];
-  }
+/**
+ * One noul question per line, asking whether the line holds information needed to answer `need`, in requests whose state is `state`
+ * plus a `lines` map, each within PREFETCH_STATE_BYTES and PREFETCH_QUESTIONS, PREFETCH_IN_FLIGHT at once, each
+ * judged within `ms`. Once `signal` aborts, requests not yet sent are skipped. Never throws: a failed or skipped
+ * request contributes no lines and one bounded error; an answer that is not a number contributes no line.
+ */
+export async function scoreViewLines<L extends ViewLine>(
+  judge: Judge,
+  state: Readonly<Record<string, string>>,
+  lines: readonly L[],
+  need: string,
+  signal: AbortSignal,
+  ms: number,
+): Promise<LineScores<L>> {
+  const keyed = lines.map((line) => ({ line, key: `${line.id}+${line.n}` }));
+  const chunks = packByBytes(
+    keyed,
+    utf8Length(JSON.stringify({ ...state, lines: {} })),
+    (entry) => utf8Length(JSON.stringify(entry.key)) + utf8Length(JSON.stringify(entry.line.text)) + 2,
+    PREFETCH_STATE_BYTES,
+    PREFETCH_QUESTIONS,
+  );
+  const parts = await pool(chunks, PREFETCH_IN_FLIGHT, async (chunk): Promise<ScorePart<L>> => {
+    if (signal.aborted) return { scored: [], failure: "not sent: the bound passed" };
+    const map: Record<string, string> = {};
+    const questions: Questions = {};
+    for (const { line, key } of chunk) {
+      map[key] = line.text;
+      questions[key] = { type: "noul", instructions: `Line ${key} holds information needed to answer ${need}` };
+    }
+    try {
+      const result = await judgeWithin(judge, { state: { ...state, lines: map }, questions }, ms, signal);
+      return { scored: chunk.map(({ line, key }) => ({ line, p: (result.answers[key] as NoulAnswer).noul })) };
+    } catch (error) {
+      return { scored: [], failure: boundedGateError(error) };
+    }
+  });
+  return {
+    scored: parts.flatMap((part) => part.scored.filter((entry) => typeof entry.p === "number" && !Number.isNaN(entry.p))),
+    failures: parts.flatMap((part) => (part.failure === undefined ? [] : [part.failure])),
+  };
 }
 
 /**
@@ -74,28 +112,18 @@ async function judgeChunk(judge: Judge, message: string, chunk: readonly Line[],
  * Returns undefined when nothing qualifies, when no judge answered, or when the bound passes. Never throws.
  */
 export async function prefetchBlock(memory: PrefetchMemory, options: PrefetchOptions): Promise<string | undefined> {
-  const lines: Line[] = memory.viewLines().filter((line) => line.n >= 2).map((line) => ({ ...line, key: `${line.id}+${line.n}` }));
+  const lines = memory.viewLines().filter((line) => line.n >= 2);
   if (lines.length === 0) return undefined;
   const message = utf8Prefix(options.message, PREFETCH_MESSAGE_BYTES);
-  const base = utf8Length(JSON.stringify({ message, lines: {} }));
-  const chunks = packByBytes(
-    lines,
-    base,
-    (line) => utf8Length(JSON.stringify(line.key)) + utf8Length(JSON.stringify(line.text)) + 2,
-    PREFETCH_STATE_BYTES,
-    PREFETCH_QUESTIONS,
-  );
   const bound = new AbortController();
   const onParent = () => bound.abort(options.signal?.reason);
   if (options.signal?.aborted) onParent();
   options.signal?.addEventListener("abort", onParent, { once: true });
   const timeoutMs = options.timeoutMs ?? PREFETCH_MS;
   const timer = setTimeout(() => bound.abort(new Error("prefetch exceeded its bound")), timeoutMs);
-  let scored: Array<{ line: Line; p: number }>;
+  let scored: ReadonlyArray<{ line: ViewLine; p: number }>;
   try {
-    const parts = await pool(chunks, PREFETCH_IN_FLIGHT, (chunk) =>
-      bound.signal.aborted ? Promise.resolve([]) : judgeChunk(options.judge, message, chunk, bound.signal, timeoutMs));
-    scored = parts.flat();
+    scored = (await scoreViewLines(options.judge, { message }, lines, "the message", bound.signal, timeoutMs)).scored;
   } finally {
     clearTimeout(timer);
     options.signal?.removeEventListener("abort", onParent);

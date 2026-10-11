@@ -23,6 +23,7 @@ After this plan is complete, an OMP user can start `omp` with no gate flags and 
 - [x] Milestone 6, live smoke with all four gates on (2026-10-11 UTC; OMP 18.9.1, `omp --no-extensions -e src/index.ts`, main `anthropic/claude-haiku-5-5`, judge `openrouter/~typesafe/jev-latest`, print mode, isolated `--optchat-dir`). Run 1, "From now on, always answer in British English spelling", wrote `{"op":"add","id":"r1",...,"source":0}` to `ledger.jsonl`. Run 2 asked to run `rm -rf build`; it was blocked as above, and the agent saw `<rules> r1 [0] ...</rules>`. `model_usage` rows: `optchat-rules` x2 and `optchat-tool-gate` x1 (all `stop`), and `optchat-value` x1 (`aborted`). Prefetch made no call. Focused tests (`tests/system1.test.ts`, `tests/memory.test.ts`): 89 pass / 0 fail (re-run during the port, 2026-10-11).
 - [x] Milestone 6, docs: README section "System One gates" and the CHANGELOG Unreleased entry (2026-10-11 UTC).
 - [ ] Milestone 6, remaining: the scripted import session with a merged view and the prefetch status line; the same session with every gate off; the usage counts for Outcomes.
+- [x] Retrieval primitives (2026-10-11 UTC, release 0.7.0): `chat_search` (`Memory.search`, `src/handoff.ts`), `zoom` depth (`Memory.zoom`, `Memory.lineAt`), and the recall gate (`src/system1/recall.ts`, wired in `src/index.ts` `registerRecall`/`recallFor`, flags in `src/config.ts`). Tests: `tests/search.test.ts`, `tests/recall.test.ts`, three `chat_recall` cases in `tests/system1-e2e.test.ts`. Ticket 10's synthetic comparison (`bun run evidence:retrieval`) is recorded in that ticket.
 - [x] Reconciliation with the sibling draft (2026-10-11 UTC): the uncommitted draft in the main checkout was reviewed and kept in place, with the fixes the implementer listed (see Surprises, and the Decision Log entry dated 2026-10-11, as built). Nothing was dropped.
 - [ ] Open items (from the implementer's unverified list and the live run; not milestones): (a), (b), (c) and (d) closed 2026-10-11 (cache, end-to-end prefetch, value-hint composition tests; abort cause in Surprises); (e) judge accuracy on real messages, untested; (f) real-timer tests with fixed bounds (shutdown 1.5 s, prefetch 50 ms, memory hint 20 ms) are a flake risk; each carries a comment naming the exception.
 
@@ -75,6 +76,17 @@ After this plan is complete, an OMP user can start `omp` with no gate flags and 
 - Observation (2026-10-11): `tests/cache.test.ts` is unmodified, so the cache check with extra messages is not in the suite.
 
 ## Decision Log
+
+- Decision (2026-10-11): add three retrieval primitives, all on by default: `chat_search` (deterministic AND-of-words search over the raw log, newest first, `before` paging), `zoom` `depth` (1–4 levels per call), and the recall gate's `chat_recall(question)` (judge scores the view lines, single-message lines included; the best line at or above `--optchat-recall-min`, default 0.5, is descended with one two-way `choice` per level to one message). `chat_search` and `depth` are memory tools, not gates: they use no judge. Recall is a gate with `--no-optchat-recall`.
+  Rationale: zoom only reaches a detail while some summary still names it; once compression drops a name, path or error, raw-log search is the only deterministic way back. A line covering n messages costs log₂ n zoom calls, and prefetch opens one level only, so a judge-guided descent is the cheapest way to let Jev pick branches. The descent keeps Jev's output behind code thresholds: a min for the first line and argmax per level; it never writes prose and never touches the merge.
+  Date/Author: 2026-10-11 / main agent, from the "missing primitives along zoom" review.
+
+- Decision (2026-10-11): the new tools are named `chat_search` and `chat_recall`. OMP canonicalizes `search` to `grep` (`node_modules/@oh-my-pi/pi-coding-agent/src/tools/builtin-names.ts:40`), so a tool named `search` never appears as active and the core refusal check refused every real-host turn; `recall` is a host builtin (same file, line 28).
+  Rationale: observed failure of the real-host background cases with `search`; they pass with `chat_search`.
+  Date/Author: 2026-10-11 / main agent.
+
+- Decision (2026-10-11): search skips memory tool call records (`zoom`, `date`, `work`, `chat_search`, `chat_recall`) and echoes that start with `[optchat search]` or `[optchat recall]`. Zoom page echoes are not skipped: the message metadata schema admits only `work` and `images`, so a tool name cannot be recorded without breaking older readers, and those echoes are faithful copies.
+  Date/Author: 2026-10-11 / main agent.
 
 - Decision (2026-10-11): a rule stores only the sentences that state it. When a user message has several sentences, triage adds one noul question per sentence (`s0`, `s1`, …, at most 12, whole sentences within the 4,000-byte state bound), and the rule text is the sentences that reach `--optchat-rule-add`, joined in order. If none reaches it, nothing changes. A one-sentence message is kept whole, as before.
   Rationale: the live run stored a whole two-part message as rule `r1`, including an unrelated `rm -rf` request, which then rode along in every `<rules>` block. Jev never writes prose, so it cannot rewrite the rule; selecting the user's own sentences keeps the text verbatim and the decision owned by a code threshold.
@@ -197,6 +209,8 @@ After this plan is complete, an OMP user can start `omp` with no gate flags and 
 - Decision (2026-10-11, port): `AGENTS.md` replaces the kit's `.env` secrets rule with OMP's credential store. This repo's `.gitignore` covers `node_modules/`, `coverage/`, `*.tgz` and `.optchat/` and has no `.env` entry. The kit's build-in-a-worktree rule is dropped. Date/Author: 2026-10-11 / port.
 
 ## Outcomes & Retrospective
+
+2026-10-11, retrieval (0.7.0): in a synthetic tree with a rule-based summariser and a lexical fake judge, every summary-navigating strategy found only the facts whose topic survived in the view (3/12 and 5/12 over two seeds), and `chat_search` found 12/12 in 24 calls and about 8.5 KB. `chat_recall` reached the surviving facts in one agent step instead of about 200 zoom calls. This measures navigation mechanics, not Jev or real summaries; no quality or cost claim follows from it.
 
 Partly done as of 2026-10-11, see Progress for each milestone and the open items. This plan was rewritten on 2026-10-11 against omp-optchat 0.5.0 at HEAD `bc633ac`, and against the uncommitted working tree as it stood that day. When each milestone lands, add a paragraph here saying what now works, what the observed behaviour was on a real host, and what remains.
 

@@ -13,6 +13,8 @@ export const EXEMPT_TOOLS: Record<string, true> = {
   zoom: true,
   date: true,
   work: true,
+  chat_search: true,
+  chat_recall: true,
   read: true,
   grep: true,
   glob: true,

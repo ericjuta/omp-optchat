@@ -16,10 +16,12 @@ export const DEFAULTS = Object.freeze({
   prefetch: true,
   valueScore: true,
   toolGate: true,
+  recall: true,
   ruleAdd: 0.8,
   prefetchK: 8,
   prefetchMin: 0.5,
   toolAsk: 0.3,
+  recallMin: 0.5,
 });
 
 export interface OptChatConfig {
@@ -41,6 +43,8 @@ export interface GateConfig {
   prefetch: boolean;
   valueScore: boolean;
   toolGate: boolean;
+  /** Whether the recall tool may judge the view; off means the tool is not registered. */
+  recall: boolean;
   /** Minimum P(rule) to add or replace a rule, in (0, 1]. */
   ruleAdd: number;
   /** Prefetch lines zoomed per turn, from 1 to 32. */
@@ -49,6 +53,8 @@ export interface GateConfig {
   prefetchMin: number;
   /** Danger at or above which a tool call is confirmed or blocked, in (0, 1]. */
   toolAsk: number;
+  /** Minimum P(answer) for the recall tool's first line, in (0, 1]. */
+  recallMin: number;
 }
 
 type FlagReader = Pick<ExtensionAPI, "getFlag">;
@@ -103,7 +109,7 @@ export function registerFlags(api: FlagRegistrar): void {
   api.registerFlag("optchat-child-view", {
     type: "boolean",
     default: DEFAULTS.childView,
-    description: "Give subagents a read-only frozen snapshot of this chat (zoom, date and work only)",
+    description: "Give subagents a read-only frozen snapshot of this chat (zoom, date, work and chat_search only)",
   });
   for (const gate of GATE_FLAGS) {
     api.registerFlag(gate.flag, {
@@ -137,6 +143,11 @@ export function registerFlags(api: FlagRegistrar): void {
     default: String(DEFAULTS.toolAsk),
     description: "System One: danger probability (0, 1] at which a tool call is confirmed or blocked (default: 0.3)",
   });
+  api.registerFlag("optchat-recall-min", {
+    type: "string",
+    default: String(DEFAULTS.recallMin),
+    description: "System One: minimum probability (0, 1] for recall's first line (default: 0.5)",
+  });
 }
 
 const GATE_FLAGS = [
@@ -144,6 +155,7 @@ const GATE_FLAGS = [
   { key: "prefetch", flag: "optchat-prefetch", name: "prefetch gate", what: "zoom view lines relevant to each new user message" },
   { key: "valueScore", flag: "optchat-value-score", name: "value-score gate", what: "give the compressor a one-sentence importance hint per leaf" },
   { key: "toolGate", flag: "optchat-tool-gate", name: "tool gate", what: "screen risky tool calls before they run" },
+  { key: "recall", flag: "optchat-recall", name: "recall gate", what: "answer questions from stored history by descending the view (chat_recall tool)" },
 ] as const;
 
 /** One gate: its opt-out wins over its flag; a malformed value of either fails closed. */
@@ -230,10 +242,12 @@ function gates(api: FlagReader): GateConfig {
     prefetch: gate(api, "optchat-prefetch", DEFAULTS.prefetch),
     valueScore: gate(api, "optchat-value-score", DEFAULTS.valueScore),
     toolGate: gate(api, "optchat-tool-gate", DEFAULTS.toolGate),
+    recall: gate(api, "optchat-recall", DEFAULTS.recall),
     ruleAdd: probability(api, "optchat-rule-add", DEFAULTS.ruleAdd),
     prefetchK: integer(api, "optchat-prefetch-k", DEFAULTS.prefetchK, 1, 32),
     prefetchMin: probability(api, "optchat-prefetch-min", DEFAULTS.prefetchMin),
     toolAsk: probability(api, "optchat-tool-ask", DEFAULTS.toolAsk),
+    recallMin: probability(api, "optchat-recall-min", DEFAULTS.recallMin),
   };
 }
 

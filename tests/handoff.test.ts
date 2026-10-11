@@ -9,6 +9,7 @@ import {
 	type ChildView,
 	type MemoryReader,
 } from "../src/handoff.ts";
+import type { SearchResult } from "../src/memory.ts";
 
 // Tool registration builds schemas through pi.zod; these tests call each tool's execute directly.
 const schemaStub: unknown = new Proxy(() => schemaStub, { get: () => schemaStub, apply: () => schemaStub });
@@ -74,6 +75,7 @@ const reader: MemoryReader = {
 		source: "task",
 		completeness: "full",
 	}),
+	search: () => ({ hits: [], next: null }),
 };
 
 const view = (render: string): ChildView => ({ ...reader, render, upperBound: 2 });
@@ -132,6 +134,54 @@ describe("paged memory tools", () => {
 	});
 });
 
+describe("search tool", () => {
+	const searching = (answer: SearchResult, seen: Array<[string, unknown]>): MemoryReader => ({
+		...reader,
+		search: (query, options) => {
+			seen.push([query, options]);
+			return answer;
+		},
+	});
+
+	test("renders the header, one line per hit and the older-hits cursor, with ids and next in details", async () => {
+		const seen: Array<[string, unknown]> = [];
+		const { pi, tools } = harness();
+		registerMemoryTools(pi, searching({ hits: [{ id: 9, kind: "talk", date: "d", snippet: "the path /tmp/a" }], next: 9 }, seen), UNGUARDED);
+		const result = await tools.get("chat_search")!.execute("call", { text: " path\n /tmp/a ", kind: "talk", before: 12 });
+		expect(seen).toEqual([[" path\n /tmp/a ", { kind: "talk", before: 12 }]]);
+		expect(result).toEqual({
+			content: [
+				{
+					type: "text",
+					text: '[optchat search] 1 hits for "path /tmp/a" (newest first)\n9|talk|the path /tmp/a\n[older hits: before=9]',
+				},
+			],
+			details: { hits: [9], next: 9 },
+		});
+	});
+
+	test("zero hits still return the header and a final no-older-hits line", async () => {
+		const seen: Array<[string, unknown]> = [];
+		const { pi, tools } = harness();
+		registerMemoryTools(pi, searching({ hits: [], next: null }, seen), UNGUARDED);
+		const result = await tools.get("chat_search")!.execute("call", { text: "nothing" });
+		expect(result).toEqual({
+			content: [{ type: "text", text: '[optchat search] 0 hits for "nothing" (newest first)\n[no older hits]' }],
+			details: { hits: [], next: null },
+		});
+	});
+
+	test("an admission failure stops the search before it reads", async () => {
+		const seen: Array<[string, unknown]> = [];
+		const { pi, tools } = harness();
+		registerMemoryTools(pi, searching({ hits: [], next: null }, seen), () => {
+			throw new Error("denied");
+		});
+		await expect(tools.get("chat_search")!.execute("call", { text: "x" })).rejects.toThrow(/denied/);
+		expect(seen).toEqual([]);
+	});
+});
+
 describe("child bridge admission", () => {
 	test("a child session ID change denies reads and prompt hooks while retaining its artifact manager", async () => {
 		const manager = {};
@@ -141,7 +191,7 @@ describe("child bridge admission", () => {
 		const counted: MemoryReader = {
 			zoom: (id, n, offset) => {
 				calls.zoom++;
-				return reader.zoom(id, n, offset);
+				return reader.zoom(id, n, offset, 1);
 			},
 			date: (id) => {
 				calls.date++;
@@ -151,6 +201,7 @@ describe("child bridge admission", () => {
 				calls.work++;
 				return reader.work(name, offset);
 			},
+			search: (query, options) => reader.search(query, options),
 		};
 		const retained: ChildView = {
 			...counted,
@@ -184,7 +235,7 @@ describe("child bridge admission", () => {
 				expect(hook({ systemPrompt: ["base"] }, current)).toEqual({
 					systemPrompt: [
 						"base",
-						"guide\n\n# Parent chat snapshot (read-only; zoom, date and work only)\n\n<chat>\n0+1|user: distinctive retained parent snapshot\n</chat>",
+						"guide\n\n# Parent chat snapshot (read-only; zoom, date, work and chat_search only)\n\n<chat>\n0+1|user: distinctive retained parent snapshot\n</chat>",
 					],
 				});
 			}
@@ -275,9 +326,9 @@ describe("read-only child bridge", () => {
 		const revoke = publishChildSource(manager, { owner: "parent", snapshot: () => view("frozen") });
 		const snapshot = adoptChildSource(manager)!.snapshot();
 		expect(snapshot.render).toBe("frozen");
-		expect(snapshot.zoom(0, 1, 0).text).toBe("0123");
+		expect(snapshot.zoom(0, 1, 0, 1).text).toBe("0123");
 		revoke();
-		expect(() => snapshot.zoom(0, 1, 0)).toThrow(/revoked/);
+		expect(() => snapshot.zoom(0, 1, 0, 1)).toThrow(/revoked/);
 		expect(() => snapshot.date(0)).toThrow(/revoked/);
 		expect(() => snapshot.work("agent-a", 0)).toThrow(/revoked/);
 		expect(adoptChildSource(manager)).toBeUndefined();
@@ -305,7 +356,7 @@ describe("read-only child bridge", () => {
 		const manager = {};
 		const revoke = publishChildSource(manager, { owner: "parent", snapshot: () => view("<chat>\n0+1|user: hi\n</chat>") });
 		attachChildView(pi, context(manager), "guide");
-		expect([...tools.keys()].sort()).toEqual(["date", "work", "zoom"]);
+		expect([...tools.keys()].sort()).toEqual(["chat_search", "date", "work", "zoom"]);
 		const prompt = (hooks[0]!({ systemPrompt: ["base"] }, context(manager))?.systemPrompt ?? []).join("\n");
 		expect(prompt).toContain("base");
 		expect(prompt).toContain("guide");

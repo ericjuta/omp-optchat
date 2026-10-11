@@ -103,12 +103,27 @@ describe("System One config", () => {
       prefetch: true,
       valueScore: true,
       toolGate: true,
+      recall: true,
       ruleAdd: 0.8,
       prefetchK: 8,
       prefetchMin: 0.5,
       toolAsk: 0.3,
+      recallMin: 0.5,
     });
     expect(DEFAULTS.ruleAdd).toBe(0.8);
+  });
+
+  test("recall is on by default; --no-optchat-recall wins over --optchat-recall", () => {
+    expect(readConfig(flagsOf({}), "/tmp/unused").gates.recall).toBe(true);
+    expect(readConfig(flagsOf({ "optchat-recall": true }), "/tmp/unused").gates.recall).toBe(true);
+    expect(readConfig(flagsOf({ "optchat-recall": true, "no-optchat-recall": true }), "/tmp/unused").gates.recall).toBe(false);
+    expect(readConfig(flagsOf({ "no-optchat-recall": "true" }), "/tmp/unused").gates.recall).toBe(false);
+  });
+
+  test("recall-min parses a probability in (0, 1] and defaults to 0.5", () => {
+    expect(readConfig(flagsOf({}), "/tmp/unused").gates.recallMin).toBe(0.5);
+    expect(readConfig(flagsOf({ "optchat-recall-min": "0.7" }), "/tmp/unused").gates.recallMin).toBe(0.7);
+    expect(readConfig(flagsOf({ "optchat-recall-min": "1" }), "/tmp/unused").gates.recallMin).toBe(1);
   });
 
   test("each opt-out turns its gate off, even when the gate flag is present", () => {
@@ -129,6 +144,10 @@ describe("System One config", () => {
       { "optchat-prefetch-k": "33" },
       { "optchat-rules": "maybe" },
       { "no-optchat-prefetch": "maybe" },
+      { "optchat-recall-min": "0" },
+      { "optchat-recall-min": "1.01" },
+      { "optchat-recall": "maybe" },
+      { "no-optchat-recall": "maybe" },
     ];
     for (const flags of malformed) {
       expect(() => readConfig(flagsOf(flags), "/tmp/unused")).toThrow();
@@ -447,6 +466,7 @@ describe("System One through OptChat", () => {
           "no-optchat-prefetch": true,
           "no-optchat-value-score": true,
           "no-optchat-tool-gate": true,
+          "no-optchat-recall": true,
         },
       },
     );
@@ -518,7 +538,7 @@ describe("System One through OptChat", () => {
   test("no judge candidate: the session still runs, and status says why", async () => {
     const host = await start({ "optchat-rules": true, "optchat-prefetch": true });
     const status = await host.command("status");
-    expect(status.some((notice) => notice.message.includes("System One gates: rules on, prefetch on, value-score on, tool-gate on"))).toBe(true);
+    expect(status.some((notice) => notice.message.includes("System One gates: rules on, prefetch on, value-score on, tool-gate on, recall on"))).toBe(true);
     expect(status.some((notice) => notice.message.includes("judge: none"))).toBe(true);
     const texts = await contextTexts(host, [host.user("hello")]);
     expect(texts).toHaveLength(2);
@@ -586,6 +606,6 @@ describe("System One through OptChat", () => {
   test("status lists every gate's state", async () => {
     const host = await start({ "no-optchat-prefetch": true, "no-optchat-value-score": true }, fakeJudge(() => ({})));
     const status = await host.command("status");
-    expect(status.some((notice) => notice.message.includes("System One gates: rules on, prefetch off, value-score off, tool-gate on"))).toBe(true);
+    expect(status.some((notice) => notice.message.includes("System One gates: rules on, prefetch off, value-score off, tool-gate on, recall on"))).toBe(true);
   });
 });

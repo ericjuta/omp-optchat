@@ -2,6 +2,29 @@
 
 An OMP extension implementing [Victor Taelin's OptChat specification](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449): one durable chat, a binary tree of contextual summaries, and a fresh model context for each user turn. Original text remains retrievable with `zoom`; summaries are navigation, not a replacement for the log.
 
+## At a glance
+
+- **One chat that never ends.** Every user message, reply, tool call, tool result and subagent report is appended to a local, fsynced log under OMP's agent directory, one store per git worktree. Nothing is ever deleted or rewritten.
+- **A view instead of a transcript.** Each turn the model sees a fixed-size view of the whole history: one-line summaries, oldest first, where older lines cover more messages. The view replaces the old inference history between turns, so a long chat stops growing the context.
+- **Nothing is lost.** The model navigates the view with memory tools: `zoom` opens a line into its halves (or several levels at once) down to the original message, `chat_search` finds exact words in the original messages, `date` and `work` fetch timestamps and captured subagent reports.
+- **System One gates, on by default.** Five small judgments through OMP's `judge` role keep standing rules across turns, prefetch relevant history before a turn, hint the compressor about what matters, screen risky tool calls, and power `chat_recall`, which walks the summary tree to the message that answers a question. Each has its own opt-out flag.
+- **Plain OMP is one flag away.** `omp --no-optchat` runs an ordinary session with no memory tools, logging, compression or context changes.
+
+What the model sees at the start of a turn (illustrative, shortened):
+
+```text
+<chat>
+0+64|user: set up the Bun repo and CI; talk: added ci.yml with typecheck, tests, smoke; echo: CI green on 18.9.1 …
+64+32|user: "never push to main without asking"; tool: git push origin feat/x; echo: rejected, non-fast-forward …
+96+2|user: why did the staging deploy fail?; talk: missing DATABASE_URL in the staging env …
+98+1|user: ok, fix it and redeploy
+</chat>
+```
+
+Each `id+n|text` line summarizes the `n` messages starting at `id`. To check the exact error from message 97, the model calls `zoom(96, 2)`, then `zoom(97, 1)` for the original text; if no line mentions it any more, `chat_search("DATABASE_URL")` finds it by its words, and `chat_recall("why did the staging deploy fail?")` lets the judge pick the branch at each level instead.
+
+What it costs: a compressor call per stored message and per merge, plus up to two judge calls per user message and one per screened tool call with the default gates. When the history still fits the model's context, OptChat costs more than plain OMP for the same answers; its value is recall past the context window (see "0.5.0 measurements").
+
 ## Requirements and start
 
 - OMP **18.9.0 or newer**, Bun, and Linux. CI checks every push and runs a weekly check against the latest published OMP SDK.
@@ -10,7 +33,7 @@ An OMP extension implementing [Victor Taelin's OptChat specification](https://gi
 Install the tagged release:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.6.0'
+omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.7.0'
 PI_OPENAI_STATEFUL=0 omp
 ```
 
@@ -40,13 +63,14 @@ Memory is per git worktree. A session inside a git checkout defaults to a direct
 
 Each memory directory has exactly one writer. If another live session already holds the directory (for example, the same `--optchat-dir` in another terminal), this session becomes inactive instead of refusing prompts: it shows one warning and runs as if started with `--no-optchat`, with no memory tools, logging, compression, or context changes. `/optchat status` reports the reason and directory. A store that cannot be opened for another reason, such as corruption, still refuses every prompt until restart. Subagents never open the store and do not conflict.
 
-Advanced overrides are `--optchat-node-bytes`, `--optchat-view-bytes`, `--optchat-jobs`, `--optchat-tries`, and `--optchat-tool-cap`; their defaults are described below. `--optchat-retry-ms` was removed in 0.4.0, because failed summaries now retry on the next message. Keep the defaults unless you have measured a reason to change them. An enabled session refuses inference if `zoom` or `date` is unavailable, including host modes that prohibit late tool registration.
+Advanced overrides are `--optchat-node-bytes`, `--optchat-view-bytes`, `--optchat-jobs`, `--optchat-tries`, and `--optchat-tool-cap`; their defaults are described below. `--optchat-retry-ms` was removed in 0.4.0, because failed summaries now retry on the next message. Keep the defaults unless you have measured a reason to change them. An enabled session refuses inference if `zoom`, `date`, `work` or `chat_search` is unavailable, including host modes that prohibit late tool registration.
 
 ## Using memory
 
 The model receives the settled historical summary view before your new message, then retains its ordinary tool loop until the turn ends. Between turns, old inference history is replaced by the view. OMP's display transcript and normal tools remain available.
 
-- `zoom(id, n)` opens an aligned power-of-two summary range into its children. `zoom(id, 1, offset)` returns one 16 KB page of the original record, cut on a UTF-8 boundary, plus its stored images. Follow `details.next` until it is `null`; together the pages reproduce the record byte for byte.
+- `zoom(id, n)` opens an aligned power-of-two summary range into its children. `zoom(id, n, depth)` opens `depth` levels at once (1 to 4, at most `log2(n)`): the `2^depth` lines `depth` levels under the range, each covering `n / 2^depth` messages. The default `depth` is 1, the same as `zoom(id, n)`. `zoom(id, 1, offset)` returns one 16 KB page of the original record, cut on a UTF-8 boundary, plus its stored images. Follow `details.next` until it is `null`; together the pages reproduce the record byte for byte.
+- `chat_search(text, kind, limit, before)` finds stored messages that contain every whitespace-separated word of `text`, case-insensitively, newest first. It searches the original messages, not the summaries, so it finds names, paths, numbers and errors that a summary dropped. `kind` restricts hits to one of `user`, `talk`, `tool`, `echo`, `note` or `work`; `limit` returns 1 to 50 hits (default 10); `before` returns only messages with an id below it. Each hit prints its id, kind and a snippet of about 240 bytes. Open a hit with `zoom(id, 1)`. When older hits remain, the last line gives `before=<id>` for the next call. Memory tool calls and search or recall results are never hits. `text` is at most 200 characters and 8 words.
 - `work(name, offset)` pages a captured subagent or background report by job ID, agent ID, or name; the newest match wins.
 - `date(id)` returns the original message's local date and time. New records keep the host's event timestamp, not the time of writing.
 - `/optchat status` reports memory and background compression state.
@@ -58,7 +82,7 @@ The model receives the settled historical summary view before your new message, 
 
 OMP subagents are ordinary sessions. They never open the Store or write to the chat. Their task, async, and launch reports become `work` records in the parent's log, captured before the ordinary tool-result cap. Each record carries provenance (source, job ID, agent ID, name, completeness), full structured data, and the typed artifact output where the host supplies one. When OMP delivered only a preview and no trusted full-output reference, the record says so: it starts with `[incomplete: reason]` and has `completeness: "pointer-only"`. URIs found in report text are never followed.
 
-`--optchat-child-view` (off by default) gives each subagent a frozen, read-only snapshot of the parent's view and `zoom`/`date`/`work` over messages up to that point. Every read and every prompt injection checks that the parent's publication is still live and that the child is still in the session that adopted it. The snapshot is revoked when the parent switches sessions or shuts down, and is refused if the child resumes, forks, or branches into another session. Without the flag, include the facts a child needs in its task, as before.
+`--optchat-child-view` (off by default) gives each subagent a frozen, read-only snapshot of the parent's view and `zoom`/`date`/`work`/`chat_search` over messages up to that point. A child's `chat_search` only sees messages that existed when the snapshot was taken. Every read and every prompt injection checks that the parent's publication is still live and that the child is still in the session that adopted it. The snapshot is revoked when the parent switches sessions or shuts down, and is refused if the child resumes, forks, or branches into another session. Without the flag, include the facts a child needs in its task, as before.
 
 ## Storage and compression
 
@@ -91,23 +115,81 @@ A model turn waits for summaries rather than seeing partial source text. Compres
 
 ## System One gates (Jev)
 
-Four gates send text to the host's `judge` model role. All four are on by default. Turn one off for a session with its opt-out flag (`--no-optchat-rules`, `--no-optchat-prefetch`, `--no-optchat-value-score`, `--no-optchat-tool-gate`); an opt-out takes precedence over the gate's own flag, which is kept for explicit launches. OMP boolean flags are presence flags, so `--optchat-rules=false` does not turn a gate off. With all four opted out, OptChat resolves no judge, registers no tool hook, and its context and `/optchat status` match 0.5.0. Subagents never run the gates.
+Five gates send text to the host's `judge` model role. All five are on by default. Turn one off for a session with its opt-out flag (`--no-optchat-rules`, `--no-optchat-prefetch`, `--no-optchat-value-score`, `--no-optchat-tool-gate`, `--no-optchat-recall`); an opt-out takes precedence over the gate's own flag, which is kept for explicit launches. OMP boolean flags are presence flags, so `--optchat-rules=false` does not turn a gate off. With all five opted out, OptChat resolves no judge, registers no tool hook and no `chat_recall` tool, and sends no gate messages: its context and `/optchat status` are the memory-only ones (0.5.0's, plus `chat_search` and `zoom` depth since 0.7.0). Subagents never run the gates.
+
+### Choosing the judge
+
+The gates use whatever model OMP's `judge` role resolves to. Set it under `modelRoles` in OMP's `config.yml` (not `models.yml`), or assign it in `/models`:
+
+```yaml
+modelRoles:
+  judge: openrouter/~typesafe/jev-latest
+```
+
+Jev (TypeSafe's typed decision model, directly or through OpenRouter) answers natively. The role also accepts tiny and ordinary chat models, which answer through OMP's prompted judge. Credentials stay in OMP's credential store; the plugin has no API-key variable or provider client of its own. If no candidate is credentialed, the gates simply do not run and `/optchat status` says so.
+
+### Turning gates off
+
+```sh
+omp --no-optchat-tool-gate                       # keep memory and the other gates, skip tool screening
+omp --no-optchat-prefetch --no-optchat-value-score
+omp --no-optchat-recall                          # no chat_recall tool; chat_search and zoom stay
+omp --no-optchat-rules --no-optchat-prefetch --no-optchat-value-score --no-optchat-tool-gate --no-optchat-recall   # memory only
+omp --no-optchat                                 # plain OMP: no memory, no gates
+```
+
+### What you will see
+
+`/optchat status` gains a gate section while any gate is on:
+
+```text
+System One gates: rules on, prefetch on, value-score on, tool-gate on, recall on
+judge: openrouter/~typesafe/jev-latest
+standing rules: 1 active
+last System One failure: none
+```
+
+Active standing rules follow the view as their own message, with the id, the source message id and the user's words, for example:
+
+```text
+<rules>
+r1 [42] From now on, always answer in British English spelling.
+</rules>
+```
+
+A prefetch block, when the judge finds relevant lines, follows as `<prefetch>` with the opened lines and a header marking them as data, not instructions. A screened tool call above the danger threshold opens a confirm dialog in an interactive session; in print or JSON mode it is blocked and the model is told why, for example "danger 0.96, no UI to confirm".
+
+A `chat_recall` call returns the descent it took and the message it reached, for example:
+
+```text
+[optchat recall] why did the staging deploy fail?
+64+32|user: deploy to staging; echo: deploy failed … (p=0.91)
+80+16|… (p=0.84)
+…
+97+1|echo: Error: DATABASE_URL is not set … (p=0.77)
+message 97:
+Error: DATABASE_URL is not set in environment "staging" …
+[end of 1840 bytes]
+```
+
+### Gates and thresholds
 
 | Flag | Gate | What it does | Judged per |
 | --- | --- | --- | --- |
 | `--optchat-rules` | Standing rules | Judges each user message for a standing instruction, then adds it to `ledger.jsonl` or replaces the active rule it overrides. Active rules appear in a `<rules>` block after the view. | user message |
 | `--optchat-prefetch` | Prefetch | Judges merged view lines against the new user message and zooms the relevant ones into a `<prefetch>` block. Bounded to 5 s, and to the settle deadline's remaining time. | user message |
 | `--optchat-value-score` | Value hint | Judges each long leaf's label and importance, and adds one fixed sentence to its compaction instruction. The sentence never contains record text or ids. | compacted leaf |
-| `--optchat-tool-gate` | Tool gate | Judges each tool call except read-only and OptChat's own tools (`zoom`, `date`, `work`, `read`, `grep`, `glob`, `find`, `todo`, `ask`, `think`, `web_search`). Danger at or above `--optchat-tool-ask` asks the user, or blocks when no UI is available. Bounded to 8 s. | tool call |
+| `--optchat-tool-gate` | Tool gate | Judges each tool call except read-only and OptChat's own tools (`zoom`, `date`, `work`, `chat_search`, `chat_recall`, `read`, `grep`, `glob`, `find`, `todo`, `ask`, `think`, `web_search`). Danger at or above `--optchat-tool-ask` asks the user, or blocks when no UI is available. Bounded to 8 s. | tool call |
+| `--optchat-recall` | Recall | Registers the `chat_recall(question)` tool. Scores the view lines against the question (single-message lines are returned directly), takes the best one at or above `--optchat-recall-min`, then asks one two-way choice per level (which half more likely holds the answer) down to a single message, and returns the path with that message's first 8 KB. At most ⌈lines/64⌉ + log₂ n judge calls; bounded to 20 s, 5 s per call. A failure or timeout returns an explicit "recall failed" result, never a guessed answer. | tool call |
 
-Thresholds: `--optchat-rule-add` (default `0.8`), `--optchat-prefetch-k` (default `8`, integer 1–32), `--optchat-prefetch-min` (default `0.5`), `--optchat-tool-ask` (default `0.3`). Probabilities are plain decimals in (0, 1]. A malformed value fails the session's configuration closed.
+Thresholds: `--optchat-rule-add` (default `0.8`), `--optchat-prefetch-k` (default `8`, integer 1–32), `--optchat-prefetch-min` (default `0.5`), `--optchat-tool-ask` (default `0.3`), `--optchat-recall-min` (default `0.5`). Probabilities are plain decimals in (0, 1]. A malformed value fails the session's configuration closed.
 
 Behavior:
 
 - **Judge.** The judge is the host's `judge` role, resolved per call. If the role has no credentialed candidate, or resolving it throws, that gate does not run. `/optchat status` says so. OptChat keeps working.
 - **Failures.** A judge failure, a timeout, or a missing judge changes no rule and adds no prefetch block. The tool gate fails closed: it asks with a UI and blocks without one. `/optchat status` shows the last failure, cut to 200 characters.
 - **Privacy.** An enabled gate sends the text it judges to the judge role's provider: user messages, view lines, tool names and inputs, and record text for the value hint. With every gate opted out, nothing is sent.
-- **Cost.** With the defaults, each user message costs up to two judge requests (rules, then prefetch on a merged view), each long compacted leaf one, and each screened tool call one, before the call runs.
+- **Cost.** With the defaults, each user message costs up to two judge requests (rules, then prefetch on a merged view), each long compacted leaf one, and each screened tool call one, before the call runs. A `chat_recall` call costs one scoring request per 64 view lines plus one choice per tree level, and only when the model calls it.
 - **Rules.** A rule's text is the user's own words. When a message has several sentences, the judge rates each one, and the rule keeps only the sentences that reach `--optchat-rule-add`, so "From now on, answer in British English. Also run the tests." stores only the first sentence. Rule IDs (`r1`, `r2`, …) are never reused. `/optchat rules` lists active rules, and `/optchat rules remove ID` removes one. A triage that is still running at shutdown is abandoned and writes nothing.
 - **Shutdown.** A print or JSON run exits right after its reply. On `session_shutdown`, OptChat waits up to 1.5 s for queued rule triage, then abandons whatever is still running. The bound stays under the host's 2 s session-shutdown cap, so the wait is shorter than the 5 s the design allowed.
 - **Frozen per turn.** The rules and prefetch blocks are decided when a turn starts, and every request in that turn carries the same blocks, including tool loops. A rule stated mid-turn applies from the next turn.
@@ -157,6 +239,8 @@ bun run smoke
 CI runs this sequence with the pinned SDK cohort and with the latest published cohort, on every push and pull request, weekly, and on demand.
 
 `bun run evidence:recall` is an opt-in recall and usage experiment against real models with a synthetic corpus. Without `--confirm-live-provider-calls` it checks prerequisites and prints its plan. It runs the host with private HOME and agent directories that hold only the selected credentials, so no global context files reach a provider. Call count, compressor output, and wall time are capped. The artifact separates main, compressor, and auxiliary usage and records unobserved fields as `null`, never zero. Auxiliary usage is the session's `model_usage` entries for side phases: exact SDK costs, or unobserved. Maintenance (native compaction) has its own summary: a compaction count and an estimated low/high cost interval, priced from the captured compaction frames (tokens before compaction at the cache-read and input rates, and the summary's UTF-8 bytes divided by four at the output rate). A frame that cannot be priced leaves the interval null, and zero compactions is an exact zero. A run's total cost sums the exact main, compressor, and auxiliary costs with the maintenance interval; it is null, with a reason, when any part is unobserved. Cache-read share is reported for each role and over all roles; the all-role share is null whenever maintenance is estimated or unobserved. The per-question steady-state main share sums cache reads and prompt tokens over each phase's turns after the first, and is null in batch mode. A paired delta is the off-minus-on interval difference (off low minus on high, and off high minus on low) plus the steady-state difference, present only when both arms are observed. It never reports savings it did not measure. `OPTCHAT_METRICS_FILE=/path` appends one content-free JSON line per compressor call.
+
+`bun run evidence:retrieval` is an offline, deterministic comparison of the retrieval strategies (zoom one level at a time, zoom with depth, `chat_search`, prefetch, `chat_recall`, and a scripted beam descent) on the same probes. It builds a real memory in a temporary directory over a synthetic 256-message chat with 12 planted facts, a rule-based summariser that drops values and, with depth, topics, and a fake judge that scores word overlap. It reports per strategy the probes found, agent steps, judge calls, zoom calls and bytes returned, plus a per-fact table by age; `--seed` and `--out` select the seed and write a JSON artifact. It makes no provider calls and measures navigation mechanics only, not real summaries or Jev. The 0.7.0 results are in `.scratch/optchat-jev/issues/10-codemode-retrieval.md`: every summary-navigating strategy found only the facts whose topic survived in the view (3/12 and 5/12 over two seeds), `chat_search` found 12/12, and `chat_recall` reached the surviving facts in one agent step instead of about 200 zoom calls.
 
 `--arms on,off` pairs the OptChat arm with a plain-OMP arm over the same corpus and questions. The off arm resumes a seeded session with OptChat disabled: it is offered no memory tools, its prompt never mentions them, and native compaction may run inside that session. Off-arm maintenance is estimated the same way as on-arm maintenance, from its captured compaction frames. A paired delta is computed only when both arms completed every requested scenario and both totals are observed, and the artifact claims no savings.
 

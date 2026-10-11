@@ -102,6 +102,7 @@ function assertToolNames(body: ObjectValue): void {
   assert(names.includes("zoom"), "real zoom tool must be registered");
   assert(names.includes("date"), "real date tool must be registered");
   assert(names.includes("work"), "named work retrieval must be registered");
+  assert(names.includes("chat_search"), "real chat_search tool must be registered");
 }
 function sse(model: string, sequence: number, text?: string, thinking?: string, calls?: Json[]): Response {
   const chunk = (delta: ObjectValue, finish: string | null = null) => `data: ${JSON.stringify({
@@ -591,6 +592,7 @@ async function main(): Promise<void> {
       "--optchat-model", "optchat-smoke/optchat-smoke-compact",
       // The loopback scripts every request: System One gates (on by default) would send judge calls to it.
       "--no-optchat-rules", "--no-optchat-prefetch", "--no-optchat-value-score", "--no-optchat-tool-gate",
+      "--no-optchat-recall",
     ];
     // No enable flag: the full active lifecycle below proves default activation.
     const args = [...baseArgs, "--optchat-dir", memory];

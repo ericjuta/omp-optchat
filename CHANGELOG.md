@@ -1,8 +1,19 @@
 # Changelog
 
+## 0.7.0 — 2026-10-11
+
+- **`chat_search(text, kind, limit, before)`:** finds stored messages containing every word of `text`, case-insensitively, newest first, with ~240-byte snippets and `before` paging. It reads the original log, so it reaches names, paths, numbers and errors that summaries dropped. Memory tool calls and search/recall results are never hits. Child views search only their snapshot. Always on with memory, like `zoom`.
+- **`zoom(id, n, depth)`:** opens up to 4 levels at once (`2^depth` lines). `depth` 1 is the old behavior, byte for byte.
+- **Recall gate (on by default; `--no-optchat-recall`):** registers `chat_recall(question)`. The judge scores the view lines, the best line at or above `--optchat-recall-min` (default 0.5) is opened, and one two-way choice per level leads to a single message, returned with its descent path and first 8 KB. At most ⌈lines/64⌉ + log₂ n judge calls, 20 s overall and 5 s per call. Failures return an explicit "recall failed" result.
+- Tool names carry a `chat_` prefix because OMP reserves `search` (alias of `grep`) and `recall` (builtin).
+- The tool gate never screens `chat_search` or `chat_recall`. `/optchat status` shows the recall gate. The memory guide in the system prompt documents both tools, so its bytes change once (the evidence runner's pinned system-block size is 6277 bytes).
+- Memory-only harnesses (integration tests, smoke, `evidence:recall`) also opt out of the recall gate.
+- **`bun run evidence:retrieval`:** offline, deterministic comparison of zoom, zoom depth, `chat_search`, prefetch, `chat_recall` and a scripted beam descent over a synthetic tree with planted facts (fake summariser and judge, no provider calls). Two seeds: summary navigators found only the facts whose topic survived in the view (3/12, 5/12); `chat_search` found 12/12; `chat_recall` needed one agent step where zoom needed about 200. Mechanics only, not a quality claim; details in ticket 10.
+
 ## 0.6.0 — 2026-10-11
 
 - **System One gates (all on by default; opt out per gate with `--no-optchat-rules`, `--no-optchat-prefetch`, `--no-optchat-value-score`, `--no-optchat-tool-gate`):** Four judge-backed gates use the host's `judge` role: standing rules (`--optchat-rules`, with `/optchat rules` and `/optchat rules remove ID`), view prefetch for each user message (`--optchat-prefetch`), a one-sentence importance hint per compacted leaf (`--optchat-value-score`), and a tool-call gate (`--optchat-tool-gate`). Thresholds: `--optchat-rule-add`, `--optchat-prefetch-k`, `--optchat-prefetch-min`, `--optchat-tool-ask`. A failed judge changes nothing and the session keeps running; the tool gate fails closed.
+- **Upgrading (behavior change):** the gates send judged text to the `judge` role's provider and cost up to two judge requests per user message, one per long compacted leaf and one per screened tool call. Set `modelRoles.judge` in OMP's `config.yml` (for example `openrouter/~typesafe/jev-latest`); with no credentialed judge the gates do not run. Opt out per gate, or pass all four `--no-optchat-*` gate flags for 0.5.0 behavior.
 - A rule keeps only the sentences of the message that the judge rates as standing instructions; a one-sentence message is kept whole.
 - Standing rules are stored in `ledger.jsonl` beside the chat log. Shutdown waits up to 1.5 s for queued rule triage, then abandons it, so a triage never writes after the store closes.
 - With every gate opted out, context and `/optchat status` match 0.5.0. The evidence runner opts its hosts out, so its benchmark keeps measuring memory alone.
