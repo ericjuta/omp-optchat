@@ -6,6 +6,7 @@
 - **Archive GC (#12):** Reclaim unreferenced image blobs and abandoned image/view staging files after validated writer startup, preserving replayed references and reporting nonfatal cleanup failures.
 - **Behavior change:** Sessions inside git repositories no longer use `~/.omp/agent/optchat`. Each worktree gets its own memory under `optchat-worktrees/` beside that directory, and a new worktree starts empty. Sessions outside git keep the global store. `--optchat-dir ~/.omp/agent/optchat` restores the old single shared memory.
 - A startup lock conflict (another live session holds the store directory) now deactivates OptChat for that session, as `--no-optchat` does, with one warning, instead of refusing every prompt. Corrupt or otherwise unreadable stores still refuse prompts.
+- **Refusal fallback:** A compressor refusal (`stopReason` error starting `Refusal`) is retried once with the session's main model. If that also refuses, OptChat commits a marked, source-derived excerpt for the node so the tree settles and later prompts are not refused. The "not ready after 25 s" notice now appears only for real timeouts; a summary that failed without retry says so. `/optchat status` counts main-model retries and stand-ins.
 
 ## 0.4.1 — 2026-10-11
 

@@ -37,7 +37,7 @@ import { attachChildView, publishChildSource, registerMemoryTools, UNGUARDED, ty
 import { appendMetric, boundedProviderError, type CompressorUsage } from "./metrics.js";
 import { captureWorkReports, type ArtifactPathSource } from "./reports.js";
 import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } from "./archive.js";
-import { Memory, type CompactionRequest, type Summarize } from "./memory.js";
+import { CompressorRefusedError, Memory, type CompactionRequest, type Summarize } from "./memory.js";
 import { VIEW_DOC } from "./prompts.js";
 import { Store, StoreLeaseConflictError, type Kind, type Message } from "./store.js";
 
@@ -90,6 +90,11 @@ interface CompressorPolicy {
 }
 
 class Refusal extends Error {}
+
+/** pi-ai reports a provider refusal (Anthropic `stop_reason: refusal`) as stopReason "error" with an errorMessage beginning "Refusal". */
+function isProviderRefusal(reply: AssistantMessage): boolean {
+	return reply.stopReason === "error" && (reply.errorMessage ?? "").startsWith("Refusal");
+}
 
 /** Keep the head and tail of a long tool result, with a note of what was cut; never longer than `cap`. */
 export function capText(text: string, cap: number): string {
@@ -454,6 +459,8 @@ class OptChat {
 	private state: State = { kind: "starting" };
 	private config: OptChatConfig | undefined;
 	private compressor: Model | undefined;
+	/** Compactions the compressor refused that were retried with the main model, this process. */
+	private mainRetries = 0;
 	private store: Store | undefined;
 	private memory: Memory | undefined;
 	private ready: Promise<void> = Promise.resolve();
@@ -686,9 +693,42 @@ class OptChat {
 	}
 
 	private async compress(request: CompactionRequest, signal: AbortSignal): Promise<string> {
-		const model = this.compressor;
+		const compressor = this.compressor;
 		const ctx = this.ctx;
-		if (!model || !ctx) throw new Error("Compressor model is not configured");
+		if (!compressor || !ctx) throw new Error("Compressor model is not configured");
+		let model = compressor;
+		let reply = await this.compressorReply(compressor, ctx, request, signal);
+		if (isProviderRefusal(reply)) {
+			const main = this.mainFallback(compressor, ctx);
+			if (main) {
+				this.mainRetries++;
+				this.notify(
+					`OptChat: the compressor ${compressor.provider}/${compressor.id} refused a compaction; retrying it once with the main model ${main.provider}/${main.id}.`,
+					"warning",
+				);
+				model = main;
+				reply = await this.compressorReply(main, ctx, request, signal);
+			}
+			// Still refused, or no distinct main model: Memory commits a source-derived stand-in for this node.
+			if (isProviderRefusal(reply)) throw new CompressorRefusedError();
+		}
+		return this.summaryText(model, reply);
+	}
+
+	/** The live main model as a compaction fallback; none when it is the compressor, absent, or needs native tools. */
+	private mainFallback(compressor: Model, ctx: ExtensionContext): Model | undefined {
+		const main = ctx.model;
+		if (!main || (main.provider === compressor.provider && main.id === compressor.id)) return undefined;
+		return requiresNativeTools(main) ? undefined : main;
+	}
+
+	/** One admitted provider attempt with `model`. Admission, cache coordination and metering are identical for every model. */
+	private async compressorReply(
+		model: Model,
+		ctx: ExtensionContext,
+		request: CompactionRequest,
+		signal: AbortSignal,
+	): Promise<AssistantMessage> {
 		const messages: LlmMessage[] = [
 			{
 				role: "user",
@@ -753,6 +793,11 @@ class OptChat {
 		// A refused attempt was never sent: it is not a completed call and writes no metric line.
 		if (!admitted) throw new Error("compressor call was not admitted");
 		this.observeUsage(model, reply, request.feedback.length, performance.now() - started);
+		return reply;
+	}
+
+	/** The summary text of a completed reply. Provider errors, aborts and tool calls are never summaries. */
+	private summaryText(model: Model, reply: AssistantMessage): string {
 		if (reply.stopReason === "error" || reply.stopReason === "aborted") {
 			const status = reply.errorStatus === undefined ? "" : ` (HTTP ${reply.errorStatus})`;
 			const detail = boundedProviderError(reply.errorMessage);
@@ -1083,6 +1128,13 @@ class OptChat {
 			this.logNew(tail);
 			if (job.abandoned) return undefined;
 			if (this.state.kind !== "ready") throw new Refusal("OptChat refused the request: memory is closed.");
+			// Only the deadline aborts this wait. A false settle without it is a failed summary, retried on the next append.
+			if (!job.controller.signal.aborted) {
+				throw new Refusal(
+					"OptChat: a memory summary failed and is retried only when the next message is saved, so nothing was sent. " +
+						"Your message is saved in the chat log, unanswered. Send it again to retry the summary.",
+				);
+			}
 			throw new Refusal(
 				`OptChat: the memory summaries were not ready after ${Math.round(this.settleTimeoutMs / 1000)} s, so nothing was sent. ` +
 					"Your message is saved in the chat log, unanswered. The compressor keeps working in the background; " +
@@ -1285,6 +1337,7 @@ class OptChat {
 			lines.push(
 				`messages: ${status.messages}; tree nodes: ${status.nodes}; compressor jobs running: ${status.pending}`,
 				`view: ${status.parts} lines, ${status.viewBytes} of ${this.config!.viewBytes} bytes`,
+				`compressor fallbacks: ${this.mainRetries} main-model retries; ${status.extractive} unsummarized stand-ins`,
 			);
 		}
 		lines.push(

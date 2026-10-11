@@ -14,6 +14,14 @@ export type Summarize = (
   signal: AbortSignal,
 ) => Promise<string>;
 
+/** The compressor refused every model eligible for one compaction. The message carries no provider text. */
+export class CompressorRefusedError extends Error {
+  constructor() {
+    super("compressor refused the compaction");
+    this.name = "CompressorRefusedError";
+  }
+}
+
 export interface MemoryOptions {
   nodeBytes?: number;
   viewBytes?: number;
@@ -55,6 +63,9 @@ interface Compactor {
 /** Level-0 nodes admitted but not yet built, at most this many, regardless of `jobs`. */
 const ADMISSION_WINDOW = 8;
 const MIN_PAGE_BYTES = 4;
+/** Marks and joins a source-derived stand-in: an excerpt of the source, never a summary. */
+const EXTRACTIVE_MARK = "[unsummarized: compressor refused] ";
+const EXTRACTIVE_JOIN = " | ";
 
 export const utf8Bytes = (text: string): number => Buffer.byteLength(text, "utf8");
 
@@ -158,6 +169,8 @@ export class Memory {
   /** Failed nodes awaiting the next append. */
   private readonly failed = new Map<string, ViewPart>();
   private readonly reported = new Set<string>();
+  /** Nodes committed as source-derived stand-ins after a terminal compressor refusal, this process. */
+  private extractiveNodes = 0;
   private readonly ready: ViewPart[] = [];
   private readyHead = 0;
   private readonly queued = new Set<string>();
@@ -303,13 +316,14 @@ export class Memory {
     return this.closing;
   }
 
-  status(): { messages: number; nodes: number; pending: number; viewBytes: number; parts: number } {
+  status(): { messages: number; nodes: number; pending: number; viewBytes: number; parts: number; extractive: number } {
     return {
       messages: this.store.messages.length,
       nodes: this.store.nodes.size,
       pending: this.busy.size,
       viewBytes: this.bytes,
       parts: this.view.length,
+      extractive: this.extractiveNodes,
     };
   }
 
@@ -574,14 +588,27 @@ export class Memory {
       source = `${left.text}\n${right.text}`;
     }
     let text = source;
+    let degraded = false;
     if (utf8Bytes(source) > this.nodeBytes) {
       const input = left && right ? `${flatten(left.text)}\n${flatten(right.text)}` : source;
-      const summary = await this.summarizeLong(part, input, signal);
+      let summary: string | undefined;
+      try {
+        summary = await this.summarizeLong(part, input, signal);
+      } catch (error) {
+        // Only a terminal compressor refusal becomes a stand-in; other failures keep the append-driven retry.
+        if (!(error instanceof CompressorRefusedError) || this.stopped || signal.aborted) throw error;
+        summary = this.extractive(part, left, right);
+        degraded = true;
+      }
       if (summary === undefined) return;
       text = summary;
     }
     if (this.stopped || signal.aborted) return;
     this.store.saveNode({ l: part.l, i: part.i, text, size: utf8Bytes(text) });
+    if (degraded) {
+      this.extractiveNodes++;
+      this.reportExtractive(part);
+    }
     this.reported.delete(nodeKey(part.l, part.i));
     if (part.l === 0) this.unbuilt--;
     this.advanceFirst();
@@ -657,6 +684,40 @@ export class Memory {
       items = next;
     }
     return items[0];
+  }
+
+  /**
+   * Source-derived stand-in for a node the compressor refused everywhere: a marked
+   * excerpt of its source within the node budget. A merge keeps both children,
+   * sharing the room between them. The original messages remain zoomable.
+   */
+  private extractive(part: ViewPart, left: TreeNode | undefined, right: TreeNode | undefined): string {
+    if (!left || !right) {
+      return utf8Prefix(`${EXTRACTIVE_MARK}${flatten(this.store.messages[part.i]!.text)}`, this.nodeBytes);
+    }
+    const first = flatten(left.text);
+    const second = flatten(right.text);
+    const room = Math.max(0, this.nodeBytes - utf8Bytes(EXTRACTIVE_MARK) - utf8Bytes(EXTRACTIVE_JOIN));
+    const secondBytes = Math.min(utf8Bytes(second), room - Math.min(utf8Bytes(first), Math.floor(room / 2)));
+    const firstBytes = Math.min(utf8Bytes(first), room - secondBytes);
+    return utf8Prefix(
+      `${EXTRACTIVE_MARK}${utf8Prefix(first, firstBytes)}${EXTRACTIVE_JOIN}${utf8Prefix(second, secondBytes)}`,
+      this.nodeBytes,
+    );
+  }
+
+  private reportExtractive(part: ViewPart): void {
+    const width = 2 ** part.l;
+    try {
+      // Detached, as failure reports are: a reporter may call close(), which awaits this job.
+      void Promise.resolve(
+        this.report(
+          `unsummarized at ${part.i * width}+${width}: the compressor refused it; stored a marked source excerpt (zoom returns the originals)`,
+        ),
+      ).catch(() => {});
+    } catch {
+      // Diagnostics must not break compaction.
+    }
   }
 
   /**

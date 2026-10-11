@@ -1,8 +1,8 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Memory, utf8Bytes, utf8Prefix, type CompactionRequest, type MemoryOptions, type Summarize } from "../src/memory.ts";
+import { CompressorRefusedError, Memory, utf8Bytes, utf8Prefix, type CompactionRequest, type MemoryOptions, type Summarize } from "../src/memory.ts";
 import { Store, nodeKey } from "../src/store.ts";
 
 const PLACEHOLDER = "(not summarized yet: zoom it)";
@@ -1584,4 +1584,153 @@ test("append forwards work metadata to the stored record and it survives restart
 
   const restored = await reopen(store);
   expect(restored.messages[message.i]!.metadata).toEqual(metadata);
+});
+
+describe("terminal compressor refusal stand-ins", () => {
+  const marker = "[unsummarized: compressor refused] ";
+
+  test("leaf refusal saves a bounded UTF-8 source prefix and preserves exact zoom text", async () => {
+    const store = await openStore();
+    const reports: string[] = [];
+    const model = new Model();
+    // 語 (3) + 🙂 (4) + é (2) = 9 bytes; the next 漢 spans bytes 9..12.
+    // Eleven excerpt bytes must stop before 漢, not emit a replacement character.
+    const nodeBytes = Buffer.byteLength(marker, "utf8") + 11;
+    const original = "語🙂é漢字🌍".repeat(12);
+    const memory = memoryFor(store, model, {
+      nodeBytes,
+      pageBytes: 1_024,
+      report: (message) => reports.push(message),
+    });
+    const message = memory.append("user", original);
+    await until(() => model.open().length === 1, "leaf request");
+    model.take("compress message 0").reject(new CompressorRefusedError());
+
+    expect(await memory.settle()).toBe(true);
+    expect(store.nodes.has(nodeKey(0, message.i))).toBe(true);
+    const node = store.nodes.get(nodeKey(0, message.i))!;
+    expect(node.text.startsWith(marker)).toBe(true);
+    const excerpt = node.text.slice(marker.length);
+    expect(excerpt).toBe("語🙂é");
+    expect(original.startsWith(excerpt)).toBe(true);
+    expect(excerpt).not.toContain("\uFFFD");
+    expect(Buffer.byteLength(node.text, "utf8")).toBeLessThanOrEqual(nodeBytes);
+    expect(node.size).toBe(Buffer.byteLength(node.text, "utf8"));
+    expect(memory.status().extractive).toBe(1);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]!.startsWith("unsummarized at 0+1:")).toBe(true);
+    expect(memory.zoom(message.i, 1)).toEqual({
+      text: original,
+      next: null,
+      totalBytes: Buffer.byteLength(original, "utf8"),
+      offset: 0,
+    });
+  });
+
+  test("merge refusal preserves fragments of both children and completes the tree", async () => {
+    const store = await openStore();
+    const left = "LEFT-child:" + "a".repeat(21);
+    const right = "RIGHT-child:" + "b".repeat(20);
+    const nodeBytes = 64;
+    const model = new Model();
+    const memory = memoryFor(store, model, { nodeBytes, pageBytes: 1_024 });
+    memory.append("user", "[m0] " + "left raw detail ".repeat(20));
+    memory.append("user", "[m1] " + "right raw detail ".repeat(20));
+    await until(() => model.open().length === 2, "two leaf requests");
+    model.take("[m0]").resolve(left);
+    model.take("[m1]").resolve(right);
+    await until(() => model.open().length === 1, "merge request");
+    const merge = model.take("merge lines 0+1 and 1+1");
+    expect(inputOf(merge)).toBe(`${left}\n${right}`);
+    merge.reject(new CompressorRefusedError());
+
+    // Each child is 32 bytes, but their newline-joined parent is 65 > 64.
+    expect(Buffer.byteLength(`${left}\n${right}`, "utf8")).toBe(nodeBytes + 1);
+    expect(await memory.settle()).toBe(true);
+    expect(store.nodes.get(nodeKey(0, 0))!.text).toBe(left);
+    expect(store.nodes.get(nodeKey(0, 1))!.text).toBe(right);
+    // settle() resolves once every leaf is built; the refused merge may still be in flight.
+    await until(() => store.nodes.has(nodeKey(1, 0)), "refused merge stand-in");
+    const parent = store.nodes.get(nodeKey(1, 0))!;
+    expect(parent.text.startsWith(marker)).toBe(true);
+    expect(parent.text).toContain("LEFT-child:");
+    expect(parent.text).toContain("RIGHT-child:");
+    expect(Buffer.byteLength(parent.text, "utf8")).toBeLessThanOrEqual(nodeBytes);
+    expect(parent.size).toBe(Buffer.byteLength(parent.text, "utf8"));
+    expect(store.nodes.size).toBe(3);
+    await until(() => memory.status().pending === 0, "merge job drained");
+    expect(memory.status()).toMatchObject({ messages: 2, nodes: 3, pending: 0, extractive: 1 });
+  });
+
+  test("ordinary HTTP failure saves no stand-in and recovers on the next append", async () => {
+    const store = await openStore();
+    const model = new Model();
+    const reports: string[] = [];
+    const memory = memoryFor(store, model, {
+      nodeBytes: 64,
+      pageBytes: 1_024,
+      report: (message) => reports.push(message),
+    });
+    const original = "[m0] " + "failed raw detail ".repeat(10);
+    memory.append("user", original);
+    await until(() => model.open().length === 1, "initial leaf request");
+    model.take("[m0]").reject(new Error("HTTP 500"));
+
+    expect(await memory.settle()).toBe(false);
+    expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
+    expect(store.nodes.size).toBe(0);
+    expect(memory.status().extractive).toBe(0);
+    expect(reports).toEqual([
+      "OptChat compaction failed at 0+1; retrying on the next appended message: HTTP 500",
+    ]);
+    expect(model.calls).toHaveLength(1);
+
+    memory.append("user", "[m1] " + "new raw detail ".repeat(10));
+    await until(() => model.open().length === 2, "failed leaf retry and new leaf request");
+    expect(inputOf(model.take("[m0]"))).toBe(`user: ${original}`);
+    model.take("[m0]").resolve("recovered leaf");
+    model.take("[m1]").resolve("new leaf");
+    expect(await memory.settle()).toBe(true);
+    expect(store.nodes.get(nodeKey(0, 0))!.text).toBe("recovered leaf");
+    expect(store.nodes.get(nodeKey(0, 1))!.text).toBe("new leaf");
+    expect(store.nodes.get(nodeKey(1, 0))!.text).toBe("recovered leaf\nnew leaf");
+    await until(() => memory.status().pending === 0, "recovered merge job drained");
+    expect(memory.status()).toMatchObject({ messages: 2, nodes: 3, pending: 0, extractive: 0 });
+    expect(model.calls).toHaveLength(3);
+    expect(reports).toHaveLength(1);
+  });
+
+  test("second-page refusal excerpts the whole original rather than the first-page summary", async () => {
+    const store = await openStore();
+    const model = new Model();
+    const original = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(3);
+    const pageBytes = 16;
+    const nodeBytes = Buffer.byteLength(marker, "utf8") + 20;
+    const memory = memoryFor(store, model, { nodeBytes, pageBytes });
+    memory.append("user", original);
+    // The 84-byte source includes the six-byte role prefix; it exceeds both budgets.
+    expect(utf8Bytes(`user: ${original}`)).toBe(84);
+    expect(utf8Bytes(`user: ${original}`)).toBeGreaterThan(nodeBytes);
+    expect(utf8Bytes(`user: ${original}`)).toBeGreaterThan(pageBytes);
+    await until(() => model.open().length === 1, "first source page");
+    const first = model.take("part 1,");
+    expect(inputOf(first)).toBe("user: ABCDEFGHIJ");
+    expect(first.request.instruction).toContain("source bytes 0 to 16 of 84");
+    first.resolve("partial digest");
+
+    await until(() => model.open().length === 1, "second source page");
+    const second = model.take("part 2,");
+    expect(inputOf(second)).toBe("KLMNOPQRSTUVWXYZ");
+    expect(second.request.instruction).toContain("source bytes 16 to 32 of 84");
+    second.reject(new CompressorRefusedError());
+    expect(await memory.settle()).toBe(true);
+    expect(model.calls).toHaveLength(2);
+    const node = store.nodes.get(nodeKey(0, 0))!;
+    // The stand-in is the whole original message, not the first-page summary: 55 - 35 marker bytes leave 20.
+    expect(node.text).toBe(`${marker}ABCDEFGHIJKLMNOPQRST`);
+    expect(node.text).not.toContain("partial digest");
+    expect(Buffer.byteLength(node.text, "utf8")).toBe(nodeBytes);
+    expect(node.size).toBe(nodeBytes);
+    expect(memory.status()).toMatchObject({ nodes: 1, pending: 0, extractive: 1 });
+  });
 });

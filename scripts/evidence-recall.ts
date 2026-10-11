@@ -595,14 +595,21 @@ function reserveHostAllowance(context: Context, hostId: string, usdPerCall: numb
 	return allowance;
 }
 
-/** Worst case for one compressor call, from the measured prompt bytes and the compactor layout. */
-function hostUsdPerCall(context: Context, compressor: string): number {
+/**
+ * Worst case for one compaction call on this host, from the measured prompt bytes and the compactor layout. OptChat retries a refused compaction once on the main model with the
+ * same prompt and output cap, and every attempt passes the same admission, so each call is priced at the dearer model.
+ */
+function hostUsdPerCall(context: Context, compressor: string, main: string): number {
 	if (context.capUsd === null) return 0;
 	const system = effectiveSystemBytes(context.systemBytes);
 	if (system === null) throw new BudgetStop("unknown-cost", "effective prompt bytes are not measured");
-	const bound = compressorCallBoundUsd(context.rates.get(compressor) ?? null, system, COMPACTOR_LAYOUT, context.limits.maxCompressorOutputTokens);
-	if (bound === null) throw new BudgetStop("unknown-cost", `rate or context window for ${compressor} is unknown`);
-	return bound;
+	let worst = 0;
+	for (const model of new Set([compressor, main])) {
+		const bound = compressorCallBoundUsd(context.rates.get(model) ?? null, system, COMPACTOR_LAYOUT, context.limits.maxCompressorOutputTokens);
+		if (bound === null) throw new BudgetStop("unknown-cost", `rate or context window for ${model} is unknown`);
+		worst = Math.max(worst, bound);
+	}
+	return worst;
 }
 
 /** Adds an observed USD amount to a running total; null on either side keeps the total unobserved. */
@@ -681,7 +688,7 @@ async function openHost(context: Context, spec: HostSpec): Promise<HostSlot> {
 	const on = spec.arm === "on";
 	const compressor = spec.compressor ?? context.options.compressor;
 	const callAllowance = on ? callAllowanceFor(context, spec.kind, spec.share) : 0;
-	const usdPerCall = on ? hostUsdPerCall(context, compressor) : 0;
+	const usdPerCall = on ? hostUsdPerCall(context, compressor, spec.model) : 0;
 	const extraArgs: string[] = [];
 	let historyBytes = 0;
 	if (!on) {

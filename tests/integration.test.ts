@@ -92,6 +92,10 @@ const CASE_TITLES = {
   "fresh-turn-steering": "the installed default sends settled summaries; its tool loop and steering stay raw under one view",
   "thinking-exclusion": "provider thinking never reaches fresh turns, the compressor or the durable store",
   "compressor-tool-refusal": "compressor tool calls are neither executed nor accepted as summaries",
+  "compressor-refusal-main-retry": "a refused compaction retries once with the main model, which stores its summary without a stand-in",
+  "compressor-refusal-standin": "a refusal by the compressor and the main model stores a bounded labelled stand-in; the next prompt is answered",
+  "compressor-error-append-retry": "a non-refusal compaction error never reaches the main model or stores anything, and the next append retries it",
+  "compressor-refusal-same-model": "a compressor equal to the main model refuses once, stores the stand-in directly and sends no retry",
   "compressor-without-tools": "a compressor without tool support never receives captured main tools",
   "side-prefix-text-mismatch": "a same-model side request's reworded system prefix never replaces the compressor's guide or adds tools",
   "reasoning-tools-compressor": "with disableReasoningWithTools the tool-bearing main request reasons none; the compressor stays medium and tool-free",
@@ -167,6 +171,7 @@ function childEnvironment(root: string, name: CaseName): Record<string, string> 
     PI_NO_TITLE: "1",
     [CHILD_ENV]: name,
     [ROOT_ENV]: root,
+    OPTCHAT_METRICS_FILE: join(root, "metrics.jsonl"),
   };
   return Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined));
 }
@@ -259,6 +264,8 @@ interface CaseContext {
   cwd: string;
   agentDir: string;
   memory: string;
+  /** This child's private metric file, read directly; the OptChat host appends one line per compressor attempt. */
+  metrics: string;
 }
 
 function object(value: Json | undefined, label: string): WireObject {
@@ -457,6 +464,9 @@ interface CompactInput {
   target: number;
 }
 
+/** A scripted compressor outcome: hang, a tool call, or an in-band provider error. */
+type CompactOutcome = "hang" | "tool" | { error: string };
+
 interface Capture {
   seq: number;
   model: string;
@@ -486,6 +496,17 @@ function compactInput(body: WireObject): CompactInput {
   const input = match[3]!;
   const leaf = match[1]!.startsWith("compress message ");
   return { leaf, kind: leaf ? input.slice(0, input.indexOf(":")) : undefined, input, target: Number(match[2]) };
+}
+
+/**
+ * A compaction is recognised by its instruction. The compressor models always
+ * carry one; the main model carries one only on a fallback compaction.
+ */
+function compactionRequest(body: WireObject, model: string): CompactInput | undefined {
+  const last = wireMessages(body).filter((message) => message.role === "user").at(-1);
+  const compaction = last !== undefined && INSTRUCTION.test(wireText(last));
+  if (model === CHAT_MODEL && !compaction) return undefined;
+  return compactInput(body);
 }
 
 /** OpenAI Chat Completions SSE: reasoning_content, content, tool_call argument deltas, finish, usage, [DONE]. */
@@ -535,15 +556,16 @@ function sse(model: string, seq: number, reply: Reply): Response {
  * Captures every parsed request. Chat requests consume a strict queue of
  * scripted replies; an unplanned request, endpoint, model or body is recorded
  * as a failure and answered with an error, never with a made-up success.
- * Compressor requests get short deterministic summaries, or a hang that ends
- * only at cleanup.
+ * Compressor requests get short deterministic summaries, a scripted in-band
+ * provider error, or a hang that ends only at cleanup.
  */
 class Fixture {
   readonly captures: Capture[] = [];
   readonly failures: Error[] = [];
   /** Rejects on the first failure, so awaited barriers stop at once. */
   readonly fatal: Promise<never>;
-  compactPolicy: ((input: CompactInput) => "hang" | "tool" | undefined) | undefined;
+  /** Scripted compressor outcome by source and model; undefined keeps the normal summary. */
+  compactPolicy: ((input: CompactInput, model: string) => CompactOutcome | undefined) | undefined;
   readonly baseUrl: string;
   private readonly rejectFatal: (error: Error) => void;
   private readonly scripts: Array<{ label: string; reply: Reply }> = [];
@@ -562,12 +584,14 @@ class Fixture {
     this.baseUrl = `http://127.0.0.1:${this.server.port}/v1`;
   }
 
+  /** Ordinary chat requests only: a fallback compaction on the main model is never a queued reply. */
   chat(): Capture[] {
-    return this.captures.filter((capture) => capture.model === CHAT_MODEL);
+    return this.captures.filter((capture) => capture.model === CHAT_MODEL && capture.compact === undefined);
   }
 
+  /** Every compaction request, from the compressor or, on a fallback, the main model. */
   compact(): Capture[] {
-    return this.captures.filter((capture) => capture.model === COMPACT_MODEL || capture.model === NO_TOOLS_COMPACT_MODEL);
+    return this.captures.filter((capture) => capture.compact !== undefined);
   }
 
   queueChat(label: string, reply: Reply): void {
@@ -666,19 +690,22 @@ class Fixture {
         throw new Error(`unexpected model ${JSON.stringify(body.model)}`);
       }
       wireMessages(body);
-      const compact = model === COMPACT_MODEL || model === NO_TOOLS_COMPACT_MODEL ? compactInput(body) : undefined;
+      const compact = compactionRequest(body, model);
       const capture: Capture = { seq: this.captures.length + 1, model, body, at: performance.now(), compact };
       this.captures.push(capture);
       let response: Response;
       if (compact) {
-        const policy = this.compactPolicy?.(compact);
-        if (policy === "hang") {
+        const outcome = this.compactPolicy?.(compact, model);
+        if (outcome === "hang") {
           response = this.hang();
-        } else if (policy === "tool") {
+        } else if (outcome === "tool") {
           response = sse(model, capture.seq, {
             text: "COMPRESSOR_TOOL_OUTPUT_MUST_NOT_BE_SAVED",
             calls: [{ id: `compact-call-${capture.seq}`, name: "probe", args: { label: "must-not-execute" } }],
           });
+        } else if (outcome !== undefined) {
+          // An in-band provider error inside HTTP 200, as aggregators send it: an `error` member and no status.
+          response = new Response(`data: ${JSON.stringify({ error: { message: outcome.error } })}\n\n`, { headers: SSE_HEADERS });
         } else {
           const summary = compact.leaf ? LEAF_SUMMARY[compact.kind ?? ""] : MERGE_SUMMARY;
           if (summary === undefined) throw new Error(`no fixture summary for source kind ${JSON.stringify(compact.kind)}`);
@@ -1202,6 +1229,237 @@ async function compressorToolRefusal(ctx: CaseContext): Promise<Evidence> {
     assert.deepEqual(pairs(rows), [["user", T1_USER], ["talk", T1_TALK]], "compressor tool calls and purported summaries are not chat messages");
     assert(!JSON.stringify(jsonlRecords(join(ctx.memory, "tree"))).includes("COMPRESSOR_TOOL_OUTPUT_MUST_NOT_BE_SAVED"), "tool-bearing replies never become tree nodes");
     return { executions, compressorRequests: ctx.fixture.compact().length };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Compressor refusal and error recovery: one seeded leaf, scripted per model
+// ---------------------------------------------------------------------------
+
+/** One seeded user message, longer than the 64-byte node budget, so its leaf needs a summary. */
+const SEED_USER = `OPTCHAT_IT_SEED_USER ${"seeded user words that need a memory summary; ".repeat(3)}`.trim();
+/** The compaction input of that leaf: its kind, a colon, and the text. */
+const SEED_SOURCE = `user: ${SEED_USER}`;
+const REFUSAL_TEXT = "Refusal (bio): OPTCHAT_IT scripted safety refusal.";
+// Not a rate limit: the SDK classifies "rate limit" as transient and would retry it inside the stream, adding requests.
+const COMPRESSOR_FAILURE_TEXT = "Compressor request failed upstream (OPTCHAT_IT scripted failure).";
+const STAND_IN_MARK = "[unsummarized: compressor refused] ";
+const MAIN_RETRY_NOTICE = "retrying it once with the main model";
+const DEFERRED_FAILURE = "a memory summary failed and is retried only when the next message is saved";
+
+/** Compaction requests for exactly the seeded leaf, whichever model served them. */
+function seedRequests(fixture: Fixture): Capture[] {
+  return fixture.compact().filter((capture) => capture.compact?.input === SEED_SOURCE);
+}
+
+/** The whole compaction instruction: the source, its byte target and the fixed ruler. */
+function instructionText(capture: Capture): string {
+  return userTexts(capture.body).at(-1) ?? "";
+}
+
+/** Complete newline-terminated metric lines of this child's file; a line still being appended is skipped. */
+function metricRecords(path: string): WireObject[] {
+  if (!existsSync(path)) return [];
+  const content = readFileSync(path, "utf8");
+  return content.slice(0, content.lastIndexOf("\n") + 1).split("\n").filter((line) => line.length > 0)
+    .map((line) => object(JSON.parse(line) as Json, "metric record"));
+}
+
+/** A tree node from its complete on-disk record; the host owns the store, so no Store is opened. */
+function persistedNode(memory: string, l: number, i: number): WireObject | undefined {
+  return jsonlRecords(join(memory, "tree")).find((record) => record.l === l && record.i === i);
+}
+
+/**
+ * A stand-in is a marked prefix of its own source inside the node budget. The
+ * budget and the stored size are UTF-8 byte counts, as the store measures them.
+ */
+function standInText(node: WireObject): string {
+  const text = node.text;
+  assert(typeof text === "string" && text.startsWith(STAND_IN_MARK), "the stand-in carries the refusal mark");
+  const excerpt = text.slice(STAND_IN_MARK.length);
+  assert(excerpt.length > 0 && SEED_USER.startsWith(excerpt), "the stand-in excerpts its own source");
+  const bytes = new TextEncoder().encode(text).byteLength;
+  assert(bytes <= 64, `the stand-in fits the 64-byte node budget (${bytes} bytes)`);
+  assert.equal(node.size, bytes, "the stored size is the stand-in's UTF-8 byte length");
+  return text;
+}
+
+/**
+ * An ordinary prompt that must reach the strict chat queue. Its durable rows
+ * and reply show the host settled; its window holds no refusal or error notice.
+ */
+async function ordinaryTurn(ctx: CaseContext, host: Host, prompt: string, reply: string): Promise<Capture> {
+  const { fixture, memory } = ctx;
+  const chatBefore = fixture.chat().length;
+  const noticesBefore = host.notices.length;
+  fixture.queueChat(prompt, { text: reply });
+  expectCompleted(await bounded(`prompt ${prompt}`, host.prompt(prompt), STEP_MS, fixture.fatal), prompt);
+  await host.idle();
+  const rows = await fixture.until(`durable reply to ${prompt}`, () => {
+    const all = mainRows(memory);
+    return all.at(-1)?.kind === "talk" && all.at(-1)?.text === reply ? all : undefined;
+  });
+  assert.deepEqual(pairs(rows.slice(-2)), [["user", prompt], ["talk", reply]], "the ordinary prompt and its reply are durable");
+  // A refused user prompt or an error; compaction fallback warnings are neither.
+  const refusals = host.notices.slice(noticesBefore).filter((notice) =>
+    notice.type === "error" || /OptChat refused the request|a memory summary failed|not ready after|keeps working in the background/.test(notice.message));
+  assert.deepEqual(refusals.map((notice) => notice.message), [], "the ordinary prompt is not refused, aborted or failed");
+  assert.equal(fixture.chat().length, chatBefore + 1, "the ordinary prompt reaches the strict chat queue once");
+  fixture.assertScriptsConsumed();
+  return fixture.chat().at(-1)!;
+}
+
+/** Refusal by the compressor, then a successful main-model compaction: stored summary, no stand-in. */
+async function compressorRefusalMainRetry(ctx: CaseContext): Promise<Evidence> {
+  const { fixture, memory, metrics } = ctx;
+  fixture.compactPolicy = (input, model) => (input.input === SEED_SOURCE && model === COMPACT_MODEL ? { error: REFUSAL_TEXT } : undefined);
+  await seedStore(ctx, [["user", SEED_USER]]);
+  return withHost(ctx, { notices: true, settleTimeoutMs: POSITIVE_SETTLE_MS }, async (host) => {
+    const node = await fixture.until("seed summary persisted", () => persistedNode(memory, 0, 0));
+    assert.equal(node.text, LEAF_SUMMARY.user, "the main model's summary is the stored node, with no stand-in");
+    const lines = await fixture.until("both seed attempts metered", () => {
+      const records = metricRecords(metrics);
+      return records.length >= 2 ? records : undefined;
+    });
+    assert.equal(lines.length, 2, "only the two seed attempts are metered before any follow-up");
+    const requests = seedRequests(fixture);
+    assert.deepEqual(requests.map((capture) => capture.model), [COMPACT_MODEL, CHAT_MODEL], "the compressor, then the main model, once each");
+    assert.equal(instructionText(requests[1]!), instructionText(requests[0]!), "the fallback repeats the full compaction instruction");
+    // The fallback aligns to the main model's captured host prefix, so its system text need not equal the compressor's.
+    assert(systemText(requests[1]!.body).includes(ctx.lib.optchat.SYSTEM_BLOCK), "the fallback carries the OptChat guide");
+    assert.deepEqual(lines.map((line) => [line.model, line.attempt, line.purpose, line.stopReason]), [
+      [`${PROVIDER}/${COMPACT_MODEL}`, 1, "leaf", "error"],
+      [`${PROVIDER}/${CHAT_MODEL}`, 1, "leaf", "stop"],
+    ], "each attempt is metered with its own identity and outcome");
+    assert(String(lines[0]!.error).includes("Refusal"), "the compressor's metric records the refusal");
+    assert.equal(lines[1]!.error, null, "the successful fallback records no error");
+    await fixture.until("main-model retry notice", () => host.notices.find((notice) =>
+      notice.message.includes(`${PROVIDER}/${COMPACT_MODEL} refused a compaction`) && notice.message.includes(MAIN_RETRY_NOTICE)));
+    assert(!host.notices.some((notice) => notice.message.includes("unsummarized")), "a successful fallback stores no stand-in");
+    const followUp = await ordinaryTurn(ctx, host, "OPTCHAT_IT_RETRY_FOLLOW: say ok.", "OPTCHAT_IT_RETRY_REPLY: ok.");
+    assert.equal(soleView(followUp.body, "follow-up"), "<chat>\n0+1|user: prior turn summary\n</chat>", "the settled view holds the main model's summary");
+    return {
+      requests: requests.map((capture) => capture.model),
+      metrics: lines.map((line) => [line.model, line.stopReason]),
+    };
+  });
+}
+
+/** Refusal by both compressor and main model: a bounded, marked, source-derived stand-in is stored and answers the next prompt. */
+async function compressorRefusalStandIn(ctx: CaseContext): Promise<Evidence> {
+  const { fixture, memory, metrics } = ctx;
+  fixture.compactPolicy = (input) => (input.input === SEED_SOURCE ? { error: REFUSAL_TEXT } : undefined);
+  await seedStore(ctx, [["user", SEED_USER]]);
+  return withHost(ctx, { notices: true, settleTimeoutMs: POSITIVE_SETTLE_MS }, async (host) => {
+    const node = await fixture.until("stand-in persisted", () => persistedNode(memory, 0, 0));
+    const standIn = standInText(node);
+    const lines = await fixture.until("both refusals metered", () => {
+      const records = metricRecords(metrics);
+      return records.length >= 2 ? records : undefined;
+    });
+    assert.equal(lines.length, 2, "only the two seed attempts are metered before any follow-up");
+    const requests = seedRequests(fixture);
+    assert.deepEqual(requests.map((capture) => capture.model), [COMPACT_MODEL, CHAT_MODEL], "the compressor, then the main model, once each");
+    assert.equal(instructionText(requests[1]!), instructionText(requests[0]!), "the fallback repeats the full compaction instruction");
+    // The fallback aligns to the main model's captured host prefix, so its system text need not equal the compressor's.
+    assert(systemText(requests[1]!.body).includes(ctx.lib.optchat.SYSTEM_BLOCK), "the fallback carries the OptChat guide");
+    assert.deepEqual(lines.map((line) => [line.model, line.attempt, line.purpose, line.stopReason]), [
+      [`${PROVIDER}/${COMPACT_MODEL}`, 1, "leaf", "error"],
+      [`${PROVIDER}/${CHAT_MODEL}`, 1, "leaf", "error"],
+    ], "both refusals are metered with their own identities");
+    assert(lines.every((line) => String(line.error).includes("Refusal")), "both metrics record the refusal");
+    await fixture.until("main-model retry notice", () => host.notices.find((notice) =>
+      notice.message.includes(MAIN_RETRY_NOTICE)));
+    await fixture.until("stand-in notice", () => host.notices.find((notice) =>
+      notice.message.includes("unsummarized at 0+1") && notice.message.includes("stored a marked source excerpt")));
+    const followUp = await ordinaryTurn(ctx, host, "OPTCHAT_IT_STANDIN_FOLLOW: say ok.", "OPTCHAT_IT_STANDIN_REPLY: ok.");
+    assert.equal(soleView(followUp.body, "follow-up"), `<chat>\n0+1|${standIn}\n</chat>`, "the settled view holds the stand-in");
+    return {
+      requests: requests.map((capture) => capture.model),
+      metrics: lines.map((line) => [line.model, line.stopReason]),
+      standInBytes: new TextEncoder().encode(standIn).byteLength,
+    };
+  });
+}
+
+/**
+ * A non-refusal compressor error: no main-model retry and no stand-in. The
+ * unanswered prompt that follows is refused by settle; its logged write is the
+ * append that retries the compressor, which then succeeds.
+ */
+async function compressorErrorAppendRetry(ctx: CaseContext): Promise<Evidence> {
+  const { fixture, memory, metrics } = ctx;
+  let failing = true;
+  fixture.compactPolicy = (input) => (failing && input.input === SEED_SOURCE ? { error: COMPRESSOR_FAILURE_TEXT } : undefined);
+  await seedStore(ctx, [["user", SEED_USER]]);
+  return withHost(ctx, { notices: true, settleTimeoutMs: POSITIVE_SETTLE_MS }, async (host) => {
+    const failed = await fixture.until("seed failure metered", () => {
+      const records = metricRecords(metrics);
+      return records.length >= 1 ? records : undefined;
+    });
+    assert.deepEqual([failed[0]!.model, failed[0]!.attempt, failed[0]!.purpose, failed[0]!.stopReason], [`${PROVIDER}/${COMPACT_MODEL}`, 1, "leaf", "error"], "the failed compressor attempt is metered");
+    assert(String(failed[0]!.error).includes("upstream"), "the metric records the non-refusal error, not a refusal");
+    await fixture.until("compaction failure warning", () => host.notices.find((notice) =>
+      notice.message.includes("OptChat compaction failed at 0+1; retrying on the next appended message")));
+    assert.deepEqual(seedRequests(fixture).map((capture) => capture.model), [COMPACT_MODEL], "a non-refusal error is never retried with the main model");
+    assert.equal(persistedNode(memory, 0, 0), undefined, "no summary or stand-in is stored for the failed seed");
+    assert(!host.notices.some((notice) => notice.message.includes("unsummarized") || notice.message.includes(MAIN_RETRY_NOTICE)), "no stand-in or main-model retry is announced");
+
+    failing = false;
+    // Settle sees the failed node: this prompt is refused, and logging it is the append that retries the compressor.
+    await bounded("refused prompt", host.prompt("OPTCHAT_IT_APPEND_RETRY_FIRST: say ok."), STEP_MS, fixture.fatal);
+    await fixture.until("prompt refused until the next append", () => host.notices.find((notice) => notice.message.includes(DEFERRED_FAILURE)));
+    const node = await fixture.until("retried summary persisted", () => persistedNode(memory, 0, 0));
+    assert.equal(node.text, LEAF_SUMMARY.user, "the append's retry stores the compressor's summary");
+    const lines = await fixture.until("retry attempt metered", () => {
+      const records = metricRecords(metrics);
+      return records.length >= 2 ? records : undefined;
+    });
+    assert.deepEqual(seedRequests(fixture).map((capture) => capture.model), [COMPACT_MODEL, COMPACT_MODEL], "the retry is the compressor again, never the main model");
+    assert.deepEqual([lines[1]!.model, lines[1]!.stopReason], [`${PROVIDER}/${COMPACT_MODEL}`, "stop"], "the retry is metered as a successful compressor call");
+    assert(!host.notices.some((notice) => notice.message.includes("unsummarized")), "the recovered summary is not a stand-in");
+
+    const followUp = await ordinaryTurn(ctx, host, "OPTCHAT_IT_APPEND_RETRY_SECOND: say ok.", "OPTCHAT_IT_APPEND_RETRY_REPLY: ok.");
+    assert(soleView(followUp.body, "follow-up").includes("\n0+1|user: prior turn summary\n"), "the recovered summary is settled into the next view");
+    assert(!host.notices.some((notice) => /not ready after|keeps working in the background/.test(notice.message)), "a failed summary never reports a deadline");
+    return {
+      compressorAttempts: seedRequests(fixture).map((capture) => capture.model),
+      metrics: lines.slice(0, 2).map((line) => [line.model, line.stopReason]),
+    };
+  });
+}
+
+/** The compressor is the main model: its refusal goes straight to a stand-in, with one request and no retry. */
+async function compressorRefusalSameModel(ctx: CaseContext): Promise<Evidence> {
+  const { fixture, memory, metrics } = ctx;
+  fixture.compactPolicy = (input) => (input.input === SEED_SOURCE ? { error: REFUSAL_TEXT } : undefined);
+  await seedStore(ctx, [["user", SEED_USER]]);
+  return withHost(ctx, {
+    notices: true,
+    settleTimeoutMs: POSITIVE_SETTLE_MS,
+    flags: { "optchat-model": `${PROVIDER}/${CHAT_MODEL}` },
+  }, async (host) => {
+    const node = await fixture.until("stand-in persisted", () => persistedNode(memory, 0, 0));
+    const standIn = standInText(node);
+    const lines = await fixture.until("the single refusal metered", () => {
+      const records = metricRecords(metrics);
+      return records.length >= 1 ? records : undefined;
+    });
+    assert.equal(lines.length, 1, "one compressor attempt is metered");
+    assert.deepEqual(seedRequests(fixture).map((capture) => capture.model), [CHAT_MODEL], "the main model is the compressor, so no retry request is sent");
+    assert.deepEqual([lines[0]!.model, lines[0]!.attempt, lines[0]!.purpose, lines[0]!.stopReason], [`${PROVIDER}/${CHAT_MODEL}`, 1, "leaf", "error"], "the single refusal is metered with its identity");
+    assert(String(lines[0]!.error).includes("Refusal"), "the metric records the refusal");
+    await fixture.until("stand-in notice", () => host.notices.find((notice) =>
+      notice.message.includes("unsummarized at 0+1") && notice.message.includes("stored a marked source excerpt")));
+    assert(!host.notices.some((notice) => notice.message.includes(MAIN_RETRY_NOTICE)), "no same-model retry is announced");
+    const followUp = await ordinaryTurn(ctx, host, "OPTCHAT_IT_SAME_FOLLOW: say ok.", "OPTCHAT_IT_SAME_REPLY: ok.");
+    assert.equal(soleView(followUp.body, "follow-up"), `<chat>\n0+1|${standIn}\n</chat>`, "the settled view holds the stand-in");
+    return {
+      requests: seedRequests(fixture).map((capture) => capture.model),
+      metrics: lines.map((line) => [line.model, line.stopReason]),
+      standInBytes: new TextEncoder().encode(standIn).byteLength,
+    };
   });
 }
 
@@ -3131,6 +3389,10 @@ const CASES: Record<CaseName, (ctx: CaseContext) => Promise<Evidence>> = {
   "fresh-turn-steering": freshTurnSteering,
   "thinking-exclusion": thinkingExclusion,
   "compressor-tool-refusal": compressorToolRefusal,
+  "compressor-refusal-main-retry": compressorRefusalMainRetry,
+  "compressor-refusal-standin": compressorRefusalStandIn,
+  "compressor-error-append-retry": compressorErrorAppendRetry,
+  "compressor-refusal-same-model": compressorRefusalSameModel,
   "compressor-without-tools": compressorWithoutTools,
   "side-prefix-text-mismatch": sidePrefixTextMismatch,
   "reasoning-tools-compressor": (ctx) => reasoningToolsCompressor(ctx, {
@@ -3197,7 +3459,7 @@ async function runChild(name: string): Promise<void> {
   const lib = await loadLibraries();
   const fixture = new Fixture();
   try {
-    const evidence = await CASES[name]({ lib, fixture, cwd, agentDir, memory: join(root, "memory") });
+    const evidence = await CASES[name]({ lib, fixture, cwd, agentDir, memory: join(root, "memory"), metrics: join(root, "metrics.jsonl") });
     assert.deepEqual(fixture.failures.map((failure) => failure.message), [], "the fixture recorded no failures");
     console.log(`${RESULT_MARK}${JSON.stringify({ case: name, ok: true, evidence })}`);
   } finally {
