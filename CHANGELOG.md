@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 — 2026-10-11
+
+- Automatically activate OptChat in main-agent sessions when the enabled plugin is discovered, for fresh installations and upgrades alike; `--optchat` is no longer required.
+- Add `--no-optchat` as a session opt-out that takes precedence regardless of flag order, leaving ordinary context intact and creating no OptChat store or compressor work. Subagents remain inactive.
+- Exercise isolated plugin linking, automatic discovery, default activation, and explicit opt-out against the real OMP host. Preserve existing memory-directory ownership and host compaction behavior; no global settings are changed.
+
 ## 0.2.0 — 2026-10-11
 
 - Correct merge priority to measure age from each sibling pair's last message.

@@ -10,28 +10,30 @@ An OMP extension implementing [Victor Taelin's OptChat specification](https://gi
 Install the tagged release:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.2.0'
-PI_OPENAI_STATEFUL=0 omp --optchat
+omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.3.0'
+PI_OPENAI_STATEFUL=0 omp
 ```
 
-From this checkout:
+From a local checkout:
 
 ```sh
 bun install --frozen-lockfile
-PI_OPENAI_STATEFUL=0 omp -e . --optchat
+PI_OPENAI_STATEFUL=0 omp -e .
 ```
 
 Or install the local plugin once:
 
 ```sh
 omp plugin link .
-PI_OPENAI_STATEFUL=0 omp --optchat
+PI_OPENAI_STATEFUL=0 omp
 ```
 
-Discovery alone does **not** enable OptChat. Only `--optchat` activates it: ordinary sessions gain the flags and `/optchat` command, but no memory tools, logging, or context changes. Subagents do not open the main chat. Run just one enabled session per chat directory. To select a different memory or compressor:
+Installing or linking the enabled plugin activates OptChat automatically in new main-agent sessions. This default applies to both fresh installations and upgrades; no first-install marker is used. `--optchat` remains an optional explicit enable flag. Use `omp --no-optchat` for an ordinary session with no OptChat memory tools, logging, compression, or context changes; `/optchat` remains registered. The opt-out wins even when both flags are present, in either order. Do not use `--optchat=false`: OMP's boolean CLI parser treats that as enabled.
+
+Subagents do not open the main chat. Run just one enabled session per chat directory. To select a different memory or compressor:
 
 ```sh
-PI_OPENAI_STATEFUL=0 omp -e . --optchat --optchat-dir /path/to/private/chat --optchat-model anthropic/claude-sonnet-4-6
+PI_OPENAI_STATEFUL=0 omp -e . --optchat-dir /path/to/private/chat --optchat-model anthropic/claude-sonnet-4-6
 ```
 
 The default chat lives in `optchat/` under OMP's active agent directory. Working-directory changes and OMP session restarts do not start a new memory; a different `--optchat-dir` does. The extension does not import existing OMP sessions automatically.
@@ -74,6 +76,7 @@ A model turn waits for summaries rather than seeing partial source text. Compres
 
 - OMP caps extension context handlers at 30 seconds. OptChat therefore cancels a turn if memory has not settled within 25 seconds, before the host could ignore a timed-out hook. The unanswered user message stays in the log, and compression continues; send the request again after memory is ready. It never substitutes raw old history or half a summary.
 - The extension preserves OMP's system instructions, tool policy, display, and in-turn reasoning rather than replacing the harness. It does not change your delegation policy or create its own subagent system.
+- Activation does not change host settings or replace the Sharpshooter memory backend. OptChat vetoes normal automatic/manual compaction and experimental rollover, but this is not a blanket maintenance disable: OMP can still check raw-history thresholds, and automatic shake pruning can bypass that hook. This release does not change those host maintenance settings.
 - The storage format is textual. Do not treat it as an archive of image/audio binary attachments.
 - Permanent storage uses fsync, not automatic Git commits. Backups remain the operator's responsibility.
 
@@ -108,7 +111,7 @@ bun test
 bun run smoke
 ```
 
-The smoke harness exercises the actual OMP host with a local deterministic model endpoint, captures inference requests, and checks fresh turns, shared main/compactor prompt and tools, the dash ruler, lossless retrieval, saved-view stability, and restart persistence. Set `OPTCHAT_SMOKE_OMP` to a compiled OMP executable and `OPTCHAT_SMOKE_PLUGIN` to an installed plugin directory to verify that artifact rather than the checkout. It is not a measurement of summary quality or real-provider cache hit rates.
+The smoke harness links the plugin into an isolated fresh host environment, then exercises automatic discovery and activation without `--optchat` or an explicit plugin extension path. It uses the actual OMP host with a local deterministic model endpoint, captures inference requests, and checks fresh turns, shared main/compactor prompt and tools, the dash ruler, lossless retrieval, saved-view stability, and restart persistence. Separate opt-out processes prove ordinary history remains intact, no memory store or tools are created, and no compressor requests occur, including both positive/negative flag orders. Set `OPTCHAT_SMOKE_OMP` to a compiled OMP executable and `OPTCHAT_SMOKE_PLUGIN` to an installed plugin directory to verify that artifact rather than the checkout. It is not a measurement of summary quality or real-provider cache hit rates.
 
 The 0.2.0 release was exercised with compiled OMP 18.8.9 against the synthetic provider. A separate real-filesystem run ingested 300 synthetic messages, observed the 128,000-to-64,000-byte main batch and 32,000-to-16,000-byte compactor cycle, and checked byte-identical saved views on restart plus migration from a log without a snapshot.
 
