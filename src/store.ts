@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
@@ -11,6 +11,8 @@ import {
   readFileSync,
   readdirSync,
   readlinkSync,
+  renameSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
 import { createServer, type Server } from "node:net";
@@ -31,6 +33,19 @@ export interface TreeNode {
   size: number;
 }
 export const nodeKey = (l: number, i: number): string => `${l}:${i}`;
+/**
+ * Durable main-view tiling. Ordered [level, index] parts cover messages
+ * [0, length) exactly, each spanning [i * 2 ** l, (i + 1) * 2 ** l). Level-0
+ * parts may still be unbuilt; higher levels name saved tree nodes. `length` may
+ * trail the message log after a crash: the owner appends the durable suffix.
+ * `compacting` latches a partially coarsened batch across restarts. No text.
+ */
+export interface ViewSnapshot {
+  readonly version: 1;
+  readonly length: number;
+  readonly parts: ReadonlyArray<readonly [number, number]>;
+  readonly compacting: boolean;
+}
 
 type Report = (message: string) => void;
 type Stream = {
@@ -44,6 +59,8 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const filePattern = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
 const messageFields = ["i", "kind", "text", "size", "date"];
 const nodeFields = ["l", "i", "text", "size"];
+const viewFields = ["version", "length", "parts", "compacting"];
+const viewName = "view.json";
 
 function hasCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
@@ -97,6 +114,49 @@ function parseNode(value: unknown, where: string): TreeNode {
   return Object.freeze({
     l: row.l, i: row.i, text: row.text, size: row.size,
   });
+}
+
+// Reads every caller-controlled value once, then publishes a deep frozen copy.
+function parseView(
+  value: unknown,
+  where: string,
+  messages: number,
+  nodes: ReadonlyMap<string, TreeNode>,
+): ViewSnapshot {
+  const { version, length, parts, compacting } = record(value, viewFields, where);
+  if (
+    version !== 1 || !isIndex(length) || length > messages ||
+    typeof compacting !== "boolean" || !Array.isArray(parts)
+  ) {
+    throw new Error(`Invalid view snapshot schema or length at ${where}`);
+  }
+  const count = parts.length;
+  const copied: (readonly [number, number])[] = [];
+  let end = 0;
+  for (let k = 0; k < count; k++) {
+    const part: unknown = parts[k];
+    if (!Array.isArray(part) || part.length !== 2) {
+      throw new Error(`Invalid view part ${k} at ${where}`);
+    }
+    const l: unknown = part[0];
+    const i: unknown = part[1];
+    if (!isIndex(l) || l > 52 || !isIndex(i)) {
+      throw new Error(`Invalid view part ${k} coordinates at ${where}`);
+    }
+    const next = (i + 1) * 2 ** l;
+    if (!Number.isSafeInteger(next) || i * 2 ** l !== end || next > length) {
+      throw new Error(`View part ${nodeKey(l, i)} leaves a gap, overlap, or overrun at ${where}`);
+    }
+    if (l > 0 && !nodes.has(nodeKey(l, i))) {
+      throw new Error(`View part ${nodeKey(l, i)} names an unbuilt summary at ${where}`);
+    }
+    copied.push(Object.freeze([l, i] as const));
+    end = next;
+  }
+  if (end !== length) {
+    throw new Error(`View parts do not cover messages [0, ${length}) at ${where}`);
+  }
+  return Object.freeze({ version: 1, length, parts: Object.freeze(copied), compacting });
 }
 
 // Names daily files by the local wall-clock day a record is written.
@@ -267,6 +327,85 @@ function writeDurably(fd: number, text: string): void {
   fsyncSync(fd);
 }
 
+// Loads the committed view after log replay. Both the file and the rename that
+// committed it become durable before the snapshot is published.
+function loadView(
+  rootFd: number,
+  directory: string,
+  messages: number,
+  nodes: ReadonlyMap<string, TreeNode>,
+): ViewSnapshot | undefined {
+  const path = join(directory, viewName);
+  let fd: number;
+  try {
+    fd = openFile(at(rootFd, viewName), path, constants.O_RDONLY);
+  } catch (error) {
+    // Stores written before view snapshots exist have none; the owner migrates.
+    if (hasCode(error, "ENOENT")) return undefined;
+    throw error;
+  }
+  let bytes: Buffer;
+  try {
+    fsyncSync(fd);
+    bytes = readFileSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  fsyncSync(rootFd);
+  let value: unknown;
+  try {
+    value = JSON.parse(decoder.decode(bytes));
+  } catch (error) {
+    throw new Error(`Malformed JSON or UTF-8 view snapshot at ${path}`, { cause: error });
+  }
+  return parseView(value, path, messages, nodes);
+}
+
+// Commits the view only after its complete private file is durable. Every name
+// resolves against the leased root inode, even if the public root path moves.
+// Only the exclusively created temporary is ever unlinked; a crash may leave an
+// inert `.view-<uuid>.tmp` (0600, no text) that is never read or removed.
+function replaceView(rootFd: number, directory: string, text: string): void {
+  const target = at(rootFd, viewName);
+  try {
+    // Refuse to replace a planted link or non-file; tightens a loose mode.
+    closeSync(openFile(target, join(directory, viewName), constants.O_RDONLY));
+  } catch (error) {
+    if (!hasCode(error, "ENOENT")) throw error;
+  }
+  const name = `.view-${randomUUID()}.tmp`;
+  const display = join(directory, name);
+  const temporary = at(rootFd, name);
+  const fd = openSync(
+    temporary,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    0o600,
+  );
+  let pending = true;
+  try {
+    try {
+      checkOwner(fd, display, false);
+      const bytes = Buffer.from(text, "utf8");
+      if (writeSync(fd, bytes) !== bytes.length) throw new Error(`Short Store write at ${display}`);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, target);
+    pending = false;
+    fsyncSync(rootFd);
+  } catch (error) {
+    if (pending) {
+      try {
+        unlinkSync(temporary);
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], `View write and temporary cleanup failed at ${display}`, { cause: error });
+      }
+    }
+    throw error;
+  }
+}
+
 function reportSafely(report: Report | undefined, message: string): void {
   try { (report ?? console.warn)(message); } catch { /* Diagnostics must not change replay semantics. */ }
 }
@@ -280,10 +419,12 @@ function reportSafely(report: Report | undefined, message: string): void {
  * links), so renaming or replacing the root or stream pathnames cannot redirect
  * replay, repairs, or writer rollover away from the leased inode. Daily files are
  * named by local write day; each message keeps its caller-supplied date.
+ * `view.json` holds the latest committed ViewSnapshot, replaced atomically.
  */
 export class Store {
   readonly messages: Message[] = [];
   readonly nodes = new Map<string, TreeNode>();
+  private view?: ViewSnapshot;
   private closing?: Promise<void>;
   private closed = false;
   private failed = false;
@@ -316,6 +457,7 @@ export class Store {
       streams.push(tree);
       const store = new Store(canonical, rootFd, main, tree, lease);
       store.replay(report);
+      store.view = loadView(rootFd, canonical, store.messages.length, store.nodes);
       return store;
     } catch (error) {
       try {
@@ -481,6 +623,28 @@ export class Store {
     }
     this.appendRecord(this.tree, node);
     this.nodes.set(key, node);
+  }
+
+  /** The last committed view, deeply frozen; undefined until one is saved. */
+  get viewSnapshot(): ViewSnapshot | undefined {
+    return this.view;
+  }
+
+  /**
+   * Durably commits a validated copy, then publishes it. Invalid input throws
+   * without side effects; an I/O failure leaves the previous snapshot published
+   * and fails the Store, since the replacement may or may not be durable.
+   */
+  saveView(value: ViewSnapshot): void {
+    this.assertWritable();
+    const view = parseView(value, "new view snapshot", this.messages.length, this.nodes);
+    try {
+      replaceView(this.rootFd, this.directory, `${JSON.stringify(view)}\n`);
+    } catch (error) {
+      this.failed = true;
+      throw error;
+    }
+    this.view = view;
   }
 
   close(): Promise<void> {

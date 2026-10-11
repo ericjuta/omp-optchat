@@ -14,6 +14,7 @@ type Capture = { sequence: number; body: ObjectValue };
 type DiskMessage = { i: number; kind: string; text: string; date: string };
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const PLUGIN = resolve(process.env.OPTCHAT_SMOKE_PLUGIN ?? ROOT);
 const STEP_MS = 25_000;
 const TOTAL_MS = 120_000;
 const FIRST_USER = "OPTCHAT_SMOKE_OLD_USER: Remember the public archive, then finish.";
@@ -326,7 +327,7 @@ async function main(): Promise<void> {
     const args = [
       "--mode", "rpc", "--no-ui", "--no-title", "--no-tools", "--no-extensions", "--no-skills", "--no-rules",
       "--session-dir", join(temporary, "sessions"),
-      "-e", ROOT,
+      "-e", PLUGIN,
       "-e", join(ROOT, "scripts", "fixture-provider.ts"),
       "--model", "optchat-smoke/optchat-smoke-chat",
       "--optchat", "--optchat-dir", memory,
@@ -353,6 +354,11 @@ async function main(): Promise<void> {
     assert(compactText.includes(FIRST_USER), "compactor must receive prior contextual prefix");
     assert(compactText.indexOf(FIRST_USER) < compactText.indexOf("OPTCHAT_SMOKE_RAW_BEGIN"), "compactor context must precede its target record");
     assert(!compactText.includes(SECOND_USER), "current user must not leak into past-record compaction context");
+    const firstRequest = captures.find((capture) => capture.body.model === "optchat-smoke-chat")!;
+    assert.deepEqual(oldRecordCompaction.body.tools, firstRequest.body.tools, "compactor must share the active main-turn tool schemas without executing tools");
+    const system = (body: ObjectValue) => messages(body).filter((message) => message.role === "system");
+    assert.deepEqual(system(oldRecordCompaction.body), system(firstRequest.body), "compactor must share the stable main-turn system prefix");
+    assert.match(compactText, /-{512}/, "compaction must use the dash ruler rather than example content");
 
     currentPhase = "second-writer rejection";
     const beforeContender = captures.filter((capture) => capture.body.model === "optchat-smoke-chat").length;
@@ -369,8 +375,11 @@ async function main(): Promise<void> {
     currentPhase = "graceful process shutdown";
     await bounded("first host shutdown", first.stop());
     assert.equal((await first.exited).code, 0, "first host must finish graceful session_shutdown");
+    const persistedView = await readFile(join(memory, "view.json"), "utf8");
     currentPhase = "restoration in new process";
     const restarted = new Host(executable, args, workspace, env);
+    await restarted.until("restored RPC ready", () => restarted.events.some((event) => event.type === "ready"));
+    assert.equal(await readFile(join(memory, "view.json"), "utf8"), persistedView, "restarting must preserve the persisted main view instead of rebuilding it");
     await restarted.prompt(RESTART_USER);
     const restored = await diskMessages(memory);
     assert(restored.some((record) => record.kind === "talk" && record.text === RESTORED), "restored session final answer must be durable");
@@ -387,11 +396,11 @@ async function main(): Promise<void> {
     const chatRequests = captures.filter((capture) => capture.body.model === "optchat-smoke-chat");
     assert.equal(chatRequests.length, 4, "expected first turn, tool request, tool continuation, restored turn");
     console.log(JSON.stringify({
-      ok: true, evidence: "synthetic-model/real-installed-omp-host", executable,
+      ok: true, evidence: "synthetic-model/real-installed-omp-host", executable, plugin: PLUGIN,
       hostProcesses: hosts.length, chatRequests: chatRequests.length,
       compactorRequests: captures.length - chatRequests.length,
       durableMessages: restored.length, retrievedBytes: Buffer.byteLength(LONG_REPLY),
-      checks: ["same-process history replacement", "pre-user settled snapshot", "contextual past-record compaction", "active reasoning and tool-loop retention", "real zoom/date tools", "lossless oversized retrieval", "durable history excludes reasoning", "second-writer rejection", "new-process restoration"],
+      checks: ["same-process history replacement", "pre-user settled snapshot", "contextual past-record compaction", "shared main/compactor prompt and tools", "dash compression ruler", "active reasoning and tool-loop retention", "real zoom/date tools", "lossless oversized retrieval", "durable history excludes reasoning", "second-writer rejection", "persisted view stability", "new-process restoration"],
     }, null, 2));
   } finally {
     clearTimeout(deadline);

@@ -512,6 +512,526 @@ describe("Store record validation", () => {
   });
 });
 
+type ViewSnapshot = Parameters<Store["saveView"]>[0];
+
+function rawView(length: number, compacting = false): ViewSnapshot {
+  return { version: 1, length, parts: Array.from({ length }, (_, i) => [0, i] as const), compacting };
+}
+
+function expectFrozenView(view: ViewSnapshot): void {
+  expect(Object.isFrozen(view)).toBe(true);
+  expect(Object.isFrozen(view.parts)).toBe(true);
+  expect(Reflect.set(view, "compacting", !view.compacting)).toBe(false);
+  expect(() => Reflect.apply(Array.prototype.push, view.parts, [[0, 99]])).toThrow();
+  for (const part of view.parts) {
+    expect(Object.isFrozen(part)).toBe(true);
+    expect(Reflect.set(part, "1", 99)).toBe(false);
+  }
+}
+
+describe("Store view snapshot persistence", () => {
+  test.each(["empty store", "legacy history"] as const)("missing snapshot remains absent for %s", async (history) => {
+    await withFixture(async (fixture) => {
+      if (history === "legacy history") {
+        await seed(fixture.directory, "main", "2026-01-01.jsonl", [message(0), message(1)]);
+        await seed(fixture.directory, "tree", "2026-01-01.jsonl", [node(0, 0), node(0, 1), node(1, 0)]);
+      }
+      const store = await fixture.open();
+      expect(store.viewSnapshot).toBeUndefined();
+      expect(store.messages).toEqual(history === "legacy history" ? [message(0), message(1)] : []);
+      expect(store.nodes.size).toBe(history === "legacy history" ? 3 : 0);
+      expect((await readdir(fixture.directory)).sort()).toEqual(["main", "tree"]);
+      await store.close();
+      expect((await fixture.open()).viewSnapshot).toBeUndefined();
+    });
+  });
+
+  test("snapshot replacements persist before close and round-trip raw, compacting, summary and empty views", async () => {
+    await withFixture(async (fixture) => {
+      let store = await fixture.open();
+      for (let i = 0; i < 4; i++) store.append("user", `source ${i}`);
+      for (let i = 0; i < 4; i++) store.saveNode(node(0, i));
+      store.saveNode(node(1, 0));
+      store.saveNode(node(1, 1));
+      store.saveNode(node(2, 0));
+      const messages = [...store.messages];
+      const nodes = [...store.nodes];
+      const mainBytes = await streamContents(fixture.directory, "main");
+      const treeBytes = await streamContents(fixture.directory, "tree");
+      const views: ViewSnapshot[] = [
+        rawView(4),
+        { version: 1, length: 4, parts: [[1, 0], [0, 2], [0, 3]], compacting: true },
+        { version: 1, length: 4, parts: [[2, 0]], compacting: false },
+        rawView(0),
+      ];
+      for (const view of views) {
+        store.saveView(view);
+        expect(store.viewSnapshot).toEqual(view);
+        expect(JSON.parse(await readFile(join(fixture.directory, "view.json"), "utf8"))).toEqual(view);
+        expect(await streamContents(fixture.directory, "main")).toBe(mainBytes);
+        expect(await streamContents(fixture.directory, "tree")).toBe(treeBytes);
+        await store.close();
+        store = await fixture.open();
+        expect(store.viewSnapshot).toEqual(view);
+        expectFrozenView(store.viewSnapshot!);
+        expect(store.messages).toEqual(messages);
+        expect([...store.nodes]).toEqual(nodes);
+      }
+    });
+  });
+
+  test("a saved prefix survives trailing durable raw logs without silently extending its view", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      store.append("user", "first");
+      store.append("talk", "second");
+      for (const summary of [node(0, 0), node(0, 1), node(1, 0)]) store.saveNode(summary);
+      const prefix: ViewSnapshot = { version: 1, length: 2, parts: [[1, 0]], compacting: true };
+      store.saveView(prefix);
+      const published = store.viewSnapshot;
+      const bytes = await readFile(join(fixture.directory, "view.json"));
+      store.append("tool", "durable suffix one");
+      store.append("note", "durable suffix two");
+      store.saveNode(node(0, 2));
+      expect(store.viewSnapshot).toBe(published);
+      expect(await readFile(join(fixture.directory, "view.json"))).toEqual(bytes);
+      // Explicitly resaving a stale prefix must also be legal; the view owner,
+      // not the store, decides when the durable suffix joins its tiling.
+      store.saveView(prefix);
+      await store.close();
+      const recovered = await fixture.open();
+      expect(recovered.viewSnapshot).toEqual(prefix);
+      expect(recovered.messages.map((record) => record.text))
+        .toEqual(["first", "second", "durable suffix one", "durable suffix two"]);
+      expect(recovered.nodes.get(nodeKey(0, 2))).toEqual(node(0, 2));
+      expect(recovered.append("echo", "next durable raw message").i).toBe(4);
+      expect(recovered.viewSnapshot).toEqual(prefix);
+      expect(await readFile(join(fixture.directory, "view.json"))).toEqual(bytes);
+    });
+  });
+
+  test("save and load deeply copy and freeze snapshots without freezing callers or changing old snapshots", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      for (let i = 0; i < 3; i++) store.append("user", `source ${i}`);
+      for (const summary of [node(0, 0), node(0, 1), node(1, 0)]) store.saveNode(summary);
+      const input: { version: 1; length: number; parts: [number, number][]; compacting: boolean } = {
+        version: 1, length: 3, parts: [[1, 0], [0, 2]], compacting: true,
+      };
+      const expected: ViewSnapshot = { version: 1, length: 3, parts: [[1, 0], [0, 2]], compacting: true };
+      store.saveView(input);
+      const saved = store.viewSnapshot!;
+      const bytes = await readFile(join(fixture.directory, "view.json"));
+      expect(saved).not.toBe(input);
+      expect(saved.parts).not.toBe(input.parts);
+      for (let i = 0; i < saved.parts.length; i++) expect(saved.parts[i]).not.toBe(input.parts[i]);
+      expectFrozenView(saved);
+      expect(Object.isFrozen(input)).toBe(false);
+      expect(Object.isFrozen(input.parts)).toBe(false);
+      expect(Object.isFrozen(input.parts[0])).toBe(false);
+      input.length = 99;
+      input.compacting = false;
+      input.parts[0]![0] = 52;
+      input.parts[1]![1] = 99;
+      input.parts.push([0, 99]);
+      expect(saved).toEqual(expected);
+      expect(store.viewSnapshot).toBe(saved);
+      expect(await readFile(join(fixture.directory, "view.json"))).toEqual(bytes);
+      await store.close();
+
+      const recovered = await fixture.open();
+      const loaded = recovered.viewSnapshot!;
+      expect(loaded).toEqual(expected);
+      expect(loaded).not.toBe(saved);
+      expect(loaded.parts).not.toBe(saved.parts);
+      for (let i = 0; i < loaded.parts.length; i++) expect(loaded.parts[i]).not.toBe(saved.parts[i]);
+      expectFrozenView(loaded);
+      expect(await readFile(join(fixture.directory, "view.json"))).toEqual(bytes);
+      recovered.saveView(rawView(3));
+      expect(recovered.viewSnapshot).not.toBe(loaded);
+      expect(recovered.viewSnapshot).toEqual(rawView(3));
+      expect(saved).toEqual(expected);
+      expect(loaded).toEqual(expected);
+      expectFrozenView(saved);
+      expectFrozenView(loaded);
+      expect(JSON.parse(await readFile(join(fixture.directory, "view.json"), "utf8"))).toEqual(rawView(3));
+    });
+  });
+
+  test("an abandoned malformed snapshot temporary stays inert and is not owned by later saves", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      store.append("user", "source");
+      store.saveView(rawView(1, true));
+      const abandoned = join(fixture.directory, ".view-00000000-0000-0000-0000-000000000000.tmp");
+      const malformed = Buffer.from([0x7b, 0x22, 0xff, 0xfe]);
+      await writeFile(abandoned, malformed, { mode: 0o600 });
+      await store.close();
+      const recovered = await fixture.open();
+      expect(recovered.viewSnapshot).toEqual(rawView(1, true));
+      expect(await readFile(abandoned)).toEqual(malformed);
+      recovered.saveView(rawView(0));
+      expect(await readFile(abandoned)).toEqual(malformed);
+      expect((await readdir(fixture.directory)).filter((name) => name.startsWith(".view-")))
+        .toEqual([".view-00000000-0000-0000-0000-000000000000.tmp"]);
+      await recovered.close();
+      expect((await fixture.open()).viewSnapshot).toEqual(rawView(0));
+      expect(await readFile(abandoned)).toEqual(malformed);
+    });
+  });
+});
+
+describe("Store view snapshot durability faults", () => {
+  for (const initial of ["missing snapshot", "committed snapshot"] as const) {
+    test.each(["file fsync", "root fsync", "partial write", "rename"] as const)(
+      `${initial}: %s failure withholds publication, poisons writes and recovers the committed disk state`,
+      async (fault) => {
+        await withFixture(async (fixture) => {
+          const store = await fixture.open();
+          for (let i = 0; i < 3; i++) store.append("user", `source ${i}`);
+          for (const summary of [node(0, 0), node(0, 1), node(1, 0)]) store.saveNode(summary);
+          const oldView = rawView(3);
+          const nextView: ViewSnapshot = { version: 1, length: 3, parts: [[1, 0], [0, 2]], compacting: true };
+          const path = join(fixture.directory, "view.json");
+          if (initial === "committed snapshot") store.saveView(oldView);
+          const published = store.viewSnapshot;
+          const oldBytes = initial === "committed snapshot" ? await readFile(path) : undefined;
+          const messages = [...store.messages];
+          const nodes = [...store.nodes];
+          const mainBytes = await streamContents(fixture.directory, "main");
+          const treeBytes = await streamContents(fixture.directory, "tree");
+          const root = store.directory;
+          const isTemporary = (path: string) => path.startsWith(`${root}/.view-`) && path.endsWith(".tmp");
+          const fsync = fs.fsyncSync;
+          const write = fs.writeSync;
+          const renameFile = fs.renameSync;
+          const failure = Object.assign(new Error(`injected snapshot ${fault} failure`), { code: "EIO" });
+          let hits = 0;
+          let partialBytes = 0;
+          let temporarySize = 0;
+          let fullSize = 0;
+          const fsyncSpy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+            const target = fs.readlinkSync(`/proc/self/fd/${fd}`);
+            if ((fault === "file fsync" && isTemporary(target)) || (fault === "root fsync" && target === root)) {
+              hits++;
+              throw failure;
+            }
+            fsync(fd);
+          });
+          const writeSpy = spyOn(fs, "writeSync").mockImplementation(((fd: number, bytes: Buffer, ...args: unknown[]) => {
+            if (fault === "partial write" && isTemporary(fs.readlinkSync(`/proc/self/fd/${fd}`))) {
+              hits++;
+              fullSize = bytes.length;
+              // Write actual bytes to the actual file, not a fabricated count.
+              partialBytes = write(fd, bytes.subarray(0, Math.max(1, Math.floor(bytes.length / 2))));
+              temporarySize = fs.fstatSync(fd).size;
+              return partialBytes;
+            }
+            return Reflect.apply(write, fs, [fd, bytes, ...args]);
+          }) as typeof fs.writeSync);
+          const renameSpy = spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+            if (fault === "rename" && isTemporary(fs.realpathSync(source)) && String(destination).endsWith("/view.json")) {
+              hits++;
+              throw failure;
+            }
+            renameFile(source, destination);
+          });
+          try {
+            expect(() => store.saveView(nextView)).toThrow();
+            expect(hits).toBe(1);
+            if (fault === "partial write") {
+              expect(partialBytes).toBeGreaterThan(0);
+              expect(partialBytes).toBeLessThan(fullSize);
+              expect(temporarySize).toBe(partialBytes);
+            }
+            expect(store.viewSnapshot).toBe(published);
+            expect(() => store.append("talk", "must not publish")).toThrow();
+            expect(() => store.saveNode(node(0, 2))).toThrow();
+            expect(() => store.saveView(oldView)).toThrow();
+            expect(hits).toBe(1);
+            expect(store.viewSnapshot).toBe(published);
+            expect(store.messages).toEqual(messages);
+            expect([...store.nodes]).toEqual(nodes);
+            expect(await streamContents(fixture.directory, "main")).toBe(mainBytes);
+            expect(await streamContents(fixture.directory, "tree")).toBe(treeBytes);
+            if (fault === "root fsync") {
+              expect(JSON.parse(await readFile(path, "utf8"))).toEqual(nextView);
+            } else if (oldBytes) {
+              expect(await readFile(path)).toEqual(oldBytes);
+            } else {
+              await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+            }
+            expect((await readdir(fixture.directory)).filter((name) => name.startsWith(".view-") && name.endsWith(".tmp")))
+              .toEqual([]);
+          } finally {
+            renameSpy.mockRestore();
+            writeSpy.mockRestore();
+            fsyncSpy.mockRestore();
+          }
+          await store.close();
+          const recovered = await fixture.open();
+          expect(recovered.viewSnapshot).toEqual(fault === "root fsync" ? nextView : published);
+          expect(recovered.messages).toEqual(messages);
+          expect([...recovered.nodes]).toEqual(nodes);
+          expect(recovered.append("talk", "writer resumed").i).toBe(3);
+          recovered.saveNode(node(0, 2));
+          recovered.saveView(rawView(4));
+          await recovered.close();
+          const restarted = await fixture.open();
+          expect(restarted.viewSnapshot).toEqual(rawView(4));
+          expect(restarted.messages.map((record) => record.text)).toEqual(["source 0", "source 1", "source 2", "writer resumed"]);
+          expect(restarted.nodes.get(nodeKey(0, 2))).toEqual(node(0, 2));
+        });
+      },
+    );
+  }
+
+  test.each(["file", "root"] as const)("snapshot load %s fsync failure releases the lease for immediate reopen", async (fault) => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      store.append("user", "durable source");
+      store.saveView(rawView(1, true));
+      const path = join(fixture.directory, "view.json");
+      const bytes = await readFile(path);
+      const root = store.directory;
+      await store.close();
+      const fsync = fs.fsyncSync;
+      let snapshotSynced = false;
+      let hits = 0;
+      const spy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+        const target = fs.readlinkSync(`/proc/self/fd/${fd}`);
+        if (target === join(root, "view.json")) {
+          if (fault === "file") {
+            hits++;
+            throw new Error("injected snapshot load fsync failure");
+          }
+          fsync(fd);
+          snapshotSynced = true;
+          return;
+        }
+        // Do not intercept root fsyncs used to admit the main/tree directories.
+        if (fault === "root" && snapshotSynced && target === root) {
+          hits++;
+          throw new Error("injected snapshot load fsync failure");
+        }
+        fsync(fd);
+      });
+      try {
+        await expect(fixture.open()).rejects.toThrow("injected snapshot load fsync failure");
+        expect(hits).toBe(1);
+        expect(await readFile(path)).toEqual(bytes);
+      } finally {
+        spy.mockRestore();
+      }
+      const recovered = await fixture.open();
+      expect(recovered.viewSnapshot).toEqual(rawView(1, true));
+      expect(recovered.append("talk", "recovered writer").i).toBe(1);
+      recovered.saveNode(node(0, 0));
+      recovered.saveView(rawView(2));
+      await recovered.close();
+      expect((await fixture.open()).viewSnapshot).toEqual(rawView(2));
+    });
+  });
+});
+
+describe("Store view snapshot privacy and lifecycle", () => {
+  for (const linkType of ["symbolic", "hard"] as const) {
+    test.each(["load", "save after open"] as const)(`rejects ${linkType}-linked view.json on %s without modifying target bytes or mode`, async (operation) => {
+      await withFixture(async (fixture) => {
+        const store = await fixture.open();
+        store.append("user", "source");
+        store.saveView(rawView(1));
+        const published = store.viewSnapshot;
+        const path = join(fixture.directory, "view.json");
+        const safeBytes = await readFile(path);
+        if (operation === "load") await store.close();
+        const outside = join(fixture.root, "outside-view.json");
+        const externalBytes = Buffer.from(`${JSON.stringify(rawView(1, true))}\n`);
+        await writeFile(outside, externalBytes, { mode: 0o644 });
+        await chmod(outside, 0o644);
+        await rm(path);
+        if (linkType === "symbolic") await symlink(outside, path);
+        else await link(outside, path);
+        if (operation === "load") {
+          await expect(fixture.open()).rejects.toThrow();
+        } else {
+          expect(() => store.saveView(rawView(0))).toThrow();
+          expect(store.viewSnapshot).toBe(published);
+        }
+        expect(await readFile(outside)).toEqual(externalBytes);
+        expect((await stat(outside)).mode & 0o777).toBe(0o644);
+        expect((await readdir(fixture.directory)).filter((name) => name.startsWith(".view-"))).toEqual([]);
+        // Unlink only the planted name; never repair through the external inode.
+        await rm(path);
+        await writeFile(path, safeBytes, { mode: 0o600 });
+        if (operation === "save after open") await store.close();
+        const recovered = await fixture.open();
+        expect(recovered.viewSnapshot).toEqual(rawView(1));
+        expect(recovered.append("talk", "after link repair").i).toBe(1);
+        recovered.saveView(rawView(2));
+        expect(await readFile(outside)).toEqual(externalBytes);
+        expect((await stat(outside)).mode & 0o777).toBe(0o644);
+      });
+    });
+  }
+
+  test("snapshot creation is 0600 and load/save tighten loose modes while load preserves exact content", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      store.append("user", "source");
+      const path = join(fixture.directory, "view.json");
+      store.saveView(rawView(1));
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      await store.close();
+      // Whitespace is intentional: loading must not rewrite canonical JSON.
+      const bytes = Buffer.from(`\n  ${JSON.stringify(rawView(1), null, 2)}  \n`);
+      await writeFile(path, bytes);
+      await chmod(path, 0o644);
+      const recovered = await fixture.open();
+      expect(recovered.viewSnapshot).toEqual(rawView(1));
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      expect(await readFile(path)).toEqual(bytes);
+      await chmod(path, 0o644);
+      recovered.saveView(rawView(1, true));
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(await readFile(path, "utf8"))).toEqual(rawView(1, true));
+      await recovered.close();
+      expect((await fixture.open()).viewSnapshot).toEqual(rawView(1, true));
+    });
+  });
+
+  test.each(["a fresh directory", "a symlink to another leased store"] as const)(
+    "snapshot saves remain anchored to the moved root when its old path becomes %s",
+    async (replacement) => {
+      await withFixture(async (fixture) => {
+        const store = await fixture.open();
+        store.append("user", "original owner");
+        store.saveView(rawView(1));
+        const directory = store.directory;
+        const moved = join(fixture.root, "moved-view-owner");
+        await rename(fixture.directory, moved);
+        const otherPath = join(fixture.root, "other-view-owner");
+        const other = replacement === "a symlink to another leased store" ? await fixture.open(undefined, otherPath) : undefined;
+        if (other) {
+          other.append("user", "other owner");
+          other.saveView(rawView(1));
+          await symlink(otherPath, fixture.directory);
+        } else {
+          await mkdir(fixture.directory, { mode: 0o700 });
+          await writeFile(join(fixture.directory, "view.json"), "fresh directory sentinel\n", { mode: 0o644 });
+        }
+        const replacementBytes = await readFile(join(fixture.directory, "view.json"));
+        const replacementMode = (await stat(join(fixture.directory, "view.json"))).mode & 0o777;
+        const otherPublished = other?.viewSnapshot;
+        const mainBytes = await streamContents(moved, "main");
+        const treeBytes = await streamContents(moved, "tree");
+        const otherMain = other ? await streamContents(otherPath, "main") : "";
+        const otherTree = other ? await streamContents(otherPath, "tree") : "";
+        store.saveView(rawView(1, true));
+        expect(store.directory).toBe(directory);
+        expect(store.viewSnapshot).toEqual(rawView(1, true));
+        expect(JSON.parse(await readFile(join(moved, "view.json"), "utf8"))).toEqual(rawView(1, true));
+        expect(await readFile(join(fixture.directory, "view.json"))).toEqual(replacementBytes);
+        expect((await stat(join(fixture.directory, "view.json"))).mode & 0o777).toBe(replacementMode);
+        expect(await streamContents(moved, "main")).toBe(mainBytes);
+        expect(await streamContents(moved, "tree")).toBe(treeBytes);
+        expect((await readdir(moved)).sort()).toEqual(["main", "tree", "view.json"]);
+        if (other) {
+          expect(other.viewSnapshot).toBe(otherPublished);
+          expect(await streamContents(otherPath, "main")).toBe(otherMain);
+          expect(await streamContents(otherPath, "tree")).toBe(otherTree);
+          expect(other.append("talk", "other still owns its writer").i).toBe(1);
+          other.saveView(rawView(2));
+        } else {
+          expect(await readdir(fixture.directory)).toEqual(["view.json"]);
+        }
+        await store.close();
+        const recovered = await fixture.open(undefined, moved);
+        expect(recovered.viewSnapshot).toEqual(rawView(1, true));
+        expect(recovered.messages.map((record) => record.text)).toEqual(["original owner"]);
+        expect(recovered.append("note", "moved writer resumed").i).toBe(1);
+        recovered.saveView(rawView(2));
+        expect(JSON.parse(await readFile(join(moved, "view.json"), "utf8"))).toEqual(rawView(2));
+      });
+    },
+  );
+
+  test("saveView rejects immediately when close starts and retains the last committed snapshot", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      store.append("user", "kept");
+      store.saveView(rawView(1, true));
+      const published = store.viewSnapshot;
+      const bytes = await readFile(join(fixture.directory, "view.json"));
+      const closing = store.close();
+      expect(() => store.saveView(rawView(0))).toThrow();
+      expect(store.viewSnapshot).toBe(published);
+      await Promise.all([closing, store.close()]);
+      expect(() => store.saveView(rawView(1))).toThrow();
+      expect(store.viewSnapshot).toBe(published);
+      expect(await readFile(join(fixture.directory, "view.json"))).toEqual(bytes);
+      const recovered = await fixture.open();
+      expect(recovered.viewSnapshot).toEqual(rawView(1, true));
+      recovered.saveView(rawView(0));
+      expect(store.viewSnapshot).toBe(published);
+      expect(store.viewSnapshot).toEqual(rawView(1, true));
+    });
+  });
+
+  test("a committed snapshot survives SIGKILL and rejects a competing process until its holder exits", async () => {
+    await withFixture(async (fixture) => {
+      const holder = fixture.spawn(`
+        import { createServer } from "node:net";
+        const store = await Store.open(directory);
+        store.append("user", "snapshot source zero");
+        store.append("talk", "snapshot source one");
+        for (const [l, i] of [[0, 0], [0, 1], [1, 0]]) {
+          const text = "summary " + l + ":" + i;
+          store.saveNode({ l, i, text, size: Buffer.byteLength(text, "utf8") });
+        }
+        store.saveView({ version: 1, length: 2, parts: [[1, 0]], compacting: true });
+        // A referenced socket, not a timer or sleep, holds this real process
+        // alive so the parent can exercise OS lease exclusion and SIGKILL.
+        const keepAlive = createServer();
+        const listening = Promise.withResolvers();
+        keepAlive.once("error", listening.reject);
+        keepAlive.listen(0, "127.0.0.1", listening.resolve);
+        await listening.promise;
+        console.log("ready");
+      `);
+      await waitForReady(holder);
+      const snapshot: ViewSnapshot = { version: 1, length: 2, parts: [[1, 0]], compacting: true };
+      expect(JSON.parse(await readFile(join(fixture.directory, "view.json"), "utf8"))).toEqual(snapshot);
+      const contender = fixture.spawn(`
+        let store;
+        try { store = await Store.open(directory); }
+        catch { console.log("rejected"); process.exit(0); }
+        await store.close();
+        console.error("competing snapshot writer unexpectedly acquired lock");
+        process.exit(1);
+      `);
+      expect(await processResult(contender)).toEqual({ code: 0, stdout: "rejected\n", stderr: "" });
+      expect(holder.exitCode).toBeNull();
+      holder.kill("SIGKILL");
+      await withDeadline(holder.exited, "snapshot holder SIGKILL exit");
+      const recovered = await fixture.open();
+      expect(recovered.viewSnapshot).toEqual(snapshot);
+      expectFrozenView(recovered.viewSnapshot!);
+      expect(recovered.messages.map((record) => record.text)).toEqual(["snapshot source zero", "snapshot source one"]);
+      expect(recovered.nodes.get(nodeKey(1, 0))).toEqual(node(1, 0));
+      expect((await readdir(fixture.directory)).sort()).toEqual(["main", "tree", "view.json"]);
+      expect(recovered.append("note", "after killed holder").i).toBe(2);
+      recovered.saveNode(node(0, 2));
+      const resumed: ViewSnapshot = { version: 1, length: 3, parts: [[1, 0], [0, 2]], compacting: false };
+      recovered.saveView(resumed);
+      await recovered.close();
+      const restarted = await fixture.open();
+      expect(restarted.viewSnapshot).toEqual(resumed);
+      expect(restarted.messages[2]!.text).toBe("after killed holder");
+    });
+  }, 20_000);
+});
+
 describe("Store privacy and lifecycle", () => {
   test("new directories and logs are private", async () => {
     await withFixture(async (fixture) => {
@@ -752,4 +1272,191 @@ describe("Store process-lifetime lock", () => {
         .toEqual(["durable before SIGKILL", "recovered"]);
     });
   }, 20_000);
+});
+
+describe("Store view snapshot validation", () => {
+  // Four messages with cached leaves 0:0..0:3 and parent 1:0; 1:1 and 2:0 are unbuilt.
+  const history = [0, 1, 2, 3].map((i) => message(i));
+  const summaries = [node(0, 0), node(0, 1), node(0, 2), node(0, 3), node(1, 0)];
+  const valid: ViewSnapshot = { version: 1, length: 4, parts: [[1, 0], [0, 2], [0, 3]], compacting: false };
+  const encoded = JSON.stringify(valid);
+  const viewPath = (directory: string) => join(directory, "view.json");
+  const withField = (field: string, value: unknown) => ({ ...valid, [field]: value });
+  const withoutField = (field: string) => Object.fromEntries(Object.entries(valid).filter(([key]) => key !== field));
+  const withParts = (parts: unknown, length = valid.length) => ({ ...valid, length, parts });
+
+  // JSON-representable, so each case is exercised identically on save and replay.
+  const invalidViews: { name: string; value: unknown }[] = [
+    { name: "null snapshot", value: null },
+    { name: "array snapshot", value: [] },
+    { name: "string snapshot", value: "view" },
+    ...["version", "length", "parts", "compacting"].map((field) => ({ name: `missing ${field}`, value: withoutField(field) })),
+    { name: "unknown text field", value: withField("text", "summary text") },
+    { name: "unsupported version", value: withField("version", 2) },
+    { name: "string version", value: withField("version", "1") },
+    { name: "string length", value: withField("length", "4") },
+    { name: "negative length", value: withField("length", -1) },
+    { name: "fractional length", value: withField("length", 3.5) },
+    { name: "unsafe length", value: withField("length", Number.MAX_SAFE_INTEGER + 1) },
+    { name: "numeric compacting", value: withField("compacting", 0) },
+    { name: "string compacting", value: withField("compacting", "false") },
+    { name: "null compacting", value: withField("compacting", null) },
+    { name: "null parts", value: withField("parts", null) },
+    { name: "array-like parts object", value: withField("parts", { 0: [1, 0], 1: [0, 2], 2: [0, 3], length: 3 }) },
+    { name: "scalar part", value: withParts([[1, 0], 2, [0, 3]]) },
+    { name: "object part", value: withParts([[1, 0], { l: 0, i: 2 }, [0, 3]]) },
+    { name: "empty part", value: withParts([[1, 0], [], [0, 2], [0, 3]]) },
+    { name: "one-element part", value: withParts([[1, 0], [0], [0, 3]]) },
+    { name: "three-element part", value: withParts([[1, 0], [0, 2, 3], [0, 3]]) },
+    { name: "string level", value: withParts([["1", 0], [0, 2], [0, 3]]) },
+    { name: "string index", value: withParts([[1, "0"], [0, 2], [0, 3]]) },
+    { name: "boolean level", value: withParts([[true, 0], [0, 1], [0, 2], [0, 3]]) },
+    { name: "null index", value: withParts([[1, null], [0, 2], [0, 3]]) },
+    { name: "negative level", value: withParts([[-1, 0], [0, 1], [0, 2], [0, 3]]) },
+    { name: "fractional level", value: withParts([[0.5, 0], [0, 1], [0, 2], [0, 3]]) },
+    { name: "negative index", value: withParts([[1, 0], [0, -1], [0, 3]]) },
+    { name: "fractional index", value: withParts([[1, 0], [0, 2.5], [0, 3]]) },
+    { name: "unsupported level", value: withParts([[53, 0]]) },
+    { name: "unsafe index", value: withParts([[0, Number.MAX_SAFE_INTEGER + 1]]) },
+    { name: "unsafe endpoint", value: withParts([[1, Number.MAX_SAFE_INTEGER]]) },
+    { name: "unsafe endpoint at maximum level", value: withParts([[52, 1]]) },
+    { name: "maximum level beyond length", value: withParts([[52, 0]]) },
+    { name: "gap before first part", value: withParts([[0, 1], [0, 2], [0, 3]]) },
+    { name: "interior gap", value: withParts([[1, 0], [0, 3]]) },
+    { name: "overlapping parts", value: withParts([[1, 0], [0, 1], [0, 2], [0, 3]]) },
+    { name: "duplicate part", value: withParts([[1, 0], [0, 2], [0, 2], [0, 3]]) },
+    { name: "out-of-order parts", value: withParts([[0, 2], [0, 3], [1, 0]]) },
+    { name: "parts end before length", value: withParts([[1, 0], [0, 2]]) },
+    { name: "no parts for nonzero length", value: withParts([]) },
+    { name: "part beyond declared length", value: withParts([[1, 0], [0, 2], [0, 3]], 3) },
+    { name: "parts for zero length", value: withParts([[0, 0]], 0) },
+    { name: "length beyond history", value: withParts([[1, 0], [0, 2], [0, 3], [0, 4]], 5) },
+    { name: "missing level-1 summary over cached leaves", value: withParts([[1, 0], [1, 1]]) },
+    { name: "missing level-2 summary", value: withParts([[2, 0]]) },
+  ];
+
+  // Values JSON cannot carry, so only a caller can pass them to saveView.
+  const nonJsonViews: { name: string; value: unknown }[] = [
+    { name: "NaN length", value: withField("length", Number.NaN) },
+    { name: "infinite length", value: withField("length", Number.POSITIVE_INFINITY) },
+    { name: "bigint length", value: withField("length", BigInt(4)) },
+    { name: "undefined compacting", value: withField("compacting", undefined) },
+    { name: "infinite index", value: withParts([[1, 0], [0, 2], [0, Number.POSITIVE_INFINITY]]) },
+    { name: "hole in part", value: withParts([[1, 0], Object.assign(new Array<unknown>(2), { 1: 2 }), [0, 3]]) },
+  ];
+
+  const malformedJson = [
+    { name: "empty file", bytes: "" },
+    { name: "whitespace only", bytes: " \n" },
+    { name: "truncated document", bytes: encoded.slice(0, -1) },
+    { name: "trailing comma", bytes: `${encoded.slice(0, -1)},}\n` },
+    { name: "concatenated documents", bytes: `${encoded}\n${encoded}\n` },
+    { name: "non-JSON number literal", bytes: `${encoded.replace('"length":4', '"length":NaN')}\n` },
+    { name: "single-quoted strings", bytes: `${encoded.replaceAll('"', "'")}\n` },
+  ];
+
+  const malformedUtf8 = [
+    { name: "invalid byte 0xFF", sequence: [0xff] },
+    { name: "lone continuation byte", sequence: [0x80] },
+    { name: "overlong encoding", sequence: [0xc0, 0xaf] },
+    { name: "truncated multibyte sequence", sequence: [0xe2, 0x82] },
+    { name: "encoded UTF-16 surrogate", sequence: [0xed, 0xa0, 0x80] },
+  ];
+
+  // The bytes sit inside a string a later duplicate key overwrites, so lossy
+  // decoding parses to exactly `valid`; only strict UTF-8 decoding rejects it.
+  const shadowed = (sequence: number[]) => Buffer.concat([
+    Buffer.from('{"version":"'),
+    Buffer.from(sequence),
+    Buffer.from(`",${encoded.slice(1)}\n`),
+  ]);
+
+  async function seedHistory(directory: string): Promise<void> {
+    await seed(directory, "main", "2026-01-01.jsonl", history);
+    await seed(directory, "tree", "2026-01-01.jsonl", summaries);
+  }
+
+  async function diskState(directory: string) {
+    const entries = (await readdir(directory)).sort();
+    return {
+      entries,
+      view: entries.includes("view.json") ? await readFile(viewPath(directory)) : undefined,
+      main: await streamContents(directory, "main"),
+      tree: await streamContents(directory, "tree"),
+    };
+  }
+
+  async function expectRejectedSave(store: Store, directory: string, value: unknown): Promise<void> {
+    const published = store.viewSnapshot;
+    const messages = [...store.messages];
+    const nodes = [...store.nodes];
+    const before = await diskState(directory);
+    expect(() => store.saveView(value as ViewSnapshot)).toThrow();
+    expect(store.viewSnapshot).toBe(published);
+    expect(store.messages).toEqual(messages);
+    expect([...store.nodes]).toEqual(nodes);
+    expect(await diskState(directory)).toEqual(before);
+  }
+
+  async function expectSaveRejection(value: unknown): Promise<void> {
+    await withFixture(async (fixture) => {
+      await seedHistory(fixture.directory);
+      const store = await fixture.open();
+      await expectRejectedSave(store, fixture.directory, value);
+      expect(store.viewSnapshot).toBeUndefined();
+      store.saveView(valid);
+      await expectRejectedSave(store, fixture.directory, value);
+      expect(store.viewSnapshot).toEqual(valid);
+      // The rejection does not poison later writes; 1:1 was the missing summary.
+      const appended = store.append("talk", "after rejected view");
+      expect(appended.i).toBe(4);
+      store.saveNode(node(1, 1));
+      const next: ViewSnapshot = { version: 1, length: 5, parts: [[1, 0], [1, 1], [0, 4]], compacting: true };
+      store.saveView(next);
+      expect(store.viewSnapshot).toEqual(next);
+      await store.close();
+      const restarted = await fixture.open();
+      expect(restarted.messages).toEqual([...history, appended]);
+      expect(restarted.nodes.get(nodeKey(1, 1))).toEqual(node(1, 1));
+      expect(restarted.viewSnapshot).toEqual(next);
+    });
+  }
+
+  async function expectReplayRejection(bytes: string | Uint8Array): Promise<void> {
+    await withFixture(async (fixture) => {
+      await seedHistory(fixture.directory);
+      await writeFile(viewPath(fixture.directory), bytes, { mode: 0o600 });
+      const before = await diskState(fixture.directory);
+      await expect(fixture.open()).rejects.toThrow();
+      expect(await diskState(fixture.directory)).toEqual(before);
+      await writeFile(viewPath(fixture.directory), `${encoded}\n`);
+      // Reopening at once proves the rejected open released its lease.
+      const store = await fixture.open();
+      expect(store.viewSnapshot).toEqual(valid);
+      expect(store.messages).toEqual(history);
+      expect([...store.nodes.values()]).toEqual(summaries);
+    });
+  }
+
+  test.each(invalidViews)("rejects on save without publication, disk change, or poisoning: $name", async ({ value }) => {
+    await expectSaveRejection(value);
+  });
+
+  test.each(nonJsonViews)("rejects non-JSON value on save without publication, disk change, or poisoning: $name", async ({ value }) => {
+    await expectSaveRejection(value);
+  });
+
+  test.each(invalidViews)("rejects on replay, then reopens immediately once repaired: $name", async ({ value }) => {
+    await expectReplayRejection(`${JSON.stringify(value)}\n`);
+  });
+
+  test.each(malformedJson)("rejects malformed JSON on replay, then reopens immediately once repaired: $name", async ({ bytes }) => {
+    await expectReplayRejection(bytes);
+  });
+
+  test.each(malformedUtf8)("rejects malformed UTF-8 that lossy decoding would admit, then reopens once repaired: $name", async ({ sequence }) => {
+    const bytes = shadowed(sequence);
+    expect(JSON.parse(new TextDecoder().decode(bytes))).toEqual(valid);
+    await expectReplayRejection(bytes);
+  });
 });

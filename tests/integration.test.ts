@@ -23,10 +23,14 @@
  * - initializeExtensions, which emits the real session_start (modes/runtime-init.ts:56-212)
  * - session.prompt / steer / subscribe / waitForIdle / abort / clearQueue / dispose
  *   (session/agent-session.ts:6888, 7829, 4838, 5805, 9109, 8584, 5201)
+ * - session.prepareSimpleStreamOptions with pi-ai completeSimple: a side request
+ *   through the session's real provider hooks (agent-session.ts:6291)
  * dispose emits the real session_shutdown; the test never emits it manually.
  * Real-host cases use no module stubs, streamFn overrides or patched internals.
  * Fake-host cases exercise captured extension handlers with plain objects and
  * the same durable store, in their own sanitized children (no SDK session).
+ * Their prefix cases use the real pi-ai encoders; the compressor's request
+ * reaches a loopback recorder that holds it open.
  */
 import assert from "node:assert/strict";
 import { describe, test } from "bun:test";
@@ -36,7 +40,9 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, completeSimple, Model } from "@oh-my-pi/pi-ai";
+import type { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog";
+import type { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import type * as OmpSdk from "@oh-my-pi/pi-coding-agent";
 import type {
   AgentSession,
@@ -73,6 +79,7 @@ const POLL_MS = 20;
 const PROVIDER = "optchat-smoke";
 const CHAT_MODEL = "optchat-smoke-chat";
 const COMPACT_MODEL = "optchat-smoke-compact";
+const NO_TOOLS_COMPACT_MODEL = "optchat-smoke-compact-notools";
 const TOOL_CAP = 128;
 /** Generous for success cases; still below the host's 30 s context-handler limit. */
 const POSITIVE_SETTLE_MS = 20_000;
@@ -81,6 +88,11 @@ const SSE_HEADERS = { "content-type": "text/event-stream", "cache-control": "no-
 const CASE_TITLES = {
   "fresh-turn-steering": "a fresh turn sends settled summaries; its tool loop and steering stay raw under one view",
   "thinking-exclusion": "provider thinking never reaches fresh turns, the compressor or the durable store",
+  "compressor-tool-refusal": "compressor tool calls are neither executed nor accepted as summaries",
+  "compressor-without-tools": "a compressor without tool support never receives captured main tools",
+  "side-prefix-text-mismatch": "a same-model side request's reworded system prefix never replaces the compressor's guide or adds tools",
+  "reasoning-tools-compressor": "with disableReasoningWithTools the tool-bearing main request reasons none; the compressor stays medium and tool-free",
+  "reasoning-tools-compressor-when-thinking": "with base disableReasoningWithTools false and whenThinking true the tool-bearing main request reasons none; the compressor stays medium and tool-free",
   "tool-cap-zoom": "ordinary tool output is capped live and durably; zoom returns and stores the whole original",
   "lock-held": "a store held by another writer refuses prompts with zero chat requests",
   "missing-compressor": "an unresolvable compressor selector refuses prompts with zero chat requests",
@@ -95,6 +107,11 @@ const CASE_TITLES = {
   "fake-continuation": "willContinue retains the view and a terminal agent_end refreshes it",
   "fake-think-exclusion": "private think calls and results never enter durable memory while talk does",
   "fake-settle-bounds": "settleTimeoutMs rejects zero, NaN and the host deadline but accepts 29999",
+  "prefix-chat-system": "Chat Completions system prefixes replay only across cache metadata differences",
+  "prefix-chat-developer": "Chat Completions developer prefixes replay only across cache metadata differences",
+  "prefix-responses-instructions": "Responses instructions replay only when identical and alone",
+  "prefix-responses-input": "Responses developer input prefixes replay only across cache metadata differences",
+  "prefix-anthropic-system": "Anthropic system blocks replay only across cache metadata differences",
   "cap-text": "capText keeps head and tail within the cap without splitting surrogate pairs",
   "view-blocks": "viewBlocks cuts only at stable line ends and joins back to the view",
 } as const;
@@ -184,7 +201,10 @@ interface Libraries {
   initializeExtensions: typeof initializeExtensions;
   optchat: typeof OptChatModule;
   viewBlocks: typeof viewBlocks;
+  getBundledModels: typeof getBundledModels;
   Store: typeof Store;
+  completeSimple: typeof completeSimple;
+  clampThinkingLevelForModel: typeof clampThinkingLevelForModel;
 }
 
 /**
@@ -200,10 +220,16 @@ async function loadLibraries(): Promise<Libraries> {
   const { initializeExtensions } = await import("@oh-my-pi/pi-coding-agent/modes/runtime-init");
   const optchat = await import("../src/index.ts");
   const { viewBlocks } = await import("../src/cache.ts");
+  const { getBundledModels } = await import("@oh-my-pi/pi-catalog/models");
   const { Store } = await import("../src/store.ts");
+  const { completeSimple } = await import("@oh-my-pi/pi-ai");
+  const { clampThinkingLevelForModel } = await import("@oh-my-pi/pi-catalog");
   // Keep the fake-host schema dependency behind the same child-only loading boundary.
   const zod = await import("zod");
-  return { sdk, ThinkingLevel, zod, EventBus, initializeExtensions, optchat, viewBlocks, Store };
+  return {
+    sdk, ThinkingLevel, zod, EventBus, initializeExtensions, optchat, viewBlocks, getBundledModels, Store,
+    completeSimple, clampThinkingLevelForModel,
+  };
 }
 
 interface CaseContext {
@@ -266,11 +292,12 @@ function occurrences(texts: readonly string[], needle: string): number {
   return texts.reduce((count, text) => count + text.split(needle).length - 1, 0);
 }
 
+function systemMessages(body: WireObject): WireObject[] {
+  return wireMessages(body).filter((message) => message.role === "system" || message.role === "developer");
+}
+
 function systemText(body: WireObject): string {
-  return wireMessages(body)
-    .filter((message) => message.role === "system" || message.role === "developer")
-    .map(wireText)
-    .join("\n");
+  return systemMessages(body).map(wireText).join("\n");
 }
 
 function toolNames(body: WireObject): string[] {
@@ -416,8 +443,8 @@ interface Capture {
   compact: CompactInput | undefined;
 }
 
-/** memory.ts:358, the last block of every compressor request. */
-const INSTRUCTION = /(Compress this message|Merge these two lines) into one line, in at most (\d+) bytes:\n([\s\S]*)$/;
+/** The instruction after the view; the fixed dash ruler never contributes content to a summary. */
+const INSTRUCTION = /Compaction: (compress message \d+|merge lines [^\n]+) into one line of at most (\d+) bytes\n[^\n]+\n-{512}\n(?:<chat> may hold their messages, \d+ to \d+, in more detail: take details\nof them from there too\.\n)?<input>\n([\s\S]*)\n<\/input>$/;
 /** Plain nonblank compressor replies, each under the 64-byte summary target. */
 const LEAF_SUMMARY: Record<string, string> = {
   user: "user: prior turn summary",
@@ -434,7 +461,7 @@ function compactInput(body: WireObject): CompactInput {
   const match = INSTRUCTION.exec(wireText(user));
   assert(match, "a compressor request ends with the OptChat compaction instruction");
   const input = match[3]!;
-  const leaf = match[1] === "Compress this message";
+  const leaf = match[1]!.startsWith("compress message ");
   return { leaf, kind: leaf ? input.slice(0, input.indexOf(":")) : undefined, input, target: Number(match[2]) };
 }
 
@@ -493,7 +520,7 @@ class Fixture {
   readonly failures: Error[] = [];
   /** Rejects on the first failure, so awaited barriers stop at once. */
   readonly fatal: Promise<never>;
-  compactPolicy: ((input: CompactInput) => "hang" | undefined) | undefined;
+  compactPolicy: ((input: CompactInput) => "hang" | "tool" | undefined) | undefined;
   readonly baseUrl: string;
   private readonly rejectFatal: (error: Error) => void;
   private readonly scripts: Array<{ label: string; reply: Reply }> = [];
@@ -517,7 +544,7 @@ class Fixture {
   }
 
   compact(): Capture[] {
-    return this.captures.filter((capture) => capture.model === COMPACT_MODEL);
+    return this.captures.filter((capture) => capture.model === COMPACT_MODEL || capture.model === NO_TOOLS_COMPACT_MODEL);
   }
 
   queueChat(label: string, reply: Reply): void {
@@ -612,15 +639,23 @@ class Fixture {
       const body = object((await request.json()) as Json, "request body");
       assert.equal(body.stream, true, "the fixture serves streaming adapter requests only");
       const model = typeof body.model === "string" ? body.model : "";
-      if (model !== CHAT_MODEL && model !== COMPACT_MODEL) throw new Error(`unexpected model ${JSON.stringify(body.model)}`);
+      if (model !== CHAT_MODEL && model !== COMPACT_MODEL && model !== NO_TOOLS_COMPACT_MODEL) {
+        throw new Error(`unexpected model ${JSON.stringify(body.model)}`);
+      }
       wireMessages(body);
-      const compact = model === COMPACT_MODEL ? compactInput(body) : undefined;
+      const compact = model === COMPACT_MODEL || model === NO_TOOLS_COMPACT_MODEL ? compactInput(body) : undefined;
       const capture: Capture = { seq: this.captures.length + 1, model, body, at: performance.now(), compact };
       this.captures.push(capture);
       let response: Response;
       if (compact) {
-        if (this.compactPolicy?.(compact) === "hang") {
+        const policy = this.compactPolicy?.(compact);
+        if (policy === "hang") {
           response = this.hang();
+        } else if (policy === "tool") {
+          response = sse(model, capture.seq, {
+            text: "COMPRESSOR_TOOL_OUTPUT_MUST_NOT_BE_SAVED",
+            calls: [{ id: `compact-call-${capture.seq}`, name: "probe", args: { label: "must-not-execute" } }],
+          });
         } else {
           const summary = compact.leaf ? LEAF_SUMMARY[compact.kind ?? ""] : MERGE_SUMMARY;
           if (summary === undefined) throw new Error(`no fixture summary for source kind ${JSON.stringify(compact.kind)}`);
@@ -686,17 +721,27 @@ const PROBE_RESULT = "OPTCHAT_IT_PROBE_RESULT: probe finished.";
 const LONG_TOOL_TEXT =
   `OPTCHAT_IT_TOOL_HEAD ${"long tool output filler; ".repeat(40)}OPTCHAT_IT_TOOL_INTERIOR ${"long tool output filler; ".repeat(40)}OPTCHAT_IT_TOOL_TAIL`;
 
+const FIXTURE_API_KEY = "optchat-smoke-fixture-key";
+
+/** Merged over every fixture model's compat: the SDK's reasoning-with-tools policy. */
+interface FixtureCompat {
+  disableReasoningWithTools: boolean;
+  reasoningDisableMode: "none-effort";
+  whenThinking?: { disableReasoningWithTools: boolean; reasoningDisableMode: "none-effort" };
+}
+
 /** Same provider as scripts/fixture-provider.ts, bound to this child's own server port. */
-function fixtureProvider(baseUrl: string): (pi: ExtensionAPI) => void {
+function fixtureProvider(baseUrl: string, compat?: FixtureCompat): (pi: ExtensionAPI) => void {
   return (pi) => {
     pi.registerProvider(PROVIDER, {
       baseUrl,
-      apiKey: "optchat-smoke-fixture-key",
+      apiKey: FIXTURE_API_KEY,
       api: "openai-completions",
-      models: [CHAT_MODEL, COMPACT_MODEL].map((id) => ({
+      models: [CHAT_MODEL, COMPACT_MODEL, NO_TOOLS_COMPACT_MODEL].map((id) => ({
         id,
         name: id,
         reasoning: true,
+        ...(id === NO_TOOLS_COMPACT_MODEL ? { supportsTools: false } : {}),
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128_000,
@@ -711,6 +756,7 @@ function fixtureProvider(baseUrl: string): (pi: ExtensionAPI) => void {
           thinkingFormat: "openai",
           reasoningContentField: "reasoning_content",
           replayReasoningContent: true,
+          ...compat,
         },
       })),
     });
@@ -735,6 +781,8 @@ interface HostOptions {
   beforeContext?: (messages: unknown[]) => void;
   /** A real `context` hook in an extension loaded after OptChat. */
   afterContext?: (messages: unknown[]) => void;
+  /** Compat for every fixture model; omitted means the plain fixture provider. */
+  compat?: FixtureCompat;
 }
 
 function defaultFlags(memory: string): Record<string, string | boolean> {
@@ -831,7 +879,7 @@ class Host {
       const loaded = await sdk.bindPreparedExtensions([], ctx.cwd, eventBus);
       // Load order is context-hook order (runner.ts:1995-2009).
       const factories: Array<(pi: ExtensionAPI) => void> = [
-        fixtureProvider(ctx.fixture.baseUrl),
+        fixtureProvider(ctx.fixture.baseUrl, options.compat),
         testExtension(options),
         optchat.createOptChat(options.settleTimeoutMs === undefined ? {} : { settleTimeoutMs: options.settleTimeoutMs }),
       ];
@@ -1008,6 +1056,119 @@ const STEER = "OPTCHAT_IT_STEER: also mention the steering note.";
 const PROBE_CALL_ID = "optchat-it-probe-call";
 const PROBE_ARGS = { label: "OPTCHAT_IT_PROBE_LABEL" };
 
+async function compressorWithoutTools(ctx: CaseContext): Promise<Evidence> {
+  const { fixture, memory } = ctx;
+  const { SYSTEM_BLOCK } = ctx.lib.optchat;
+  const secondPrompt = "OPTCHAT_IT_NO_TOOLS_SECOND_USER: say hello again.";
+  const secondReply = "OPTCHAT_IT_NO_TOOLS_SECOND_TALK: hello again.";
+  const expectedPairs: Array<[string, string]> = [
+    ["user", T1_USER],
+    ["talk", T1_TALK],
+    ["user", secondPrompt],
+    ["talk", secondReply],
+  ];
+  const { firstRows, runtimeErrors } = await withHost(ctx, {
+    settleTimeoutMs: POSITIVE_SETTLE_MS,
+    flags: { "optchat-model": `${PROVIDER}/${NO_TOOLS_COMPACT_MODEL}` },
+  }, async (host) => {
+    fixture.queueChat("no-tools turn 1 reply", { text: T1_TALK });
+    expectCompleted(await bounded("no-tools turn 1", host.prompt(T1_USER), STEP_MS, fixture.fatal), "no-tools turn 1");
+    await host.idle();
+    const firstRows = await durableRows(ctx, 2, "no-tools turn 1 durable rows");
+    assert.deepEqual(pairs(firstRows), expectedPairs.slice(0, 2), "the first ordinary turn is logged exactly once");
+
+    fixture.queueChat("no-tools turn 2 reply", { text: secondReply });
+    expectCompleted(await bounded("no-tools turn 2", host.prompt(secondPrompt), STEP_MS, fixture.fatal), "no-tools turn 2");
+    await host.idle();
+    const rows = await durableRows(ctx, 4, "no-tools turn 2 durable rows");
+    assert.deepEqual(pairs(rows), expectedPairs, "both ordinary turns are logged exactly once");
+    return { firstRows, runtimeErrors: host.runtimeErrors };
+  });
+
+  assert.deepEqual(runtimeErrors, [], "no extension runtime errors, including during close");
+  assert.deepEqual(fixture.failures, [], "the fixture recorded no failures");
+  fixture.assertScriptsConsumed();
+  const mainCaptures = fixture.chat();
+  assert.equal(mainCaptures.length, 2, "exactly two ordinary main requests");
+  const first = mainCaptures[0]!;
+  const second = mainCaptures[1]!;
+  for (const capture of mainCaptures) {
+    const names = toolNames(capture.body);
+    for (const name of ["zoom", "date", "probe"]) {
+      assert(names.includes(name), `${name} remains active on every main request`);
+    }
+  }
+
+  const compactCaptures = fixture.compact();
+  assert(compactCaptures.length > 0, "the no-tools compressor receives requests");
+  for (const capture of compactCaptures) {
+    assert.equal(capture.model, NO_TOOLS_COMPACT_MODEL, "every compressor request uses the no-tools model");
+    if (capture.body.tools !== undefined) {
+      assert.deepEqual(capture.body.tools, [], "a no-tools compressor never receives captured main tools");
+    }
+  }
+  const postMainCaptures = compactCaptures.filter((capture) => capture.seq > first.seq);
+  assert(postMainCaptures.length > 0, "compression after main tool capture exercises the no-tools boundary");
+  const firstSystem = wireMessages(first.body).filter((message) => message.role === "system" || message.role === "developer");
+  assert(firstSystem.length > 0, "the first main request has a system/developer prefix");
+  assert(systemText(first.body).includes(SYSTEM_BLOCK), "the prefix includes OptChat instructions");
+  for (const capture of [...mainCaptures, ...compactCaptures]) {
+    assert.deepEqual(
+      wireMessages(capture.body).filter((message) => message.role === "system" || message.role === "developer"),
+      firstSystem,
+      "every main and compressor request retains the exact host system prefix",
+    );
+  }
+  const leafInputs = compactCaptures.flatMap((capture) => (capture.compact?.leaf ? [capture.compact.input] : []));
+  assert(leafInputs.includes(`user: ${T1_USER}`), "the compressor summarized the whole first user message");
+  assert(leafInputs.includes(`talk: ${T1_TALK}`), "the compressor summarized the whole first reply");
+  const expectedView = "<chat>\n0+1|user: prior turn summary\n1+1|talk: prior reply summary\n</chat>";
+  assert.equal(soleView(second.body, "no-tools turn 2"), expectedView);
+  assert.equal(occurrences(outsideTexts(second.body), secondPrompt), 1, "the second prompt occurs once outside the view");
+  const secondRaw = JSON.stringify(second.body);
+  for (const raw of ["OPTCHAT_IT_T1_USER", "OPTCHAT_IT_T1_TALK", T1_USER, T1_TALK]) {
+    assert(!secondRaw.includes(raw), "the second request excludes first-turn raw text");
+  }
+
+  const tree = jsonlRecords(join(memory, "tree"));
+  let persistedSummaries = 0;
+  for (const row of firstRows) {
+    const expected = LEAF_SUMMARY[row.kind];
+    assert(expected !== undefined, `a deterministic summary exists for ${row.kind}`);
+    const leaves = tree.filter((record) => record.l === 0 && record.i === row.i);
+    assert.equal(leaves.length, 1, `exactly one persisted leaf for first-turn row ${row.i}`);
+    assert.equal(leaves[0]!.text, expected, `the persisted leaf for row ${row.i} is the exact summary`);
+    persistedSummaries++;
+  }
+  assert.deepEqual(pairs(mainRows(memory)), expectedPairs, "closing the host preserves exactly the four raw rows");
+  return {
+    mainRequests: mainCaptures.length,
+    noToolsCompactRequests: compactCaptures.length,
+    postMainCompactRequests: postMainCaptures.length,
+    persistedSummaries,
+    view: expectedView,
+  };
+}
+
+async function compressorToolRefusal(ctx: CaseContext): Promise<Evidence> {
+  ctx.fixture.compactPolicy = () => "tool";
+  let executions = 0;
+  return withHost(ctx, {
+    notices: true,
+    probe: { started: () => { executions++; }, release: Promise.resolve() },
+  }, async (host) => {
+    ctx.fixture.queueChat("ordinary main reply", { text: T1_TALK });
+    expectCompleted(await bounded("main reply", host.prompt(T1_USER), STEP_MS, ctx.fixture.fatal), "main reply");
+    await host.idle();
+    await ctx.fixture.until("compressor tool-call refusal", () => host.notices.find((notice) => notice.message.includes("Compressor returned a tool call")));
+    assert.equal(executions, 0, "no compressor tool call reaches the host executor");
+    const rows = await durableRows(ctx, 2, "main messages remain durable");
+    assert.deepEqual(pairs(rows), [["user", T1_USER], ["talk", T1_TALK]], "compressor tool calls and purported summaries are not chat messages");
+    assert(!JSON.stringify(jsonlRecords(join(ctx.memory, "tree"))).includes("COMPRESSOR_TOOL_OUTPUT_MUST_NOT_BE_SAVED"), "tool-bearing replies never become tree nodes");
+    return { executions, compressorRequests: ctx.fixture.compact().length };
+  });
+}
+
 async function freshTurnSteering(ctx: CaseContext): Promise<Evidence> {
   const { fixture, memory } = ctx;
   const { SYSTEM_BLOCK } = ctx.lib.optchat;
@@ -1070,6 +1231,20 @@ async function freshTurnSteering(ctx: CaseContext): Promise<Evidence> {
     const leafInputs = fixture.compact().flatMap((capture) => (capture.compact?.leaf ? [capture.compact.input] : []));
     assert(leafInputs.includes(`user: ${T1_USER}`), "the compressor summarized the whole turn 1 user");
     assert(leafInputs.includes(`talk: ${T1_TALK}`), "the compressor summarized the whole turn 1 reply");
+    const firstSystem = wireMessages(first).filter((message) => message.role === "system" || message.role === "developer");
+    let sharedToolPrefixes = 0;
+    for (const capture of fixture.compact()) {
+      if (capture.seq > fixture.chat()[0]!.seq || capture.body.tools !== undefined) {
+        assert.deepEqual(capture.body.tools, first.tools, "compressor exposes the same captured host tool definitions, without executing them");
+        sharedToolPrefixes++;
+      }
+      assert.deepEqual(
+        wireMessages(capture.body).filter((message) => message.role === "system" || message.role === "developer"),
+        firstSystem,
+        "compressor shares the host system prompt, including current host authority",
+      );
+    }
+    assert(sharedToolPrefixes > 0, "post-main compression exercises exact tool-prefix sharing");
 
     // Continuation: identical view bytes; the tool loop and steering raw outside it.
     assert.equal(soleView(continuation, "continuation"), expectedView, "the view is not re-snapshotted mid-turn");
@@ -1095,6 +1270,133 @@ async function freshTurnSteering(ctx: CaseContext): Promise<Evidence> {
       ["talk", T2_FINAL],
     ], "each completed message is logged once, in order; thinking never");
     return { chatRequests: fixture.chat().length, compactRequests: fixture.compact().length, view: expectedView };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Late prefix replay: a side request, and the reasoning-with-tools policy
+// ---------------------------------------------------------------------------
+
+const SIDE_SYSTEM = "OPTCHAT_IT_SIDE_SYSTEM";
+const SIDE_USER = "OPTCHAT_IT_SIDE_USER: a side question outside the turn.";
+const SIDE_TALK = "OPTCHAT_IT_SIDE_TALK";
+const SIDE_TOOL = {
+  name: "side_lookup",
+  description: "OPTCHAT_IT_SIDE_TOOL: a tool only the side request declares.",
+  parameters: { type: "object", properties: {}, additionalProperties: false },
+};
+/** Under 58 characters: its user leaf stays raw, so the turn's only new compressor request is its talk leaf. */
+const RECAPTURE_USER = "OPTCHAT_IT_RECAPTURE_USER: answer again.";
+const RECAPTURE_TALK = `OPTCHAT_IT_RECAPTURE_TALK ${"second turn reply that needs a summary; ".repeat(3)}`.trim();
+
+function leafCapture(fixture: Fixture, input: string): Capture | undefined {
+  return fixture.compact().find((capture) => capture.compact?.input === input);
+}
+
+/**
+ * A side request through the session's real provider hooks: same context, same
+ * model, system messages with the main request's roles and shape but other
+ * text, and a tool of its own. It is the latest captured prefix when turn 1's
+ * talk leaf is compressed. The SDK encodes that compressor request before its
+ * onPayload; the late prefix must neither replace the encoded OptChat guide
+ * nor add tools. Turn 2's main request recaptures and restores tool sharing.
+ */
+async function sidePrefixTextMismatch(ctx: CaseContext): Promise<Evidence> {
+  const { fixture, lib } = ctx;
+  const { SYSTEM_BLOCK } = lib.optchat;
+  const hold = fixture.gate();
+  return withHost(ctx, { settleTimeoutMs: POSITIVE_SETTLE_MS }, async (host) => {
+    fixture.queueChat("turn 1 reply, held across the side request", { text: T1_TALK, hold: hold.promise });
+    fixture.queueChat("side reply", { text: SIDE_TALK });
+    const turn1 = host.prompt(T1_USER);
+    const first = await fixture.until("turn 1 main request", () => fixture.chat()[0]);
+    const mainSystem = systemMessages(first.body);
+    assert(mainSystem.length > 0 && systemText(first.body).includes(SYSTEM_BLOCK), "the main prefix carries the complete OptChat guide");
+    const model = host.session.model;
+    assert(model, "the session has its chat model");
+    const side = await bounded("side request", lib.completeSimple(model, {
+      systemPrompt: mainSystem.map((_, index) => `${SIDE_SYSTEM} block ${index}`),
+      messages: [{ role: "user", content: SIDE_USER, timestamp: Date.now() }],
+      tools: [SIDE_TOOL],
+    }, host.session.prepareSimpleStreamOptions({ apiKey: FIXTURE_API_KEY }, model.provider)), STEP_MS, fixture.fatal);
+    assert.equal(side.stopReason, "stop", `the side request completes through the session hooks: ${side.errorMessage ?? ""}`);
+    hold.release();
+    expectCompleted(await bounded("turn 1", turn1, STEP_MS, fixture.fatal), "turn 1");
+    await host.idle();
+    const rejectedLeaf = await fixture.until("turn 1 talk leaf after the side capture", () => leafCapture(fixture, `talk: ${T1_TALK}`));
+    fixture.queueChat("turn 2 reply", { text: RECAPTURE_TALK });
+    expectCompleted(await bounded("turn 2", host.prompt(RECAPTURE_USER), STEP_MS, fixture.fatal), "turn 2");
+    await host.idle();
+    const sharedLeaf = await fixture.until("turn 2 talk leaf after the main recapture", () => leafCapture(fixture, `talk: ${RECAPTURE_TALK}`));
+    assert.deepEqual(host.runtimeErrors, [], "no extension runtime errors");
+    fixture.assertScriptsConsumed();
+
+    const chat = fixture.chat();
+    assert.equal(chat.length, 3, "two main requests and one side request");
+    const sideCapture = chat[1]!;
+    const second = chat[2]!;
+    const sideSystem = systemMessages(sideCapture.body);
+    const shape = (message: WireObject) => [message.role, Object.keys(message).sort().join(","), typeof message.content];
+    assert.deepEqual(sideSystem.map(shape), mainSystem.map(shape), "the side system messages keep the main roles and shape");
+    for (const [index, message] of sideSystem.entries()) {
+      assert.notEqual(wireText(message), wireText(mainSystem[index]!), `side system message ${index} differs only in text`);
+    }
+    assert.deepEqual(toolNames(sideCapture.body), [SIDE_TOOL.name], "the side request declares only its own tool");
+    assert(rejectedLeaf.seq > sideCapture.seq && rejectedLeaf.seq < second.seq, "the turn 1 talk leaf is encoded after the side capture, before any main recapture");
+    for (const capture of fixture.compact()) {
+      assert.deepEqual(systemMessages(capture.body), mainSystem, "every compressor request keeps its locally encoded complete guide");
+      const raw = JSON.stringify(capture.body);
+      assert(!raw.includes(SIDE_SYSTEM) && !raw.includes(SIDE_TOOL.name), "no side prefix text or tool reaches the compressor");
+      if (capture.seq > sideCapture.seq && capture.seq < second.seq) {
+        assert.equal(capture.body.tools, undefined, "a rejected side prefix injects no captured tools");
+      }
+    }
+    assert(sharedLeaf.seq > second.seq, "the turn 2 talk leaf follows the main recapture");
+    assert.deepEqual(sharedLeaf.body.tools, second.body.tools, "the recaptured main prefix restores exact tool sharing");
+    for (const name of ["zoom", "date", "probe"]) assert(toolNames(sharedLeaf.body).includes(name), `${name} is shared again`);
+    return {
+      chatRequests: chat.length,
+      compactRequests: fixture.compact().length,
+      sideSeq: sideCapture.seq,
+      rejectedLeafSeq: rejectedLeaf.seq,
+      sharedLeafSeq: sharedLeaf.seq,
+    };
+  });
+}
+
+/**
+ * Base or whenThinking compat.disableReasoningWithTools with none-effort:
+ * the SDK encodes the tool-bearing main request with reasoning "none". The compressor's own
+ * request, encoded without tools, keeps medium reasoning; a captured main
+ * prefix may replay its system messages but must not add tools to it.
+ */
+async function reasoningToolsCompressor(ctx: CaseContext, compat: FixtureCompat): Promise<Evidence> {
+  const { fixture } = ctx;
+  const { SYSTEM_BLOCK } = ctx.lib.optchat;
+  return withHost(ctx, {
+    settleTimeoutMs: POSITIVE_SETTLE_MS,
+    compat,
+  }, async (host) => {
+    fixture.queueChat("tool-bearing main reply", { text: T1_TALK });
+    expectCompleted(await bounded("main turn", host.prompt(T1_USER), STEP_MS, fixture.fatal), "main turn");
+    await host.idle();
+    const talkLeaf = await fixture.until("talk leaf after the main capture", () => leafCapture(fixture, `talk: ${T1_TALK}`));
+    assert.deepEqual(host.runtimeErrors, [], "no extension runtime errors");
+    fixture.assertScriptsConsumed();
+    const chat = fixture.chat();
+    assert.equal(chat.length, 1, "one main request");
+    const main = chat[0]!;
+    for (const name of ["zoom", "date", "probe"]) assert(toolNames(main.body).includes(name), `${name} is declared on the main request`);
+    assert.equal(main.body.reasoning_effort, "none", "the SDK disables reasoning on the tool-bearing main request");
+    const mainSystem = systemMessages(main.body);
+    assert(systemText(main.body).includes(SYSTEM_BLOCK), "the main prefix carries the OptChat guide");
+    assert(talkLeaf.seq > main.seq, "a compressor request follows the main prefix capture");
+    for (const capture of fixture.compact()) {
+      assert.equal(capture.body.tools, undefined, "the compressor stays tool-free");
+      assert.equal(capture.body.reasoning_effort, "medium", "the compressor keeps medium reasoning");
+      assert.deepEqual(systemMessages(capture.body), mainSystem, "the compressor keeps the exact host system prefix");
+    }
+    return { compactRequests: fixture.compact().length, talkLeafSeq: talkLeaf.seq, mainReasoning: "none", compressorReasoning: "medium" };
   });
 }
 
@@ -1763,7 +2065,8 @@ type FakeHostEvent =
   | { type: "session_start" | "session_shutdown" }
   | { type: "context"; messages: FakeHostMessage[] }
   | { type: "message_end"; message: FakeHostMessage }
-  | { type: "agent_end"; messages: FakeHostMessage[]; willContinue: boolean };
+  | { type: "agent_end"; messages: FakeHostMessage[]; willContinue: boolean }
+  | { type: "before_provider_request"; payload: unknown };
 type FakeHostHandler = (event: FakeHostEvent, ctx: OmpSdk.ExtensionContext) => unknown;
 
 interface FakeHost {
@@ -1775,8 +2078,22 @@ interface FakeHost {
   assistant(content: AssistantMessage["content"]): AssistantMessage;
 }
 
-/** Only the adapter's touched APIs: no SDK session, registry, auth or provider transport. */
-async function withFakeHost(ctx: CaseContext, run: (host: FakeHost) => Promise<Evidence>): Promise<Evidence> {
+interface FakeHostOptions {
+  /** ctx.model and the compressor; its real pi-ai transport reaches this model's baseUrl with the fixture key. */
+  model?: Model;
+  /** ctx.getSystemPrompt(); the default is the OptChat guide alone. */
+  systemPrompt?: string[];
+}
+
+/**
+ * Only the adapter's touched APIs: no SDK session, registry or auth. Without a
+ * model option there is no provider transport either.
+ */
+async function withFakeHost(
+  ctx: CaseContext,
+  run: (host: FakeHost) => Promise<Evidence>,
+  options: FakeHostOptions = {},
+): Promise<Evidence> {
   const memory = await mkdtemp(join(tmpdir(), "optchat-fake-"));
   const fakeCase = { ...ctx, memory };
   const flags: Record<string, string | boolean> = { ...defaultFlags(memory), "optchat-model": "fake/fake" };
@@ -1813,12 +2130,19 @@ async function withFakeHost(ctx: CaseContext, run: (host: FakeHost) => Promise<E
     pi: { getAgentDir: () => memory },
   } as unknown as ExtensionAPI;
   const fakeCtx = {
-    getSystemPrompt: () => [ctx.lib.optchat.SYSTEM_BLOCK],
+    getSystemPrompt: () => options.systemPrompt ?? [ctx.lib.optchat.SYSTEM_BLOCK],
     isIdle: () => false,
     abort: () => { abortCalls++; },
     ui: { notify: (message: string, type?: string) => { notices.push({ message, type, at: Date.now() }); } },
-    models: { resolve: () => model },
+    models: { resolve: () => options.model ?? model },
     agent: { kind: "main" },
+    ...(options.model
+      ? {
+        model: options.model,
+        modelRegistry: { resolver: () => FIXTURE_API_KEY },
+        sessionManager: { getSessionId: () => "optchat-it-fake-session" },
+      }
+      : {}),
   } as unknown as OmpSdk.ExtensionContext;
   const fire = (event: FakeHostEvent): Promise<unknown[]> => bounded(`fake ${event.type}`, (async () => {
     const results: unknown[] = [];
@@ -1967,6 +2291,323 @@ async function fakeSettleBounds(ctx: CaseContext): Promise<Evidence> {
 }
 
 // ---------------------------------------------------------------------------
+// Prefix admission per request dialect: real pi-ai encoders, fake host
+// ---------------------------------------------------------------------------
+
+interface Recorded {
+  path: string;
+  body: WireObject;
+}
+
+/**
+ * A loopback provider for every dialect: records each request and holds its
+ * stream open (headers, no events) until the client aborts or stop(). A held
+ * compressor request keeps its leaf unfinished, so each run uses a fresh host.
+ */
+class WireRecorder {
+  readonly requests: Recorded[] = [];
+  readonly origin: string;
+  /** The first request; rejects when a body is unreadable. */
+  readonly arrived: Promise<Recorded>;
+  private readonly arrive: (request: Recorded) => void;
+  private readonly unreadable: (error: Error) => void;
+  private readonly closers = new Set<() => void>();
+  private readonly server: Bun.Server<undefined>;
+
+  constructor() {
+    const arrived = Promise.withResolvers<Recorded>();
+    this.arrived = arrived.promise;
+    this.arrive = arrived.resolve;
+    this.unreadable = arrived.reject;
+    // Observed here; every run awaits it within a step deadline.
+    this.arrived.catch(() => {});
+    this.server = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 0, fetch: (request) => this.handle(request) });
+    this.origin = `http://127.0.0.1:${this.server.port}`;
+  }
+
+  async stop(): Promise<void> {
+    for (const close of this.closers) close();
+    this.closers.clear();
+    await this.server.stop(true);
+  }
+
+  private async handle(request: Request): Promise<Response> {
+    try {
+      const recorded = { path: new URL(request.url).pathname, body: object((await request.json()) as Json, "recorded request body") };
+      this.requests.push(recorded);
+      this.arrive(recorded);
+    } catch (error) {
+      this.unreadable(error instanceof Error ? error : new Error(String(error)));
+      return Response.json({ error: { message: "unreadable recorded request" } }, { status: 400 });
+    }
+    let open = true;
+    return new Response(new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        this.closers.add(() => {
+          if (!open) return;
+          open = false;
+          controller.close();
+        });
+      },
+      cancel: () => {
+        open = false;
+      },
+    }), { headers: SSE_HEADERS });
+  }
+}
+
+type PrefixLayout = "chat-system" | "chat-developer" | "responses-instructions" | "responses-input" | "anthropic-system";
+/** One change to the main payload's prefix, made in its onPayload before the host hook captures it. */
+type PrefixEdit = "unchanged" | "cache-only" | "instructions" | "text" | "role" | "type" | "attribute" | "cache-like" | "extra";
+
+const PREFIX_HOST = "OPTCHAT_IT_PREFIX_HOST: the host system prompt before the OptChat guide.";
+const PREFIX_MAIN_USER = "OPTCHAT_IT_PREFIX_MAIN_USER: the main request.";
+/** Over the 64-byte summary target: its talk leaf is each run's first compressor request. */
+const PREFIX_TALK = `OPTCHAT_IT_PREFIX_TALK ${"main reply words that need a summary; ".repeat(3)}`.trim();
+const PREFIX_EDIT = "OPTCHAT_IT_PREFIX_EDIT";
+const PREFIX_TOOL = {
+  name: "prefix_probe",
+  description: "OPTCHAT_IT_PREFIX_TOOL: a tool the main request declares.",
+  parameters: { type: "object", properties: { label: { type: "string" } }, required: ["label"] },
+};
+const MESSAGE_REJECTS: readonly PrefixEdit[] = ["text", "role", "type", "attribute", "cache-like", "extra"];
+const PREFIX_LAYOUTS: Record<PrefixLayout, {
+  path: string;
+  /** Role of every leading prefix message; none means the prompt sits in a head field. */
+  role?: "system" | "developer";
+  head?: "system" | "instructions";
+  accept: PrefixEdit;
+  reject: readonly PrefixEdit[];
+}> = {
+  "chat-system": { path: "/v1/chat/completions", role: "system", accept: "cache-only", reject: MESSAGE_REJECTS },
+  "chat-developer": { path: "/v1/chat/completions", role: "developer", accept: "cache-only", reject: MESSAGE_REJECTS },
+  "responses-instructions": { path: "/v1/responses", head: "instructions", accept: "unchanged", reject: ["instructions", "extra"] },
+  "responses-input": { path: "/v1/responses", role: "developer", accept: "cache-only", reject: MESSAGE_REJECTS },
+  "anthropic-system": {
+    path: "/v1/messages",
+    head: "system",
+    accept: "cache-only",
+    reject: ["text", "type", "attribute", "cache-like", "extra"],
+  },
+};
+
+/**
+ * A bundled model of the layout's dialect, routed to the recorder. Candidates
+ * lack whenThinking, so reasoning cannot relocate the prompt between runs, and
+ * keep tool sharing on; supportsDeveloperRole selects the OpenAI layout.
+ */
+function prefixModel(ctx: CaseContext, layout: PrefixLayout, origin: string): Model {
+  const { getBundledModels } = ctx.lib;
+  const plain = (candidate: Model): boolean => {
+    const compat: unknown = candidate.compat;
+    const field = (key: string): unknown => (compat !== null && typeof compat === "object" ? Reflect.get(compat, key) : undefined);
+    return candidate.kind === undefined && candidate.reasoning && candidate.supportsTools !== false &&
+      field("whenThinking") === undefined && field("disableReasoningWithTools") !== true;
+  };
+  if (layout === "anthropic-system") {
+    const found = getBundledModels("anthropic").find((candidate): candidate is Model<"anthropic-messages"> =>
+      candidate.api === "anthropic-messages" && plain(candidate));
+    assert(found, "the catalog bundles a reasoning Anthropic Messages model");
+    const { transport: _transport, ...model } = found;
+    return { ...model, baseUrl: origin };
+  }
+  const supportsDeveloperRole = PREFIX_LAYOUTS[layout].role === "developer";
+  if (layout === "chat-system" || layout === "chat-developer") {
+    const found = getBundledModels("groq").find((candidate): candidate is Model<"openai-completions"> =>
+      candidate.api === "openai-completions" && plain(candidate));
+    assert(found, "the catalog bundles a reasoning Groq Chat Completions model");
+    const { transport: _transport, ...model } = found;
+    return { ...model, baseUrl: `${origin}/v1`, compat: { ...model.compat, supportsDeveloperRole } };
+  }
+  const found = getBundledModels("openai").find((candidate): candidate is Model<"openai-responses"> =>
+    candidate.api === "openai-responses" && plain(candidate));
+  assert(found, "the catalog bundles a reasoning OpenAI Responses model");
+  const { transport: _transport, ...model } = found;
+  return { ...model, baseUrl: `${origin}/v1`, compat: { ...model.compat, supportsDeveloperRole } };
+}
+
+/** The leading system/developer messages of Chat Completions messages or Responses input. */
+function leadingPrefix(body: WireObject): { list: Json[]; count: number } {
+  const list = Array.isArray(body.messages) ? body.messages : body.input;
+  assert(Array.isArray(list), "an encoded request carries messages or input");
+  let count = 0;
+  for (const entry of list) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry) || (entry.role !== "system" && entry.role !== "developer")) break;
+    count++;
+  }
+  return { list, count };
+}
+
+/** What prefix admission compares and copies, plus the destination suffix it must keep. */
+interface PrefixParts {
+  system: Json | undefined;
+  instructions: Json | undefined;
+  leading: Json[];
+  suffix: Json[];
+  tools: Json | undefined;
+}
+
+function prefixParts(body: WireObject): PrefixParts {
+  const { list, count } = leadingPrefix(body);
+  return { system: body.system, instructions: body.instructions, leading: list.slice(0, count), suffix: list.slice(count), tools: body.tools };
+}
+
+/** Apply one edit in place to the encoded main payload: Anthropic system blocks, leading messages or instructions. */
+function editPrefix(payload: WireObject, edit: PrefixEdit): void {
+  if (edit === "unchanged") return;
+  if (edit === "instructions") {
+    assert(typeof payload.instructions === "string", "the instructions layout encodes a string head");
+    payload.instructions = `${payload.instructions} ${PREFIX_EDIT}`;
+    return;
+  }
+  const { list, count } = Array.isArray(payload.system) ? { list: payload.system, count: payload.system.length } : leadingPrefix(payload);
+  if (edit === "extra" && count === 0) {
+    // A leading message beside an instructions head.
+    list.unshift({ role: "developer", content: `${PREFIX_EDIT} extra message` });
+    return;
+  }
+  assert(count > 0, `${edit} needs an encoded system prefix`);
+  const entries = list.slice(0, count).map((entry, index) => object(entry, `prefix entry ${index}`));
+  const last = entries[count - 1]!;
+  const textKey = typeof last.text === "string" ? "text" : "content";
+  assert(typeof last[textKey] === "string", "a prefix entry carries its text as one string");
+  switch (edit) {
+    case "cache-only":
+      // Exactly the two cache metadata keys change; every other byte stays.
+      for (const entry of entries) {
+        if (entry.cache_control === undefined) entry.cache_control = { type: "ephemeral", ttl: "5m" };
+        else delete entry.cache_control;
+        entry.prompt_cache_breakpoint = { mode: "explicit" };
+      }
+      return;
+    case "text":
+      last[textKey] = `${last[textKey]} ${PREFIX_EDIT}`;
+      return;
+    case "role":
+      last.role = last.role === "system" ? "developer" : "system";
+      return;
+    case "type":
+      last.type = typeof last.type === "string" ? PREFIX_EDIT : "message";
+      return;
+    case "attribute":
+      last.name = PREFIX_EDIT;
+      return;
+    case "cache-like":
+      last.cache_breakpoint = { mode: "explicit" };
+      return;
+    case "extra":
+      list.splice(count, 0, { ...last, [textKey]: `${PREFIX_EDIT} extra entry` });
+      return;
+  }
+}
+
+interface PrefixRun {
+  /** The edited main payload as the host hook saw it; none for the local reference run. */
+  captured: PrefixParts | undefined;
+  compressor: PrefixParts;
+}
+
+/**
+ * One fresh fake host: a short user opens the turn; with an edit, the real
+ * encoder builds a tool-bearing main payload whose onPayload applies the edit,
+ * fires the host hook and aborts, so nothing is sent; a long talk leaf then
+ * makes the compressor encode its own request, which the recorder holds.
+ * Without an edit nothing is captured: the compressor's local encoding.
+ */
+async function prefixRun(ctx: CaseContext, layout: PrefixLayout, edit: PrefixEdit | undefined): Promise<PrefixRun> {
+  const { lib } = ctx;
+  const recorder = new WireRecorder();
+  try {
+    const model = prefixModel(ctx, layout, recorder.origin);
+    const systemPrompt = [PREFIX_HOST, lib.optchat.SYSTEM_BLOCK];
+    // Closure results live on an object: control flow does not see callback assignments to locals.
+    const seen: { captured?: PrefixParts; request?: Recorded } = {};
+    await withFakeHost(ctx, async (host) => {
+      assert(await host.context([host.user("U1")]), "a short user opens the turn without a compressor request");
+      if (edit !== undefined) {
+        const stop = new AbortController();
+        const reply = await bounded("main payload encode", lib.completeSimple(model, {
+          systemPrompt,
+          messages: [{ role: "user", content: PREFIX_MAIN_USER, timestamp: host.timestamp() }],
+          tools: [PREFIX_TOOL],
+        }, {
+          apiKey: FIXTURE_API_KEY,
+          statefulResponses: false,
+          // The compressor's effort: tools and the turn suffix are the only encoder inputs that differ.
+          reasoning: lib.clampThinkingLevelForModel(model, lib.ThinkingLevel.Medium),
+          signal: stop.signal,
+          onPayload: async (payload) => {
+            const main = object(payload as Json, "main payload");
+            editPrefix(main, edit);
+            seen.captured = prefixParts(object(JSON.parse(JSON.stringify(main)) as Json, "captured main payload"));
+            await host.fire({ type: "before_provider_request", payload: main });
+            stop.abort();
+            return undefined;
+          },
+        }));
+        assert.equal(reply.stopReason, "aborted", `the main payload reaches the host hook and is never sent: ${reply.errorMessage ?? ""}`);
+      }
+      await host.fire({ type: "message_end", message: host.assistant([{ type: "text", text: PREFIX_TALK }]) });
+      seen.request = await bounded("compressor request", recorder.arrived);
+      assert.deepEqual(recorder.requests.map((request) => request.path), [PREFIX_LAYOUTS[layout].path], "only the compressor request reaches the provider");
+      return { layout, edit: edit ?? "local" };
+    }, { model, systemPrompt });
+    assert(seen.request, "the compressor request was recorded");
+    return { captured: seen.captured, compressor: prefixParts(seen.request.body) };
+  } finally {
+    await recorder.stop();
+  }
+}
+
+/**
+ * The layout's local compressor encoding, then the cache-only (or identical)
+ * capture that must replay exactly, then every semantic edit that must leave
+ * the local encoding byte-for-byte.
+ */
+async function prefixLayoutCase(ctx: CaseContext, layout: PrefixLayout): Promise<Evidence> {
+  const { SYSTEM_BLOCK } = ctx.lib.optchat;
+  const spec = PREFIX_LAYOUTS[layout];
+  const head = (parts: PrefixParts) => ({ system: parts.system, instructions: parts.instructions, leading: parts.leading });
+
+  const local = (await prefixRun(ctx, layout, undefined)).compressor;
+  const roles = local.leading.map((entry) => object(entry, "leading message").role);
+  if (spec.role) assert(roles.length > 0 && roles.every((role) => role === spec.role), `${layout}: the prompt is ${spec.role} messages`);
+  else assert.deepEqual(roles, [], `${layout}: no leading prompt messages`);
+  assert.equal(Array.isArray(local.system), spec.head === "system", `${layout}: Anthropic system blocks only where expected`);
+  assert.equal(typeof local.instructions === "string", spec.head === "instructions", `${layout}: Responses instructions only where expected`);
+  const guide = [
+    ...[...(Array.isArray(local.system) ? local.system : []), ...local.leading].map((entry) => {
+      const value = object(entry, "prefix entry");
+      return typeof value.text === "string" ? value.text : wireText(value);
+    }),
+    typeof local.instructions === "string" ? local.instructions : "",
+  ].join("\n");
+  assert(guide.includes(PREFIX_HOST) && guide.includes(SYSTEM_BLOCK), `${layout}: the local encoding carries the host prompt and the complete OptChat guide`);
+  assert.equal(local.tools, undefined, `${layout}: the compressor's own encoding declares no tools`);
+  assert(JSON.stringify(local.suffix).includes("Compaction: compress message"), `${layout}: the suffix is the compressor's own task`);
+
+  const accepted = await prefixRun(ctx, layout, spec.accept);
+  assert(accepted.captured, "the accepted run captured a main payload");
+  assert.notEqual(accepted.captured.tools, undefined, `${layout}: the main payload declares its tools`);
+  if (spec.accept === "cache-only") assert.notDeepEqual(head(accepted.captured), head(local), `${layout}: the capture differs in cache metadata`);
+  assert.deepEqual(
+    accepted.compressor,
+    { ...accepted.captured, suffix: local.suffix },
+    `${layout} ${spec.accept}: the exact captured prefix and tools replay; the compressor's own suffix survives`,
+  );
+  const outcomes: Evidence = { [spec.accept]: "accepted" };
+  for (const edit of spec.reject) {
+    const rejected = await prefixRun(ctx, layout, edit);
+    assert(rejected.captured, `${edit}: the run captured a main payload`);
+    assert.notEqual(rejected.captured.tools, undefined, `${layout} ${edit}: captured tools were available`);
+    assert.notDeepEqual(head(rejected.captured), head(local), `${layout} ${edit}: the edit changes the captured prefix`);
+    assert.deepEqual(rejected.compressor, local, `${layout} ${edit}: the local guide, suffix and tool-free encoding stay untouched`);
+    outcomes[edit] = "rejected";
+  }
+  return outcomes;
+}
+
+// ---------------------------------------------------------------------------
 // Unit: capText (src/index.ts) and viewBlocks (src/cache.ts)
 // ---------------------------------------------------------------------------
 
@@ -2024,81 +2665,41 @@ async function capTextUnit(ctx: CaseContext): Promise<Evidence> {
   return { checked };
 }
 
-const VIEW_MARKS = [50_000, 80_000, 100_000];
-
-/** Spec: per mark below the length, the offset after the last newline before it; never at or before the first line's end; no repeats. */
-function expectedCuts(view: string): number[] {
-  const firstLineEnd = view.indexOf("\n") + 1;
-  const cuts: number[] = [];
-  for (const mark of VIEW_MARKS) {
-    if (mark >= view.length) break;
-    let cut = 0;
-    for (let index = mark - 1; index >= 0; index--) {
-      if (view[index] === "\n") {
-        cut = index + 1;
-        break;
-      }
-    }
-    if (cut <= Math.max(firstLineEnd, cuts.at(-1) ?? 0)) continue;
-    cuts.push(cut);
-  }
-  return cuts;
-}
-
 async function viewBlocksUnit(ctx: CaseContext): Promise<Evidence> {
-  const { viewBlocks } = ctx.lib;
-  const cutsOf = (view: string, label: string): number[] => {
-    const blocks = viewBlocks(view);
-    assert(blocks.length >= 1 && blocks.length <= VIEW_MARKS.length + 1, `${label}: ${blocks.length} blocks`);
+  const { viewBlocks, getBundledModels } = ctx.lib;
+  const model = getBundledModels("anthropic").find((candidate) =>
+    candidate.api === "anthropic-messages" && candidate.provider === "anthropic" &&
+    candidate.baseUrl === "https://api.anthropic.com" &&
+    candidate.compat && "officialEndpoint" in candidate.compat && candidate.compat.officialEndpoint === true &&
+    candidate.input.length === 2 && candidate.input.includes("text") && candidate.input.includes("image"));
+  assert(model, "an official image-capable Anthropic model is bundled");
+  const rows = Array.from({ length: 13 }, (_, index) => `${index}+1|user: memory 🦊 e\u0301 漢字 ${"x".repeat(index * 100)}`);
+  for (let count = 0; count <= rows.length; count++) {
+    const view = `<chat>\n${rows.slice(0, count).map((row) => `${row}\n`).join("")}</chat>`;
+    const blocks = viewBlocks(view, model);
+    assert.equal(blocks.map((block) => block.text).join(""), view, "blocks preserve every source byte");
+    const fullBlocks = Math.floor(count / 4);
+    assert.equal(blocks.length, fullBlocks + 1, `${count} rows: whole four-line blocks plus trailing remainder/closing tag`);
+    for (let index = 0; index < fullBlocks; index++) {
+      const expected = `${index === 0 ? "<chat>\n" : ""}${rows.slice(index * 4, index * 4 + 4).join("\n")}\n`;
+      assert.deepEqual(blocks[index], { type: "text", text: expected }, "four lines, independent of character count");
+    }
     for (const block of blocks) {
-      assert.deepEqual(Object.keys(block).sort(), ["text", "type"], `${label}: plain text blocks`);
-      assert.equal(block.type, "text");
-      if (view.length > 0) assert(block.text.length > 0, `${label}: no empty block`);
+      assert.deepEqual(Object.keys(block).sort(), ["text", "type"], "plain text until the provider adds cache metadata");
+      assert(block.text.length > 0, "no empty blocks");
     }
-    assert.equal(blocks.map((block) => block.text).join(""), view, `${label}: blocks join back to the view`);
-    const cuts: number[] = [];
-    let offset = 0;
-    for (const block of blocks.slice(0, -1)) {
-      offset += block.text.length;
-      cuts.push(offset);
-    }
-    for (const cut of cuts) assert.equal(view[cut - 1], "\n", `${label}: cut ${cut} follows a newline`);
-    assert.deepEqual(cuts, expectedCuts(view), `${label}: cuts at the last line end at or before each mark`);
-    return cuts;
-  };
-
-  assert.deepEqual(viewBlocks(""), [{ type: "text", text: "" }], "an empty view is one empty block");
-  assert.deepEqual(cutsOf("<chat>\n</chat>", "empty chat"), []);
-  assert.deepEqual(cutsOf("<chat>\n0+1|user: hi\n</chat>", "short"), []);
-
-  // 100-character lines after a 7-character header: line k starts at 7 + 100k.
-  const lines = Array.from({ length: 1_200 }, (_, index) => `${index}+1|`.padEnd(99, "x")).join("\n");
-  const regular = `<chat>\n${lines}\n</chat>`;
-  assert.deepEqual(cutsOf(regular, "regular lines"), [49_907, 79_907, 99_907]);
-
-  const atLength = `<chat>\n${"a".repeat(50_000 - 7 - 8)}\n</chat>`;
-  assert.equal(atLength.length, 50_000);
-  assert.deepEqual(cutsOf(atLength, "length at the first mark"), [], "marks at or past the end never cut");
-
-  // A newline exactly at mark-1 cuts exactly at the mark; that line spans 80000, so the repeat is dropped.
-  const atMark = `<chat>\n${"a".repeat(49_999 - 7)}\n${"b".repeat(40_000)}\n</chat>`;
-  assert.equal(atMark[49_999], "\n");
-  assert.deepEqual(cutsOf(atMark, "newline at a mark"), [50_000]);
-
-  // A newline just past a mark does not count for it; a later mark reuses one cut only once.
-  const pastMark = `<chat>\n${"a".repeat(50_000 - 7)}\n${"c".repeat(29_998)}\n${"d".repeat(30_000)}\n</chat>`;
-  assert.equal(pastMark[50_000], "\n");
-  assert.deepEqual(cutsOf(pastMark, "newline past a mark"), [80_000]);
-
-  // An unbroken line stays whole: the only earlier line end is the header's, which is never a cut.
-  assert.deepEqual(cutsOf(`<chat>\n0+1|${"x".repeat(150_000)}\n</chat>`, "unbroken chat line"), []);
-  assert.deepEqual(cutsOf(`<optchat-context>\n${"y".repeat(150_000)}\n</optchat-context>`, "unbroken context line"), []);
-
-  // A header line longer than the first mark is never split, and no cut lands before its end.
-  const longHeader = `<chat>${"z".repeat(60_000)}\n${lines}\n</chat>`;
-  const headerCuts = cutsOf(longHeader, "long first line");
-  assert(headerCuts.length > 0 && headerCuts[0]! > longHeader.indexOf("\n"), "the first block holds the whole first line");
-  return { regularCuts: [49_907, 79_907, 99_907] };
+  }
+  for (const view of ["", `<chat>\n0+1|${"x".repeat(150_000)}\n</chat>`, "not a chat view"]) {
+    assert.deepEqual(viewBlocks(view, model), [{ type: "text", text: view }], "unbroken lines and non-views are untouched");
+  }
+  const view = `<chat>\n${rows.join("\n")}\n</chat>`;
+  assert(view.length < 50_000, "the 13-row view is below 50,000 UTF-16 units");
+  assert.deepEqual(viewBlocks(view, undefined), [{ type: "text", text: view }], "an undefined model keeps a single block");
+  assert.deepEqual(viewBlocks(view, { ...model, input: ["text"] }), [{ type: "text", text: view }], "a text-only Anthropic model keeps a single block");
+  const first = viewBlocks(`<chat>\n${rows.slice(0, 8).join("\n")}\n</chat>`, model);
+  const appended = viewBlocks(view, model);
+  assert.deepEqual(appended.slice(0, 2), first.slice(0, 2), "appending rows retains every earlier whole block");
+  return { rowCases: rows.length + 1, linesPerBlock: 4 };
 }
 
 // ---------------------------------------------------------------------------
@@ -2108,6 +2709,18 @@ async function viewBlocksUnit(ctx: CaseContext): Promise<Evidence> {
 const CASES: Record<CaseName, (ctx: CaseContext) => Promise<Evidence>> = {
   "fresh-turn-steering": freshTurnSteering,
   "thinking-exclusion": thinkingExclusion,
+  "compressor-tool-refusal": compressorToolRefusal,
+  "compressor-without-tools": compressorWithoutTools,
+  "side-prefix-text-mismatch": sidePrefixTextMismatch,
+  "reasoning-tools-compressor": (ctx) => reasoningToolsCompressor(ctx, {
+    disableReasoningWithTools: true,
+    reasoningDisableMode: "none-effort",
+  }),
+  "reasoning-tools-compressor-when-thinking": (ctx) => reasoningToolsCompressor(ctx, {
+    disableReasoningWithTools: false,
+    reasoningDisableMode: "none-effort",
+    whenThinking: { disableReasoningWithTools: true, reasoningDisableMode: "none-effort" },
+  }),
   "tool-cap-zoom": toolCapZoom,
   "lock-held": lockHeld,
   "missing-compressor": missingCompressor,
@@ -2122,6 +2735,11 @@ const CASES: Record<CaseName, (ctx: CaseContext) => Promise<Evidence>> = {
   "fake-continuation": fakeContinuation,
   "fake-think-exclusion": fakeThinkExclusion,
   "fake-settle-bounds": fakeSettleBounds,
+  "prefix-chat-system": (ctx) => prefixLayoutCase(ctx, "chat-system"),
+  "prefix-chat-developer": (ctx) => prefixLayoutCase(ctx, "chat-developer"),
+  "prefix-responses-instructions": (ctx) => prefixLayoutCase(ctx, "responses-instructions"),
+  "prefix-responses-input": (ctx) => prefixLayoutCase(ctx, "responses-input"),
+  "prefix-anthropic-system": (ctx) => prefixLayoutCase(ctx, "anthropic-system"),
   "cap-text": capTextUnit,
   "view-blocks": viewBlocksUnit,
 };

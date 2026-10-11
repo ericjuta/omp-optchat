@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { SCALE } from "./prompts.js";
+import { RULER } from "./prompts.js";
 import { nodeKey, type Kind, type Message, Store, type TreeNode } from "./store.js";
 
 export interface CompactionRequest {
@@ -16,6 +16,8 @@ export type Summarize = (
 export interface MemoryOptions {
   nodeBytes?: number;
   viewBytes?: number;
+  /** Upper compactor-context threshold; each batch targets half this size. */
+  compactionViewBytes?: number;
   jobs?: number;
   tries?: number;
   retryMs?: number;
@@ -81,12 +83,20 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 export class Memory {
   private readonly nodeBytes: number;
   private readonly budget: number;
+  private readonly target: number;
+  private readonly compactionBudget: number;
+  private readonly compactionTarget: number;
   private readonly jobs: number;
   private readonly tries: number;
   private readonly retryMs: number;
   private readonly report: (message: string) => void;
   private readonly wait: (ms: number, signal: AbortSignal) => Promise<void>;
-  private readonly view: ViewPart[] = [];
+  private view: ViewPart[] = [];
+  private compacting = false;
+  private compactionView: ViewPart[] = [];
+  private compactionEnd = 0;
+  private compactionBytes = 0;
+  private compactionPending = true;
   private readonly busy = new Map<string, Job>();
   private readonly failed = new Set<string>();
   // Built prefixes can never become unbuilt. Skip them on subsequent scans.
@@ -105,6 +115,9 @@ export class Memory {
   ) {
     this.nodeBytes = positive(options.nodeBytes, 512, "nodeBytes");
     this.budget = positive(options.viewBytes, 128_000, "viewBytes");
+    this.target = Math.max(1, Math.floor(this.budget / 2));
+    this.compactionBudget = positive(options.compactionViewBytes, 32_000, "compactionViewBytes");
+    this.compactionTarget = Math.max(1, Math.floor(this.compactionBudget / 2));
     this.jobs = positive(options.jobs, 8, "jobs");
     this.tries = positive(options.tries, 5, "tries");
     this.retryMs = options.retryMs ?? 10_000;
@@ -113,19 +126,23 @@ export class Memory {
     }
     this.report = options.report ?? ((message) => console.error(message));
     this.wait = options.wait ?? delay;
-    for (let i = 0; i < store.messages.length; i++) {
+    const snapshot = store.viewSnapshot;
+    this.view = snapshot?.parts.map(([l, i]) => ({ l, i })) ?? [];
+    this.compacting = snapshot?.compacting ?? false;
+    // A crash can leave durable log records after the last view commit. Keep
+    // its exact prefix; only a store with no snapshot needs a one-time migration.
+    for (let i = snapshot?.length ?? 0; i < store.messages.length; i++) {
       this.view.push({ l: 0, i });
-      // Age at this historical append, not today's final history length.
-      this.fit(i + 1);
     }
+    this.advanceFirst();
+    this.fit(this.view, !snapshot || snapshot.length !== store.messages.length);
     this.schedulePump();
   }
 
   append(kind: Kind, text: string, date?: Date): Message {
     if (this.stopped) throw new Error("Memory is closed");
     const message = this.store.append(kind, text, date);
-    this.view.push({ l: 0, i: message.i });
-    this.fit(this.store.messages.length);
+    this.fit([...this.view, { l: 0, i: message.i }], true);
     this.schedulePump();
     return message;
   }
@@ -210,25 +227,28 @@ export class Memory {
     return `${part.i * n}+${n}|${flatten(this.node(part)?.text ?? PLACEHOLDER)}`;
   }
 
-  private fit(length: number): void {
-    this.bytes = 0;
-    this.first = length;
-    for (const part of this.view) {
-      const node = this.node(part);
-      this.bytes += node?.size ?? PLACEHOLDER_BYTES;
-      if (!node && this.first === length) this.first = part.i * 2 ** part.l;
-    }
-    while (this.bytes > this.budget) {
+  private size(parts: readonly ViewPart[]): number {
+    let bytes = 0;
+    for (const part of parts) bytes += this.node(part)?.size ?? PLACEHOLDER_BYTES;
+    return bytes;
+  }
+
+  /** Merge oldest equal-due siblings. Age is measured from the pair's LAST
+   * message, not its first: at T=10, 8+1|9+1 precedes 0+4|4+4. */
+  private coarsen(parts: ViewPart[], bytes: number, target: number): number {
+    const length = this.store.messages.length;
+    while (bytes > target) {
       let best = -1;
       let due = -1;
       let parent: TreeNode | undefined;
-      for (let j = 0; j + 1 < this.view.length; j++) {
-        const a = this.view[j]!;
-        const b = this.view[j + 1]!;
+      for (let j = 0; j + 1 < parts.length; j++) {
+        const a = parts[j]!;
+        const b = parts[j + 1]!;
         if (a.l !== b.l || a.i % 2 !== 0 || b.i !== a.i + 1) continue;
         const candidate = this.store.nodes.get(nodeKey(a.l + 1, a.i / 2));
         if (!candidate) continue;
-        const age = (length - a.i * 2 ** a.l) / 2 ** (a.l + 2);
+        const width = 2 ** a.l;
+        const age = (length - ((a.i + 2) * width - 1)) / width;
         if (age > due) {
           best = j;
           due = age;
@@ -236,15 +256,66 @@ export class Memory {
         }
       }
       if (best < 0 || !parent) break;
-      const a = this.view[best]!;
-      const b = this.view[best + 1]!;
-      this.bytes += parent.size -
-        (this.node(a)?.size ?? PLACEHOLDER_BYTES) -
-        (this.node(b)?.size ?? PLACEHOLDER_BYTES);
-      this.view.splice(best, 2, { l: parent.l, i: parent.i });
+      bytes += parent.size - this.node(parts[best]!)!.size - this.node(parts[best + 1]!)!.size;
+      parts.splice(best, 2, { l: parent.l, i: parent.i });
     }
-    // Coarsening only uses built parents, so it cannot introduce an unbuilt line.
-    if (this.first === length) this.wake(true);
+    return bytes;
+  }
+
+  private advanceFirst(): void {
+    while (this.first < this.store.messages.length && this.store.nodes.has(nodeKey(0, this.first))) this.first++;
+  }
+
+  private fit(proposed: ViewPart[] = this.view, persist = false): void {
+    let bytes = this.size(proposed);
+    let compacting = this.compacting || bytes > this.budget;
+    let merged = false;
+    if (compacting) {
+      // Do not publish a changed tiling before its atomic snapshot is durable.
+      proposed = proposed.slice();
+      const count = proposed.length;
+      bytes = this.coarsen(proposed, bytes, this.target);
+      merged = proposed.length !== count;
+      compacting = bytes > this.target;
+    }
+    if (persist || merged || compacting !== this.compacting) {
+      this.store.saveView({
+        version: 1,
+        length: this.store.messages.length,
+        parts: proposed.map(({ l, i }) => [l, i] as const),
+        compacting,
+      });
+    }
+    this.view = proposed;
+    this.bytes = bytes;
+    this.compacting = compacting;
+    this.refreshCompactionView(merged);
+    if (this.first === this.store.messages.length) this.wake(true);
+  }
+
+  private refreshCompactionView(reset = false): void {
+    if (reset) {
+      this.compactionView = [];
+      this.compactionEnd = 0;
+      this.compactionBytes = 0;
+      this.compactionPending = true;
+    }
+    for (const part of this.view) {
+      const width = 2 ** part.l;
+      const end = (part.i + 1) * width;
+      if (end <= this.compactionEnd) continue;
+      if (end > this.first) break;
+      const node = this.node(part);
+      if (!node) break;
+      this.compactionView.push(part);
+      this.compactionEnd = end;
+      this.compactionBytes += node.size;
+    }
+    if (this.compactionBytes > this.compactionBudget) this.compactionPending = true;
+    if (this.compactionPending) {
+      this.compactionBytes = this.coarsen(this.compactionView, this.compactionBytes, this.compactionTarget);
+      this.compactionPending = this.compactionBytes > this.compactionTarget;
+    }
   }
 
   private wake(settled: boolean): void {
@@ -253,11 +324,13 @@ export class Memory {
 
   private context(end: number): string {
     const lines: string[] = [];
-    for (const part of this.view) {
-      if (part.i * 2 ** part.l >= end) break;
+    for (const part of this.compactionView) {
+      // A coarse line that straddles the request boundary contains future
+      // messages too. Omit it, rather than leaking those messages as context.
+      if ((part.i + 1) * 2 ** part.l > end) break;
       const node = this.node(part);
-      if (!node) throw new Error("Compaction context contains an unbuilt part");
-      lines.push(flatten(node.text));
+      if (!node) break;
+      lines.push(this.renderPart(part));
     }
     return chat(lines);
   }
@@ -355,7 +428,15 @@ export class Memory {
       const input = left && right ? `${flatten(left.text)}\n${flatten(right.text)}` : source;
       const end = part.l === 0 ? part.i : (part.i + 1) * 2 ** part.l;
       const context = this.context(end);
-      const instruction = `For scale, this line is exactly 512 bytes:\n${SCALE}\n\n${part.l === 0 ? "Compress this message" : "Merge these two lines"} into one line, in at most ${this.nodeBytes} bytes:\n${input}`;
+      const id = part.i * 2 ** part.l;
+      const task = part.l === 0
+        ? `compress message ${id}`
+        : `merge lines ${id}+${2 ** (part.l - 1)} and ${id + 2 ** (part.l - 1)}+${2 ** (part.l - 1)}, adjacent,`;
+      const details = part.l === 0 ? "" : `<chat> may hold their messages, ${id} to ${end - 1}, in more detail: take details\nof them from there too.\n`;
+      const ruler = this.nodeBytes === 512
+        ? "(about 70 words), the length of this ruler:"
+        : "The ruler is a fixed 512-byte reference; the numeric limit above is authoritative:";
+      const instruction = `Compaction: ${task} into one line of at most ${this.nodeBytes} bytes\n${ruler}\n${RULER}\n${details}<input>\n${input}\n</input>`;
       let feedback: CompactionRequest["feedback"] = [];
       let shortest: { text: string; size: number } | undefined;
       for (let attempt = 0; attempt < this.tries; attempt++) {
@@ -367,7 +448,7 @@ export class Memory {
         if (bytes <= this.nodeBytes || attempt + 1 === this.tries) break;
         feedback = [...feedback, {
           reply,
-          instruction: `That line is ${bytes} bytes; the limit is ${this.nodeBytes}. It must end where it is cut here:\n${utf8Prefix(reply, this.nodeBytes)}| ← LIMIT`,
+          instruction: `Too long: your line is ${bytes} bytes, over the ${this.nodeBytes}-byte limit. Write\nthe whole line again for the same <input>, cutting just enough of the\nleast valuable items to fit before this cut:\n${utf8Prefix(reply, this.nodeBytes)}| ← LIMIT`,
         }];
       }
       text = shortest!.text;
@@ -375,6 +456,7 @@ export class Memory {
     }
     if (this.stopped || signal.aborted) return;
     this.store.saveNode({ l: part.l, i: part.i, text, size });
-    this.fit(this.store.messages.length);
+    this.advanceFirst();
+    this.fit();
   }
 }

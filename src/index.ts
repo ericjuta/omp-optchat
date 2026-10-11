@@ -1,6 +1,7 @@
 import { openSync, closeSync, fsyncSync, readFileSync, writeSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { clampThinkingLevelForModel, Effort } from "@oh-my-pi/pi-catalog";
+import { requiresNativeTools } from "@oh-my-pi/pi-catalog/compat/tools";
 import {
 	completeSimple,
 	type AssistantMessage,
@@ -8,6 +9,7 @@ import {
 	type Message as LlmMessage,
 	type Model,
 	type TextContent,
+	type Tool,
 	type UserMessage,
 } from "@oh-my-pi/pi-ai";
 import type {
@@ -19,11 +21,19 @@ import type {
 	ToolResultEvent,
 	ToolResultEventResult,
 } from "@oh-my-pi/pi-coding-agent";
-import { applyOptChatCache, viewBlocks } from "./cache.js";
+import {
+	applyOptChatCache,
+	OptChatCacheCoordinator,
+	type OptChatCacheRelease,
+	viewBlocks,
+	viewPartition,
+	type ViewPartition,
+} from "./cache.js";
+import { dialectKey, sharedToolsAllowed } from "./dialect.js";
 import { readConfig, registerFlags, type OptChatConfig } from "./config.js";
 import { exportHtml, importHistory } from "./history.js";
 import { Memory, type CompactionRequest, type Summarize } from "./memory.js";
-import { COMPACT, VIEW_DOC } from "./prompts.js";
+import { VIEW_DOC } from "./prompts.js";
 import { Store, type Kind } from "./store.js";
 
 type AgentMessage = ContextEvent["messages"][number];
@@ -113,7 +123,7 @@ function entriesOf(message: AgentMessage, toolCap: number): Array<{ kind: Kind; 
 			// A background job's report: work delivered to the chat, marked so it never reads as the user's words.
 			if (Object.hasOwn(BACKGROUND_RESULT_TYPES, message.customType)) {
 				const ids = jobIds(message.details);
-				// The gist logs a worker's report as "[id] report" under kind user.
+				// Preserve the host's existing report-row encoding; prompts label its provenance as work.
 				const label = ids.length > 0 ? `[${ids.join(", ")}]` : "[background]";
 				return [{ kind: "user", text: capText(`${label} ${text}`, toolCap) }];
 			}
@@ -205,6 +215,7 @@ function mark(message: AgentMessage): Mark {
 interface Turn {
 	/** Snapshot taken before the turn's first message was logged; sent unchanged on every request. */
 	blocks: TextContent[];
+	partition: ViewPartition;
 	timestamp: number;
 	/** First host message of the turn. */
 	first?: Mark;
@@ -226,6 +237,68 @@ type State =
 	| { kind: "failed"; reason: string }
 	| { kind: "closed" };
 
+type WireObject = Record<string, unknown>;
+
+function wireObject(value: unknown): value is WireObject {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Exact JSON-shaped wire equality except cache metadata; no serialization or temporary arrays. */
+function sameWireValue(left: unknown, right: unknown): boolean {
+	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return Object.is(left, right);
+	if (Array.isArray(left)) {
+		if (!Array.isArray(right) || left.length !== right.length) return false;
+		for (let index = 0; index < left.length; index++) {
+			if (!Object.hasOwn(left, index) || !Object.hasOwn(right, index) ||
+				!sameWireValue(left[index], right[index])) return false;
+		}
+		return true;
+	}
+	if (!wireObject(left) || !wireObject(right)) return false;
+	let leftCount = 0;
+	let rightCount = 0;
+	for (const key in left) {
+		// These two fields mark cache placement, not the encoded prompt or tool definition.
+		if (!Object.hasOwn(left, key) || key === "cache_control" || key === "prompt_cache_breakpoint") continue;
+		leftCount++;
+		if (!Object.hasOwn(right, key) || !Object.prototype.propertyIsEnumerable.call(right, key) ||
+			!sameWireValue(left[key], right[key])) return false;
+	}
+	for (const key in right) {
+		if (Object.hasOwn(right, key) && key !== "cache_control" && key !== "prompt_cache_breakpoint") rightCount++;
+	}
+	return leftCount === rightCount;
+}
+
+/** Only these stateless request dialects expose passive function definitions. */
+function functionDialect(model: Model): boolean {
+	return model.transport !== "pi-native" &&
+		["anthropic-messages", "openai-completions", "openai-responses", "openai-codex-responses"].includes(model.api);
+}
+
+/** These declarations ask the caller for execution; hosted/native tools are deliberately excluded. */
+function passiveTool(tool: unknown, api: Model["api"]): boolean {
+	if (!wireObject(tool)) return false;
+	if (api === "anthropic-messages") {
+		return (tool.type === undefined || tool.type === "custom") && typeof tool.name === "string" && wireObject(tool.input_schema);
+	}
+	if (api === "openai-completions") return tool.type === "function" && wireObject(tool.function);
+	if (tool.type === "namespace") return Array.isArray(tool.tools) && tool.tools.every((child) => passiveTool(child, api));
+	return (tool.type === "function" || tool.type === "custom") && typeof tool.name === "string";
+}
+
+interface SharedPrefix {
+	model: Model;
+	dialect: string;
+	systemPrompt: string[];
+	tools: Tool[];
+	wireTools: unknown;
+	/** Provider-added formatting stays in the same request dialect; never copied across providers. */
+	head: WireObject;
+	messageField?: "messages" | "input";
+	messages?: WireObject[];
+}
+
 class OptChat {
 	private state: State = { kind: "starting" };
 	private config: OptChatConfig | undefined;
@@ -241,6 +314,11 @@ class OptChat {
 	private cutoff = Date.now();
 	private readonly logged = new Set<string>();
 	private ctx: ExtensionContext | undefined;
+	private sharedPrefix: SharedPrefix | undefined;
+	private readonly cache = new OptChatCacheCoordinator();
+	private cacheFence = new AbortController();
+	/** Cancels main requests still waiting on compressor writers once their run moves on. */
+	private mainWaits = new AbortController();
 
 	constructor(
 		private readonly pi: ExtensionAPI,
@@ -262,6 +340,9 @@ class OptChat {
 		const model = ctx.models.resolve(config.model);
 		if (!model) {
 			throw new Error(`compressor model "${config.model}" is not available (configure it or pass --optchat-model provider/id)`);
+		}
+		if (requiresNativeTools(model)) {
+			throw new Error(`compressor model "${config.model}" requires native tools that cannot be disabled; choose a model with tool-free inference`);
 		}
 		this.compressor = model;
 		this.registerTools();
@@ -328,8 +409,9 @@ class OptChat {
 		return this.memory;
 	}
 
-	/** Compressor call: COMPACT system prompt, context then step, feedback turns in the same conversation. */
-	private readonly summarize: Summarize = (request, signal) => {
+	/** Compressor call: the host's shared system/tools, then its view, task and feedback. No tool executor is installed. */
+	private readonly summarize: Summarize = (request, parentSignal) => {
+		const signal = AbortSignal.any([parentSignal, this.cacheFence.signal]);
 		if (signal.aborted) return Promise.reject(new Error("Compressor call cancelled"));
 		const { promise, resolve: done, reject } = Promise.withResolvers<string>();
 		// Shutdown must not wait on a provider that ignores cancellation.
@@ -348,8 +430,8 @@ class OptChat {
 		const messages: LlmMessage[] = [
 			{
 				role: "user",
-				// Same bytes as one block; split only at the stable cache cuts.
-				content: [...viewBlocks(request.context), { type: "text", text: request.instruction }],
+				// Same bytes as one block; split only at stable whole-line boundaries.
+				content: [...viewBlocks(request.context, model), { type: "text", text: request.instruction }],
 				timestamp: Date.now(),
 			},
 		];
@@ -360,26 +442,144 @@ class OptChat {
 				timestamp: Date.now(),
 			});
 		}
+		let release: OptChatCacheRelease | undefined;
+		const finish = (started = false) => {
+			release?.(started);
+			release = undefined;
+		};
 		const reply = await completeSimple(
 			model,
-			{ systemPrompt: [COMPACT], messages },
+			{
+				systemPrompt: this.beforeAgentStart(ctx.getSystemPrompt()).systemPrompt,
+				messages,
+				// Bootstrap has no tools: public enabled names are not the final host-visible list.
+				// onPayload reuses only a compatible captured function-tool prefix.
+			},
 			{
 				apiKey: ctx.modelRegistry.resolver(model, ctx.sessionManager.getSessionId()),
 				signal,
+				// Full independent context, never the main session's response chain or mutable state.
+				statefulResponses: false,
 				// Medium effort, clamped to what the model offers; none for a model without reasoning.
 				// The output limit stays the host default (the model's own maximum).
 				reasoning: clampThinkingLevelForModel(model, Effort.Medium),
-				onPayload: (payload, payloadModel) => applyOptChatCache(payload, payloadModel ?? model, "compactor"),
+				onPayload: async (payload, payloadModel, attemptSignal) => {
+					// Auth/provider retries must release their own previous attempt before waiting.
+					finish();
+					const actualModel = payloadModel ?? model;
+					const encoded = applyOptChatCache(this.alignPrefix(payload, actualModel, ctx), actualModel);
+					// This request's own onResponse/finally release the lease: the only correlated writer.
+					release = await this.cache.acquire(encoded, actualModel, {
+						signal: attemptSignal ? AbortSignal.any([signal, attemptSignal]) : signal,
+					});
+					return encoded;
+				},
+				onResponse: (response) => finish(response.status >= 200 && response.status < 300),
 			},
-		);
+		).finally(() => finish());
 		if (reply.stopReason === "error" || reply.stopReason === "aborted") {
 			const status = reply.errorStatus === undefined ? "" : ` (HTTP ${reply.errorStatus})`;
 			throw new Error(`${model.provider}/${model.id} request ${reply.stopReason === "error" ? "failed" : "was aborted"}${status}`);
+		}
+		if (reply.stopReason === "toolUse" || reply.content.some((part) => part.type === "toolCall")) {
+			throw new Error("Compressor returned a tool call instead of a summary; no tool calls were dispatched");
 		}
 		return reply.content
 			.filter((part): part is TextContent => part.type === "text")
 			.map((part) => part.text)
 			.join("");
+	}
+
+	/** An invalidation fingerprint only; never used as compressor tool exposure. */
+	private activeToolSnapshot(model: Model): Tool[] | undefined {
+		// ToolInfo lacks visibility, examples and native/custom metadata. Compare
+		// its public subset, but send only the host's actually encoded tool list.
+		if (!functionDialect(model)) return undefined;
+		const tools = new Map(this.pi.getAllTools().map((tool) => [tool.name, tool]));
+		return this.pi.getActiveTools().flatMap((name) => {
+			const tool = tools.get(name);
+			return tool ? [{ name: tool.name, description: tool.description, parameters: tool.parameters }] : [];
+		});
+	}
+
+	/** Public ToolInfo omits custom formats/examples, so retain the host's encoded prefix when safe. */
+	private capturePrefix(payload: unknown, model: Model, ctx: ExtensionContext): void {
+		this.sharedPrefix = undefined;
+		if (!functionDialect(model) || !wireObject(payload) || payload.previous_response_id != null) return;
+		const tools = payload.tools;
+		if (tools !== undefined && (!Array.isArray(tools) || !tools.every((tool) => passiveTool(tool, model.api)))) return;
+		const head: WireObject = {};
+		if (Object.hasOwn(payload, "system")) head.system = payload.system;
+		if (Object.hasOwn(payload, "instructions")) head.instructions = payload.instructions;
+		let messages: WireObject[] | undefined;
+		let messageField: "messages" | "input" | undefined;
+		if (model.api !== "anthropic-messages") {
+			messageField = model.api === "openai-completions" ? "messages" : "input";
+			const items = payload[messageField];
+			if (!Array.isArray(items)) return;
+			messages = [];
+			for (const message of items) {
+				if (!wireObject(message) || (message.role !== "system" && message.role !== "developer")) break;
+				messages.push(message);
+			}
+		}
+		this.sharedPrefix = {
+			model,
+			dialect: dialectKey(model),
+			systemPrompt: ctx.getSystemPrompt().slice(),
+			tools: this.activeToolSnapshot(model) ?? [],
+			wireTools: structuredClone(tools),
+			head: structuredClone(head),
+			messageField,
+			messages: messages && structuredClone(messages),
+		};
+	}
+
+	private alignPrefix(payload: unknown, model: Model, ctx: ExtensionContext): unknown {
+		const prefix = this.sharedPrefix;
+		if (!prefix || !ctx.model || !functionDialect(model) || !wireObject(payload) || payload.previous_response_id != null ||
+			prefix.dialect !== dialectKey(model) || prefix.dialect !== dialectKey(ctx.model) || prefix.model.id !== ctx.model.id) return payload;
+		const prompt = this.beforeAgentStart(ctx.getSystemPrompt()).systemPrompt;
+		if (prompt.length !== prefix.systemPrompt.length || prompt.some((block, index) => block !== prefix.systemPrompt[index])) return payload;
+		const tools = this.activeToolSnapshot(model) ?? [];
+		if (tools.length !== prefix.tools.length || tools.some((tool, index) => {
+			const previous = prefix.tools[index]!;
+			return tool.name !== previous.name || tool.description !== previous.description || tool.parameters !== previous.parameters;
+		})) return payload;
+		// Require exact encoded prefix equality except cache metadata. Reasoning and
+		// compat.whenThinking can relocate the prompt between heads and messages;
+		// replay must reject that relocation rather than override the destination encoder.
+		const hasSystem = Object.hasOwn(prefix.head, "system");
+		const hasInstructions = Object.hasOwn(prefix.head, "instructions");
+		if (hasSystem !== Object.hasOwn(payload, "system") || hasInstructions !== Object.hasOwn(payload, "instructions")) return payload;
+		if (hasSystem && !sameWireValue(prefix.head.system, payload.system)) return payload;
+		if (hasInstructions && !sameWireValue(prefix.head.instructions, payload.instructions)) return payload;
+		let items: unknown[] | undefined;
+		let prefixEnd = 0;
+		if (prefix.messages && prefix.messageField) {
+			const destination = payload[prefix.messageField];
+			if (!Array.isArray(destination)) return payload;
+			while (prefixEnd < destination.length) {
+				const message: unknown = destination[prefixEnd];
+				if (!wireObject(message) || (message.role !== "system" && message.role !== "developer")) break;
+				if (!sameWireValue(prefix.messages[prefixEnd], message)) return payload;
+				prefixEnd++;
+			}
+			if (prefixEnd !== prefix.messages.length) return payload;
+			items = destination;
+		}
+		// All prefix validation precedes aligned copies and tool injection.
+		const aligned: WireObject = { ...payload, ...structuredClone(prefix.head) };
+		// Captured declarations go only to a destination whose own encoder would emit the
+		// same ones; otherwise the compressor keeps its tool-free bootstrap encoding.
+		if (sharedToolsAllowed(prefix.model, model)) {
+			if (prefix.wireTools === undefined) delete aligned.tools;
+			else aligned.tools = structuredClone(prefix.wireTools);
+		}
+		if (prefix.messages && prefix.messageField && items) {
+			aligned[prefix.messageField] = [...structuredClone(prefix.messages), ...items.slice(prefixEnd)];
+		}
+		return aligned;
 	}
 
 	private notify(message: string, type: "info" | "warning" | "error"): void {
@@ -404,6 +604,37 @@ class OptChat {
 	}
 
 	// --- host events -----------------------------------------------------------------
+
+	async beforeProviderRequest(payload: unknown, ctx: ExtensionContext): Promise<unknown> {
+		if (!ctx.model) return undefined;
+		this.capturePrefix(payload, ctx.model, ctx);
+		const encoded = applyOptChatCache(payload, ctx.model);
+		if (!this.turn || ctx.isIdle()) return encoded;
+		// Public host hooks carry no request identity: side requests share them, and
+		// retries or advisors report responses without a matching request event. A
+		// main request therefore never claims a writer lease; it only waits for the
+		// compressor writers already covering its prefix.
+		const signal = AbortSignal.any([this.mainWaits.signal, this.cacheFence.signal]);
+		try {
+			await this.cache.wait(encoded, ctx.model, { signal });
+		} catch (error) {
+			if (!signal.aborted) throw error;
+		}
+		return encoded;
+	}
+
+	private releaseMainWaits(): void {
+		this.mainWaits.abort();
+		this.mainWaits = new AbortController();
+	}
+
+	resetCacheFence(): void {
+		this.releaseMainWaits();
+		this.cacheFence.abort();
+		this.cache.clear();
+		this.cacheFence = new AbortController();
+		this.sharedPrefix = undefined;
+	}
 
 	beforeAgentStart(systemPrompt: string[]): { systemPrompt: string[] } {
 		return { systemPrompt: systemPrompt.includes(SYSTEM_BLOCK) ? systemPrompt : [...systemPrompt, SYSTEM_BLOCK] };
@@ -431,6 +662,12 @@ class OptChat {
 					return undefined;
 				}
 				throw new Refusal("OptChat refused the request: this turn's messages are missing from the host context.");
+			}
+			const partition = viewPartition(ctx.model);
+			if (turn.partition !== partition) {
+				// A model switch may change only block boundaries, never the frozen view bytes.
+				turn.blocks = viewBlocks(turn.blocks.map((block) => block.text).join(""), ctx.model);
+				turn.partition = partition;
 			}
 			// Agent-started runs (background reports in an idle session) skip before_agent_start, so the
 			// memory instructions may be absent from the system prompt: carry them in front of the view.
@@ -540,12 +777,13 @@ class OptChat {
 			);
 		}
 		const first = tail[0];
-		const blocks = viewBlocks(memory.render());
+		const blocks = viewBlocks(memory.render(), ctx.model);
 		const timestamp = first ? stamp(first) : Date.now();
 		this.logNew(tail);
+		const partition = viewPartition(ctx.model);
 		const turn: Turn = first
-			? { blocks, timestamp, first: mark(first) }
-			: { blocks, timestamp, after: start > 0 ? mark(messages[start - 1]!) : undefined };
+			? { blocks, partition, timestamp, first: mark(first) }
+			: { blocks, partition, timestamp, after: start > 0 ? mark(messages[start - 1]!) : undefined };
 		this.turn = turn;
 		return turn;
 	}
@@ -574,6 +812,7 @@ class OptChat {
 
 	/** A completed message is durable at once, unless a fresh turn still needs its snapshot first. */
 	messageEnd(message: AgentMessage): void {
+		if (message.role === "assistant") this.releaseMainWaits();
 		if (this.state.kind !== "ready" || stamp(message) < this.cutoff) return;
 		try {
 			if (this.turn) this.logMessage(message);
@@ -593,6 +832,7 @@ class OptChat {
 				if (start < 0) return;
 				for (let index = start; index < messages.length; index++) this.logMessage(messages[index]!);
 			}
+			this.releaseMainWaits();
 			// Retries and queued continuations stay in the turn.
 			if (willContinue) return;
 			this.turn = undefined;
@@ -620,11 +860,13 @@ class OptChat {
 		this.saveUnanswered();
 		this.turn = undefined;
 		this.cutoff = Date.now();
+		this.resetCacheFence();
 	}
 
 	async shutdown(): Promise<void> {
 		this.saveUnanswered();
 		this.state = { kind: "closed" };
+		this.resetCacheFence();
 		const memory = this.memory;
 		const store = this.store;
 		this.memory = undefined;
@@ -753,9 +995,8 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 			// Registered only for an activated session: these hooks change host behavior even as no-ops.
 			pi.on("before_agent_start", (event) => active.beforeAgentStart(event.systemPrompt));
 			pi.on("context", (event, handlerCtx) => active.context(event.messages, handlerCtx));
-			pi.on("before_provider_request", (event, handlerCtx) =>
-				handlerCtx.model ? applyOptChatCache(event.payload, handlerCtx.model) : undefined,
-			);
+			pi.on("before_provider_request", (event, handlerCtx) => active.beforeProviderRequest(event.payload, handlerCtx));
+			pi.on("credential_disabled", () => active.resetCacheFence());
 			pi.on("tool_result", (event) => active.toolResult(event));
 			pi.on("message_end", (event) => active.messageEnd(event.message));
 			pi.on("agent_end", (event) => active.agentEnd(event.messages, event.willContinue === true));

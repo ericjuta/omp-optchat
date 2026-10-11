@@ -3,7 +3,6 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Memory, utf8Bytes, utf8Prefix, type CompactionRequest, type MemoryOptions, type Summarize } from "../src/memory.ts";
-import { SCALE } from "../src/prompts.ts";
 import { Store, nodeKey } from "../src/store.ts";
 
 const PLACEHOLDER = "(not summarized yet: zoom it)";
@@ -41,6 +40,24 @@ async function reopen(store: Store): Promise<Store> {
 
 function saveText(store: Store, l: number, i: number, text: string): void {
   store.saveNode({ l, i, text, size: utf8Bytes(text) });
+}
+
+function seedTree(
+  store: Store,
+  length: number,
+  text: (l: number, i: number) => string | undefined = (l, i) => `[n${l}-${i}]`.padEnd(12, "."),
+): void {
+  for (let i = 0; i < length; i++) store.append("user", `[m${i}] seeded long message`);
+  for (let l = 0, width = 1; width <= length; l++, width *= 2) {
+    for (let i = 0; (i + 1) * width <= length; i++) {
+      const value = text(l, i);
+      if (value !== undefined) saveText(store, l, i, value);
+    }
+  }
+}
+
+function saveView(store: Store, parts: ReadonlyArray<readonly [number, number]>, compacting = false): void {
+  store.saveView({ version: 1, length: store.messages.length, parts, compacting });
 }
 
 interface Call {
@@ -191,6 +208,9 @@ const summary = (tag: string): string => `[${tag}]`.padEnd(12, ".");
 
 const coordinates = /\d+\+\d+\|/;
 
+const contextBytes = (context: string): number =>
+  chatLines(context).reduce((bytes, line) => bytes + utf8Bytes(line.slice(line.indexOf("|") + 1)), 0);
+
 test("UTF-8 helpers count bytes and never split a code point", () => {
   expect(utf8Bytes("aé🙂")).toBe(7);
   expect(utf8Prefix("abcde🙂fg", 7)).toBe("abcde");
@@ -261,7 +281,7 @@ test("merges run concurrently but never beyond the job cap", async () => {
   expect(store.nodes.has(nodeKey(3, 0))).toBe(true);
 });
 
-test("compactor sees only built summary lines without addresses, and its whole input", async () => {
+test("compactor sees only addressed built summary lines and its whole input", async () => {
   const store = await openStore();
   const model = new Model();
   const memory = memoryFor(store, model, { nodeBytes: 16, jobs: 1, viewBytes: 1_000_000 });
@@ -271,44 +291,47 @@ test("compactor sees only built summary lines without addresses, and its whole i
   memory.append("user", texts[0]!);
   memory.append("echo", texts[1]!);
   memory.append("talk", texts[2]!);
-  expect(utf8Bytes(SCALE)).toBe(512);
+  const ruler = "-".repeat(512);
 
   await until(() => model.calls.length === 1, "leaf 0");
   const leaf0 = model.calls[0]!;
   expect(chatLines(leaf0.request.context)).toEqual([]);
-  expect(leaf0.request.instruction).toContain(`\nuser: ${texts[0]}`);
-  expect(leaf0.request.instruction).toContain(SCALE);
+  expect(leaf0.request.instruction).toContain(`<input>\nuser: ${texts[0]}\n</input>`);
+  expect(leaf0.request.instruction.split("\n")).toContain(ruler);
   expect(leaf0.request.instruction).toContain("at most 16 bytes");
+  expect(leaf0.request.instruction).toContain("fixed 512-byte reference; the numeric limit above is authoritative");
   expect(leaf0.request.feedback).toEqual([]);
   leaf0.resolve("[s0] alpha\nbeta");
 
   await until(() => model.calls.length === 2, "leaf 1");
   const leaf1 = model.calls[1]!;
-  // Prior line flattened, no id+n| prefix, and no raw text of either message.
-  expect(chatLines(leaf1.request.context)).toEqual(["[s0] alpha beta"]);
+  // Prior line uses the main view's address format, flattened without raw text.
+  expect(chatLines(leaf1.request.context)).toEqual(["0+1|[s0] alpha beta"]);
   expect(leaf1.request.context).not.toContain("[m0]");
   expect(leaf1.request.context).not.toContain("línea");
   expect(leaf1.request.context).not.toContain(PLACEHOLDER);
   // The 40 KB message arrives whole, newlines kept, never cut.
-  expect(leaf1.request.instruction).toContain(`\necho: ${texts[1]}`);
+  expect(leaf1.request.instruction).toContain(`<input>\necho: ${texts[1]}\n</input>`);
   leaf1.resolve("[s1] gamma");
 
   await until(() => model.calls.length === 3, "leaf 2 before the merge");
   const leaf2 = model.calls[2]!;
   expect(label(leaf2)).toBe("[m2]");
-  expect(chatLines(leaf2.request.context)).toEqual(["[s0] alpha beta", "[s1] gamma"]);
+  expect(chatLines(leaf2.request.context)).toEqual(["0+1|[s0] alpha beta", "1+1|[s1] gamma"]);
   leaf2.resolve("[s2] delta");
 
   await until(() => model.calls.length === 4, "merge 0+2");
   const merge = model.calls[3]!;
   // Context ends at the merge's last message even though message 2 is already summarized.
-  expect(chatLines(merge.request.context)).toEqual(["[s0] alpha beta", "[s1] gamma"]);
-  expect(merge.request.instruction).toContain("\n[s0] alpha beta\n[s1] gamma");
+  expect(chatLines(merge.request.context)).toEqual(["0+1|[s0] alpha beta", "1+1|[s1] gamma"]);
+  expect(merge.request.instruction).toContain("<input>\n[s0] alpha beta\n[s1] gamma\n</input>");
+  expect(merge.request.instruction).toContain("merge lines 0+1 and 1+1, adjacent,");
+  expect(merge.request.instruction).toContain("take details\nof them from there too");
   expect(merge.request.instruction).not.toContain("[s2]");
-  expect(merge.request.instruction).toContain(SCALE);
+  expect(merge.request.instruction.split("\n")).toContain(ruler);
 
   for (const call of model.calls) {
-    expect(call.request.context).not.toMatch(coordinates);
+    for (const line of chatLines(call.request.context)) expect(line).toMatch(/^\d+\+\d+\|/);
     expect(call.request.instruction).not.toMatch(coordinates);
   }
   // Even a summarized message never enters the view whole.
@@ -343,7 +366,7 @@ test("short sources become nodes verbatim without a model call, measured in UTF-
   const merge = model.calls[1]!;
   // 40 + 1 + 31 bytes exceeds the target, so the top merge asks the model.
   expect(merge.request.instruction).toContain(`\n${leaf0} ${leaf1}\n[s2] short ${leaf3}`);
-  expect(chatLines(merge.request.context)).toEqual([leaf0, leaf1, "[s2] short", leaf3]);
+  expect(chatLines(merge.request.context)).toEqual([`0+1|${leaf0}`, `1+1|${leaf1}`, "2+1|[s2] short", `3+1|${leaf3}`]);
 });
 
 test("size enforcement trims only, cuts feedback at the limit, keeps the shortest try, and stops early", async () => {
@@ -364,7 +387,7 @@ test("size enforcement trims only, cuts feedback at the limit, keeps the shortes
   expect(second.request.feedback.map((turn) => turn.reply.trim())).toEqual(["x".repeat(30)]);
   const cut = second.request.feedback[0]!.instruction;
   expect(cut).toContain("30 bytes");
-  expect(cut).toMatch(/limit is 20\b/);
+  expect(cut).toContain("20-byte limit");
   expect(cut).toContain(`\n${"x".repeat(20)}| ← LIMIT`);
   expect(cut).not.toContain("x".repeat(21));
   second.resolve(`${"y".repeat(25)}  `);
@@ -673,163 +696,320 @@ test("close before the scheduled pump runs starts no compaction", async () => {
   expect(store.nodes.size).toBe(0);
 });
 
-test("live fit merges the most due built pair on append and on build, passes over unbuilt parents, and never splits", async () => {
+test("restart restores the persisted live tiling instead of replaying today's complete tree", async () => {
   const store = await openStore();
+  seedTree(store, 4);
   const model = new Model();
-  // Leaf replies are 10 bytes, merge replies 6, a placeholder 29; tries 1 keeps one call per node.
-  const memory = memoryFor(store, model, { nodeBytes: 8, viewBytes: 40, tries: 1 });
-  const expectView = async (view: string[], bytes: number) => {
-    await flush();
-    expect(addresses(memory)).toEqual(view);
-    expect(memory.status().viewBytes).toBe(bytes);
-  };
-  const append = async (i: number) => {
-    memory.append("user", `[m${i}] a long user message`);
-    await until(() => model.open().some((call) => label(call) === `[m${i}]`), `leaf ${i} call`);
-  };
-  const leaf = async (i: number) => {
-    model.take(`[m${i}]`).resolve(`[s${i}]`.padEnd(10, "."));
-    await until(() => store.nodes.has(nodeKey(0, i)), `leaf ${i}`);
-  };
-  const merge = async (l: number, i: number, markers: string[], reply: string) => {
-    model.take(...markers).resolve(reply);
-    await until(() => store.nodes.has(nodeKey(l, i)), `merge ${l}:${i}`);
-  };
+  const options = { nodeBytes: 16, viewBytes: 60 };
+  const memory = memoryFor(store, model, options);
+  expect(addresses(memory)).toEqual(["0+1", "1+1", "2+1", "3+1"]);
 
-  await append(0);
-  await expectView(["0+1"], 29);
-  await leaf(0);
-  await expectView(["0+1"], 10);
-  await append(1);
-  await leaf(1);
-  await expectView(["0+1", "1+1"], 20);
-  await append(2);
-  await expectView(["0+1", "1+1", "2+1"], 49); // over budget, but 0+2 is not built yet
-  await leaf(2);
-  await append(3);
-  await leaf(3);
-  await append(4);
-  await expectView(["0+1", "1+1", "2+1", "3+1", "4+1"], 69);
-  await leaf(4);
-  await expectView(["0+1", "1+1", "2+1", "3+1", "4+1"], 50);
+  memory.append("user", "[m4] next long message");
+  await until(() => model.open().length === 1, "leaf 4");
+  model.take("[m4]").resolve(summary("s4"));
+  await until(() => store.nodes.has(nodeKey(0, 4)), "leaf 4 saved");
+  expect(addresses(memory)).toEqual(["0+4", "4+1"]);
+  expect(memory.status().viewBytes).toBe(24);
+  const rendered = memory.render();
+  const parts = memory.viewParts();
+  await memory.close();
 
-  // Building 2+2 refits: the older 0|1 pair is passed over because its parent is unbuilt.
-  await merge(1, 1, ["[s2]", "[s3]"], "[p2-3]");
-  await expectView(["0+1", "1+1", "2+2", "4+1"], 36);
-  // Under budget, a newly built parent does not coarsen anything.
-  await merge(1, 0, ["[s0]", "[s1]"], "[p0-1]");
-  await expectView(["0+1", "1+1", "2+2", "4+1"], 36);
-
-  await append(5);
-  await expectView(["0+2", "2+2", "4+1", "5+1"], 51);
-  await leaf(5);
-  await expectView(["0+2", "2+2", "4+1", "5+1"], 32);
-  await append(6);
-  await expectView(["0+2", "2+2", "4+1", "5+1", "6+1"], 61);
-  await merge(2, 0, ["[p0-1]", "[p2-3]"], "[p0-3]");
-  await expectView(["0+4", "4+1", "5+1", "6+1"], 55);
-  await merge(1, 2, ["[s4]", "[s5]"], "[p4-5]");
-  await expectView(["0+4", "4+2", "6+1"], 41);
-  await leaf(6);
-  await expectView(["0+4", "4+2", "6+1"], 22);
+  const restoredStore = await reopen(store);
+  const restoredModel = new Model();
+  const restored = memoryFor(restoredStore, restoredModel, options);
+  expect(restored.render()).toBe(rendered);
+  expect(restored.viewParts()).toEqual(parts);
+  expect(restored.status().viewBytes).toBe(24);
+  expect(await restored.settle()).toBe(true);
+  await flush();
+  expect(restoredModel.calls).toHaveLength(0);
+  // All five leaves fit exactly in 60 bytes now; reconstructing from them
+  // would incorrectly split the persisted 0+4 line back into four leaves.
+  expect(restoredStore.viewSnapshot?.parts).toEqual([[2, 0], [0, 4]]);
 });
 
-test("live view stays an aligned tiling that never splits and fits whenever a built pair can merge", async () => {
+test("a stale snapshot preserves its coarse prefix and admits only the durable message suffix", async () => {
   const store = await openStore();
-  let replies = 0;
-  const model = new Model({ auto: () => "r".repeat(3 + ((replies++ * 7) % 10)) }); // 3..12 bytes
-  const viewBytes = 60;
-  const memory = memoryFor(store, model, { nodeBytes: 12, viewBytes });
-  const fullTree = (t: number) => {
+  seedTree(store, 4);
+  saveView(store, [[2, 0]]);
+  store.append("user", "[m4] logged after the snapshot");
+  store.append("talk", "[m5] still needs summarizing");
+  saveText(store, 0, 4, summary("s4"));
+
+  const restoredStore = await reopen(store);
+  const model = new Model();
+  const memory = memoryFor(restoredStore, model, { nodeBytes: 16, viewBytes: 100 });
+  expect(addresses(memory)).toEqual(["0+4", "4+1", "5+1"]);
+  expect(memory.render()).toContain(`5+1|${PLACEHOLDER}`);
+  expect(memory.status().viewBytes).toBe(24 + utf8Bytes(PLACEHOLDER));
+  expect(restoredStore.viewSnapshot?.length).toBe(6);
+  await until(() => model.open().length === 1, "unbuilt suffix leaf");
+  const leaf = model.take("[m5]");
+  expect(chatLines(leaf.request.context)).toEqual([`0+4|${summary("n2-0")}`, `4+1|${summary("s4")}`]);
+  expect(leaf.request.context).not.toContain(PLACEHOLDER);
+  leaf.resolve(summary("s5"));
+  await until(() => restoredStore.nodes.has(nodeKey(0, 5)), "suffix summarized");
+  expect(addresses(memory)).toEqual(["0+4", "4+1", "5+1"]);
+  expect(memory.status().viewBytes).toBe(36);
+  expect(await memory.settle()).toBe(true);
+});
+
+test("a node durable before its snapshot is used on restart without rebuilding or splitting the prefix", async () => {
+  const store = await openStore();
+  seedTree(store, 4, (l, i) => l === 0 ? summary(`s${i}`).padEnd(20, ".") : undefined);
+  saveView(store, [[0, 0], [0, 1], [0, 2], [0, 3]], true);
+  // Model the crash window with public persistence operations: the tree log
+  // commit succeeded, but the corresponding view snapshot was never written.
+  saveText(store, 1, 0, "[p0-1]....");
+
+  const restoredStore = await reopen(store);
+  const model = new Model();
+  const memory = memoryFor(restoredStore, model, { nodeBytes: 16, viewBytes: 60 });
+  expect(addresses(memory)).toEqual(["0+2", "2+1", "3+1"]);
+  expect(memory.status().viewBytes).toBe(50);
+  expect(restoredStore.viewSnapshot?.compacting).toBe(true);
+  expect(restoredStore.viewSnapshot?.parts).toEqual([[1, 0], [0, 2], [0, 3]]);
+  await until(() => model.open().length === 1, "remaining pair");
+  expect(model.labels()).toEqual(["[s2]+[s3]"]);
+  model.take("[s2]", "[s3]").resolve("[p2-3]....");
+  await until(() => restoredStore.nodes.has(nodeKey(1, 1)), "remaining pair saved");
+  expect(addresses(memory)).toEqual(["0+2", "2+2"]);
+  expect(memory.status().viewBytes).toBe(20);
+  expect(restoredStore.viewSnapshot?.compacting).toBe(false);
+});
+
+test("a partial batch resumes after restart even below upper, then stops at half without splitting", async () => {
+  const store = await openStore();
+  seedTree(store, 4, (l, i) => l === 0 ? summary(`s${i}`).padEnd(20, ".") : undefined);
+  saveText(store, 1, 0, "[p0-1]....");
+  const model = new Model();
+  const options = { nodeBytes: 16, viewBytes: 60 };
+  const memory = memoryFor(store, model, options);
+  expect(addresses(memory)).toEqual(["0+2", "2+1", "3+1"]);
+  expect(memory.status().viewBytes).toBe(50); // below 60, still above the batch's 30-byte target
+  expect(store.viewSnapshot?.compacting).toBe(true);
+  await until(() => model.open().length === 1, "unfinished pair before shutdown");
+  await memory.close();
+  expect(store.nodes.has(nodeKey(1, 1))).toBe(false);
+
+  const restoredStore = await reopen(store);
+  const restoredModel = new Model();
+  const restored = memoryFor(restoredStore, restoredModel, options);
+  expect(addresses(restored)).toEqual(["0+2", "2+1", "3+1"]);
+  expect(restored.status().viewBytes).toBe(50);
+  await until(() => restoredModel.open().length === 1, "resumed pair");
+  restoredModel.take("[s2]", "[s3]").resolve("[p2-3]....");
+  await until(() => restoredStore.nodes.has(nodeKey(1, 1)), "resumed pair saved");
+  expect(addresses(restored)).toEqual(["0+2", "2+2"]);
+  expect(restored.status().viewBytes).toBe(20);
+  expect(restoredStore.viewSnapshot?.compacting).toBe(false);
+  await until(() => restoredModel.open().length === 1, "top parent after both children");
+  restoredModel.take("[p0-1]", "[p2-3]").resolve("top");
+  await until(() => restoredStore.nodes.has(nodeKey(2, 0)), "top parent saved");
+  // This parent is now available, but neither a new batch nor a split is due.
+  expect(addresses(restored)).toEqual(["0+2", "2+2"]);
+  expect(restored.status().viewBytes).toBe(20);
+});
+
+test("a store without a snapshot migrates once from the complete tree and persists that tiling", async () => {
+  const seeded = await openStore();
+  seedTree(seeded, 10);
+  expect(seeded.viewSnapshot).toBeUndefined();
+  const store = await reopen(seeded);
+  const model = new Model();
+  const memory = memoryFor(store, model, { viewBytes: 50 });
+  expect(addresses(memory)).toEqual(["0+8", "8+2"]);
+  expect(memory.status().viewBytes).toBe(24);
+  expect(store.viewSnapshot).toEqual({ version: 1, length: 10, parts: [[3, 0], [1, 4]], compacting: false });
+  await flush();
+  expect(model.calls).toHaveLength(0);
+  await memory.close();
+
+  const restoredStore = await reopen(store);
+  const restored = memoryFor(restoredStore, new Model(), { viewBytes: 1_000 });
+  expect(addresses(restored)).toEqual(["0+8", "8+2"]);
+  expect(restored.status().viewBytes).toBe(24);
+});
+
+test("last-message age at T10 prefers 8+1|9+1 over 0+4|4+4", async () => {
+  const store = await openStore();
+  seedTree(store, 10, (l, i) => {
+    if (l === 2) return i === 0 ? "AA" : "BB";
+    if (l === 0 && i >= 8) return i === 8 ? "eeee" : "ffff";
+    if (l === 1 && i === 4) return "N";
+    if (l === 3) return "O";
+    return "x";
+  });
+  saveView(store, [[2, 0], [2, 1], [0, 8], [0, 9]]);
+  const model = new Model();
+  const memory = memoryFor(store, model, { viewBytes: 10 });
+  // 12 > upper 10. Last-message ages: (10-9)/1 = 1 beats (10-7)/4 = .75.
+  // The newer pair reaches target 5 exactly; choosing the old pair first
+  // would need both merges and produce 0+8,8+2 instead.
+  expect(addresses(memory)).toEqual(["0+4", "4+4", "8+2"]);
+  expect(memory.render()).toBe("<chat>\n0+4|AA\n4+4|BB\n8+2|N\n</chat>");
+  expect(memory.status().viewBytes).toBe(5);
+  await flush();
+  expect(model.calls).toHaveLength(0);
+});
+
+test("main bytes sawtooth from upper to half and available parents do not retile between batches", async () => {
+  const store = await openStore();
+  seedTree(store, 8, (l) => (l === 0 ? "l".repeat(10) : "p".repeat(6)));
+  const model = new Model({ auto: (request) => request.instruction.includes("<input>\nuser:") ? "l".repeat(10) : "p".repeat(6) });
+  const memory = memoryFor(store, model, { nodeBytes: 8, tries: 1, viewBytes: 80 });
+  expect(memory.status().viewBytes).toBe(80);
+  expect(addresses(memory)).toEqual(Array.from({ length: 8 }, (_, i) => `${i}+1`));
+  const built = (length: number) => {
     let count = 0;
-    for (let width = 1; width <= t; width *= 2) count += Math.floor(t / width);
+    for (let width = 1; width <= length; width *= 2) count += Math.floor(length / width);
     return count;
   };
+  const appendAndFinish = async (i: number) => {
+    memory.append("user", `[m${i}] next long message`);
+    await until(() => store.nodes.size === built(i + 1) && memory.status().pending === 0, `complete tree through ${i}`);
+  };
 
-  let previous: Array<[number, number]> = [];
-  for (let t = 1; t <= 40; t++) {
-    memory.append(t % 3 === 0 ? "talk" : "user", `message ${t} ${"x".repeat(t)}`);
-    await until(() => store.nodes.size === fullTree(t) && memory.status().pending === 0, `tree for ${t} messages`);
-    await flush();
-    const lines = chatLines(memory.render());
-    const parts = lines.map((line): [number, number] => {
-      const [id, n] = line.slice(0, line.indexOf("|")).split("+").map(Number);
-      return [id!, n!];
-    });
-
-    let next = 0;
-    for (const [id, n] of parts) {
-      expect(id).toBe(next);
-      expect(n & (n - 1)).toBe(0);
-      expect(id % n).toBe(0);
-      next = id + n;
-    }
-    expect(next).toBe(t);
-    for (const [id, n] of previous) {
-      expect(parts.some(([start, width]) => start <= id && id + n <= start + width)).toBe(true);
-    }
-    const bytes = lines.reduce((sum, line) => sum + utf8Bytes(line.slice(line.indexOf("|") + 1)), 0);
-    expect(memory.status().viewBytes).toBe(bytes);
-    expect(memory.render()).not.toContain(PLACEHOLDER);
-    // With every parent built, an over-budget view must have no mergeable pair left.
-    const mergeable = parts.some(([id, n], k) => parts[k + 1]?.[1] === n && id % (2 * n) === 0);
-    if (bytes > viewBytes) expect(mergeable).toBe(false);
-    previous = parts;
+  await appendAndFinish(8);
+  expect(addresses(memory)).toEqual(["0+8", "8+1"]);
+  expect(memory.status().viewBytes).toBe(16);
+  const growth: number[] = [];
+  for (let i = 9; i <= 12; i++) {
+    await appendAndFinish(i);
+    expect(addresses(memory)).toEqual(["0+8", ...Array.from({ length: i - 7 }, (_, k) => `${k + 8}+1`)]);
+    growth.push(memory.status().viewBytes);
   }
+  expect(growth).toEqual([26, 36, 46, 56]);
+  expect(store.nodes.has(nodeKey(2, 2))).toBe(true); // 8+4 is built but not yet selected
+  await appendAndFinish(13); // 56 + a 29-byte placeholder crosses upper 80
+  expect(addresses(memory)).toEqual(["0+8", "8+4", "12+1", "13+1"]);
+  expect(memory.status().viewBytes).toBe(32);
+  expect(memory.status().viewBytes).toBeLessThanOrEqual(40);
 });
 
-// Each stored message folds with the history length it had when appended, not today's length.
-const replays = [
-  {
-    // At T=6 the view [0+2, 2+2, 4, 5] is over budget. Historical due: level-1 pair 6/8
-    // beats leaves 4|5 at 2/4. Replaying with T=10 (or fitting once at the end) would
-    // instead pick 4|5 (6/4 > 10/8) and keep 0+2, 2+2, 4+2.
-    name: "historical age",
-    leaves: [12, 12, 12, 12, 12, 12, 1, 1, 1, 1],
-    levels: [0, 3, 4, 5],
-    viewBytes: 18,
-    view: ["0+4", "4+2", "6+1", "7+1", "8+1", "9+1"],
-    bytes: 11,
-  },
-  {
-    // At T=10 the view is 21 bytes; dues: 0+2|2+2 10/8, 4|5 6/4, 6|7 4/4, 8|9 2/4.
-    // The most due pair is neither the first nor the newest candidate.
-    name: "most due pair",
-    leaves: [6, 6, 6, 6, 8, 1, 1, 1, 1, 7],
-    levels: [0, 1, 1, 1],
-    viewBytes: 20,
-    view: ["0+2", "2+2", "4+2", "6+1", "7+1", "8+1", "9+1"],
-    bytes: 13,
-  },
-];
+test("compactor context has its own half-target batch and grows independently of the main tiling", async () => {
+  const store = await openStore();
+  seedTree(store, 8);
+  const model = new Model();
+  const memory = memoryFor(store, model, { nodeBytes: 16, viewBytes: 1_000, compactionViewBytes: 60 });
+  const original = addresses(memory);
+  expect(original).toEqual(Array.from({ length: 8 }, (_, i) => `${i}+1`));
+  expect(memory.status().viewBytes).toBe(96);
+  memory.append("user", "[m8] next long message");
+  await until(() => model.open().length === 1, "leaf 8");
+  const first = model.take("[m8]");
+  expect(chatLines(first.request.context)).toEqual([`0+4|${summary("n2-0")}`, `4+4|${summary("n2-1")}`]);
+  expect(contextBytes(first.request.context)).toBe(24);
+  first.resolve(summary("s8"));
+  await until(() => store.nodes.has(nodeKey(0, 8)), "leaf 8 saved");
+  memory.append("talk", "[m9] another long message");
+  await until(() => model.open().length === 1, "leaf 9");
+  const second = model.take("[m9]");
+  expect(chatLines(second.request.context)).toEqual([`0+4|${summary("n2-0")}`, `4+4|${summary("n2-1")}`, `8+1|${summary("s8")}`]);
+  expect(contextBytes(second.request.context)).toBe(36);
+  expect(second.request.context).not.toContain(PLACEHOLDER);
+  expect(addresses(memory)).toEqual([...original, "8+1", "9+1"]);
+});
 
-for (const replay of replays) {
-  test(`load replays append and fit per message: ${replay.name}`, async () => {
-    const seeded = await openStore();
-    const t = replay.leaves.length;
-    for (let i = 0; i < t; i++) seeded.append("user", `[m${i}] seeded message`);
-    for (let l = 0, width = 1; width <= t; l++, width *= 2) {
-      for (let i = 0; (i + 1) * width <= t; i++) {
-        const bytes = l === 0 ? replay.leaves[i]! : replay.levels[l]!;
-        saveText(seeded, l, i, String.fromCharCode(l === 0 ? 97 + i : 64 + l).repeat(bytes));
-      }
-    }
-    const store = await reopen(seeded);
-    const model = new Model();
-    const memory = memoryFor(store, model, { viewBytes: replay.viewBytes });
+test("a main-view batch refreshes compactor context even when its independent budget has room", async () => {
+  const store = await openStore();
+  seedTree(store, 4);
+  const model = new Model();
+  const memory = memoryFor(store, model, { nodeBytes: 16, viewBytes: 64, compactionViewBytes: 1_000 });
+  expect(addresses(memory)).toEqual(["0+1", "1+1", "2+1", "3+1"]);
+  memory.append("user", "[m4] full next message");
+  await until(() => model.open().length === 1, "leaf after main batch");
+  const leaf = model.take("[m4]");
+  expect(addresses(memory)).toEqual(["0+4", "4+1"]);
+  expect(chatLines(leaf.request.context)).toEqual([`0+4|${summary("n2-0")}`]);
+  expect(leaf.request.context).not.toContain("[n0-");
+  expect(leaf.request.context).not.toContain(PLACEHOLDER);
+  expect(leaf.request.instruction).toContain("<input>\nuser: [m4] full next message\n</input>");
+});
 
-    expect(addresses(memory)).toEqual(replay.view);
-    await flush();
-    expect(model.calls).toHaveLength(0);
-    expect(memory.status()).toEqual({
-      messages: t,
-      nodes: store.nodes.size,
-      pending: 0,
-      viewBytes: replay.bytes,
-      parts: replay.view.length,
-    });
-  });
-}
+test("out-of-order concurrent merges use only the eligible built prefix and both complete children", async () => {
+  const store = await openStore();
+  seedTree(store, 8, (l, i) => l === 0 ? summary(`s${i}`) : undefined);
+  const model = new Model();
+  memoryFor(store, model, { nodeBytes: 16, jobs: 4, viewBytes: 1_000, compactionViewBytes: 1_000 });
+  await until(() => model.open().length === 4, "four sibling-pair jobs");
+  expect(chatLines(model.take("[s0]", "[s1]").request.context)).toEqual([`0+1|${summary("s0")}`, `1+1|${summary("s1")}`]);
+  expect(chatLines(model.take("[s2]", "[s3]").request.context)).toEqual(Array.from({ length: 4 }, (_, i) => `${i}+1|${summary(`s${i}`)}`));
+  model.take("[s2]", "[s3]").resolve(summary("p2-3"));
+  await until(() => store.nodes.has(nodeKey(1, 1)), "later pair saved first");
+  await flush();
+  expect(model.calls).toHaveLength(4); // 0+4 still lacks its left child
+  model.take("[s0]", "[s1]").resolve(summary("p0-1"));
+  await until(() => model.open().some((call) => label(call) === "[p0-1]+[p2-3]"), "ready 0+4 parent");
+  const parent = model.take("[p0-1]", "[p2-3]");
+  expect(chatLines(parent.request.context)).toEqual(Array.from({ length: 4 }, (_, i) => `${i}+1|${summary(`s${i}`)}`));
+  expect(parent.request.context).not.toContain("[s4]");
+  expect(parent.request.context).not.toContain(PLACEHOLDER);
+  expect(parent.request.instruction).toContain(`<input>\n${summary("p0-1")}\n${summary("p2-3")}\n</input>`);
+  expect(model.open().map(label).sort()).toEqual(["[p0-1]+[p2-3]", "[s4]+[s5]", "[s6]+[s7]"]);
+  expect(model.peak).toBe(4);
+});
+
+test("default main upper is 128000 bytes and an overflow batch reaches 64000 with a 16000-byte context", async () => {
+  const store = await openStore();
+  seedTree(store, 8, (l, i) => `[n${l}-${i}]`.padEnd(l === 0 ? 16_000 : 8_000, "."));
+  const model = new Model();
+  const memory = memoryFor(store, model);
+  expect(memory.status().viewBytes).toBe(128_000);
+  expect(addresses(memory)).toEqual(Array.from({ length: 8 }, (_, i) => `${i}+1`));
+  memory.append("user", `[m8] ${"x".repeat(600)}`);
+  expect(addresses(memory)).toEqual(["0+2", "2+2", "4+2", "6+1", "7+1", "8+1"]);
+  expect(memory.status().viewBytes).toBe(56_000 + utf8Bytes(PLACEHOLDER));
+  expect(memory.status().viewBytes).toBeLessThanOrEqual(64_000);
+  await until(() => model.open().length === 1, "default-budget leaf");
+  const leaf = model.take("[m8]");
+  expect(leaf.request.instruction).toContain("at most 512 bytes");
+  expect(leaf.request.instruction).toContain("(about 70 words), the length of this ruler:");
+  expect(leaf.request.instruction.split("\n")).toContain("-".repeat(512));
+  expect(chatLines(leaf.request.context)).toEqual([
+    `0+4|${"[n2-0]".padEnd(8_000, ".")}`,
+    `4+4|${"[n2-1]".padEnd(8_000, ".")}`,
+  ]);
+  expect(contextBytes(leaf.request.context)).toBe(16_000);
+});
+
+test("default compactor context grows through 32000 bytes before a batch returns it to 16000", async () => {
+  const store = await openStore();
+  seedTree(store, 2, (l, i) => `[n${l}-${i}]`.padEnd(l === 0 ? 16_000 : 8_000, "."));
+  const model = new Model();
+  const memory = memoryFor(store, model, { nodeBytes: 16_000 });
+  const append = (i: number) => memory.append("user", `[m${i}] ${"x".repeat(16_001)}`);
+  append(2);
+  await until(() => model.open().length === 1, "leaf 2");
+  expect(chatLines(model.take("[m2]").request.context)).toEqual([`0+2|${"[n1-0]".padEnd(8_000, ".")}`]);
+  model.take("[m2]").resolve("[s2]".padEnd(16_000, "."));
+  await until(() => store.nodes.has(nodeKey(0, 2)), "leaf 2 saved");
+  append(3);
+  await until(() => model.open().length === 1, "leaf 3");
+  const third = model.take("[m3]");
+  expect(contextBytes(third.request.context)).toBe(24_000);
+  third.resolve("[s3]".padEnd(8_000, "."));
+  await until(() => model.open().some((call) => label(call) === "[s2]+[s3]"), "pair 2+2");
+  const pair = model.take("[s2]", "[s3]");
+  expect(contextBytes(pair.request.context)).toBe(32_000);
+  pair.resolve("[p2-3]".padEnd(8_000, "."));
+  await until(() => store.nodes.has(nodeKey(1, 1)), "pair 2+2 saved");
+  await until(() => model.open().some((call) => label(call) === "[n1-0]+[p2-3]"), "top pair");
+  model.take("[n1-0]", "[p2-3]").resolve("[p0-3]".padEnd(8_000, "."));
+  await until(() => store.nodes.has(nodeKey(2, 0)), "top pair saved");
+  // Available parents alone do not compact a context exactly at upper.
+  append(4);
+  await until(() => model.open().length === 1, "leaf 4");
+  expect(contextBytes(model.take("[m4]").request.context)).toBe(32_000);
+  model.take("[m4]").resolve(summary("s4"));
+  await until(() => store.nodes.has(nodeKey(0, 4)), "leaf 4 saved");
+  append(5);
+  await until(() => model.open().length === 1, "leaf 5");
+  const after = model.take("[m5]");
+  expect(chatLines(after.request.context)).toEqual([`0+4|${"[p0-3]".padEnd(8_000, ".")}`, `4+1|${summary("s4")}`]);
+  expect(contextBytes(after.request.context)).toBe(8_012);
+  expect(memory.status().viewBytes).toBeGreaterThan(32_000);
+});
 
 test("view budget counts UTF-8 bytes of summaries, not UTF-16 units", async () => {
   const store = await openStore();
@@ -846,7 +1026,13 @@ test("view budget counts UTF-8 bytes of summaries, not UTF-16 units", async () =
   expect(tight.status().viewBytes).toBe(1);
   await tight.close();
 
-  const roomy = memoryFor(store, model, { viewBytes: 40 });
+  const restored = memoryFor(store, model, { viewBytes: 40 });
+  expect(addresses(restored)).toEqual(["0+2"]); // a larger budget never splits a saved tiling
+  expect(restored.status().viewBytes).toBe(1);
+
+  const separate = await openStore();
+  seedTree(separate, 2, (l) => l === 0 ? "é".repeat(10) : "p");
+  const roomy = memoryFor(separate, new Model(), { viewBytes: 40 });
   expect(addresses(roomy)).toEqual(["0+1", "1+1"]);
   expect(roomy.status().viewBytes).toBe(40);
 });

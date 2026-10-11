@@ -10,7 +10,7 @@ An OMP extension implementing [Victor Taelin's OptChat specification](https://gi
 Install the tagged release:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.1.0'
+omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.2.0'
 PI_OPENAI_STATEFUL=0 omp --optchat
 ```
 
@@ -55,11 +55,18 @@ The model receives the settled historical summary view before your new message, 
 chat/
   main/YYYY-MM-DD.jsonl   # {i,kind,text,size,date}
   tree/YYYY-MM-DD.jsonl   # {l,i,text,size}
+  view.json               # {version,length,parts:[[l,i],...],compacting}
 ```
 
 Records are appended and fsynced before publication; replay also fsyncs recovered files before admitting them. Daily filenames use the local day of writing, while each record retains its original timestamp, including imported historical dates. IDs are permanent. Malformed/torn lines are reported; missing IDs or conflicting records are not silently renumbered. The tree can be rebuilt conceptually, but existing summaries are retained to avoid paying twice.
 
-Defaults follow the specification: 512-byte summary target, 128,000-byte view budget, eight compaction jobs, five shortening attempts, and fixed ten-second retries. Short records and child pairs that already fit are free nodes. Longer records are summarized whole, with the preceding summarized context. Leaf summaries are built in order; ready merges run alongside. The incremental view only appends and merges the most-due available sibling pair, never splits. UTF-8 sizes—not token estimates—govern compression.
+The main view is atomically replaced and fsynced before a new tiling is published. Its versioned envelope preserves an unfinished compaction batch as well as the ordered node coordinates. Restarts load that exact tiling instead of reconstructing it. After a crash, durable messages beyond the saved view are appended to its existing prefix. A pre-0.2.0 chat without `view.json` is migrated once; malformed or inconsistent snapshots fail closed rather than silently rebuilding a different view.
+
+The summary target is 512 UTF-8 bytes. The main view grows by appending leaves until its summary text exceeds 128,000 bytes, then merges a batch down to 64,000 bytes. Merge priority measures age from the sibling pair's **last** message, with oldest-first ties. Only built parents can be used; an unfinished batch remains active across subsequent node completions, messages, and restarts. The view never splits.
+
+The compressor has its own 16,000–32,000-byte sawtooth view, coarsened from the main view and refreshed when the main view merges. It contains only built, addressed summary lines before the target message, or through the end of a target merge—never later messages. Compression instructions use a 512-dash ruler rather than example content. Sizes govern summary text, not token estimates or provider-envelope overhead.
+
+Short records and child pairs that already fit are free nodes. Longer records are summarized whole. OMP retains eight concurrent compaction jobs, five shortening attempts, fixed ten-second retries, and serial leaf construction with concurrent ready merges; this release does not replace that scheduler with upstream's newer ready queues.
 
 A model turn waits for summaries rather than seeing partial source text. Compression failures are reported and retried. Cancel a wait if the provider is unavailable; history already accepted by the plugin is retained. Reasoning/thinking is not written to the OptChat log. Ordinary tool-result text is head-and-tail capped at 30,000 characters; full `zoom` retrieval is exempt so original messages remain accessible.
 
@@ -72,9 +79,15 @@ A model turn waits for summaries rather than seeing partial source text. Compres
 
 ### Provider caching
 
-For native official Anthropic requests, the plugin places up to three stable view breakpoints at line ends before 50k/80k/100k characters and retains a request-end marker, with at most four five-minute cache markers total. Official OpenAI Responses models with the host's explicit-breakpoint capability receive their native view markers. Supported official Codex requests retain reasoning across turns of an active tool loop using `all_turns`.
+For native official Anthropic requests to image-capable models, the view is split into blocks of **four summary lines**, with a cache mark on the last whole block and another at the request end. Other routes, including text-only Anthropic-compatible models whose encoder joins text blocks with newlines, keep the original fixed-offset blocks, so the view's wire bytes never change. Existing markers are bounded to four total, using five-minute entries. Concurrent compressor requests sharing a marked prefix wait for its writer's response to start; failed or canceled writers release their waiters. Coordination follows Anthropic's 20-block prefix lookup window and is limited to this enabled session. It does not send renewal requests.
 
-Gateways and unsupported transports (including OpenRouter, Azure, Bedrock, Vertex, Foundry, custom endpoints, and pi-native) keep the host's existing cache behavior. No renewal requests are sent. Wire-level marker tests are not proof of cache hits or savings on a real provider.
+Official OpenAI Responses models with the host's explicit-breakpoint capability retain their supported view markers; supported official Codex requests retain reasoning across turns of an active tool loop using `all_turns`. The new writer coordination is Anthropic-only.
+
+Gateways and unsupported transports (including OpenRouter, Azure, Bedrock, Vertex, Foundry, custom endpoints, and pi-native) keep the host's existing cache behavior. Wire-level marker and coordination checks are not proof of real-provider cache hits, account sharing, or savings.
+
+Turns and compactions share the effective host system prompt plus one stable OptChat guide. After a compatible host request exposes an encoded prefix, compactions can reuse its system prefix and passive callable-tool schemas; they never execute tools and reject tool-call responses. Reuse requires the encoded system content to match the compressor's own effective prompt, so side requests cannot replace its guide. Tool schemas also require matching request dialect, tool support, freeform `apply_patch` grammar, and computer-use capability; models that disable reasoning when tools are present stay tool-free. Before the first compatible request, compression is tool-free. This avoids exposing tools hidden by the host: OMP's public tool inventory is not the final model-visible catalog. Hosted-native tool schemas are not replayed, and a model requiring native tool execution cannot be selected as the compressor.
+
+OMP's public provider hooks carry no request identity: side requests share them, and provider retries or advisors can report a response without a matching request event. The plugin therefore tracks only compressor requests as in-flight cache writers; main requests can wait for those writers, but are not tracked themselves. Main requests still use the provider's normal cache. Compressor callbacks are directly correlated, and an abandoned tracked writer has a 20-second fail-open bound. Other extensions that change payloads after this plugin's hook are outside its prefix-sharing guarantee.
 
 **Use `PI_OPENAI_STATEFUL=0` as shown above for the specification's stateless `store:false` OpenAI requests.** OMP otherwise defaults to stateful official OpenAI Responses. A plugin cannot change the host's main-request options; deleting a response ID or changing retention mid-chain would lose context. With stateful mode left enabled, fresh turns still replace the prefix, but in-turn continuation requests keep the host's chain and receive no extra view markers. The compressor is already stateless. An explicit host caching-off setting is respected where exposed (`PI_CACHE_RETENTION=none` for OpenAI).
 
@@ -82,7 +95,7 @@ Gateways and unsupported transports (including OpenRouter, Azure, Bedrock, Verte
 
 **This is permanent local history, not a secret scrubber.** User text, public assistant replies, tool arguments, and tool-result text may contain secrets. The compressor receives historical content through your configured provider. Do not use it for material you cannot retain or send there. OMP may independently persist its own sessions and diagnostics; `--no-session` controls OMP session files, not the OptChat log.
 
-Keep the memory directory private and back it up. The extension never commits or publishes it. HTML exports contain the original log. No telemetry or external storage service is added. Stop the enabled session before restoring backups or copying a consistent pair of log/tree streams.
+Keep the memory directory private and back it up. The extension never commits or publishes it. HTML exports contain the original log. No telemetry or external storage service is added. Stop the enabled session before restoring backups or copying a consistent set of log, tree, and view files.
 
 The Linux lock uses an OS-owned abstract Unix socket keyed by the directory's filesystem identity, avoiding PID-age guesses and stale-file unlink races. A second writer in the same network namespace fails; process death releases the lock. Filesystem operations stay anchored to held directory descriptors through `/proc/self/fd`, even if a path is renamed. Linux procfs and a local fsync-capable filesystem are required; containers in different network namespaces must not share a writable chat. Other operating systems are not supported by this release.
 
@@ -95,10 +108,12 @@ bun test
 bun run smoke
 ```
 
-The smoke harness exercises the actual OMP host with a local deterministic model endpoint, captures inference requests, and checks fresh turns, tool retrieval, compression, and restart persistence. It is not a measurement of summary quality or real-provider cache hit rates.
+The smoke harness exercises the actual OMP host with a local deterministic model endpoint, captures inference requests, and checks fresh turns, shared main/compactor prompt and tools, the dash ruler, lossless retrieval, saved-view stability, and restart persistence. Set `OPTCHAT_SMOKE_OMP` to a compiled OMP executable and `OPTCHAT_SMOKE_PLUGIN` to an installed plugin directory to verify that artifact rather than the checkout. It is not a measurement of summary quality or real-provider cache hit rates.
+
+The 0.2.0 release was exercised with compiled OMP 18.8.9 against the synthetic provider. A separate real-filesystem run ingested 300 synthetic messages, observed the 128,000-to-64,000-byte main batch and 32,000-to-16,000-byte compactor cycle, and checked byte-identical saved views on restart plus migration from a log without a snapshot.
 
 The initial release was also exercised with the compiled OMP 18.6.1 binary and an authenticated `@smol` model: a long synthetic note was compressed to 185 bytes and its canary name/color were recalled correctly in a new process. Fresh-process discovery after `omp plugin link .` was verified without an explicit extension path. The HTML export was checked in Chromium at desktop and 375-pixel mobile widths, including navigation and escaped script text. These checks do not establish real-provider cache hit rates.
 
 ## Attribution
 
-Design and compression prompt: Victor Taelin, [OptChat — how to replicate my setup](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449), retrieved October 5, 2026. This project is an independent OMP adaptation, not an official OptChat release.
+Design and compression prompt: Victor Taelin, [UniiChat / OptChat — how to replicate my setup](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449), revised October 8 and retrieved October 11, 2026. This project is an independent OMP adaptation, not an official upstream release.
