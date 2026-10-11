@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { UsageRecord } from "./artifact.ts";
 import { initialAdmission } from "./admission.ts";
 import type { Corpus, Question } from "./corpus.ts";
-import { hostStopReason, initMetricsFile, observeTurn, RpcHost, type Frame, type HostLaunch } from "./host.ts";
+import { compressorFailures, hostStopReason, initMetricsFile, observeTurn, readAdmissionCounts, readMetricLines, RpcHost, type Frame, type HostLaunch } from "./host.ts";
 import { answerInstruction, scoreAnswers, type Failure, type Outcome, type RetrievedPage } from "./scoring.ts";
 
 /**
@@ -119,6 +119,14 @@ export interface ChildTaskOutcome {
 	readonly spend: ChildSpend;
 	/** Main-model usage of the parent's own turns for this task (nested child messages excluded). */
 	readonly parentUsage: UsageRecord[];
+	/** The parent turn's host stop reason (with bounded error text) when it did not complete; null when it completed. */
+	readonly parentStopReason: string | null;
+	/** Last observed memory state when the copied store did not settle, so no prompt was sent; null otherwise. */
+	readonly setupDiagnostic: string | null;
+	/** Compressor admissions refused by the host's counter, read before the host stopped; null when not read. */
+	readonly admissionsRefused: number | null;
+	/** Failed compressor calls grouped by provider error, read before the host stopped; empty when none. */
+	readonly compressorFailures: string;
 }
 
 export interface ChildArmResult {
@@ -145,11 +153,13 @@ function asFrame(value: unknown): Frame | null {
 }
 
 /**
- * The child's final text. A schemaless `yield` reaches the parent JSON-encoded (a string literal, with escaped newlines and
- * quotes), so a whole-string JSON literal is decoded to its value. Any other output is returned unchanged.
+ * The child's final text. A schema-typed `yield` reaches the parent as its bare JSON object, which is the answer block
+ * unfenced, so it is fenced for the parser. A schemaless `yield` reaches the parent JSON-encoded (a string literal, with
+ * escaped newlines and quotes), so a whole-string JSON literal is decoded to its value. Any other output is returned unchanged.
  */
 function childText(output: string): string {
 	const trimmed = output.trim();
+	if (trimmed.startsWith("{") && trimmed.endsWith("}")) return ["```json", trimmed, "```"].join("\n");
 	if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) return output;
 	try {
 		const decoded: unknown = JSON.parse(trimmed);
@@ -367,6 +377,10 @@ function outcomeFor(task: ChildTask, fields: Partial<ChildTaskOutcome> & { statu
 		childTaskIssued: false,
 		spend: "none",
 		parentUsage: [],
+		parentStopReason: null,
+		setupDiagnostic: null,
+		admissionsRefused: null,
+		compressorFailures: "",
 		...fields,
 	};
 }
@@ -385,12 +399,14 @@ export function analyzeTaskTurn(input: {
 	const calls = taskCalls(events);
 
 	if (calls.length === 0) {
+		const parent = observeTurn(events, price);
+		const stop = hostStopReason(parent);
+		// A parent turn that never completed (aborted, errored, or with no assistant message) is a host failure, not a choice not to delegate.
+		if (stop !== null) {
+			return outcomeFor(task, { status: "incomplete", reason: `parent turn did not complete: ${stop}`, parentStopReason: stop, parentUsage: parent.usage });
+		}
 		// The parent answered on its own: never a child success, and no child ran.
-		return outcomeFor(task, {
-			status: "not-delegated",
-			reason: "parent did not call the task tool",
-			parentUsage: observeTurn(events, price).usage,
-		});
+		return outcomeFor(task, { status: "not-delegated", reason: "parent did not call the task tool", parentUsage: parent.usage });
 	}
 	if (calls.length > 1) {
 		// Several children ran; one result cannot account for all of their cost.
@@ -434,6 +450,7 @@ export function analyzeTaskTurn(input: {
 	};
 	const childUsage = childUsageOf(call.result);
 	const common = {
+		parentStopReason: hostStopReason(parent),
 		parentUsage: parent.usage,
 		childZoomCalls: observed ? countCalls(span, "zoom") : progressCount("zoom"),
 		childWorkCalls: observed ? countCalls(span, "work") : progressCount("work"),
@@ -513,6 +530,13 @@ export interface ChildArmInput {
 	readonly admit: (reserveUsd: number) => string | null;
 	readonly promptTimeoutMs: number;
 	readonly price: Price | null;
+	/**
+	 * Settles one task's copied memory on its ready host, before the task prompt. Null once settled; a string is the last
+	 * observed state. Deadline errors propagate.
+	 */
+	readonly settle: (files: TaskFiles) => Promise<string | null>;
+	/** Called once per admitted task, after it ends, so its reserve can be replaced by observed spend before the next task. */
+	readonly taskDone: (outcome: ChildTaskOutcome) => void;
 }
 
 /**
@@ -535,6 +559,24 @@ async function runTask(input: ChildArmInput, task: ChildTask, overlayFile: strin
 		await writeFile(files.admissionFile, JSON.stringify(initialAdmission()), { flag: "wx", mode: 0o600 });
 		const host = new RpcHost(childLaunch(input.launch, input.arm, files), input.extension);
 		try {
+			// Ready barrier: the host has opened its session, so OptChat has the copied store before memory is judged.
+			let ready = true;
+			try {
+				await host.effectiveSystemPrompt(input.promptTimeoutMs);
+			} catch {
+				// Startup detail may carry provider or path text, so only the fact of failure is recorded.
+				ready = false;
+			}
+			const setup = ready ? await input.settle(files) : "host did not become ready";
+			if (setup !== null) {
+				// OptChat refuses a prompt sent before its summaries settle, so no prompt is sent and the task has no parent turn.
+				return outcomeFor(task, {
+					status: "incomplete",
+					reason: "memory did not settle before the prompt; no prompt was sent",
+					setupDiagnostic: setup,
+					...(await taskDiagnostics(files)),
+				});
+			}
 			let promptFailed = false;
 			try {
 				await host.prompt(parentPrompt(task), input.promptTimeoutMs);
@@ -542,8 +584,10 @@ async function runTask(input: ChildArmInput, task: ChildTask, overlayFile: strin
 				// The error text may carry provider detail, so only the fact of failure is recorded. A child may have run.
 				promptFailed = true;
 			}
+			// Read at failure time, before the host stops: shutdown work must not be blamed on this task's turn.
+			const diagnostics = await taskDiagnostics(files);
 			const analyzed = analyzeTaskTurn({ task, events: host.events, knownIds: input.knownIds, price: input.price });
-			if (!promptFailed) return analyzed;
+			if (!promptFailed) return { ...analyzed, ...diagnostics };
 			return outcomeFor(task, {
 				status: "incomplete",
 				reason: "host error during the prompt",
@@ -551,6 +595,8 @@ async function runTask(input: ChildArmInput, task: ChildTask, overlayFile: strin
 				spend: "unobserved",
 				parentUsage: analyzed.parentUsage,
 				childUsage: analyzed.childUsage,
+				parentStopReason: analyzed.parentStopReason,
+				...diagnostics,
 			});
 		} finally {
 			await host.stop();
@@ -560,9 +606,15 @@ async function runTask(input: ChildArmInput, task: ChildTask, overlayFile: strin
 	}
 }
 
+/** Admission refusals and compressor failures for one task's host. Read before the host stops, so shutdown work is excluded. */
+async function taskDiagnostics(files: TaskFiles): Promise<Pick<ChildTaskOutcome, "admissionsRefused" | "compressorFailures">> {
+	const { refused } = await readAdmissionCounts(files.admissionFile);
+	return { admissionsRefused: refused, compressorFailures: compressorFailures(await readMetricLines(files.metricsFile)) };
+}
+
 /**
  * Runs one arm: each task on its own host, in sequence. Each task is admitted with its worst-case
- * reserve before it starts; a non-null admit result refuses it.
+ * reserve before it starts; a non-null admit result refuses it. Each admitted task reports to `taskDone` when it ends.
  */
 export async function runChildArm(input: ChildArmInput): Promise<ChildArmResult> {
 	const { arm, tasks } = input;
@@ -579,7 +631,9 @@ export async function runChildArm(input: ChildArmInput): Promise<ChildArmResult>
 			outcomes.push(outcomeFor(task, { status: "refused", reason: refusal }));
 			continue;
 		}
-		outcomes.push(await runTask(input, task, overlayFile));
+		const outcome = await runTask(input, task, overlayFile);
+		outcomes.push(outcome);
+		input.taskDone(outcome);
 	}
 	return {
 		arm,

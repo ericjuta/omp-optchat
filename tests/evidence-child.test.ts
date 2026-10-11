@@ -196,6 +196,24 @@ describe("analyzeTaskTurn", () => {
 		expect(outcome.outcome).toBe("hallucinated");
 	});
 
+	test("a parent turn that never completed is incomplete with its stop reason, not a not-delegated model choice", () => {
+		const question = questionOf("minor-fact");
+		const task = taskFor(question);
+		const aborted: Frame = {
+			type: "message_end",
+			message: { role: "assistant", stopReason: "aborted", errorMessage: "request aborted by host", content: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } },
+		};
+		const outcome = analyzeTaskTurn({ task, events: [aborted], knownIds, price: null });
+		expect(outcome.status).toBe("incomplete");
+		expect(outcome.parentStopReason).toContain("aborted");
+		expect(outcome.reason).toContain("aborted");
+		expect(outcome.childTaskIssued).toBe(false);
+		expect(outcome.spend).toBe("none");
+		const empty = analyzeTaskTurn({ task, events: [], knownIds, price: null });
+		expect(empty.status).toBe("incomplete");
+		expect(empty.parentStopReason).toBe("host produced no assistant message");
+	});
+
 	test("a parent that answers without calling task is not-delegated, never a success, and no child ran", () => {
 		const question = questionOf("minor-fact");
 		const task = taskFor(question);
@@ -206,6 +224,7 @@ describe("analyzeTaskTurn", () => {
 			price: null,
 		});
 		expect(outcome.status).toBe("not-delegated");
+		expect(outcome.parentStopReason).toBeNull();
 		expect(outcome.success).toBe(false);
 		expect(outcome.valueCorrect).toBeNull();
 		expect(outcome.childTaskIssued).toBe(false);
@@ -450,6 +469,25 @@ describe("child cost is counted once", () => {
 		const outcome = analyzeTaskTurn({ task, events: delegatedTurn(task, correct, [], false, { usage: { input: 20, output: 8, cacheRead: 0, cacheWrite: 0, totalTokens: 28, cost: { total: 0.004 } } }), knownIds, price: null });
 		expect(outcome.spend).toBe("observed");
 		expect(childSpendUsd(outcome)).toBe(0.004);
+	});
+});
+
+describe("schema-typed child yields", () => {
+	const question = questionOf("minor-fact");
+	const task = taskFor(question);
+
+	test("a bare JSON answer object, as a schema-typed yield delivers it, is graded as the fenced answer it is", () => {
+		const bare = JSON.stringify({ answers: [{ id: question.id, value: question.expect.join(" "), uncertain: false, citations: [] }] }, null, 2);
+		const outcome = analyzeTaskTurn({ task, events: delegatedTurn(task, bare), knownIds, price: null });
+		expect(outcome.status).toBe("completed");
+		expect(outcome.failure).not.toBe("schema");
+		expect(outcome.valueCorrect).toBe(true);
+	});
+
+	test("a bare object that is not an answer set remains a schema failure", () => {
+		const outcome = analyzeTaskTurn({ task, events: delegatedTurn(task, JSON.stringify({ result: 1 }, null, 2)), knownIds, price: null });
+		expect(outcome.failure).toBe("schema");
+		expect(outcome.success).toBe(false);
 	});
 });
 

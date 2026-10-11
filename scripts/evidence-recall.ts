@@ -53,8 +53,10 @@ import {
 	childSpendUsd,
 	type ChildTaskOutcome,
 	type ChildUsage,
+	type ChildTask,
 	DEFAULT_CHILD_TASKS,
 	deriveChildTasks,
+	parentPrompt,
 	runChildArm,
 } from "./evidence/child.ts";
 import { hostVersion, isAvailable, pluginRevision, providerOf, readCatalogEntry, type CatalogEntry } from "./evidence/discovery.ts";
@@ -121,12 +123,10 @@ const COMPACTOR_LAYOUT: CompactorLayout = { nodeBytes: 512, pageBytes: 16_384, c
 
 /** UTF-8 bytes of one retrieved zoom page, matching src/archive.ts DEFAULT_PAGE_BYTES. */
 const PAGE_BYTES = 16_384;
-/**
- * A child task reserves this multiple of one main prompt's worst case: the parent turn plus the child
- * run, with the child's own calls not separately bounded. The factor is generous on purpose; the
- * reserve is released only by observed spend at the end of the arm.
- */
-const CHILD_RESERVE_FACTOR = 2;
+/** Requests one child task admits: its parent's delegating prompt, then the child run's prompts. */
+const CHILD_TASK_CALLS = 1 + DEFAULT_PROMPT_CALLS;
+/** The files a settle check reads for one host: its copied store, compressor metric sink, and admission counter. */
+type SettleFiles = Pick<HostSlot, "memory" | "metrics" | "admission">;
 /** Scenarios the off arm can run: it has no memory state to restart, expire, share, or swap. */
 const OFF_SCENARIOS: readonly ScenarioName[] = ["cold", "warm"];
 /** Maintenance with no compaction: zero tokens and zero cost. Any compaction replaces this with a captured estimate. */
@@ -968,7 +968,8 @@ function judge(
  * lines) and the saved tree covers every durable record. OptChat refuses a prompt sent before its summaries settle,
  * so a prompt is only sent after this. Returns null once settled; on the bounded wait, returns the last observed state.
  */
-async function awaitSettled(context: Context, slot: HostSlot, memory: string): Promise<string | null> {
+async function awaitSettled(context: Context, slot: SettleFiles): Promise<string | null> {
+	const { memory } = slot;
 	const deadline = Date.now() + SETTLE_WAIT_MS;
 	for (;;) {
 		assertLive(context);
@@ -1027,7 +1028,7 @@ function recordPrompt(context: Context, draft: PhaseDraft, arm: Arm, group: read
 async function answerGroup(context: Context, slot: HostSlot, name: string, questions: readonly Question[]): Promise<PhaseDraft> {
 	const draft = newPhase(name, slot);
 	if (slot.arm === "on") {
-		const unsettled = await awaitSettled(context, slot, slot.memory);
+		const unsettled = await awaitSettled(context, slot);
 		if (unsettled !== null) {
 			const message = `memory did not settle within ${SETTLE_WAIT_MS} ms (${unsettled}); no prompt was sent`;
 			draft.error = message;
@@ -1118,7 +1119,7 @@ async function seed(context: Context, unit: Unit): Promise<void> {
 		const durable = await readDurableRecords(unit.memory);
 		if (durable.length !== count) throw new Error(`seeding stored ${durable.length} of ${count} records; /optchat import over RPC is unverified`);
 		draft.timestamps = { records: durable.length, matched: durable.filter((record) => context.dates.get(record.i) === record.date).length };
-		const unsettled = await awaitSettled(context, slot, unit.memory);
+		const unsettled = await awaitSettled(context, { memory: unit.memory, metrics: slot.metrics, admission: slot.admission });
 		if (unsettled !== null) throw new Error(`seeding did not settle within ${SETTLE_WAIT_MS} ms (${unsettled})`);
 		await collectCompressor(context, slot);
 		draft.segmentEnd = slot.segments.length;
@@ -1234,6 +1235,10 @@ async function runUnit(context: Context, unit: Unit): Promise<void> {
 			return;
 		}
 	}
+	// The child experiment's input: a copy of the memory the seed settled, taken before any scenario writes to it.
+	if (unit.arm === "on" && context.options.experiments.includes("child") && unit.compressor === context.options.compressors[0]) {
+		await cp(unit.memory, join(context.root, `child-snapshot-${basename(unit.memory)}`), { recursive: true });
+	}
 	for (const draft of unit.scenarios) {
 		if (draft.status === "not-run") continue;
 		try {
@@ -1258,10 +1263,24 @@ function scenarioDrafts(arm: Arm, compressor: string | null, requested: Readonly
 }
 
 /**
- * Child experiment: each arm runs the derived tasks on one parent host over a fresh copy of the settled default-compressor
- * memory. Each task reserves `CHILD_RESERVE_FACTOR` times one main prompt's worst case before it starts; the reserve is
- * replaced by observed spend when the arm ends, and the arm's pending reserves are counted against the cap meanwhile.
- * The child hosts' compressor allowance is zero: their memory is already settled.
+ * Worst case for one child task, reserved before it starts: the parent's delegating prompt (one request, carrying the on
+ * arm's view and the task text) plus the child run, priced as DEFAULT_PROMPT_CALLS requests that each carry the system,
+ * the tool schemas, the task text, and the retrieval pages. Both are priced at the pinned output cap. The child run's
+ * requests are not separately admitted, so this is the same call-count assumption the main prompts rely on. Null when unknown.
+ */
+function childTaskReserveUsd(rates: ModelRates | null, measuredSystemBytes: number | null, options: Options, tasks: readonly ChildTask[]): number | null {
+	const system = effectiveSystemBytes(measuredSystemBytes);
+	if (system === null) return null;
+	const taskBytes = Math.max(0, ...tasks.map((task) => Buffer.byteLength(parentPrompt(task), "utf8")));
+	const parent = mainPromptBoundUsd(rates, { system, tools: TOOL_SCHEMA_BYTES, history: options.viewBytes, question: taskBytes, retrieval: 0 }, options.maxMainOutputTokens, 1);
+	const child = mainPromptBoundUsd(rates, { system, tools: TOOL_SCHEMA_BYTES, history: 0, question: taskBytes, retrieval: DEFAULT_PROMPT_CALLS * PAGE_BYTES }, options.maxMainOutputTokens, DEFAULT_PROMPT_CALLS);
+	return parent === null || child === null ? null : parent + child;
+}
+
+/**
+ * Child experiment: each arm runs the derived tasks on one parent host over a fresh copy of the settled snapshot. Each task
+ * reserves `childTaskReserveUsd` before it starts, and its reserve is replaced by its observed spend as soon as it ends, so
+ * only the running task's reserve is held against the cap. Each task's host settles its copy before the task prompt is sent.
  */
 async function runChildExperiment(context: Context): Promise<ChildExperiment | null> {
 	if (!context.options.experiments.includes("child")) return null;
@@ -1271,13 +1290,12 @@ async function runChildExperiment(context: Context): Promise<ChildExperiment | n
 		return { status: "unavailable", reason: "no completed on-arm build for the default compressor", arms: { view: null, blind: null } };
 	}
 	const main = context.options.main;
-	const questionBytes = Math.max(0, ...context.questions.map((question) => Buffer.byteLength(question.prompt, "utf8")));
-	const bound = mainBoundUsd(context.rates.get(main) ?? null, context.systemBytes, context.options, "on", 0, 0, questionBytes);
+	const tasks = deriveChildTasks(context.corpus, DEFAULT_CHILD_TASKS);
+	const bound = childTaskReserveUsd(context.rates.get(main) ?? null, context.systemBytes, context.options, tasks);
 	if (bound === null && context.capUsd !== null) {
 		return { status: "unavailable", reason: "main model rate or context window is unknown; the child experiment cannot be admitted", arms: { view: null, blind: null } };
 	}
-	const reserve = bound === null ? 0 : CHILD_RESERVE_FACTOR * bound;
-	const tasks = deriveChildTasks(context.corpus, DEFAULT_CHILD_TASKS);
+	const reserve = bound ?? 0;
 	const arms: Record<"view" | "blind", ChildArmResult | null> = { view: null, blind: null };
 	for (const arm of ["view", "blind"] as const) {
 		context.fixture.childArm = arm;
@@ -1299,7 +1317,7 @@ async function runChildExperiment(context: Context): Promise<ChildExperiment | n
 		const pending = { calls: 0 };
 		const reservations: { readonly id: string; readonly bound: number }[] = [];
 		const admit = (reserveUsd: number): string | null => {
-			const admission = admitPrompt(recordCalls(context.state, "main", pending.calls), context.limits, Date.now(), DEFAULT_PROMPT_CALLS);
+			const admission = admitPrompt(recordCalls(context.state, "main", pending.calls), context.limits, Date.now(), CHILD_TASK_CALLS);
 			if (!admission.admitted) return admission.reason;
 			if (context.capUsd !== null) {
 				const id = `child-${arm}-${++context.reservationSeq}`;
@@ -1307,7 +1325,7 @@ async function runChildExperiment(context: Context): Promise<ChildExperiment | n
 				if (!reserved.admitted) return reserved.reason;
 				reservations.push({ id, bound: reserveUsd });
 			}
-			pending.calls += DEFAULT_PROMPT_CALLS;
+			pending.calls += CHILD_TASK_CALLS;
 			return null;
 		};
 		const result = await runChildArm({
@@ -1316,16 +1334,20 @@ async function runChildExperiment(context: Context): Promise<ChildExperiment | n
 			extension: context.hostExtension,
 			tasks,
 			knownIds: context.knownIds,
-			snapshot: base.memory,
+			snapshot: join(context.root, `child-snapshot-${basename(base.memory)}`),
 			workRoot: join(context.root, `child-${arm}`),
 			taskReserveUsd: reserve,
 			admit,
+			settle: (files) => awaitSettled(context, { memory: files.memory, metrics: files.metricsFile, admission: files.admissionFile }),
+			taskDone: (outcome) => {
+				// Admission is sequential, so the oldest pending reservation is this task's.
+				releaseChildReservations(context, reservations.splice(0, 1), childArmSpendUsd([outcome]));
+				settleChildOutcome(context, outcome);
+			},
 			promptTimeoutMs: PROMPT_TIMEOUT_MS,
 			price: context.prices.get(main) ?? null,
 		});
 		arms[arm] = result;
-		releaseChildReservations(context, reservations, childArmSpendUsd(result.outcomes));
-		for (const outcome of result.outcomes) settleChildOutcome(context, outcome);
 	}
 	return { status: "completed", reason: null, arms };
 }
@@ -1586,10 +1608,12 @@ function childReport(experiment: ChildExperiment | null): ChildReport | null {
  * whole cap. The off arm's compaction bound needs the seeded history's size, known only when a host opens, so it is added
  * at admission rather than printed.
  */
-function budgetPlan(options: Options, questions: readonly Question[], rates: ReadonlyMap<string, ModelRates | null>, measuredSystemBytes: number | null) {
+function budgetPlan(options: Options, questions: readonly Question[], rates: ReadonlyMap<string, ModelRates | null>, measuredSystemBytes: number | null, childTasks: readonly ChildTask[]) {
 	const questionBytes = Math.max(0, ...questions.map((question) => Buffer.byteLength(question.prompt, "utf8")));
 	const mains = [options.main, ...(options.modelChange === null ? [] : [options.modelChange])];
 	const system = effectiveSystemBytes(measuredSystemBytes);
+	// Child reserves are printed only for the child experiment. An arm holds one reserve per task until the arm ends.
+	const childTaskUsd = options.experiments.includes("child") ? childTaskReserveUsd(rates.get(options.main) ?? null, measuredSystemBytes, options, childTasks) : null;
 	return {
 		capUsd: options.maxCostUsd,
 		compressorShare: options.compressorShare,
@@ -1600,10 +1624,13 @@ function budgetPlan(options: Options, questions: readonly Question[], rates: Rea
 		// A refused compaction is retried once on the main model; that attempt is charged at this bound.
 		fallbackCallUsd: system === null ? null : compressorCallBoundUsd(rates.get(options.main) ?? null, system, COMPACTOR_LAYOUT, options.limits.maxCompressorOutputTokens),
 		hostAllowanceUsd: options.maxCostUsd === null ? null : options.maxCostUsd * options.compressorShare,
+		childTaskReserveUsd: childTaskUsd,
+		childArmReserveUsd: childTaskUsd === null ? null : childTaskUsd * childTasks.length,
 		basis: [
 			"main prompt: tokens bounded by UTF-8 bytes (system, tools, view, prior turns, four zoom pages, question), clamped to the context window; output at the pinned cap; times the prompt's call bound",
 			"off arm adds the native compaction bound over the seeded history, prior turns, and the question, at the pinned cap",
 			"compressor call: system plus compactor view, batch input, and shorten step bytes; output at the compressor cap",
+			"child task: parent delegating prompt (on-arm view, one request) plus child run (four retrieval-page requests), each at the pinned output cap; an arm holds one reserve per task until it ends",
 		],
 	};
 }
@@ -1669,7 +1696,7 @@ async function run(options: Options, corpus: Corpus, questions: readonly Questio
 			prices.set(selector, preflight.catalog[selector]?.price ?? null);
 			rates.set(selector, ratesOf(preflight.catalog[selector]));
 		}
-		const budget = budgetPlan(options, questions, rates, preflight.prompt?.bytes ?? null);
+		const budget = budgetPlan(options, questions, rates, preflight.prompt?.bytes ?? null, deriveChildTasks(corpus, DEFAULT_CHILD_TASKS));
 		const plan = {
 			schema: ARTIFACT_SCHEMA,
 			providerMode: fixture ? "fixture" : "live",
