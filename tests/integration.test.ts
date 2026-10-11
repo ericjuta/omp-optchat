@@ -51,6 +51,7 @@ import type {
   ExtensionAPI,
   ExtensionUIContext,
 } from "@oh-my-pi/pi-coding-agent";
+import type { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import type { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import type { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type * as Zod from "zod";
@@ -86,7 +87,7 @@ const POSITIVE_SETTLE_MS = 20_000;
 const SSE_HEADERS = { "content-type": "text/event-stream", "cache-control": "no-cache" };
 
 const CASE_TITLES = {
-  "fresh-turn-steering": "a fresh turn sends settled summaries; its tool loop and steering stay raw under one view",
+  "fresh-turn-steering": "the installed default sends settled summaries; its tool loop and steering stay raw under one view",
   "thinking-exclusion": "provider thinking never reaches fresh turns, the compressor or the durable store",
   "compressor-tool-refusal": "compressor tool calls are neither executed nor accepted as summaries",
   "compressor-without-tools": "a compressor without tool support never receives captured main tools",
@@ -98,7 +99,17 @@ const CASE_TITLES = {
   "missing-compressor": "an unresolvable compressor selector refuses prompts with zero chat requests",
   "settle-timeout": "the settle deadline refuses the request and keeps the prompt durable and unanswered",
   "abort-while-settling": "aborting during the settle wait sends nothing and keeps the prompt durable and unanswered",
-  "disabled-flag": "--optchat false exposes no zoom/date tools and installs no hooks",
+  "legacy-flag": "the legacy positive CLI flag activates OptChat and boolean equals values are not false syntax",
+  "disabled-flag": "SDK optchat false leaves no OptChat side effects",
+  "cli-optout": "CLI optout leaves no OptChat side effects or model resolution",
+  "cli-optout-first": "CLI optout wins before the positive flag without OptChat side effects",
+  "cli-optout-last": "CLI optout wins after the positive flag without OptChat side effects",
+  "optout-invalid-config": "optout skips invalid nonactivation configuration without installing behavioral hooks",
+  "subagent-default": "a real subagent stays inactive under the installed default",
+  "subagent-shared-store": "a real subagent never owns or mutates the main agent's shared store",
+  "malformed-positive": "malformed positive activation fails closed within startup",
+  "malformed-optout": "malformed optout activation fails closed within startup",
+  "malformed-config": "nonactivation validation fails closed within startup",
   "background-report": "an idle background report starts a raw turn and enters the next turn's view",
   "background-report-cold": "a cold idle background report gets OptChat instructions before its view and runs",
   "aside": "an unflagged mid-run aside stays raw under the same view without new compression",
@@ -199,6 +210,7 @@ interface Libraries {
   zod: typeof Zod;
   EventBus: typeof EventBus;
   initializeExtensions: typeof initializeExtensions;
+  parseArgs: typeof parseArgs;
   optchat: typeof OptChatModule;
   viewBlocks: typeof viewBlocks;
   getBundledModels: typeof getBundledModels;
@@ -218,6 +230,7 @@ async function loadLibraries(): Promise<Libraries> {
   const { ThinkingLevel } = await import("@oh-my-pi/pi-agent-core");
   const { EventBus } = await import("@oh-my-pi/pi-coding-agent/utils/event-bus");
   const { initializeExtensions } = await import("@oh-my-pi/pi-coding-agent/modes/runtime-init");
+  const { parseArgs } = await import("@oh-my-pi/pi-coding-agent/cli/args");
   const optchat = await import("../src/index.ts");
   const { viewBlocks } = await import("../src/cache.ts");
   const { getBundledModels } = await import("@oh-my-pi/pi-catalog/models");
@@ -227,7 +240,7 @@ async function loadLibraries(): Promise<Libraries> {
   // Keep the fake-host schema dependency behind the same child-only loading boundary.
   const zod = await import("zod");
   return {
-    sdk, ThinkingLevel, zod, EventBus, initializeExtensions, optchat, viewBlocks, getBundledModels, Store,
+    sdk, ThinkingLevel, zod, EventBus, initializeExtensions, parseArgs, optchat, viewBlocks, getBundledModels, Store,
     completeSimple, clampThinkingLevelForModel,
   };
 }
@@ -768,6 +781,10 @@ interface HostOptions {
   settleTimeoutMs?: number;
   /** Merged over the defaults; numeric flags stay decimal strings. */
   flags?: Record<string, string | boolean>;
+  /** Parsed after factory registration, using the actual registered extension flag definitions. */
+  argv?: string[];
+  /** The SDK derives ctx.agent.kind from its actual task nesting depth. */
+  taskDepth?: number;
   /**
    * Capture ctx.ui.notify through a UI context built on the runner's own no-op
    * one. This makes hasUI true, so it is used only in cases where no tool runs.
@@ -787,7 +804,6 @@ interface HostOptions {
 
 function defaultFlags(memory: string): Record<string, string | boolean> {
   return {
-    optchat: true,
     "optchat-dir": memory,
     "optchat-model": `${PROVIDER}/${COMPACT_MODEL}`,
     "optchat-node-bytes": "64",
@@ -862,6 +878,7 @@ class Host {
     private readonly fixture: Fixture,
     readonly notices: Notice[],
     readonly runtimeErrors: string[],
+    readonly optchatExtension: OmpSdk.Extension,
   ) {}
 
   static async start(ctx: CaseContext, options: HostOptions): Promise<Host> {
@@ -896,9 +913,18 @@ class Host {
         loaded.extensions.push(await sdk.loadExtensionFromFactory(factory, ctx.cwd, eventBus, loaded.runtime, `<inline-${index}>`));
       }
       assert.deepEqual(loaded.errors, [], "inline extensions must bind");
+      const optchatExtension = loaded.extensions[2];
+      assert(optchatExtension, "the actual OptChat factory must be loaded");
       // Flag defaults are written while factories run; real values go in afterwards, before session_start.
       for (const [name, value] of Object.entries({ ...defaultFlags(ctx.memory), ...options.flags })) {
         loaded.runtime.flagValues.set(name, value);
+      }
+      if (options.argv) {
+        const parsed = ctx.lib.parseArgs(options.argv, optchatExtension.flags);
+        assert.deepEqual(parsed.unrecognizedFlags, [], "the actual extension registrations recognize every CLI flag");
+        assert.deepEqual(parsed.invalidFlagValues, [], "CLI flags have valid host syntax");
+        assert.deepEqual(parsed.messages, [], "activation flags do not become positional messages");
+        for (const [name, value] of parsed.unknownFlags) loaded.runtime.flagValues.set(name, value);
       }
       // Build the explicit chat model now. The queue stays intact: the SDK clears
       // the source and replays it itself (sdk.ts:2657-2667).
@@ -916,6 +942,7 @@ class Host {
         model,
         sessionManager: sdk.SessionManager.inMemory(ctx.cwd),
         agentRegistry: new sdk.AgentRegistry(),
+        taskDepth: options.taskDepth,
         eventBus,
         preloadedExtensions: loaded,
         disableExtensionDiscovery: true,
@@ -938,7 +965,7 @@ class Host {
       });
       const notices: Notice[] = [];
       const runtimeErrors: string[] = [];
-      host = new Host(session, auth, ctx.fixture, notices, runtimeErrors);
+      host = new Host(session, auth, ctx.fixture, notices, runtimeErrors, optchatExtension);
       session.subscribe((event) => {
         host?.events.push(event);
         ctx.fixture.changed();
@@ -1908,7 +1935,7 @@ async function backgroundReportCold(ctx: CaseContext): Promise<Evidence> {
 }
 
 // ---------------------------------------------------------------------------
-// Aside (an unflagged mid-run user message), then case 8: disabled flag
+// Aside (an unflagged mid-run user message), then activation boundaries
 // ---------------------------------------------------------------------------
 
 /**
@@ -2031,28 +2058,114 @@ async function asideMessage(ctx: CaseContext): Promise<Evidence> {
 const DISABLED_USER = "OPTCHAT_IT_DISABLED_USER: plain session.";
 const DISABLED_TALK = "OPTCHAT_IT_DISABLED_TALK";
 
-async function disabledFlag(ctx: CaseContext): Promise<Evidence> {
+async function legacyFlag(ctx: CaseContext): Promise<Evidence> {
   const { fixture, memory } = ctx;
   const { SYSTEM_BLOCK } = ctx.lib.optchat;
-  const evidence = await withHost(ctx, { flags: { optchat: false } }, async (host) => {
-    fixture.queueChat("plain reply", { text: DISABLED_TALK });
-    expectCompleted(await bounded("prompt", host.prompt(DISABLED_USER), STEP_MS, fixture.fatal), "disabled prompt");
+  return withHost(ctx, { argv: ["--optchat"], settleTimeoutMs: POSITIVE_SETTLE_MS }, async (host) => {
+    // Host booleans are presence flags: an equals suffix is discarded, not parsed as false.
+    // Derive the parser input schema from the factory the host actually loaded, not a test copy.
+    for (const name of ["optchat", "no-optchat"]) {
+      const parsed = ctx.lib.parseArgs([`--${name}=false`], host.optchatExtension.flags);
+      assert.deepEqual(parsed.unrecognizedFlags, []);
+      assert.deepEqual(parsed.messages, []);
+      assert.equal(parsed.unknownFlags.get(name), true, "boolean equals values do not set a registered flag to false");
+    }
+    fixture.queueChat("legacy first turn", { text: T1_TALK });
+    expectCompleted(await bounded("legacy first prompt", host.prompt(T1_USER), STEP_MS, fixture.fatal), "legacy first prompt");
     await host.idle();
+    assert.deepEqual(pairs(await durableRows(ctx, 2, "legacy durable rows")), [["user", T1_USER], ["talk", T1_TALK]]);
+    fixture.queueChat("legacy second turn", { text: DISABLED_TALK });
+    expectCompleted(await bounded("legacy second prompt", host.prompt(DISABLED_USER), STEP_MS, fixture.fatal), "legacy second prompt");
+    await host.idle();
+    const request = fixture.chat()[1]?.body;
+    assert(request, "legacy activation completes a second turn");
+    assert.equal(soleView(request, "legacy second turn"), "<chat>\n0+1|user: prior turn summary\n1+1|talk: prior reply summary\n</chat>");
+    assert(systemText(request).includes(SYSTEM_BLOCK), "legacy activation installs the OptChat guide");
+    for (const name of ["zoom", "date"]) assert(toolNames(request).includes(name), `${name} is available`);
+    assert(fixture.compact().length > 0, "legacy activation performs compression");
+    assert(existsSync(memory), "legacy activation owns a store");
+    assert.deepEqual(host.runtimeErrors, []);
+    fixture.assertScriptsConsumed();
+    return { chatRequests: fixture.chat().length, compactRequests: fixture.compact().length };
+  });
+}
+
+async function disabledFlag(ctx: CaseContext, options: HostOptions): Promise<Evidence> {
+  const { fixture, memory } = ctx;
+  const { SYSTEM_BLOCK } = ctx.lib.optchat;
+  const existingRows = existsSync(memory) ? pairs(mainRows(memory)) : undefined;
+  const nextUser = "OPTCHAT_IT_DISABLED_NEXT: retain the previous raw conversation.";
+  const evidence = await withHost(ctx, {
+    ...options,
+    notices: true,
+    // A resolvable main model but unavailable compressor makes accidental model setup observable.
+    flags: { "optchat-model": MISSING_SELECTOR, ...options.flags },
+  }, async (host) => {
+    const assertInactive = () => {
+      assert.deepEqual([...host.optchatExtension.handlers.keys()], ["session_start"], "no behavioral hooks, including compaction veto or shutdown ownership");
+      assert.equal(host.optchatExtension.tools.size, 0, "no OptChat tools are registered");
+      assert.deepEqual(host.notices, [], "neither model resolution failure nor activation is reported");
+    };
+    assertInactive();
+    fixture.queueChat("plain reply", { text: DISABLED_TALK });
+    expectCompleted(await bounded("disabled prompt", host.prompt(DISABLED_USER), STEP_MS, fixture.fatal), "disabled prompt");
+    await host.idle();
+    fixture.queueChat("plain next turn", { text: "OPTCHAT_IT_DISABLED_NEXT_TALK" });
+    expectCompleted(await bounded("disabled next prompt", host.prompt(nextUser), STEP_MS, fixture.fatal), "disabled next prompt");
+    await host.idle();
+    assertInactive();
     assert.deepEqual(host.runtimeErrors, [], "no extension runtime errors");
     fixture.assertScriptsConsumed();
-    const request = fixture.chat()[0]?.body;
-    assert(request, "one chat request");
-    const names = toolNames(request);
-    assert(names.includes("probe"), "the request does expose tools");
-    assert(!names.includes("zoom") && !names.includes("date"), "no zoom/date tools");
-    assert(!systemText(request).includes(SYSTEM_BLOCK), "no OptChat system block");
-    assert(!userTexts(request).some((text) => text.includes("<chat>")), "no view");
-    assert.equal(occurrences(userTexts(request), DISABLED_USER), 1, "the prompt is sent as-is");
-    return { tools: names };
+    for (const { body } of fixture.chat()) {
+      const names = toolNames(body);
+      assert(names.includes("long_output"), "the real host exposes its ordinary tools");
+      assert(!names.includes("zoom") && !names.includes("date"), "no zoom/date tools");
+      assert(!systemText(body).includes(SYSTEM_BLOCK), "no OptChat system block");
+      assert(!userTexts(body).some((text) => text.includes("<chat>")), "no OptChat view");
+      assert.equal(occurrences(userTexts(body), DISABLED_USER), 1, "the first prompt is retained raw");
+    }
+    const next = fixture.chat()[1]?.body;
+    assert(next, "the next turn reaches the model");
+    assert(wireMessages(next).some((message) => message.role === "assistant" && wireText(message).includes(DISABLED_TALK)), "the previous reply remains raw on the next turn");
+    assert.equal(occurrences(userTexts(next), nextUser), 1, "the next prompt is sent once");
+    return { chatRequests: fixture.chat().length };
   });
-  assert.equal(fixture.chat().length, 1, "one chat request");
+  assert.equal(fixture.chat().length, 2, "only the requested turns run");
   assert.equal(fixture.compact().length, 0, "no compressor requests");
-  assert.equal(existsSync(memory), false, "no store directory was created");
+  assert.equal(existsSync(memory), existingRows !== undefined, "no store directory was created or removed");
+  if (existingRows) assert.deepEqual(pairs(mainRows(memory)), existingRows, "the existing shared memory was not changed");
+  return evidence;
+}
+
+async function subagentSharedStore(ctx: CaseContext): Promise<Evidence> {
+  const holder = await ctx.lib.Store.open(ctx.memory);
+  try {
+    holder.append("user", HOLDER_SEED);
+    const evidence = await disabledFlag(ctx, { taskDepth: 1 });
+    holder.append("talk", "OPTCHAT_IT_HOLDER_STILL_OWNS_STORE");
+    assert.deepEqual(pairs(mainRows(ctx.memory)), [
+      ["user", HOLDER_SEED], ["talk", "OPTCHAT_IT_HOLDER_STILL_OWNS_STORE"],
+    ], "the main writer still owns its store after the subagent shuts down");
+    return evidence;
+  } finally {
+    await holder.close();
+  }
+}
+
+async function configurationRejected(ctx: CaseContext, flags: Record<string, string | boolean>, flag: string): Promise<Evidence> {
+  const { fixture, memory } = ctx;
+  const evidence = await withHost(ctx, { flags, notices: true }, async (host) => {
+    // If validation escaped the startup boundary, Host.start would throw instead of reaching here.
+    const notice = host.notices.find(({ message }) => message.includes("OptChat is off for this session"));
+    assert(notice?.message.includes(`--${flag}`), "startup reports the offending flag");
+    assert.deepEqual(host.runtimeErrors, [], "startup owns invalid configuration instead of leaking a handler error");
+    const outcome = await bounded("invalid configuration prompt", host.prompt(MISSING_USER), STEP_MS, fixture.fatal);
+    await host.idle();
+    return { outcome: outcome.ok ? "resolved" : "rejected", notices: host.notices.length };
+  });
+  assert.equal(fixture.chat().length, 0, "malformed configuration never falls back to unprotected chat");
+  assert.equal(fixture.compact().length, 0, "malformed configuration never reaches the compressor");
+  assert.equal(existsSync(memory), false, "malformed configuration never opens a store");
   return evidence;
 }
 
@@ -2726,7 +2839,17 @@ const CASES: Record<CaseName, (ctx: CaseContext) => Promise<Evidence>> = {
   "missing-compressor": missingCompressor,
   "settle-timeout": settleTimeout,
   "abort-while-settling": abortWhileSettling,
-  "disabled-flag": disabledFlag,
+  "legacy-flag": legacyFlag,
+  "disabled-flag": (ctx) => disabledFlag(ctx, { flags: { optchat: false } }),
+  "cli-optout": (ctx) => disabledFlag(ctx, { argv: ["--no-optchat"] }),
+  "cli-optout-first": (ctx) => disabledFlag(ctx, { argv: ["--no-optchat", "--optchat"] }),
+  "cli-optout-last": (ctx) => disabledFlag(ctx, { argv: ["--optchat", "--no-optchat"] }),
+  "optout-invalid-config": (ctx) => disabledFlag(ctx, { argv: ["--no-optchat"], flags: { "optchat-model": "", "optchat-jobs": "0" } }),
+  "subagent-default": (ctx) => disabledFlag(ctx, { taskDepth: 1 }),
+  "subagent-shared-store": subagentSharedStore,
+  "malformed-positive": (ctx) => configurationRejected(ctx, { optchat: "invalid" }, "optchat"),
+  "malformed-optout": (ctx) => configurationRejected(ctx, { "no-optchat": "invalid" }, "no-optchat"),
+  "malformed-config": (ctx) => configurationRejected(ctx, { "optchat-jobs": "0" }, "optchat-jobs"),
   "background-report": backgroundReport,
   "background-report-cold": backgroundReportCold,
   "aside": asideMessage,

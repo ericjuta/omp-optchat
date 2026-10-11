@@ -1,13 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { isAbsolute, resolve } from "node:path";
-import { DEFAULTS, readConfig } from "../src/config.ts";
+import { DEFAULTS, readConfig, readEnabled } from "../src/config.ts";
 
 /** Host OMP 18.6.1 `getFlag` value union; the typed Pick doubles below prove it stays compatible. */
 type FlagValue = boolean | string | undefined;
 
 type FlagName =
   | "optchat"
+  | "no-optchat"
   | "optchat-dir"
   | "optchat-model"
   | "optchat-node-bytes"
@@ -73,16 +74,28 @@ function expectRejected(values: Flags, flag: FlagName | RegExp, defaultDirectory
   return error;
 }
 
-/** Each explicit invalid value must fail regardless of whether OptChat is enabled. */
+/** Each explicit invalid value must fail across default-enabled and SDK/legacy activation values. */
 const ACTIVATIONS: Array<{ name: string; flags: Flags }> = [
-  { name: "absent (disabled)", flags: {} },
-  { name: "explicitly disabled", flags: { optchat: false } },
-  { name: "disabled by string", flags: { optchat: "false" } },
-  { name: "enabled", flags: { optchat: true } },
-  { name: "enabled with explicit model", flags: { optchat: "true", "optchat-model": MODEL } },
+  { name: "absent (default-enabled)", flags: {} },
+  { name: "legacy optchat SDK boolean false", flags: { optchat: false } },
+  { name: "legacy optchat SDK string false", flags: { optchat: "false" } },
+  { name: "legacy optchat SDK boolean true", flags: { optchat: true } },
+  { name: "legacy optchat SDK string true with explicit model", flags: { optchat: "true", "optchat-model": MODEL } },
+  { name: "no-optchat SDK boolean true", flags: { "no-optchat": true } },
+  { name: "no-optchat SDK string true", flags: { "no-optchat": "true" } },
+  { name: "no-optchat SDK boolean false", flags: { "no-optchat": false } },
+  { name: "no-optchat SDK string false", flags: { "no-optchat": "false" } },
+  { name: "no-optchat SDK boolean true overrides legacy boolean true", flags: { optchat: true, "no-optchat": true } },
+  { name: "no-optchat SDK string true overrides legacy string true", flags: { optchat: "true", "no-optchat": "true" } },
 ];
 
+const SDK_ACTIVATION_VALUES = [undefined, true, "true", false, "false"] as const;
+
 describe("readConfig defaults", () => {
+  test("absent activation flags default to enabled", () => {
+    expect(read({}).enabled).toBe(true);
+  });
+
   test("absent directory resolves the supplied default to an absolute path", () => {
     const config = read({}, "relative/agent/optchat");
     expect(isAbsolute(config.directory)).toBe(true);
@@ -90,20 +103,27 @@ describe("readConfig defaults", () => {
   });
 
   test.each(["", "   ", "agent\u0000optchat", "agent\ud800optchat"])("invalid default directory %p is rejected", (directory) => {
-    expect(() => read({}, directory)).toThrow();
-    expect(() => read({ optchat: true }, directory)).toThrow();
+    for (const { flags } of ACTIVATIONS) {
+      expect(() => read(flags, directory)).toThrow();
+    }
   });
 });
 
 describe("activation and compressor model", () => {
-  test.each([
-    { value: true, enabled: true },
-    { value: "true", enabled: true },
-    { value: false, enabled: false },
-    { value: "false", enabled: false },
-  ] as const)("--optchat $value parses as $enabled", ({ value, enabled }) => {
-    expect(read({ optchat: value }).enabled).toBe(enabled);
-  });
+  for (const { positive, expected } of [
+    { positive: undefined, expected: [true, false, false, true, true] },
+    { positive: true, expected: [true, false, false, true, true] },
+    { positive: "true", expected: [true, false, false, true, true] },
+    { positive: false, expected: [false, false, false, false, false] },
+    { positive: "false", expected: [false, false, false, false, false] },
+  ] as const) {
+    SDK_ACTIVATION_VALUES.forEach((negative, index) => {
+      test(`SDK optchat ${typeof positive} ${JSON.stringify(positive)}, no-optchat ${typeof negative} ${JSON.stringify(negative)} enables ${expected[index]}`, () => {
+        expect(read({ optchat: positive, "no-optchat": negative }).enabled).toBe(expected[index]);
+        expect(readEnabled(host({ optchat: positive, "no-optchat": negative }))).toBe(expected[index]);
+      });
+    });
+  }
 
   test.each([true, false])("explicit model overrides the default (enabled=%p)", (enabled) => {
     expect(read({ optchat: enabled, "optchat-model": MODEL }).model).toBe(MODEL);
@@ -176,9 +196,23 @@ describe("activation and compressor model", () => {
     "true\n",
     "t",
     "enabled",
-  ])("rejects malformed activation %p", (value) => {
-    expectRejected({ optchat: value }, "optchat");
+  ])("validates malformed SDK activation %p with optout precedence", (value) => {
+    for (const negative of [undefined, false, "false"] as const) {
+      const flags = { optchat: value, "no-optchat": negative };
+      expectRejected(flags, "optchat");
+      expect(() => readEnabled(host(flags))).toThrow(/--optchat(?![-\w])/);
+    }
     expectRejected({ optchat: value, "optchat-model": MODEL }, "optchat");
+    for (const negative of [true, "true"] as const) {
+      const flags = { optchat: value, "no-optchat": negative };
+      expect(read(flags).enabled).toBe(false);
+      expect(readEnabled(host(flags))).toBe(false);
+    }
+    for (const positive of [...SDK_ACTIVATION_VALUES, value]) {
+      const flags = { optchat: positive, "no-optchat": value };
+      expectRejected(flags, "no-optchat");
+      expect(() => readEnabled(host(flags))).toThrow(/--no-optchat(?![-\w])/);
+    }
   });
 });
 
@@ -346,6 +380,7 @@ describe("diagnostics", () => {
   const SECRET = "sk-live-DO-NOT-ECHO-7f3a9c";
   const cases: Array<{ flag: FlagName; value: string; context: Flags }> = [
     { flag: "optchat", value: SECRET, context: {} },
+    { flag: "no-optchat", value: SECRET, context: {} },
     { flag: "optchat-dir", value: `/tmp/${SECRET}\u0000`, context: {} },
     { flag: "optchat-dir", value: `/tmp/${SECRET}\ud800`, context: {} },
     { flag: "optchat-model", value: SECRET, context: {} },
@@ -357,6 +392,7 @@ describe("diagnostics", () => {
 
   test.each(cases)("invalid $flag diagnostics never echo the supplied value", ({ flag, value, context }) => {
     for (const { flags } of ACTIVATIONS) {
+      if (flag === "optchat" && (flags["no-optchat"] === true || flags["no-optchat"] === "true")) continue;
       const error = expectRejected({ ...flags, ...context, [flag]: value }, flag);
       expect(error.message).not.toContain(value);
       expect(error.message).not.toContain(SECRET);

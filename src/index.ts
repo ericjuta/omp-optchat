@@ -30,7 +30,7 @@ import {
 	type ViewPartition,
 } from "./cache.js";
 import { dialectKey, sharedToolsAllowed } from "./dialect.js";
-import { readConfig, registerFlags, type OptChatConfig } from "./config.js";
+import { readConfig, readEnabled, registerFlags, type OptChatConfig } from "./config.js";
 import { exportHtml, importHistory } from "./history.js";
 import { Memory, type CompactionRequest, type Summarize } from "./memory.js";
 import { VIEW_DOC } from "./prompts.js";
@@ -965,7 +965,7 @@ class OptChat {
 	}
 }
 
-/** OptChat for OMP: inactive unless the top-level session is started with --optchat. */
+/** OptChat for OMP: active by default for the main agent, unless explicitly opted out. */
 export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) => void {
 	const settleTimeoutMs = options.settleTimeoutMs ?? SETTLE_TIMEOUT_MS;
 	if (!Number.isFinite(settleTimeoutMs) || settleTimeoutMs <= 0 || settleTimeoutMs >= HOST_HANDLER_LIMIT_MS) {
@@ -980,7 +980,7 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 			description: "OptChat memory: status | view | export PATH | import PATH",
 			handler: async (args, ctx) => {
 				if (!chat) {
-					ctx.ui.notify("OptChat is not active in this session (start the top-level session with --optchat).", "info");
+					ctx.ui.notify("OptChat is not active in this session (main sessions are active unless opted out with --no-optchat).", "info");
 					return;
 				}
 				await chat.command(args, ctx);
@@ -988,8 +988,13 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 		});
 
 		pi.on("session_start", async (_event, ctx) => {
-			const flag = pi.getFlag("optchat");
-			if (chat || (flag !== true && flag !== "true") || ctx.agent.kind !== "main") return;
+			if (chat || ctx.agent.kind !== "main") return;
+			try {
+				if (!readEnabled(pi)) return;
+			} catch {
+				// Invalid activation must enter the same fail-closed startup as any other
+				// malformed config: open() reports it and installed context hooks refuse prompts.
+			}
 			const active = new OptChat(pi, settleTimeoutMs);
 			chat = active;
 			// Registered only for an activated session: these hooks change host behavior even as no-ops.

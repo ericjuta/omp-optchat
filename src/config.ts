@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { resolve } from "node:path";
 
 export const DEFAULTS = Object.freeze({
-  enabled: false,
+  enabled: true,
   model: "@smol",
   nodeBytes: 512,
   viewBytes: 128_000,
@@ -32,7 +32,12 @@ export function registerFlags(api: FlagRegistrar): void {
   api.registerFlag("optchat", {
     type: "boolean",
     default: DEFAULTS.enabled,
-    description: "Enable persistent OptChat memory for this session",
+    description: "Enable persistent OptChat memory (default; --no-optchat takes precedence)",
+  });
+  api.registerFlag("no-optchat", {
+    type: "boolean",
+    default: false,
+    description: "Disable OptChat memory for this session, even when --optchat is present",
   });
   api.registerFlag("optchat-dir", {
     type: "string",
@@ -80,11 +85,17 @@ function invalid(flag: string, requirement: string): never {
   throw new Error(`OptChat --${flag} ${requirement}`);
 }
 
-function boolean(value: FlagValue): boolean {
-  if (value === undefined) return DEFAULTS.enabled;
+function boolean(value: FlagValue, flag: string, fallback: boolean): boolean {
+  if (value === undefined) return fallback;
   if (value === true || value === "true") return true;
   if (value === false || value === "false") return false;
-  return invalid("optchat", "must be true or false");
+  return invalid(flag, "must be true or false");
+}
+
+/** Read activation alone so opted-out sessions never initialize memory or model work. */
+export function readEnabled(api: FlagReader): boolean {
+  if (boolean(api.getFlag("no-optchat"), "no-optchat", false)) return false;
+  return boolean(api.getFlag("optchat"), "optchat", DEFAULTS.enabled);
 }
 
 function integer(api: FlagReader, flag: string, fallback: number, minimum = 1, maximum = Number.MAX_SAFE_INTEGER): number {
@@ -119,7 +130,7 @@ function compressor(value: FlagValue): string {
 
 /** Only absent flags take defaults; malformed supplied values always fail closed. */
 export function readConfig(api: FlagReader, defaultDirectory: string): OptChatConfig {
-  const enabled = boolean(api.getFlag("optchat"));
+  const enabled = readEnabled(api);
   const nodeBytes = integer(api, "optchat-node-bytes", DEFAULTS.nodeBytes, 64);
   const viewBytes = integer(api, "optchat-view-bytes", DEFAULTS.viewBytes);
   if (viewBytes < nodeBytes) {

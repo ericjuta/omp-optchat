@@ -2,7 +2,7 @@
 /** Synthetic model responses, real installed OMP CLI, extension discovery and tools. */
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, mkdir, readdir, readFile, rm } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -21,6 +21,9 @@ const FIRST_USER = "OPTCHAT_SMOKE_OLD_USER: Remember the public archive, then fi
 const SECOND_USER = "OPTCHAT_SMOKE_CURRENT_USER: Retrieve the entire previous reply and its date.";
 const RESTART_USER = "OPTCHAT_SMOKE_RESTART_USER: Report that the public archive is restored.";
 const LOCK_USER = "OPTCHAT_SMOKE_REJECTED_WRITER: This must never reach a model.";
+const INACTIVE_USER = "OPTCHAT_SMOKE_INACTIVE_USER: Return the public archive without memory.";
+const INACTIVE_NEXT_USER = "OPTCHAT_SMOKE_INACTIVE_NEXT_USER: Finish this ordinary conversation.";
+const INACTIVE_FINISHED = "OPTCHAT_SMOKE_INACTIVE_FINISHED";
 const FIRST_THINKING = "OPTCHAT_SMOKE_PRIVATE_OLD_REASONING";
 const TOOL_THINKING = "OPTCHAT_SMOKE_PRIVATE_ACTIVE_TOOL_REASONING";
 const SUMMARY = "SYNTHETIC_SUMMARY_OLDEST_PUBLIC_FACT";
@@ -33,6 +36,7 @@ let targetRecord: DiskMessage | undefined;
 let retrievalSnapshot: string | undefined;
 let serverFailure: Error | undefined;
 let currentPhase = "setup";
+let hostWorkspace: string | undefined;
 const fatal = Promise.withResolvers<never>();
 // Keep early server/process failures observed until the next guarded operation.
 void fatal.promise.catch(() => {});
@@ -104,12 +108,46 @@ function answer(body: ObjectValue): Response {
     return sse(model, capture.sequence, SUMMARY);
   }
   assert.equal(model, "optchat-smoke-chat", "unexpected model reached fixture");
-  assertToolNames(body);
   const requestMessages = messages(body);
   const current = requestMessages.filter((message) => message.role === "user").at(-1);
   assert(current, "current user required");
   // Support the host's separate snapshot message as well as prepended user-content blocks.
   const prompt = content(current).replace(/<chat>[\s\S]*?<\/chat>/g, "").trim();
+  if (currentPhase.startsWith("inactive ")) {
+    // The real host prepends its date/cwd reminder as a separate text part.
+    // Admit only that exact envelope, never arbitrary prefixes around the marker.
+    const ordinaryUsers = requestMessages.filter((message) => message.role === "user").map((message) => {
+      if (typeof message.content === "string") return message.content;
+      assert(Array.isArray(message.content) && (message.content.length === 1 || message.content.length === 2), "ordinary user must contain one marker plus an optional host reminder");
+      const texts = message.content.map((part) => {
+        const entry = object(part, "ordinary user text");
+        assert(typeof entry.text === "string", "ordinary user text required");
+        assert.deepEqual(entry, { type: "text", text: entry.text }, "ordinary user must contain only text parts");
+        return entry.text;
+      });
+      if (texts.length === 2) {
+        const reminder = /^<system-reminder>\nToday: (\d{4}-\d{2}-\d{2}); current working directory: '([^'\n]+)'\. Do not repeat this information in your reply\.\n<\/system-reminder>$/.exec(texts[0]!);
+        assert(reminder, "only the observed date/cwd reminder may precede an ordinary user marker");
+        assert.equal(reminder[2], hostWorkspace, "host reminder must identify the isolated workspace");
+      }
+      return texts.at(-1)!;
+    });
+    const ordinaryPrompt = ordinaryUsers.at(-1);
+    assert(ordinaryPrompt === INACTIVE_USER || ordinaryPrompt === INACTIVE_NEXT_USER, "inactive request must end with the exact expected user marker");
+    assert.deepEqual(ordinaryUsers, ordinaryPrompt === INACTIVE_USER ? [INACTIVE_USER] : [INACTIVE_USER, INACTIVE_NEXT_USER], "ordinary user markers must each occur once, in order, with no extra content");
+    const wire = JSON.stringify(body);
+    for (const marker of ordinaryUsers) assert.equal(wire.split(marker).length - 1, 1, "each ordinary user marker must occur exactly once on the wire");
+    assert(!wire.includes("# OptChat memory"), "disabled plugin must not inject its system protocol");
+    assert(!wire.includes("<chat>") && !wire.includes("</chat>"), "disabled plugin must not inject a memory view");
+    assert(body.tools === undefined || Array.isArray(body.tools), "tools must be absent or an array");
+    const names = (body.tools ?? []).map((value) => object(object(value, "tool").function, "tool function").name);
+    assert(!names.includes("zoom") && !names.includes("date"), "disabled plugin must not inject memory tools");
+    if (ordinaryPrompt === INACTIVE_NEXT_USER) {
+      assert.equal(requestMessages.filter((message) => message.role === "assistant" && content(message) === LONG_REPLY).length, 1, "disabled plugin must preserve the oversized ordinary assistant history exactly once");
+    }
+    return sse(model, capture.sequence, ordinaryPrompt === INACTIVE_USER ? LONG_REPLY : INACTIVE_FINISHED);
+  }
+  assertToolNames(body);
   assert(requestMessages.some((message) => message.role === "system" && content(message).includes("# OptChat memory")), "plugin must append its memory protocol without replacing the host system prompt");
   if (prompt === FIRST_USER) {
     assertSnapshot(body, FIRST_USER, []);
@@ -288,6 +326,7 @@ async function main(): Promise<void> {
   const temporary = await mkdtemp(join(tmpdir(), "omp-optchat-smoke-"));
   const memory = join(temporary, "memory");
   const workspace = join(temporary, "workspace");
+  hostWorkspace = workspace;
   const home = join(temporary, "home");
   const agentDirectory = join(temporary, "agent");
   const deadline = setTimeout(() => fatal.reject(new Error(`smoke exceeded ${TOTAL_MS}ms hard deadline during ${currentPhase}`)), TOTAL_MS);
@@ -322,17 +361,22 @@ async function main(): Promise<void> {
       XDG_DATA_HOME: join(home, ".local", "share"),
       OPTCHAT_SMOKE_BASE_URL: `http://127.0.0.1:${server.port}/v1`,
     };
-    // --no-extensions disables ambient discovery, while explicit -e paths still load.
-    // Passing the package root exercises its real omp.extensions manifest.
-    const args = [
-      "--mode", "rpc", "--no-ui", "--no-title", "--no-tools", "--no-extensions", "--no-skills", "--no-rules",
+    // Link only inside this fresh synthetic HOME. The subsequent CLI launches must
+    // discover the installed package; only the synthetic provider uses explicit -e.
+    currentPhase = "isolated plugin link";
+    const link = new Host(executable, ["plugin", "link", PLUGIN, "--json"], workspace, env);
+    link.process.stdin.end();
+    const linked = await bounded("isolated plugin link", link.exited);
+    assert.equal(linked.code, 0, `isolated plugin link failed: ${link.diagnostics}`);
+    const baseArgs = [
+      "--mode", "rpc", "--no-ui", "--no-title", "--no-tools", "--no-skills", "--no-rules",
       "--session-dir", join(temporary, "sessions"),
-      "-e", PLUGIN,
       "-e", join(ROOT, "scripts", "fixture-provider.ts"),
       "--model", "optchat-smoke/optchat-smoke-chat",
-      "--optchat", "--optchat-dir", memory,
       "--optchat-model", "optchat-smoke/optchat-smoke-compact",
     ];
+    // No enable flag: the full active lifecycle below proves default activation.
+    const args = [...baseArgs, "--optchat-dir", memory];
     currentPhase = "same-process first turn";
     const first = new Host(executable, args, workspace, env);
     await first.prompt(FIRST_USER);
@@ -388,19 +432,55 @@ async function main(): Promise<void> {
     assert.equal(restored.filter((record) => record.kind === "talk" && record.text === LONG_REPLY).length, 1, "restart must not reappend old assistant turns");
     await bounded("restored host shutdown", restarted.stop());
     assert.equal((await restarted.exited).code, 0, "restored host must finish graceful session_shutdown");
+    const activeCaptures = captures.slice();
+    const inactiveEvidence: { flags: string[]; chatRequests: number; compactorRequests: number; storeCreated: boolean }[] = [];
+    for (const flags of [["--no-optchat"], ["--optchat", "--no-optchat"], ["--no-optchat", "--optchat"]]) {
+      currentPhase = `inactive ${flags.join(" ")}`;
+      // Never pre-create the disabled store: absence is part of the proof.
+      const inactiveMemory = join(temporary, `inactive-memory-${inactiveEvidence.length}`);
+      const assertNoStore = async () => {
+        await assert.rejects(lstat(inactiveMemory), { code: "ENOENT" }, "disabled plugin must not create its configured store");
+        await assert.rejects(lstat(join(agentDirectory, "optchat")), { code: "ENOENT" }, "disabled plugin must not create a fallback store");
+      };
+      await assertNoStore();
+      const before = captures.length;
+      const inactive: Host = new Host(executable, [...baseArgs, "--optchat-dir", inactiveMemory, ...flags], workspace, env);
+      await inactive.until("inactive RPC ready", () => inactive.events.some((event) => event.type === "ready"));
+      await assertNoStore();
+      // An oversized reply followed by another turn would trigger compaction if
+      // activation slipped through; completion alone would not prove inactivity.
+      await inactive.prompt(INACTIVE_USER);
+      await assertNoStore();
+      await inactive.prompt(INACTIVE_NEXT_USER);
+      assert(JSON.stringify(inactive.events).includes(INACTIVE_FINISHED), "ordinary inactive response must reach the RPC client");
+      await assertNoStore();
+      await bounded("inactive host shutdown", inactive.stop());
+      assert.equal((await inactive.exited).code, 0, "inactive host must shut down gracefully");
+      await assertNoStore();
+      const requests = captures.slice(before);
+      const chatRequests = requests.filter((capture) => capture.body.model === "optchat-smoke-chat").length;
+      const compactorRequests = requests.filter((capture) => capture.body.model === "optchat-smoke-compact").length;
+      assert.equal(chatRequests, 2, "inactive process must complete both ordinary turns");
+      assert.equal(compactorRequests, 0, "inactive process must never dispatch a compactor request");
+      inactiveEvidence.push({ flags, chatRequests, compactorRequests, storeCreated: false });
+    }
     assert(!serverFailure, serverFailure?.message ?? "smoke fixture server must not fail");
     for (const capture of captures.filter((entry) => entry.body.model === "optchat-smoke-compact")) {
       const request = JSON.stringify(capture.body);
       assert(!request.includes(FIRST_THINKING) && !request.includes(TOOL_THINKING), "reasoning must never reach the compressor");
     }
     const chatRequests = captures.filter((capture) => capture.body.model === "optchat-smoke-chat");
-    assert.equal(chatRequests.length, 4, "expected first turn, tool request, tool continuation, restored turn");
+    const activeChatRequests = activeCaptures.filter((capture) => capture.body.model === "optchat-smoke-chat");
+    assert.equal(activeChatRequests.length, 4, "expected first turn, tool request, tool continuation, restored turn");
     console.log(JSON.stringify({
       ok: true, evidence: "synthetic-model/real-installed-omp-host", executable, plugin: PLUGIN,
-      hostProcesses: hosts.length, chatRequests: chatRequests.length,
+      discovery: "fresh isolated plugin link; automatic package discovery; explicit fixture provider only",
+      defaultActivation: "full active lifecycle without --optchat",
+      setupProcesses: 1, hostProcesses: hosts.length - 1, chatRequests: chatRequests.length,
+      activeChatRequests: activeChatRequests.length, inactiveEvidence,
       compactorRequests: captures.length - chatRequests.length,
       durableMessages: restored.length, retrievedBytes: Buffer.byteLength(LONG_REPLY),
-      checks: ["same-process history replacement", "pre-user settled snapshot", "contextual past-record compaction", "shared main/compactor prompt and tools", "dash compression ruler", "active reasoning and tool-loop retention", "real zoom/date tools", "lossless oversized retrieval", "durable history excludes reasoning", "second-writer rejection", "persisted view stability", "new-process restoration"],
+      checks: ["automatic installed package discovery", "default activation without enable flag", "explicit opt-out and both flag-order precedences", "inactive store absence through shutdown", "inactive ordinary history without memory system/view/tools", "zero inactive compactor requests", "same-process history replacement", "pre-user settled snapshot", "contextual past-record compaction", "shared main/compactor prompt and tools", "dash compression ruler", "active reasoning and tool-loop retention", "real zoom/date tools", "lossless oversized retrieval", "durable history excludes reasoning", "second-writer rejection", "persisted view stability", "new-process restoration"],
     }, null, 2));
   } finally {
     clearTimeout(deadline);
