@@ -1,6 +1,6 @@
 {
   "name": "@ericjuta/omp-optchat",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "An endless OMP chat backed by a durable log and binary summary memory tree, inspired by Victor Taelin's OptChat.",
   "type": "module",
   "private": true,
@@ -10,7 +10,8 @@
   "scripts": {
     "test": "bun test tests",
     "typecheck": "tsc --noEmit",
-    "smoke": "bun run scripts/smoke.ts"
+    "smoke": "bun run scripts/smoke.ts",
+    "evidence:recall": "bun run scripts/evidence-recall.ts"
   },
   "peerDependencies": {
     "@oh-my-pi/pi-ai": ">=18.9.0",

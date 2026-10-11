@@ -4,13 +4,13 @@ An OMP extension implementing [Victor Taelin's OptChat specification](https://gi
 
 ## Requirements and start
 
-- OMP **18.6.1 or newer**, Bun, and Linux.
+- OMP **18.9.0 or newer**, Bun, and Linux. CI checks every push and runs a weekly check against the latest published OMP SDK.
 - An authenticated model for the main chat and an authenticated compressor model. Compression uses OMP's `@smol` role by default; choose a competent inexpensive model explicitly if that role is unsuitable.
 
 Install the tagged release:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.3.0'
+omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.4.0'
 PI_OPENAI_STATEFUL=0 omp
 ```
 
@@ -30,7 +30,7 @@ PI_OPENAI_STATEFUL=0 omp
 
 Installing or linking the enabled plugin activates OptChat automatically in new main-agent sessions. This default applies to both fresh installations and upgrades; no first-install marker is used. `--optchat` remains an optional explicit enable flag. Use `omp --no-optchat` for an ordinary session with no OptChat memory tools, logging, compression, or context changes; `/optchat` remains registered. The opt-out wins even when both flags are present, in either order. Do not use `--optchat=false`: OMP's boolean CLI parser treats that as enabled.
 
-Subagents do not open the main chat. Run just one enabled session per chat directory. To select a different memory or compressor:
+Subagents never open or write the main chat. Run just one enabled session per chat directory. To select a different memory or compressor:
 
 ```sh
 PI_OPENAI_STATEFUL=0 omp -e . --optchat-dir /path/to/private/chat --optchat-model anthropic/claude-sonnet-4-6
@@ -38,18 +38,25 @@ PI_OPENAI_STATEFUL=0 omp -e . --optchat-dir /path/to/private/chat --optchat-mode
 
 The default chat lives in `optchat/` under OMP's active agent directory. Working-directory changes and OMP session restarts do not start a new memory; a different `--optchat-dir` does. The extension does not import existing OMP sessions automatically.
 
-Advanced overrides are `--optchat-node-bytes`, `--optchat-view-bytes`, `--optchat-jobs`, `--optchat-tries`, `--optchat-retry-ms`, and `--optchat-tool-cap`; their defaults are described below. Keep the defaults unless you have measured a reason to change them. An enabled session refuses inference if `zoom` or `date` is unavailable, including host modes that prohibit late tool registration.
+Advanced overrides are `--optchat-node-bytes`, `--optchat-view-bytes`, `--optchat-jobs`, `--optchat-tries`, and `--optchat-tool-cap`; their defaults are described below. `--optchat-retry-ms` was removed in 0.4.0, because failed summaries now retry on the next message. Keep the defaults unless you have measured a reason to change them. An enabled session refuses inference if `zoom` or `date` is unavailable, including host modes that prohibit late tool registration.
 
 ## Using memory
 
 The model receives the settled historical summary view before your new message, then retains its ordinary tool loop until the turn ends. Between turns, old inference history is replaced by the view. OMP's display transcript and normal tools remain available.
 
-- `zoom(id, n)` opens an aligned power-of-two summary range into its children. `zoom(id, 1)` returns the original record in full.
-- `date(id)` returns the original message's local date and time.
+- `zoom(id, n)` opens an aligned power-of-two summary range into its children. `zoom(id, 1, offset)` returns one 16 KB page of the original record, cut on a UTF-8 boundary, plus its stored images. Follow `details.next` until it is `null`; together the pages reproduce the record byte for byte.
+- `work(name, offset)` pages a captured subagent or background report by job ID, agent ID, or name; the newest match wins.
+- `date(id)` returns the original message's local date and time. New records keep the host's event timestamp, not the time of writing.
 - `/optchat status` reports memory and background compression state.
 - `/optchat view` displays the current view.
 - `/optchat export /path/to/history.html` creates a self-contained, navigable HTML history (treat it as private).
-- `/optchat import /path/to/history.txt` imports plain text as a note. JSONL accepts `{ "kind": "note", "text": "…", "date": "2026-10-05T00:00:00.000Z" }`; kinds are `user`, `talk`, `tool`, `echo`, and `note`. Import is append-only, not an OMP transcript converter.
+- `/optchat import /path/to/history.txt` imports plain text as a note. JSONL accepts `{ "kind": "note", "text": "…", "date": "2026-10-05T00:00:00.000Z" }`; kinds are `user`, `talk`, `tool`, `echo`, `work`, and `note`, with optional strict `metadata`. All records and images are validated before anything is appended. Import is append-only, not an OMP transcript converter.
+
+### Subagents
+
+OMP subagents are ordinary sessions. They never open the Store or write to the chat. Their task, async, and launch reports become `work` records in the parent's log, captured before the ordinary tool-result cap. Each record carries provenance (source, job ID, agent ID, name, completeness), full structured data, and the typed artifact output where the host supplies one. When OMP delivered only a preview and no trusted full-output reference, the record says so: it starts with `[incomplete: reason]` and has `completeness: "pointer-only"`. URIs found in report text are never followed.
+
+`--optchat-child-view` (off by default) gives each subagent a frozen, read-only snapshot of the parent's view and `zoom`/`date`/`work` over messages up to that point. Every read and every prompt injection checks that the parent's publication is still live and that the child is still in the session that adopted it. The snapshot is revoked when the parent switches sessions or shuts down, and is refused if the child resumes, forks, or branches into another session. Without the flag, include the facts a child needs in its task, as before.
 
 ## Storage and compression
 
@@ -57,27 +64,33 @@ The model receives the settled historical summary view before your new message, 
 chat/
   main/YYYY-MM-DD.jsonl   # {i,kind,text,size,date}
   tree/YYYY-MM-DD.jsonl   # {l,i,text,size}
-  view.json               # {version,length,parts:[[l,i],...],compacting}
+  view.json               # {version:2,length,parts,compacting,compactor:{length,parts,compacting}}
+  images/                 # content-addressed image blobs referenced by message metadata
 ```
+
+Messages may carry an optional strict `metadata` field with work provenance and ordered image references (digest, MIME type, byte count). Older five-field records are read unchanged.
 
 Records are appended and fsynced before publication; replay also fsyncs recovered files before admitting them. Daily filenames use the local day of writing, while each record retains its original timestamp, including imported historical dates. IDs are permanent. Malformed/torn lines are reported; missing IDs or conflicting records are not silently renumbered. The tree can be rebuilt conceptually, but existing summaries are retained to avoid paying twice.
 
-The main view is atomically replaced and fsynced before a new tiling is published. Its versioned envelope preserves an unfinished compaction batch as well as the ordered node coordinates. Restarts load that exact tiling instead of reconstructing it. After a crash, durable messages beyond the saved view are appended to its existing prefix. A pre-0.2.0 chat without `view.json` is migrated once; malformed or inconsistent snapshots fail closed rather than silently rebuilding a different view.
+The main view is atomically replaced and fsynced before a new tiling is published. Its versioned envelope stores both the main and compactor tilings and their unfinished batch latches in a single transaction. Restarts load those exact tilings instead of reconstructing them, so the compactor's cache prefix survives a restart. A v0.3.0 snapshot is migrated once: its main tiling is kept exactly, and the compactor tiling is initialized from it. After a crash, durable messages beyond the saved view are appended to its existing prefix. A pre-0.2.0 chat without `view.json` is migrated once; malformed or inconsistent snapshots fail closed rather than silently rebuilding a different view.
 
 The summary target is 512 UTF-8 bytes. The main view grows by appending leaves until its summary text exceeds 128,000 bytes, then merges a batch down to 64,000 bytes. Merge priority measures age from the sibling pair's **last** message, with oldest-first ties. Only built parents can be used; an unfinished batch remains active across subsequent node completions, messages, and restarts. The view never splits.
 
 The compressor has its own 16,000–32,000-byte sawtooth view, coarsened from the main view and refreshed when the main view merges. It contains only built, addressed summary lines before the target message, or through the end of a target merge—never later messages. Compression instructions use a 512-dash ruler rather than example content. Sizes govern summary text, not token estimates or provider-envelope overhead.
 
-Short records and child pairs that already fit are free nodes. Longer records are summarized whole. OMP retains eight concurrent compaction jobs, five shortening attempts, fixed ten-second retries, and serial leaf construction with concurrent ready merges; this release does not replace that scheduler with upstream's newer ready queues.
+Short records and child pairs that already fit are free nodes. Longer records are read in bounded UTF-8 pages. Each page is summarized, and the page summaries are reduced in bounded groups to one leaf. No source byte is skipped, and no permanent ID is added. Page summaries are not persisted; after a restart, an unfinished long leaf is recomputed.
 
-A model turn waits for summaries rather than seeing partial source text. Compression failures are reported and retried. Cancel a wait if the provider is unavailable; history already accepted by the plugin is retained. Reasoning/thinking is not written to the OptChat log. Ordinary tool-result text is head-and-tail capped at 30,000 characters; full `zoom` retrieval is exempt so original messages remain accessible.
+Work sits in dependency-ready queues, as upstream specifies; the tree is never scanned for work. A message's leaf is admitted while fewer than eight earlier leaves are unbuilt, and a merge becomes ready as soon as both halves exist, in any order. At most eight calls run at once. Each summary gets five shortening attempts with bounded feedback, and the shortest whole reply is kept. If no attempt fits a 16 KB safety ceiling, the summary fails rather than being cut. A failed call releases its slot immediately and is retried on the next appended message; there are no idle retry timers.
+
+A model turn waits for summaries rather than seeing partial source text. Compression failures are reported. Cancel a wait if the provider is unavailable; history already accepted by the plugin is retained. Reasoning/thinking is not written to the OptChat log. Ordinary tool-result text is head-and-tail capped at 30,000 characters; full `zoom` retrieval is exempt so original messages remain accessible.
 
 ## OMP-specific boundaries
 
 - OMP caps extension context handlers at 30 seconds. OptChat therefore cancels a turn if memory has not settled within 25 seconds, before the host could ignore a timed-out hook. The unanswered user message stays in the log, and compression continues; send the request again after memory is ready. It never substitutes raw old history or half a summary.
 - The extension preserves OMP's system instructions, tool policy, display, and in-turn reasoning rather than replacing the harness. It does not change your delegation policy or create its own subagent system.
 - Activation does not change host settings or replace the Sharpshooter memory backend. OptChat vetoes normal automatic/manual compaction and experimental rollover, but this is not a blanket maintenance disable: OMP can still check raw-history thresholds, and automatic shake pruning can bypass that hook. This release does not change those host maintenance settings.
-- The storage format is textual. Do not treat it as an archive of image/audio binary attachments.
+- Images that reach OMP as `ImageContent` (user, assistant, tool-result, and report messages) are validated as PNG, JPEG, or WebP and stored by digest. Audio, video, and original files are not archived, because OMP 18.9.0 exposes no ingress for them. Image blobs left behind by a failed append are verified on read but never garbage-collected.
+- OMP side turns, such as idle recaps and `/btw`, pass through untouched. They are recognized as host-authored, agent-attributed messages that are absent from the session branch, and they never open, reuse, or poison a main turn. OMP 18.9.0 has no typed request purpose, so another future host-authored side-turn shape could need a matching update.
 - Permanent storage uses fsync, not automatic Git commits. Backups remain the operator's responsibility.
 
 ### Provider caching
@@ -111,7 +124,22 @@ bun test
 bun run smoke
 ```
 
+CI runs this sequence with the pinned SDK cohort and with the latest published cohort, on every push and pull request, weekly, and on demand.
+
+`bun run evidence:recall` is an opt-in recall and usage experiment against real models with a synthetic corpus. Without `--confirm-live-provider-calls` it checks prerequisites and prints its plan. It runs the host with private HOME and agent directories that hold only the selected credentials, so no global context files reach a provider. Call count, compressor output, and wall time are capped. The artifact separates main and compressor usage and records unobserved fields as `null`, never zero. It never reports savings it did not measure. `OPTCHAT_METRICS_FILE=/path` appends one content-free JSON line per compressor call.
+
 The smoke harness links the plugin into an isolated fresh host environment, then exercises automatic discovery and activation without `--optchat` or an explicit plugin extension path. It uses the actual OMP host with a local deterministic model endpoint, captures inference requests, and checks fresh turns, shared main/compactor prompt and tools, the dash ruler, lossless retrieval, saved-view stability, and restart persistence. Separate opt-out processes prove ordinary history remains intact, no memory store or tools are created, and no compressor requests occur, including both positive/negative flag orders. Set `OPTCHAT_SMOKE_OMP` to a compiled OMP executable and `OPTCHAT_SMOKE_PLUGIN` to an installed plugin directory to verify that artifact rather than the checkout. It is not a measurement of summary quality or real-provider cache hit rates.
+
+The 0.4.0 release was exercised on compiled OMP 18.9.0. Beyond the checks above, the smoke drives a `/btw` side turn followed by an ordinary prompt, a 54 KB structured async report, two images retrieved after a restart, `work` retrieval after a restart, and a real `task` child that reads the parent view without writing. A deterministic restart probe confirmed that reopening a fully built 200-message chat makes no compressor calls and leaves all 397 nodes unchanged, and that one new message costs one call.
+
+A bounded `evidence:recall` run used real models: Claude Sonnet 4.6 for the main chat, Claude Haiku 4.5 as the compressor, and a synthetic 24-source corpus. It ran a cold phase and a fresh-process restart phase; the deepest summary level was 5 in the cold phase and 6 after restart. Results:
+
+| Phase | Correct | Grounded in a zoomed original | Hallucinated | Main cache-read share | Compressor cache-read share | Cost (USD) |
+|---|---|---|---|---|---|---|
+| Cold | 8/8 | 8/8 | 0 | 76% | 46% | 0.30 |
+| Restart | 7/8 | 8/8 | 0 | 86% | 53% | 0.46 |
+
+The one miss named only part of an ambiguous answer. "Cache-read share" is cache-read tokens divided by all prompt tokens, as the provider reported them. This short run starts cold and writes most prefixes for the first time, so it is far from the specification's steady-state 96–98% model. It is a sample, not a savings measurement.
 
 The 0.2.0 release was exercised with compiled OMP 18.8.9 against the synthetic provider. A separate real-filesystem run ingested 300 synthetic messages, observed the 128,000-to-64,000-byte main batch and 32,000-to-16,000-byte compactor cycle, and checked byte-identical saved views on restart plus migration from a log without a snapshot.
 
