@@ -1,4 +1,4 @@
-import type { Question, QuestionKind, SourceRecord } from "./corpus.ts";
+import { ADVERSARIAL_KINDS, QUESTION_KINDS, type Question, type QuestionKind, type SourceRecord } from "./corpus.ts";
 import { answerInstruction } from "./scoring.ts";
 
 /** Hard ceilings for any live evidence run; the parent may lower them but never raise them. */
@@ -141,26 +141,20 @@ export function parseAccountingState(value: unknown): AccountingState {
 	};
 }
 
-const KIND_ORDER: readonly QuestionKind[] = ["merge-depth", "correction", "negation", "exact-id", "minor-fact", "attribution", "ambiguity", "work-reference"];
+/** `adversarial` rotates the recall-stressing kinds first in every round; `balanced` rotates kinds in corpus order. */
+export type QuestionEmphasis = "balanced" | "adversarial";
 
 /** Stratified selection so a small budget still covers every question kind before any kind repeats. */
-export function selectQuestions(questions: readonly Question[], limit: number): Question[] {
+export function selectQuestions(questions: readonly Question[], limit: number, emphasis: QuestionEmphasis = "balanced"): Question[] {
 	if (!Number.isInteger(limit) || limit < 1) throw new Error("question limit must be a positive integer");
-	const buckets: Record<QuestionKind, Question[]> = {
-		"merge-depth": [],
-		correction: [],
-		negation: [],
-		"exact-id": [],
-		"minor-fact": [],
-		attribution: [],
-		ambiguity: [],
-		"work-reference": [],
-	};
+	const buckets = Object.fromEntries(QUESTION_KINDS.map((kind) => [kind, [] as Question[]])) as Record<QuestionKind, Question[]>;
 	for (const question of questions) buckets[question.kind].push(question);
+	const order: readonly QuestionKind[] =
+		emphasis === "adversarial" ? [...ADVERSARIAL_KINDS, ...QUESTION_KINDS.filter((kind) => !ADVERSARIAL_KINDS.includes(kind))] : QUESTION_KINDS;
 	const selected: Question[] = [];
 	for (let round = 0; selected.length < limit; round++) {
 		let added = false;
-		for (const kind of KIND_ORDER) {
+		for (const kind of order) {
 			const candidate = buckets[kind][round];
 			if (candidate && selected.length < limit) {
 				selected.push(candidate);

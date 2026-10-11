@@ -127,10 +127,10 @@ describe("strict command-line parsing", () => {
 		expect(options.allowEnv).toEqual([]);
 	});
 
-	test("four projects need twenty-five fact records and cannot fit the twenty-four source maximum", () => {
-		expect(() => parseOptions([...BASE, "--projects", "4"])).toThrow("needs 25 fact records");
-		expect(() => parseOptions([...BASE, "--projects", "4", "--sources", "24"])).toThrow("needs 25 fact records");
-		expect(() => parseOptions([...BASE, "--sources", "25"])).toThrow("from 16 to 24");
+	test("four projects need thirty-two fact records and cannot fit the twenty-four source default", () => {
+		expect(() => parseOptions([...BASE, "--projects", "4"])).toThrow("needs 32 fact records");
+		expect(() => parseOptions([...BASE, "--projects", "4", "--sources", "24"])).toThrow("needs 32 fact records");
+		expect(() => parseOptions([...BASE, "--sources", "513"])).toThrow("from 16 to 512");
 	});
 
 	test("unknown, duplicate, and valueless flags fail before any side effect", () => {
@@ -329,7 +329,8 @@ describe("evidence-recall CLI routing gate", () => {
 			const before = await inventory(source);
 
 			const args = ["--main", "openrouter/main-model", "--compressor", "openrouter/compressor-model", "--agent-dir", source, "--omp", omp, "--out", out];
-			if (routing.confirm) args.push("--confirm-live-provider-calls");
+			// Confirmation requires the dollar cap; the routing guard still runs before any credential or host access.
+			if (routing.confirm) args.push("--confirm-live-provider-calls", "--max-cost-usd", "1");
 			child = Bun.spawn({
 				cmd: [process.execPath, CLI, ...args],
 				cwd: REPO_ROOT,

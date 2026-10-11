@@ -38,16 +38,19 @@ export type Failure =
 	| "fabricated-id"
 	| "fabricated-citation"
 	| "ambiguous-confident"
-	| "ambiguous-incomplete";
+	| "ambiguous-incomplete"
+	| "unanswerable-asserted";
 
 export interface Judgement {
 	readonly questionId: string;
 	readonly outcome: Outcome;
 	readonly failure: Failure | null;
-	/** The value is right, independent of its citations: the value rules passed, and abstention is never a value. */
+	/** The value is right, independent of its citations: the value rules passed. An abstention is a value only on an unanswerable question. */
 	readonly valueCorrect: boolean;
 	/** Answer marked uncertain by the model; reported separately from correctness. */
 	readonly uncertain: boolean;
+	/** Counted as abstained: the `abstained` outcome, or a correct abstention on an unanswerable question (which also counts as correct). */
+	readonly abstained: boolean;
 	/** Ambiguous questions: every source was cited with supporting original text. Otherwise: at least one source was. */
 	readonly grounded: boolean;
 	readonly assertedForbidden: readonly string[];
@@ -58,12 +61,16 @@ export interface Judgement {
 
 export interface ScoreInput {
 	readonly questions: readonly Question[];
-	/** Raw final assistant text; must be exactly the JSON object described by `answerInstruction`. */
+	/** Raw final assistant text; must contain exactly one fenced json block holding the object described by `answerInstruction`. */
 	readonly raw: string;
 	readonly pages: readonly RetrievedPage[];
 	readonly knownIds: ReadonlySet<string>;
-	/** Saved view text: a quote found only here is real memory text, though not a retrieved original. */
+	/** Saved view text: a quote found only here is real memory text, though not a retrieved original. On arm only. */
 	readonly viewText?: string;
+	/** Which arm produced the answer. `on` (default) grounds quotes in retrieved originals; `off` grounds them in the seeded history. */
+	readonly arm?: "on" | "off";
+	/** Off arm only, required there: recordId (as a string) → exact text of that record as seeded into the history. */
+	readonly seededRecords?: ReadonlyMap<string, string>;
 }
 
 export interface AnswerSetScore {
@@ -79,7 +86,19 @@ export interface AnswerSetScore {
 	};
 }
 
+export interface ArmTotals {
+	readonly judged: number;
+	readonly correct: number;
+	readonly valueCorrect: number;
+	readonly grounded: number;
+	readonly abstained: number;
+	readonly hallucinated: number;
+	readonly incorrectSchema: number;
+}
+
 const ANSWER_KEYS = ["id", "value", "uncertain", "citations"] as const;
+/** Explicit abstention values for unanswerable questions, matched against the normalized value by prefix. */
+const ABSTENTION_VALUES = ["not stated", "not specified", "unknown", "not in the records", "no record"] as const;
 const CITATION_KEYS = ["recordId", "quote"] as const;
 const ID_TOKEN = /\bZX-\d{4}-[A-Z]\b/g;
 /** A negation or supersession cue directly before a value (within two words). */
@@ -202,52 +221,78 @@ export function parseAnswerSet(raw: string, questionIds: readonly string[]): Par
 /** Prompt text describing the exact final answer schema for the selected question ids. */
 export function answerInstruction(questionIds: readonly string[]): string {
 	return [
-		'Reply with one JSON object and nothing else: {"answers":[{"id":string,"value":string|null,"uncertain":boolean,"citations":[{"recordId":number,"quote":string}]}]}.',
-		`Give exactly one entry for each id: ${questionIds.join(", ")}. Each quote must be copied exactly from the original record text you retrieved, and recordId must be that record's id. Set uncertain to true only when the sources are ambiguous or missing the answer.`,
+		'Reply with exactly one fenced ```json code block containing one JSON object, and nothing outside that block: {"answers":[{"id":string,"value":string|null,"uncertain":boolean,"citations":[{"recordId":number,"quote":string}]}]}.',
+		`Give exactly one entry for each id: ${questionIds.join(", ")}. Each quote must be copied exactly from the original record text you retrieved, and recordId must be that record's id. Set uncertain to true only when the sources are ambiguous or missing the answer; if they are missing the answer, set value to "not stated".`,
 	].join("\n");
 }
 
+/** What citations are checked against. `on`: retrieved originals and the saved view. `off`: the seeded history only. */
+interface Evidence {
+	readonly arm: "on" | "off";
+	readonly pages: readonly RetrievedPage[];
+	readonly viewText: string;
+	readonly seededRecords: ReadonlyMap<string, string>;
+	readonly knownIds: ReadonlySet<string>;
+}
+
 /**
- * Citation quotes: one in the cited record's retrieved original page supports it; one only in the saved view
- * is real memory text but unretrieved, so it is ungrounded; one in neither is fabricated.
+ * Citation quotes. A quote in the cited record's original text (retrieved page on the on arm, seeded text on the
+ * off arm) is original. On the on arm, a quote only in the saved view is real memory text but unretrieved, so it is
+ * ungrounded. A quote in no memory text the arm can see is fabricated.
  */
-function citationSupport(question: Question, citations: readonly Citation[], pages: readonly RetrievedPage[], viewText: string): { readonly supported: Set<number>; readonly fabricated: number } {
+function citationSupport(question: Question, citations: readonly Citation[], evidence: Evidence): { readonly supported: Set<number>; readonly fabricated: number } {
 	const supported = new Set<number>();
 	let fabricated = 0;
 	for (const citation of citations) {
-		const original = pages.some((page) => page.recordId === citation.recordId && page.text.includes(citation.quote));
+		const original =
+			evidence.arm === "on"
+				? evidence.pages.some((page) => page.recordId === citation.recordId && page.text.includes(citation.quote))
+				: (evidence.seededRecords.get(String(citation.recordId))?.includes(citation.quote) ?? false);
 		if (original) {
 			const source = question.sources.find((entry) => entry.recordId === citation.recordId);
 			if (source && citation.quote.includes(source.value)) supported.add(source.recordId);
 			continue;
 		}
-		if (!viewText.includes(citation.quote)) fabricated += 1;
+		const memory = evidence.arm === "on" ? [evidence.viewText] : [...evidence.seededRecords.values()];
+		if (memory.some((text) => text.includes(citation.quote))) continue;
+		fabricated += 1;
 	}
 	return { supported, fabricated };
 }
 
 /** The value decides first; citations only grade a value that is already right. */
-function judgeOne(question: Question, entry: StructuredAnswer, pages: readonly RetrievedPage[], knownIds: ReadonlySet<string>, viewText: string): Judgement {
+function judgeOne(question: Question, entry: StructuredAnswer, evidence: Evidence): Judgement {
 	const value = entry.value ?? "";
-	const support = citationSupport(question, entry.citations, pages, viewText);
+	const unanswerable = question.answerable === false;
+	const support = citationSupport(question, entry.citations, evidence);
 	const grounded = question.ambiguous
 		? question.sources.every((source) => support.supported.has(source.recordId))
 		: question.sources.some((source) => support.supported.has(source.recordId));
-	const asserted = assertedForbidden(value, question.forbid);
-	const fabricatedIds = [...value.matchAll(ID_TOKEN)].map((match) => match[0]).filter((id) => !knownIds.has(id));
-	const verdict = (outcome: Outcome, failure: Failure | null, valueCorrect: boolean): Judgement => ({
+	const asserted = unanswerable ? [] : assertedForbidden(value, question.forbid);
+	const fabricatedIds = [...value.matchAll(ID_TOKEN)].map((match) => match[0]).filter((id) => !evidence.knownIds.has(id));
+	const verdict = (outcome: Outcome, failure: Failure | null, valueCorrect: boolean, isGrounded = grounded): Judgement => ({
 		questionId: question.id,
 		outcome,
 		failure,
 		valueCorrect,
 		uncertain: entry.uncertain,
-		grounded,
+		grounded: isGrounded,
+		abstained: outcome === "abstained" || (unanswerable && outcome === "correct"),
 		assertedForbidden: asserted,
 		fabricatedCitations: support.fabricated,
 		fabricatedIds,
 	});
 
 	if (fabricatedIds.length > 0) return verdict("hallucinated", "fabricated-id", false);
+	if (unanswerable) {
+		// Abstaining is the only right answer. A definite value or any citation asserts one. An uncertain reply abstains
+		// without credit when its value is empty, is correct when its value is an explicit abstention, and otherwise asserts.
+		if (!entry.uncertain || entry.citations.length > 0) return verdict("hallucinated", "unanswerable-asserted", false);
+		if (value.trim() === "") return verdict("abstained", null, false, false);
+		const phrase = value.trim().toLowerCase().replace(/\s+/g, " ").replace(/\.+$/, "");
+		if (ABSTENTION_VALUES.some((token) => phrase.startsWith(token))) return verdict("correct", null, true, true);
+		return verdict("hallucinated", "unanswerable-asserted", false);
+	}
 	if (asserted.length > 0) return verdict("hallucinated", "forbidden-value", false);
 	if (question.ambiguous) {
 		if (!entry.uncertain) return verdict("hallucinated", "ambiguous-confident", false);
@@ -265,12 +310,21 @@ function judgeOne(question: Question, entry: StructuredAnswer, pages: readonly R
 
 /** Scores one final answer set. An invalid set fails every selected question with `schema`; nothing is partially credited. */
 export function scoreAnswers(input: ScoreInput): AnswerSetScore {
+	const arm = input.arm ?? "on";
+	if (arm === "off" && input.seededRecords === undefined) throw new Error("scoreAnswers: the off arm needs seededRecords to ground citations");
+	const evidence: Evidence = {
+		arm,
+		pages: input.pages,
+		viewText: input.viewText ?? "",
+		seededRecords: input.seededRecords ?? new Map(),
+		knownIds: input.knownIds,
+	};
 	const parsed = parseAnswerSet(
 		input.raw,
 		input.questions.map((question) => question.id),
 	);
 	const judgements: Judgement[] = parsed.ok
-		? input.questions.map((question) => judgeOne(question, parsed.answers.get(question.id)!, input.pages, input.knownIds, input.viewText ?? ""))
+		? input.questions.map((question) => judgeOne(question, parsed.answers.get(question.id)!, evidence))
 		: input.questions.map((question): Judgement => ({
 				questionId: question.id,
 				outcome: "incorrect",
@@ -278,6 +332,7 @@ export function scoreAnswers(input: ScoreInput): AnswerSetScore {
 				valueCorrect: false,
 				uncertain: false,
 				grounded: false,
+				abstained: false,
 				assertedForbidden: [],
 				fabricatedCitations: 0,
 				fabricatedIds: [],
@@ -290,9 +345,23 @@ export function scoreAnswers(input: ScoreInput): AnswerSetScore {
 		totals: {
 			questions: judgements.length,
 			correct: count("correct"),
-			abstained: count("abstained"),
+			abstained: judgements.filter((judgement) => judgement.abstained).length,
 			incorrect: count("incorrect"),
 			hallucinated: count("hallucinated"),
 		},
+	};
+}
+
+/** Per-arm counts over one run's judgements. A correct abstention on an unanswerable question counts as correct and abstained. */
+export function armTotals(judgements: readonly Judgement[]): ArmTotals {
+	const count = (test: (judgement: Judgement) => boolean): number => judgements.filter(test).length;
+	return {
+		judged: judgements.length,
+		correct: count((judgement) => judgement.outcome === "correct"),
+		valueCorrect: count((judgement) => judgement.valueCorrect),
+		grounded: count((judgement) => judgement.grounded),
+		abstained: count((judgement) => judgement.abstained),
+		hallucinated: count((judgement) => judgement.outcome === "hallucinated"),
+		incorrectSchema: count((judgement) => judgement.failure === "schema"),
 	};
 }

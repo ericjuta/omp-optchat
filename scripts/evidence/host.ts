@@ -19,15 +19,32 @@ export interface HostLaunch {
 	readonly metricsFile: string;
 	readonly admissionFile: string;
 	readonly allowance: number;
+	/** Per-host dollar allowance (OPTCHAT_EVIDENCE_USD_ALLOWANCE): reserved worst-case USD may not exceed it. */
+	readonly usdAllowance: number;
+	/** Worst-case USD charged per compressor admission (OPTCHAT_EVIDENCE_USD_PER_CALL), computed by the runner. */
+	readonly usdPerCall: number;
 	readonly compressorMaxTokens: number;
 	/** The host's view budget in bytes (--optchat-view-bytes). The product default is larger; see EVIDENCE_VIEW_BYTES. */
 	readonly viewBytes: number;
 	/** Complete child environment. The caller builds it from an allowlist; nothing is inherited here. */
 	readonly env: Readonly<Record<string, string>>;
+	/** false → `--no-optchat`; the evidence wrapper extension still loads. */
+	readonly optchat: boolean;
+	/** Appended after the standard arguments. */
+	readonly extraArgs: readonly string[];
+	/** null keeps `--no-tools`; a list replaces it with `--tools <csv>`. */
+	readonly tools: readonly string[] | null;
 }
 
 /** Common no-ambient-state flags: no tools, skills, rules, or discovered extensions. */
 const ISOLATION_FLAGS = ["--mode", "rpc", "--no-ui", "--no-title", "--no-tools", "--no-skills", "--no-rules", "--no-extensions"];
+/** Isolation flags for one launch: `--no-tools` unless a tool list names the tools to expose instead. */
+function isolationFlags(tools: readonly string[] | null): string[] {
+	if (tools === null) return [...ISOLATION_FLAGS];
+	if (tools.length === 0) throw new RangeError("tools must name at least one tool; use null to disable tools");
+	const at = ISOLATION_FLAGS.indexOf("--no-tools");
+	return [...ISOLATION_FLAGS.slice(0, at), "--tools", tools.join(","), ...ISOLATION_FLAGS.slice(at + 1)];
+}
 
 /**
  * Real host launch with the evidence extension as the only -e entry. The extension wraps the
@@ -35,7 +52,7 @@ const ISOLATION_FLAGS = ["--mode", "rpc", "--no-ui", "--no-title", "--no-tools",
  */
 export function launchArgs(launch: HostLaunch, extension: string): string[] {
 	return [
-		...ISOLATION_FLAGS,
+		...isolationFlags(launch.tools),
 		"-e", extension,
 		"--session-dir", launch.sessionDir,
 		"--model", launch.main,
@@ -43,6 +60,8 @@ export function launchArgs(launch: HostLaunch, extension: string): string[] {
 		"--optchat-dir", launch.memory,
 		// Runner-only: a view budget small enough that the saved tree coarsens within the call budget.
 		"--optchat-view-bytes", String(launch.viewBytes),
+		...(launch.optchat ? [] : ["--no-optchat"]),
+		...launch.extraArgs,
 	];
 }
 
@@ -94,6 +113,9 @@ export class RpcHost {
 				OPTCHAT_METRICS_FILE: launch.metricsFile,
 				OPTCHAT_EVIDENCE_ADMISSION_FILE: launch.admissionFile,
 				OPTCHAT_EVIDENCE_ALLOWANCE: String(launch.allowance),
+				// Plain decimals only: the extension's parser rejects exponent notation.
+				OPTCHAT_EVIDENCE_USD_ALLOWANCE: launch.usdAllowance.toFixed(12),
+				OPTCHAT_EVIDENCE_USD_PER_CALL: launch.usdPerCall.toFixed(12),
 				OPTCHAT_EVIDENCE_COMPRESSOR_MAX_TOKENS: String(launch.compressorMaxTokens),
 			},
 			stdio: "pipe",
@@ -216,8 +238,10 @@ export async function queryAvailableModels(
 	sessionDir: string,
 	cwd: string,
 	timeoutMs = 60_000,
+	extensions: readonly string[] = [],
 ): Promise<{ provider: string; id: string }[]> {
-	const child = spawn(omp, [...ISOLATION_FLAGS, "--session-dir", sessionDir], { cwd, env: { ...env }, stdio: "pipe", detached: true });
+	const extensionFlags = extensions.flatMap((path) => ["-e", path]);
+	const child = spawn(omp, [...ISOLATION_FLAGS, ...extensionFlags, "--session-dir", sessionDir], { cwd, env: { ...env }, stdio: "pipe", detached: true });
 	const exit = Promise.withResolvers<number | null>();
 	child.once("exit", (code) => exit.resolve(code));
 	const exited = exit.promise;

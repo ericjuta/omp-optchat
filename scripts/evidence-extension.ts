@@ -5,14 +5,17 @@
  * read-increment-write in one process.
  *
  * Environment (all required when loaded; absence fails closed):
- *   OPTCHAT_EVIDENCE_ADMISSION_FILE  per-host JSON counter file
+ *   OPTCHAT_EVIDENCE_ADMISSION_FILE  per-host JSON admission file: { dispatched, reservedUsd }
  *   OPTCHAT_EVIDENCE_ALLOWANCE       integer compressor calls this host may dispatch
+ *   OPTCHAT_EVIDENCE_USD_ALLOWANCE   decimal dollars this host may reserve in worst-case compressor bounds
+ *   OPTCHAT_EVIDENCE_USD_PER_CALL    decimal worst-case dollars charged per compressor call
  *   OPTCHAT_EVIDENCE_COMPRESSOR_MAX_TOKENS  integer 1..512 output cap per compressor call
  *   OPTCHAT_EVIDENCE_PARENT_PATHS    optional JSON string array of runner host paths that must not appear in the prompt
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { createOptChat } from "../src/index.ts";
+import { admitCompressorCall, parseUsdDecimal } from "./evidence/admission.ts";
 import { findPrivateContextMarkers, parseParentSubstrings } from "./evidence/preflight.ts";
 
 const MAX_OUTPUT = 512;
@@ -35,15 +38,10 @@ export default function evidenceExtension(pi: ExtensionAPI): void {
 	const file = required("OPTCHAT_EVIDENCE_ADMISSION_FILE");
 	const allowance = Number(process.env.OPTCHAT_EVIDENCE_ALLOWANCE ?? "");
 	if (!Number.isInteger(allowance) || allowance < 0) throw new Error("OPTCHAT_EVIDENCE_ALLOWANCE must be a nonnegative integer");
+	const usdAllowance = parseUsdDecimal(required("OPTCHAT_EVIDENCE_USD_ALLOWANCE"), "OPTCHAT_EVIDENCE_USD_ALLOWANCE");
+	const perCallUsd = parseUsdDecimal(required("OPTCHAT_EVIDENCE_USD_PER_CALL"), "OPTCHAT_EVIDENCE_USD_PER_CALL");
 	const maxTokens = positiveInteger("OPTCHAT_EVIDENCE_COMPRESSOR_MAX_TOKENS", MAX_OUTPUT);
 	const parentPaths = parseParentSubstrings(process.env.OPTCHAT_EVIDENCE_PARENT_PATHS);
-	const read = (): number => {
-		const parsed = JSON.parse(readFileSync(file, "utf8")) as { dispatched?: unknown };
-		if (typeof parsed.dispatched !== "number" || !Number.isInteger(parsed.dispatched) || parsed.dispatched < 0) {
-			throw new Error("admission file is malformed");
-		}
-		return parsed.dispatched;
-	};
 	// Every turn: the effective system prompt must carry no private ambient context, before any call.
 	pi.on("before_agent_start", (event) => {
 		const found = findPrivateContextMarkers(event.systemPrompt, parentPaths);
@@ -52,10 +50,10 @@ export default function evidenceExtension(pi: ExtensionAPI): void {
 	createOptChat({
 		compressorMaxTokens: maxTokens,
 		admitCompressorCall: () => {
-			const dispatched = read();
-			if (dispatched >= allowance) return false;
+			const decision = admitCompressorCall(JSON.parse(readFileSync(file, "utf8")), allowance, perCallUsd, usdAllowance);
+			if (!decision.admitted) return false;
 			// Written before the request is sent: a crash after this point over-counts, never under-counts.
-			writeFileSync(file, JSON.stringify({ dispatched: dispatched + 1 }));
+			writeFileSync(file, JSON.stringify(decision.state));
 			return true;
 		},
 	})(pi);

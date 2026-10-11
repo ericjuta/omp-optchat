@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ARTIFACT_SCHEMA, estimateCostUsd, summarizeUsage, validateArtifact, type UsageRecord } from "../scripts/evidence/artifact.ts";
+import { ARTIFACT_SCHEMA, estimateCostUsd, maintenanceSummary, summarizeUsage, validateArtifact, type UsageRecord } from "../scripts/evidence/artifact.ts";
+import { offCompactionBoundUsd } from "../scripts/evidence/cost.ts";
 import { buildCorpus, type Question } from "../scripts/evidence/corpus.ts";
 import { hostStopReason, observeTurn, readMetricLines, readTreeStructure } from "../scripts/evidence/host.ts";
 import { assertWorkspaceBoundary, createIsolatedDirs } from "../scripts/evidence/isolation.ts";
@@ -22,13 +23,13 @@ import {
 	selectQuestions,
 	type Limits,
 } from "../scripts/evidence/plan.ts";
-import { assertedForbidden, parseAnswerSet, scoreAnswers, type RetrievedPage } from "../scripts/evidence/scoring.ts";
+import { answerInstruction, armTotals, assertedForbidden, parseAnswerSet, scoreAnswers, type RetrievedPage } from "../scripts/evidence/scoring.ts";
 import { PHASE_COMPRESSOR_ALLOWANCE, phaseCompressorAllowance, RESTART_RESERVE_CALLS, SEED_COMPRESSOR_ALLOWANCE } from "../scripts/evidence/plan.ts";
 
 const LIMITS: Limits = { maxCalls: 80, maxCompressorOutputTokens: 512, deadlineMs: 600_000, expiryWaitMs: null };
 const SEED = 3;
 
-/** Two projects, sixteen records: the first project carries a correction, so its owner question is a correction. */
+/** Two projects, sixteen records: the second project carries a correction, so its owner question is a correction. */
 const corpus = buildCorpus({ seed: SEED, projects: 2, sourceCount: 16, minSourceBytes: 1024 });
 
 function questionOf(kind: Question["kind"]): Question {
@@ -57,9 +58,8 @@ describe("synthetic corpus", () => {
 		expect(corpus.digest).not.toBe(other.digest);
 	});
 
-	test("sixteen to twenty-four records, each above the minimum size, numbered in order, each embedding its REF", () => {
-		expect(corpus.sources.length).toBeGreaterThanOrEqual(16);
-		expect(corpus.sources.length).toBeLessThanOrEqual(24);
+	test("sixteen records (the two-project fact plan), each above the minimum size, numbered in order, each embedding its REF", () => {
+		expect(corpus.sources.length).toBe(16);
 		corpus.sources.forEach((source, index) => {
 			expect(source.recordId).toBe(index);
 			expect(source.text).toContain(`[${source.ref}]`);
@@ -69,6 +69,7 @@ describe("synthetic corpus", () => {
 
 	test("every question cites records whose original text carries the value it asserts", () => {
 		for (const entry of corpus.questions) {
+			if (!entry.answerable) continue;
 			expect(entry.sources.length).toBeGreaterThan(0);
 			for (const source of entry.sources) {
 				expect(corpus.sources[source.recordId]!.text).toContain(source.value);
@@ -129,7 +130,7 @@ describe("synthetic corpus", () => {
 		const base = { seed: SEED, projects: 2, sourceCount: 16, minSourceBytes: 1024 };
 		expect(() => buildCorpus({ ...base, projects: 1 })).toThrow();
 		expect(() => buildCorpus({ ...base, sourceCount: 15 })).toThrow();
-		expect(() => buildCorpus({ ...base, sourceCount: 25 })).toThrow();
+		expect(() => buildCorpus({ ...base, sourceCount: 513 })).toThrow();
 		expect(() => buildCorpus({ ...base, minSourceBytes: 511 })).toThrow();
 		expect(() => buildCorpus({ ...base, seed: -1 })).toThrow();
 		expect(() => buildCorpus({ ...base, projects: 3 })).toThrow();
@@ -551,11 +552,27 @@ describe("artifact validation", () => {
 	const main = summarizeUsage([{ role: "main", purpose: "turn", input: 10, output: 2, cacheRead: 0, cacheWrite: 0, costUsd: 0.001, costSource: "sdk-reported", latencyMs: 100 }]);
 	const unavailableCompressor = { status: "unavailable", reason: "no metrics sink" };
 	const corpusBlock = { version: corpus.version, seed: SEED, digest: corpus.digest, sources: corpus.sources.length, minSourceBytes: 1024, questionsTotal: corpus.questions.length, questionsSelected: 8 };
-	const limitsBlock = { ...LIMITS, enforcement: "prompt-admission", callsUsed: 1, violations: [] };
+	const limitsBlock = { ...LIMITS, enforcement: "prompt-admission", callsUsed: 1, violations: [], maxCostUsd: null, spentUsd: null, costEnforcement: "none" };
+	const zeroMaintenance = maintenanceSummary({ compactions: 0, interval: null });
 
 	/** A well-formed phase; overrides replace fields wholesale. */
 	function phase(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-		return { name: "main", model: "synthetic/model", latencyMs: 120, usage: { main, compressor: unavailableCompressor }, questions: [], tree: null, error: null, refusal: null, timestamps: null, ...overrides };
+		return {
+			name: "main",
+			model: "synthetic/model",
+			arm: "on",
+			compressor: null,
+			latencyMs: 120,
+			usage: { main, compressor: unavailableCompressor, auxiliary: summarizeUsage([]) },
+			maintenance: zeroMaintenance,
+			turns: [],
+			questions: [],
+			tree: null,
+			error: null,
+			refusal: null,
+			timestamps: null,
+			...overrides,
+		};
 	}
 
 	/** A well-formed artifact; top-level and phase overrides replace fields wholesale. */
@@ -566,6 +583,13 @@ describe("artifact validation", () => {
 			status: "completed",
 			error: null,
 			synthetic: true,
+			arms: ["on"],
+			turnMode: "batch",
+			requestedExperiments: [],
+			experiments: { child: null },
+			questionEmphasis: "balanced",
+			viewBytes: 4096,
+			paired: [],
 			corpus: corpusBlock,
 			limits: limitsBlock,
 			scenarios: [{ name: "cold", status: "completed", reason: null, phases: [phase(phaseOverrides)] }],
@@ -650,10 +674,30 @@ describe("artifact validation", () => {
 		expect(validateArtifact(artifact({}, { questions: [{ ...unavailable, correct: true }] })).length).toBeGreaterThan(0);
 	});
 
-	test("the corpus must have sixteen to twenty-four sources and an enforcement mode is required", () => {
+	test("the corpus must have sixteen to five hundred twelve sources and an enforcement mode is required", () => {
 		expect(validateArtifact(artifact({ corpus: { ...corpusBlock, sources: 15 } })).length).toBeGreaterThan(0);
+		expect(validateArtifact(artifact({ corpus: { ...corpusBlock, sources: 513 } })).length).toBeGreaterThan(0);
+		expect(validateArtifact(artifact({ corpus: { ...corpusBlock, sources: 512 } }))).toEqual([]);
 		const { enforcement: _omitted, ...unmarked } = limitsBlock;
 		expect(validateArtifact(artifact({ limits: unmarked })).length).toBeGreaterThan(0);
+	});
+});
+
+describe("off-arm compaction admission bound", () => {
+	const model = { inputRate: 1, outputRate: 2, cacheReadRate: 0.1, cacheWriteRate: 1.25, contextWindow: 100_000, maxOutput: 1000 };
+
+	test("prices the whole history and prompt at the dearest input rate, plus overhead and the catalog output ceiling", () => {
+		// 400 and 40 UTF-8 bytes are 100 and 10 tokens; 4096 tokens of overhead; the cache-write rate is the dearest input rate.
+		expect(offCompactionBoundUsd(model, 400, 40)).toBeCloseTo(((100 + 10 + 4096) * 1.25 + 1000 * 2) / 1e6, 12);
+	});
+
+	test("an unknown or invalid catalog output ceiling fails closed", () => {
+		expect(offCompactionBoundUsd({ ...model, maxOutput: null }, 400, 40)).toBeNull();
+		expect(offCompactionBoundUsd({ ...model, maxOutput: 0 }, 400, 40)).toBeNull();
+	});
+
+	test("a history larger than the context window is priced in full, not clamped", () => {
+		expect(offCompactionBoundUsd({ ...model, contextWindow: 10 }, 40_000, 0)).toBeCloseTo(((10_000 + 4096) * 1.25 + 1000 * 2) / 1e6, 12);
 	});
 });
 
@@ -712,6 +756,108 @@ describe("value before citations, saved-view grounding, and per-phase budget", (
 		expect(phaseCompressorAllowance("restart", spare - seed, 1)).toBeGreaterThanOrEqual(RESTART_RESERVE_CALLS);
 		expect(phaseCompressorAllowance("restart", 70, 1)).toBe(70);
 		expect(phaseCompressorAllowance("concurrent-0", 100, 2)).toBe(20);
+	});
+});
+
+describe("arm-aware scoring, unanswerable questions, and totals", () => {
+	const ticket = questionOf("exact-id");
+	const rec = ticket.sources[0]!.recordId;
+	const ids = new Set(corpus.knownIds);
+	const seeded = new Map([[String(rec), corpus.sources[rec]!.text]]);
+	const right = answers([{ id: ticket.id, value: ticket.expect[0]!, uncertain: false, citations: [{ recordId: rec, quote: fact(rec) }] }]);
+	const unknown: Question = { ...ticket, id: "unanswerable-probe", answerable: false, ambiguous: false, expect: [], forbid: [], candidates: [], sources: [] };
+	const probe = (entry: Record<string, unknown>) => scoreAnswers({ questions: [unknown], raw: answers([entry]), pages: [], knownIds: ids }).judgements[0]!;
+
+	test("off arm: a quote that is an exact substring of the seeded record grounds the value without retrieved pages", () => {
+		const judgement = scoreAnswers({ arm: "off", seededRecords: seeded, questions: [ticket], raw: right, pages: [], knownIds: ids }).judgements[0]!;
+		expect(judgement.outcome).toBe("correct");
+		expect(judgement.grounded).toBe(true);
+		expect(judgement.fabricatedCitations).toBe(0);
+	});
+
+	test("off arm: a paraphrased quote is fabricated-citation, and the value is still counted right", () => {
+		const raw = answers([{ id: ticket.id, value: ticket.expect[0]!, uncertain: false, citations: [{ recordId: rec, quote: "the ticket is the correct one" }] }]);
+		const judgement = scoreAnswers({ arm: "off", seededRecords: seeded, questions: [ticket], raw, pages: [], knownIds: ids }).judgements[0]!;
+		expect(judgement.outcome).toBe("hallucinated");
+		expect(judgement.failure).toBe("fabricated-citation");
+		expect(judgement.valueCorrect).toBe(true);
+		expect(judgement.fabricatedCitations).toBe(1);
+	});
+
+	test("off arm refuses to score without the seeded history", () => {
+		expect(() => scoreAnswers({ arm: "off", questions: [ticket], raw: right, pages: [], knownIds: ids })).toThrow("seededRecords");
+	});
+
+	test("a citation to any one of several non-ambiguous sources grounds the value", () => {
+		const value = ticket.expect[0]!;
+		const other = 99;
+		const multi: Question = { ...ticket, sources: [...ticket.sources, { recordId: other, value }] };
+		const text = `Staff note: the verified owner is ${value}.`;
+		const raw = answers([{ id: ticket.id, value, uncertain: false, citations: [{ recordId: other, quote: text }] }]);
+		const judgement = scoreAnswers({ questions: [multi], raw, pages: [{ recordId: other, text }], knownIds: ids }).judgements[0]!;
+		expect(judgement.outcome).toBe("correct");
+		expect(judgement.grounded).toBe(true);
+	});
+
+	test("an uncertain reply stating an explicit abstention on an unanswerable question is correct and abstained", () => {
+		const judgement = probe({ id: unknown.id, value: "not stated", uncertain: true, citations: [] });
+		expect(judgement.outcome).toBe("correct");
+		expect(judgement.abstained).toBe(true);
+		expect(judgement.failure).toBeNull();
+	});
+
+	test("an explicit abstention is matched after normalization: case, spacing, and a trailing period", () => {
+		const judgement = probe({ id: unknown.id, value: "  Not   Stated. ", uncertain: true, citations: [] });
+		expect(judgement.outcome).toBe("correct");
+		expect(judgement.abstained).toBe(true);
+	});
+
+	test("an uncertain unanswerable reply with a definite value that is not an abstention is hallucinated unanswerable-asserted", () => {
+		const judgement = probe({ id: unknown.id, value: "Ada", uncertain: true, citations: [] });
+		expect(judgement.outcome).toBe("hallucinated");
+		expect(judgement.failure).toBe("unanswerable-asserted");
+		expect(judgement.abstained).toBe(false);
+	});
+
+	test("an uncertain unanswerable reply with no value abstains without credit", () => {
+		const judgement = probe({ id: unknown.id, value: null, uncertain: true, citations: [] });
+		expect(judgement.outcome).toBe("abstained");
+		expect(judgement.abstained).toBe(true);
+	});
+
+	test("a definite value on an unanswerable question is hallucinated unanswerable-asserted", () => {
+		const judgement = probe({ id: unknown.id, value: "Ada", uncertain: false, citations: [] });
+		expect(judgement.outcome).toBe("hallucinated");
+		expect(judgement.failure).toBe("unanswerable-asserted");
+		expect(judgement.abstained).toBe(false);
+	});
+
+	test("any citation on an unanswerable question is hallucinated unanswerable-asserted, even while uncertain", () => {
+		const judgement = probe({ id: unknown.id, value: "not stated", uncertain: true, citations: [{ recordId: rec, quote: fact(rec) }] });
+		expect(judgement.outcome).toBe("hallucinated");
+		expect(judgement.failure).toBe("unanswerable-asserted");
+	});
+
+	test("armTotals counts a correct abstention as correct and abstained, and separates schema failures", () => {
+		const score = scoreAnswers({
+			questions: [ticket, unknown],
+			raw: answers([
+				{ id: ticket.id, value: ticket.expect[0]!, uncertain: false, citations: [{ recordId: rec, quote: fact(rec) }] },
+				{ id: unknown.id, value: "not stated", uncertain: true, citations: [] },
+			]),
+			pages: [page(rec)],
+			knownIds: ids,
+		});
+		expect(armTotals(score.judgements)).toEqual({ judged: 2, correct: 2, valueCorrect: 2, grounded: 2, abstained: 1, hallucinated: 0, incorrectSchema: 0 });
+		const invalid = scoreAnswers({ questions: [ticket, unknown], raw: "not json", pages: [], knownIds: ids });
+		expect(armTotals(invalid.judgements)).toEqual({ judged: 2, correct: 0, valueCorrect: 0, grounded: 0, abstained: 0, hallucinated: 0, incorrectSchema: 2 });
+	});
+
+	test("the answer instruction asks for exactly one fenced json block, not a bare JSON object", () => {
+		const instruction = answerInstruction([ticket.id]);
+		expect(instruction).toContain("```json");
+		expect(instruction).not.toContain("bare JSON");
+		expect(instruction).toContain('value to "not stated"');
 	});
 });
 

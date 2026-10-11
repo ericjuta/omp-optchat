@@ -20,6 +20,8 @@ export interface CatalogEntry {
 	readonly found: boolean;
 	readonly pricingStatus: string | null;
 	readonly contextWindow: number | null;
+	/** Catalog output ceiling (maxTokens); null when the catalog does not state one. */
+	readonly maxOutput: number | null;
 	readonly price: Price | null;
 }
 
@@ -30,9 +32,11 @@ export interface CatalogEntry {
  * 394-419). `--no-extensions` sets disableExtensionDiscovery (cli/models-cli.ts:419), which passes
  * `ambient: false` and drops settings-declared extensions (cli/models-cli.ts:329-339). stdin is closed and
  * stderr is discarded; a failed run or non-JSON output throws with the exit code only, never stderr content.
+ * `extensions` names explicit extension entries (fixture mode only); `--no-extensions` still applies to discovery.
  */
-export async function readCatalogEntry(omp: string, selector: string, env: Readonly<Record<string, string>>, cwd: string): Promise<CatalogEntry> {
-	const process = Bun.spawn([omp, "models", "--json", "--no-extensions"], {
+export async function readCatalogEntry(omp: string, selector: string, env: Readonly<Record<string, string>>, cwd: string, extensions: readonly string[] = []): Promise<CatalogEntry> {
+	const extensionArgs = extensions.flatMap((path) => ["-e", path]);
+	const process = Bun.spawn([omp, "models", "--json", "--no-extensions", ...extensionArgs], {
 		cwd,
 		stdin: "ignore",
 		stdout: "pipe",
@@ -42,14 +46,14 @@ export async function readCatalogEntry(omp: string, selector: string, env: Reado
 	const text = await new Response(process.stdout).text();
 	const code = await process.exited;
 	if (code !== 0) throw new Error(`omp models --json failed with exit code ${code}`);
-	let parsed: { models?: { selector?: string; pricingStatus?: string; contextWindow?: number; cost?: Record<string, number> }[] };
+	let parsed: { models?: { selector?: string; pricingStatus?: string; contextWindow?: number; maxTokens?: number; cost?: Record<string, number> }[] };
 	try {
 		parsed = JSON.parse(text) as typeof parsed;
 	} catch {
 		throw new Error(`omp models --json produced non-JSON output (exit code ${code})`);
 	}
 	const entry = (parsed.models ?? []).find((model) => model.selector === selector);
-	if (!entry) return { selector, found: false, pricingStatus: null, contextWindow: null, price: null };
+	if (!entry) return { selector, found: false, pricingStatus: null, contextWindow: null, maxOutput: null, price: null };
 	const cost = entry.cost;
 	const price = cost && [cost.input, cost.output, cost.cacheRead, cost.cacheWrite].every((value) => typeof value === "number")
 		? { input: cost.input!, output: cost.output!, cacheRead: cost.cacheRead!, cacheWrite: cost.cacheWrite! }
@@ -59,6 +63,7 @@ export async function readCatalogEntry(omp: string, selector: string, env: Reado
 		found: true,
 		pricingStatus: entry.pricingStatus ?? null,
 		contextWindow: typeof entry.contextWindow === "number" ? entry.contextWindow : null,
+		maxOutput: typeof entry.maxTokens === "number" ? entry.maxTokens : null,
 		price,
 	};
 }

@@ -1,21 +1,59 @@
 import { createHash } from "node:crypto";
 
 /** Synthetic-only corpus. Every value is generated from the seed; no private data is read. */
-export const CORPUS_VERSION = "optchat-evidence-corpus/2";
+export const CORPUS_VERSION = "optchat-evidence-corpus/3";
+export const MIN_PROJECTS = 2;
+export const MAX_PROJECTS = 40;
 export const MIN_SOURCES = 16;
-export const MAX_SOURCES = 24;
+export const MAX_SOURCES = 512;
 export const MIN_SOURCE_BYTES = 512;
-export const MAX_SOURCE_BYTES = 16_384;
+export const MAX_SOURCE_BYTES = 32_768;
+/**
+ * Padding appends whole sentences (6..11 words of at most 10 bytes, space-separated, plus a period) until the floor is met.
+ * Each appended sentence is preceded by one space, so a record never exceeds its floor by more than this minus one.
+ */
+export const MAX_OVERSHOOT_BYTES = 121;
 
 export type QuestionKind =
 	| "merge-depth"
 	| "correction"
+	| "multi-step-correction"
+	| "reverted-correction"
 	| "negation"
+	| "late-distractor"
 	| "exact-id"
 	| "minor-fact"
 	| "attribution"
 	| "ambiguity"
+	| "near-duplicate"
+	| "unanswerable"
 	| "work-reference";
+
+/** Every kind, in a fixed order. */
+export const QUESTION_KINDS: readonly QuestionKind[] = [
+	"merge-depth",
+	"correction",
+	"multi-step-correction",
+	"reverted-correction",
+	"negation",
+	"late-distractor",
+	"exact-id",
+	"minor-fact",
+	"attribution",
+	"ambiguity",
+	"near-duplicate",
+	"unanswerable",
+	"work-reference",
+];
+
+/** Kinds that stress recall with superseded, rejected, near-duplicate, or unstated facts. */
+export const ADVERSARIAL_KINDS: readonly QuestionKind[] = [
+	"multi-step-correction",
+	"reverted-correction",
+	"late-distractor",
+	"near-duplicate",
+	"unanswerable",
+];
 
 /** `conversation` records are seeded into memory as chat history; `work` records are host-captured work results. */
 export type SourceKind = "conversation" | "work";
@@ -61,14 +99,19 @@ export interface Question {
 	readonly id: string;
 	readonly kind: QuestionKind;
 	readonly prompt: string;
-	/** Non-ambiguous questions: every value must appear in a correct answer. Ambiguous questions: empty. */
+	/** Answerable, non-ambiguous questions: every value must appear in a correct answer. Otherwise empty. */
 	readonly expect: readonly string[];
 	/** Values asserted (not explicitly rejected) by an answer make it a hallucination. */
 	readonly forbid: readonly string[];
 	readonly ambiguous: boolean;
+	/** `false` only for questions about facts the corpus never states; a correct answer abstains. */
+	readonly answerable: boolean;
 	/** Ambiguous questions only: a correct answer is uncertain and names every candidate. */
 	readonly candidates: readonly string[];
-	/** Non-ambiguous: one source. Ambiguous: one per candidate, and every one must be cited. */
+	/**
+	 * Answerable, non-ambiguous: the records that establish the value. Any one of them cited with the value grounds it.
+	 * Ambiguous: one per candidate, and every one must be cited. Unanswerable: empty.
+	 */
 	readonly sources: readonly QuestionSource[];
 	/** Kind of record that holds the answer. */
 	readonly sourceKind: SourceKind;
@@ -76,11 +119,13 @@ export interface Question {
 
 export interface CorpusOptions {
 	readonly seed: number;
-	/** Synthetic projects, 2 to 10. Five fact records per project, plus a correction for every third project. */
+	/** Synthetic projects, MIN_PROJECTS to MAX_PROJECTS. See `factRecordCount` for the record plan each project implies. */
 	readonly projects: number;
-	/** Total source records, MIN_SOURCES to MAX_SOURCES. Must cover the fact records; the remainder is filler. */
+	/**
+	 * Total source records, MIN_SOURCES to MAX_SOURCES. Must be at least `factRecordCount(projects)`; the remainder is filler.
+	 */
 	readonly sourceCount: number;
-	/** Every record's UTF-8 length is at least this. Callers pass a value above the host's node size. */
+	/** Every record's UTF-8 length is at least this, and at most `MAX_OVERSHOOT_BYTES - 1` above it. */
 	readonly minSourceBytes: number;
 }
 
@@ -107,38 +152,118 @@ export function seededRandom(seed: number): () => number {
 	};
 }
 
-export const CODENAMES = ["Lumen", "Basalt", "Harbor", "Quill", "Cinder", "Orchid", "Meridian", "Tundra", "Velvet", "Anchor"] as const;
+export const CODENAMES = [
+	"Lumen", "Basalt", "Harbor", "Quill", "Cinder", "Orchid", "Meridian", "Tundra", "Velvet", "Anchor",
+	"Bramble", "Cobalt", "Dune", "Ember", "Fjord", "Garnet", "Hollow", "Indigo", "Juniper", "Kestrel",
+	"Lantern", "Mosaic", "Nectar", "Onyx", "Prism", "Quarry", "Ridge", "Sable", "Thistle", "Umber",
+	"Vortex", "Willow", "Xenon", "Yarrow", "Zephyr", "Alder", "Birch", "Cedar", "Dahlia", "Fathom",
+] as const;
+/** Entity never present in the corpus; questions about it are unanswerable. */
+export const UNSTATED_SUBJECT = "Obsidian";
 const OWNERS = ["Ada", "Ben", "Cara", "Dev", "Eli", "Fay", "Gus", "Hana", "Iris", "Jon"] as const;
 const VENDORS = ["Corvid", "Pellet", "Stratus", "Nimbly", "Ferrox", "Glyph"] as const;
 const REPORTERS = ["Mika", "Osei", "Priya", "Rafael", "Sun", "Tove"] as const;
 /** Lowercase neutral words for detail padding: no names, numbers, IDs, or fact vocabulary. */
 const PAD_WORDS = ["routine", "checkpoint", "buffer", "cursor", "ledger", "segment", "snapshot", "interval", "replica", "queue", "vector", "frame", "lattice", "shard", "margin", "cache", "probe", "drift"] as const;
 
-const CORRECTION_PERIOD = 3;
-const FACTS_PER_PROJECT = 5;
-const ATLAS_RECORDS = 2;
-const WORK_RECORDS = 1;
+/**
+ * Project history shape, by `index % 4`. Each family adds late correction records after the filler:
+ * plain (none), single correction (1), chain A→B→C (2), reverted correction A→B then "B was wrong, A stands" (2).
+ */
+const FAMILIES = ["plain", "single", "chain", "revert"] as const;
+type Family = (typeof FAMILIES)[number];
+const LATE_RECORDS: readonly number[] = [0, 1, 2, 2];
+/** Fact records every project contributes in the fact layers, distractor layer included. */
+const BASE_RECORDS_PER_PROJECT = 6;
+/** Global fact records: two Atlas entities and one work record. */
+const GLOBAL_RECORDS = 3;
 
-/** Records that carry facts (everything except filler) for a given project count; one place defines the formula. */
+/** Late correction records a project contributes; family is `index % 4`. */
+export function lateRecordCount(projects: number): number {
+	let total = 0;
+	for (let index = 0; index < projects; index++) total += LATE_RECORDS[index % LATE_RECORDS.length]!;
+	return total;
+}
+
+/**
+ * Records that carry facts (everything except filler) for a project count:
+ * `6P + Σ_{i<P} late(i mod 4) + 3`, closed form `6P + 5·⌊P/4⌋ + [0,0,1,3][P mod 4] + 3`.
+ * P=2 → 16, P=3 → 24, P=40 → 293. `sourceCount` must be at least this value.
+ */
 export function factRecordCount(projects: number): number {
-	return projects * FACTS_PER_PROJECT + Math.ceil(projects / CORRECTION_PERIOD) + ATLAS_RECORDS + WORK_RECORDS;
+	return projects * BASE_RECORDS_PER_PROJECT + lateRecordCount(projects) + GLOBAL_RECORDS;
 }
 
-function single(id: string, kind: QuestionKind, prompt: string, recordId: number, value: string, forbid: readonly string[], sourceKind: SourceKind): Question {
-	return { id, kind, prompt, expect: [value], forbid, ambiguous: false, candidates: [], sources: [{ recordId, value }], sourceKind };
+/** Questions a corpus of this project count yields: one per project per owner/vendor/ticket/reporter/window/late-distractor, plus four global. */
+export function questionCount(projects: number): number {
+	return projects * 6 + 4;
 }
 
-export function buildCorpus(options: CorpusOptions): Corpus {
+/** Smallest valid source count and total question count for a project count, without building a corpus. */
+export function estimateCorpusSize(projects: number): { readonly minSources: number; readonly questions: number } {
+	if (!Number.isInteger(projects) || projects < MIN_PROJECTS || projects > MAX_PROJECTS) {
+		throw new Error(`projects must be an integer from ${MIN_PROJECTS} to ${MAX_PROJECTS}`);
+	}
+	return { minSources: Math.max(MIN_SOURCES, factRecordCount(projects)), questions: questionCount(projects) };
+}
+
+/**
+ * Byte and token bounds for a corpus shape, computed without building it. Every record lies in
+ * `[minSourceBytes, minSourceBytes + MAX_OVERSHOOT_BYTES - 1]`. Tokens use a bytes/4 heuristic, not a provider tokenizer.
+ */
+export function describeCorpusSize(options: CorpusOptions): {
+	readonly sources: number;
+	readonly questions: number;
+	readonly minBytes: number;
+	readonly maxBytes: number;
+	readonly approxTokens: { readonly min: number; readonly max: number };
+} {
+	validateCorpusOptions(options);
+	const minBytes = options.sourceCount * options.minSourceBytes;
+	const maxBytes = options.sourceCount * (options.minSourceBytes + MAX_OVERSHOOT_BYTES - 1);
+	return {
+		sources: options.sourceCount,
+		questions: questionCount(options.projects),
+		minBytes,
+		maxBytes,
+		approxTokens: { min: Math.ceil(minBytes / 4), max: Math.ceil(maxBytes / 4) },
+	};
+}
+
+export function validateCorpusOptions(options: CorpusOptions): void {
 	if (!Number.isSafeInteger(options.seed) || options.seed < 0) throw new Error("seed must be a non-negative safe integer");
-	if (!Number.isInteger(options.projects) || options.projects < 2 || options.projects > CODENAMES.length) {
-		throw new Error(`projects must be an integer from 2 to ${CODENAMES.length}`);
+	if (!Number.isInteger(options.projects) || options.projects < MIN_PROJECTS || options.projects > MAX_PROJECTS) {
+		throw new Error(`projects must be an integer from ${MIN_PROJECTS} to ${MAX_PROJECTS}`);
 	}
 	if (!Number.isInteger(options.sourceCount) || options.sourceCount < MIN_SOURCES || options.sourceCount > MAX_SOURCES) {
 		throw new Error(`sourceCount must be an integer from ${MIN_SOURCES} to ${MAX_SOURCES}`);
 	}
+	const needed = factRecordCount(options.projects);
+	if (options.sourceCount < needed) {
+		throw new Error(`projects ${options.projects} need ${needed} fact records; sourceCount must be at least ${needed}`);
+	}
 	if (!Number.isInteger(options.minSourceBytes) || options.minSourceBytes < MIN_SOURCE_BYTES || options.minSourceBytes > MAX_SOURCE_BYTES) {
 		throw new Error(`minSourceBytes must be an integer from ${MIN_SOURCE_BYTES} to ${MAX_SOURCE_BYTES}`);
 	}
+}
+
+function single(id: string, kind: QuestionKind, prompt: string, recordId: number, value: string, forbid: readonly string[], sourceKind: SourceKind): Question {
+	return { id, kind, prompt, expect: [value], forbid, ambiguous: false, answerable: true, candidates: [], sources: [{ recordId, value }], sourceKind };
+}
+
+interface Placement {
+	owner: number;
+	vendor: number;
+	ticket: number;
+	report: number;
+	window: number;
+	distractor: number;
+	/** Late correction records in the order they were written. */
+	late: number[];
+}
+
+export function buildCorpus(options: CorpusOptions): Corpus {
+	validateCorpusOptions(options);
 
 	const random = seededRandom(options.seed);
 	const pick = <T>(list: readonly T[]): T => list[Math.floor(random() * list.length)]!;
@@ -147,25 +272,30 @@ export function buildCorpus(options: CorpusOptions): Corpus {
 		return `${Array.from({ length: count }, () => pick(PAD_WORDS)).join(" ")}.`;
 	};
 
+	const usedTickets = new Set<string>();
 	const projects = Array.from({ length: options.projects }, (_, index) => {
-		const name = CODENAMES[index]!;
-		const owner = OWNERS[(index * 3 + options.seed) % OWNERS.length]!;
-		const newOwner = OWNERS[(index * 3 + options.seed + 1) % OWNERS.length]!;
+		const base = index * 3 + options.seed;
 		const vendor = pick(VENDORS);
-		const wrongVendor = VENDORS[(VENDORS.indexOf(vendor) + 1) % VENDORS.length]!;
-		const ticket = `ZX-${String(1000 + Math.floor(random() * 9000)).padStart(4, "0")}-${String.fromCharCode(65 + Math.floor(random() * 26))}`;
-		const reporter = pick(REPORTERS);
-		const minutes = 5 + Math.floor(random() * 90);
-		return { index, name, owner, newOwner, vendor, wrongVendor, ticket, reporter, minutes };
+		let ticket: string;
+		do {
+			ticket = `ZX-${String(1000 + Math.floor(random() * 9000)).padStart(4, "0")}-${String.fromCharCode(65 + Math.floor(random() * 26))}`;
+		} while (usedTickets.has(ticket));
+		usedTickets.add(ticket);
+		return {
+			index,
+			name: CODENAMES[index]!,
+			family: FAMILIES[index % FAMILIES.length]! as Family,
+			owner: OWNERS[base % OWNERS.length]!,
+			firstNew: OWNERS[(base + 1) % OWNERS.length]!,
+			secondNew: OWNERS[(base + 2) % OWNERS.length]!,
+			vendor,
+			wrongVendor: VENDORS[(VENDORS.indexOf(vendor) + 1) % VENDORS.length]!,
+			ticket,
+			reporter: pick(REPORTERS),
+			reportId: `RPT-${options.seed}-${index + 1}`,
+			minutes: 5 + Math.floor(random() * 90),
+		};
 	});
-	const correctedProjects = projects.filter((entry) => entry.index % CORRECTION_PERIOD === 0);
-	const factRecords = factRecordCount(options.projects);
-	if (factRecords !== projects.length * FACTS_PER_PROJECT + correctedProjects.length + ATLAS_RECORDS + WORK_RECORDS) {
-		throw new Error("fact-record formula disagrees with the generated records");
-	}
-	if (factRecords > options.sourceCount) {
-		throw new Error(`projects ${options.projects} need ${factRecords} fact records; sourceCount must be at least ${factRecords}`);
-	}
 
 	interface Draft {
 		readonly kind: SourceKind;
@@ -173,7 +303,7 @@ export function buildCorpus(options: CorpusOptions): Corpus {
 		readonly fact: string;
 	}
 	const drafts: Draft[] = [];
-	/** Appends a draft and returns its 1-based record id. */
+	/** Appends a draft and returns its 0-based record id. */
 	const add = (fact: string, kind: SourceKind, provenance: Provenance): number => {
 		drafts.push({ kind, provenance, fact });
 		return drafts.length - 1;
@@ -186,44 +316,75 @@ export function buildCorpus(options: CorpusOptions): Corpus {
 		work: null,
 	});
 
-	// Early facts sit at the bottom of the merge tree, so answering them requires zooming.
-	const knownIds: string[] = [];
-	const records = new Map<string, { owner: number; vendor: number; ticket: number; report: number; window: number }>();
+	const placed: Placement[] = projects.map(() => ({ owner: -1, vendor: -1, ticket: -1, report: -1, window: -1, distractor: -1, late: [] }));
+
+	// Layer 1, early: fact layers grouped by type, so one project's facts sit a whole project-block apart.
 	for (const project of projects) {
-		const reportId = `RPT-${options.seed}-${project.index + 1}`;
-		const owner = add(`Project ${project.name} owner is ${project.owner}.`, "conversation", memory(project.name));
-		const vendor = add(
+		placed[project.index]!.owner = add(`Project ${project.name} owner is ${project.owner}.`, "conversation", memory(project.name));
+	}
+	for (const project of projects) {
+		placed[project.index]!.vendor = add(
 			`Project ${project.name} uses vendor ${project.vendor}; it does not use vendor ${project.wrongVendor}.`,
 			"conversation",
 			memory(project.name),
 		);
-		const ticket = add(`Ticket for project ${project.name} is ${project.ticket}.`, "conversation", memory(project.name));
-		const report = add(
-			`Project ${project.name} was reported by ${project.reporter} in report ${reportId}.`,
+	}
+	for (const project of projects) {
+		placed[project.index]!.ticket = add(`Ticket for project ${project.name} is ${project.ticket}.`, "conversation", memory(project.name));
+	}
+	for (const project of projects) {
+		placed[project.index]!.report = add(
+			`Project ${project.name} was reported by ${project.reporter} in report ${project.reportId}.`,
 			"conversation",
-			memory(project.name, project.reporter, reportId),
+			memory(project.name, project.reporter, project.reportId),
 		);
-		const window = add(`Rollback window for project ${project.name} is ${project.minutes} minutes.`, "conversation", memory(project.name));
-		records.set(project.name, { owner, vendor, ticket, report, window });
-		knownIds.push(project.ticket);
+	}
+	for (const project of projects) {
+		placed[project.index]!.window = add(`Rollback window for project ${project.name} is ${project.minutes} minutes.`, "conversation", memory(project.name));
 	}
 
-	// Filler fills the record count so the merge tree grows to several levels; it carries no facts.
-	for (let filler = 1; filler <= options.sourceCount - factRecords; filler++) {
+	// Layer 2, middle: a late review repeats each rejected vendor prominently, long after the vendor fact.
+	for (const project of projects) {
+		placed[project.index]!.distractor = add(
+			`Late review for project ${project.name}: vendor ${project.wrongVendor} was pitched, reviewed again, and rejected.`,
+			"conversation",
+			memory(project.name),
+		);
+	}
+
+	// Layer 3, filler: pushes the late corrections far from the facts they supersede.
+	const fillerCount = options.sourceCount - factRecordCount(options.projects);
+	for (let filler = 1; filler <= fillerCount; filler++) {
 		add(`Filler ${filler}: routine status line with no project facts.`, "conversation", memory(null));
 	}
 
-	// Late corrections supersede earlier owners; the question must return the newer owner.
-	const corrections = new Map<string, number>();
-	for (const project of correctedProjects) {
-		corrections.set(project.name, add(`Correction for project ${project.name}: owner is ${project.newOwner}, not ${project.owner}.`, "conversation", memory(project.name)));
+	// Layer 4, late: corrections, chains, and reverts supersede the early owner facts.
+	const correction = (name: string, to: string, from: string): string => `Correction for project ${name}: owner is ${to}, not ${from}.`;
+	for (const project of projects) {
+		const slot = placed[project.index]!;
+		const memorySubject = memory(project.name);
+		switch (project.family) {
+			case "plain":
+				break;
+			case "single":
+				slot.late.push(add(correction(project.name, project.firstNew, project.owner), "conversation", memorySubject));
+				break;
+			case "chain":
+				slot.late.push(add(correction(project.name, project.firstNew, project.owner), "conversation", memorySubject));
+				slot.late.push(add(correction(project.name, project.secondNew, project.firstNew), "conversation", memorySubject));
+				break;
+			case "revert":
+				slot.late.push(add(correction(project.name, project.firstNew, project.owner), "conversation", memorySubject));
+				slot.late.push(add(`Revert for project ${project.name}: ${project.firstNew} was wrong, ${project.owner} stands.`, "conversation", memorySubject));
+				break;
+		}
 	}
 
-	// Two same-named entities make a bare question ambiguous; the model must not pick one silently.
-	const northOwner = OWNERS[(options.seed + 4) % OWNERS.length]!;
-	const southOwner = OWNERS[(options.seed + 7) % OWNERS.length]!;
-	const north = add(`Atlas north owner is ${northOwner}.`, "conversation", memory("Atlas north"));
-	const south = add(`Atlas south owner is ${southOwner}.`, "conversation", memory("Atlas south"));
+	// Two same-subject-looking entities: a definite question on one, and a bare-name question that cannot pick one silently.
+	const atlasNorthOwner = OWNERS[(options.seed + 4) % OWNERS.length]!;
+	const atlasTwoOwner = OWNERS[(options.seed + 7) % OWNERS.length]!;
+	const atlasNorth = add(`Atlas-North owner is ${atlasNorthOwner}.`, "conversation", memory("Atlas-North"));
+	const atlasTwo = add(`Atlas North-2 owner is ${atlasTwoOwner}.`, "conversation", memory("Atlas North-2"));
 
 	const checksum = Array.from({ length: 8 }, () => Math.floor(random() * 16).toString(16)).join("");
 	const work = add(`Background report W-${options.seed}: checksum ${checksum}.`, "work", {
@@ -234,49 +395,125 @@ export function buildCorpus(options: CorpusOptions): Corpus {
 		work: null,
 	});
 
+	if (drafts.length !== options.sourceCount) throw new Error("record plan disagrees with sourceCount");
+
 	const questions: Question[] = [];
 	for (const project of projects) {
-		const record = records.get(project.name)!;
-		const correction = corrections.get(project.name);
+		const slot = placed[project.index]!;
+		const name = project.name;
+		switch (project.family) {
+			case "plain":
+				questions.push(single(`owner-${name}`, "merge-depth", `Who owns project ${name}?`, slot.owner, project.owner, [], "conversation"));
+				break;
+			case "single":
+				questions.push(
+					single(`owner-${name}`, "correction", `Who owns project ${name} now?`, slot.late[0]!, project.firstNew, [project.owner], "conversation"),
+				);
+				break;
+			case "chain":
+				questions.push(
+					single(
+						`owner-${name}`,
+						"multi-step-correction",
+						`Who owns project ${name} now?`,
+						slot.late[1]!,
+						project.secondNew,
+						[project.owner, project.firstNew],
+						"conversation",
+					),
+				);
+				break;
+			case "revert":
+				questions.push({
+					id: `owner-${name}`,
+					kind: "reverted-correction",
+					prompt: `Who owns project ${name} now?`,
+					expect: [project.owner],
+					forbid: [project.firstNew],
+					ambiguous: false,
+					answerable: true,
+					candidates: [],
+					sources: [
+						{ recordId: slot.owner, value: project.owner },
+						{ recordId: slot.late[1]!, value: project.owner },
+					],
+					sourceKind: "conversation",
+				});
+				break;
+		}
+		questions.push(single(`vendor-${name}`, "negation", `Which vendor does project ${name} use?`, slot.vendor, project.vendor, [project.wrongVendor], "conversation"));
 		questions.push(
-			correction === undefined
-				? single(`owner-${project.name}`, "merge-depth", `Who owns project ${project.name}?`, record.owner, project.owner, [], "conversation")
-				: single(`owner-${project.name}`, "correction", `Who owns project ${project.name} now?`, correction, project.newOwner, [project.owner], "conversation"),
+			single(
+				`distractor-${name}`,
+				"late-distractor",
+				`After the late review, which vendor does project ${name} use?`,
+				slot.vendor,
+				project.vendor,
+				[project.wrongVendor],
+				"conversation",
+			),
 		);
-		questions.push(
-			single(`vendor-${project.name}`, "negation", `Which vendor does project ${project.name} use?`, record.vendor, project.vendor, [project.wrongVendor], "conversation"),
-		);
-		questions.push(single(`ticket-${project.name}`, "exact-id", `What is the ticket ID for project ${project.name}?`, record.ticket, project.ticket, [], "conversation"));
-		questions.push(single(`reporter-${project.name}`, "attribution", `Who reported project ${project.name}?`, record.report, project.reporter, [], "conversation"));
-		questions.push(
-			single(`window-${project.name}`, "minor-fact", `What is the rollback window for project ${project.name}?`, record.window, `${project.minutes} minutes`, [], "conversation"),
-		);
+		questions.push(single(`ticket-${name}`, "exact-id", `What is the ticket ID for project ${name}?`, slot.ticket, project.ticket, [], "conversation"));
+		questions.push(single(`reporter-${name}`, "attribution", `Who reported project ${name}?`, slot.report, project.reporter, [], "conversation"));
+		questions.push(single(`window-${name}`, "minor-fact", `What is the rollback window for project ${name}?`, slot.window, `${project.minutes} minutes`, [], "conversation"));
 	}
+	questions.push({
+		id: "atlas-north-definite",
+		kind: "near-duplicate",
+		prompt: "Who owns Atlas-North?",
+		expect: [atlasNorthOwner],
+		forbid: [atlasTwoOwner],
+		ambiguous: false,
+		answerable: true,
+		candidates: [],
+		sources: [{ recordId: atlasNorth, value: atlasNorthOwner }],
+		sourceKind: "conversation",
+	});
 	questions.push({
 		id: "atlas-ambiguous",
 		kind: "ambiguity",
-		prompt: "Who owns Atlas?",
+		prompt: "Who owns Atlas North?",
 		expect: [],
 		forbid: [],
 		ambiguous: true,
-		candidates: [northOwner, southOwner],
+		answerable: true,
+		candidates: [atlasNorthOwner, atlasTwoOwner],
 		sources: [
-			{ recordId: north, value: northOwner },
-			{ recordId: south, value: southOwner },
+			{ recordId: atlasNorth, value: atlasNorthOwner },
+			{ recordId: atlasTwo, value: atlasTwoOwner },
 		],
+		sourceKind: "conversation",
+	});
+	questions.push({
+		id: "obsidian-unstated",
+		kind: "unanswerable",
+		prompt: `Who owns project ${UNSTATED_SUBJECT}?`,
+		expect: [],
+		forbid: [],
+		ambiguous: false,
+		answerable: false,
+		candidates: [],
+		sources: [],
 		sourceKind: "conversation",
 	});
 	questions.push(single("work-checksum", "work-reference", `What checksum did background report W-${options.seed} produce?`, work, checksum, [], "work"));
 
+	const encoder = new TextEncoder();
 	const sources: SourceRecord[] = drafts.map((draft, index) => {
 		const recordId = index;
 		const ref = `REF-${options.seed}-${recordId}`;
 		let text = `${draft.fact} [${ref}] Detail:`;
-		while (new TextEncoder().encode(text).byteLength < options.minSourceBytes) text += ` ${detailSentence()}`;
+		let bytes = encoder.encode(text).byteLength;
+		while (bytes < options.minSourceBytes) {
+			const sentence = ` ${detailSentence()}`;
+			text += sentence;
+			bytes += encoder.encode(sentence).byteLength;
+		}
 		const workMeta: WorkMetadata | null = draft.kind === "work" ? { source: "task", completeness: "full", id: ref, name: ref } : null;
 		return { recordId, ref, kind: draft.kind, provenance: { ...draft.provenance, work: workMeta }, text };
 	});
 
+	const knownIds = projects.map((project) => project.ticket);
 	const digest = createHash("sha256").update(JSON.stringify({ sources, questions })).digest("hex");
 	return {
 		version: CORPUS_VERSION,
