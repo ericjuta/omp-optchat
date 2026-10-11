@@ -5,7 +5,7 @@
  * read-increment-write in one process.
  *
  * Environment (all required when loaded; absence fails closed):
- *   OPTCHAT_EVIDENCE_ADMISSION_FILE  per-host JSON admission file: { dispatched, reservedUsd }
+ *   OPTCHAT_EVIDENCE_ADMISSION_FILE  per-host JSON admission file: { dispatched, reservedUsd, refused }
  *   OPTCHAT_EVIDENCE_ALLOWANCE       integer compressor calls this host may dispatch
  *   OPTCHAT_EVIDENCE_USD_ALLOWANCE   decimal dollars this host may reserve in worst-case compressor bounds
  *   OPTCHAT_EVIDENCE_USD_PER_CALL    decimal worst-case dollars charged per call sent by the compressor
@@ -56,10 +56,10 @@ export default function evidenceExtension(pi: ExtensionAPI): void {
 		admitCompressorCall: (model) => {
 			const price = model === compressor ? perCallUsd : perFallbackUsd;
 			const decision = admitCompressorCall(JSON.parse(readFileSync(file, "utf8")), allowance, price, usdAllowance);
-			if (!decision.admitted) return false;
 			// Written before the request is sent: a crash after this point over-counts, never under-counts.
+			// A refusal is recorded too, so the runner can explain the failed summary it causes.
 			writeFileSync(file, JSON.stringify(decision.state));
-			return true;
+			return decision.admitted;
 		},
 	})(pi);
 }

@@ -24,7 +24,7 @@ import {
 	type Limits,
 } from "../scripts/evidence/plan.ts";
 import { answerInstruction, armTotals, assertedForbidden, parseAnswerSet, scoreAnswers, type RetrievedPage } from "../scripts/evidence/scoring.ts";
-import { PHASE_COMPRESSOR_ALLOWANCE, phaseCompressorAllowance, RESTART_RESERVE_CALLS, SEED_COMPRESSOR_ALLOWANCE } from "../scripts/evidence/plan.ts";
+import { phaseCompressorAllowance, RESTART_RESERVE_CALLS } from "../scripts/evidence/plan.ts";
 
 const LIMITS: Limits = { maxCalls: 80, maxCompressorOutputTokens: 512, deadlineMs: 600_000, expiryWaitMs: null };
 const SEED = 3;
@@ -747,11 +747,11 @@ describe("value before citations, saved-view grounding, and per-phase budget", (
 		expect(judgement.fabricatedCitations).toBe(1);
 	});
 
-	test("the seed is bounded so restart keeps its reserve; cold leaves the reserve; restart takes what remains", () => {
-		const spare = 200 - 8;
+	test("non-restart hosts scale with the spare calls but leave the restart reserve; restart takes what remains", () => {
+		const spare = 1000 - 8;
 		const seed = phaseCompressorAllowance("seed", spare, 1);
-		expect(seed).toBe(SEED_COMPRESSOR_ALLOWANCE);
-		expect(phaseCompressorAllowance("cold", spare, 1)).toBe(PHASE_COMPRESSOR_ALLOWANCE);
+		expect(seed).toBe(spare - RESTART_RESERVE_CALLS);
+		expect(phaseCompressorAllowance("cold", spare, 1)).toBe(spare - RESTART_RESERVE_CALLS);
 		expect(phaseCompressorAllowance("cold", 70, 1)).toBe(10);
 		expect(phaseCompressorAllowance("cold", 40, 1)).toBe(0);
 		expect(phaseCompressorAllowance("restart", spare - seed, 1)).toBeGreaterThanOrEqual(RESTART_RESERVE_CALLS);

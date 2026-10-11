@@ -5,19 +5,18 @@ import { answerInstruction } from "./scoring.ts";
 export const MAX_CALLS = 2000;
 /** The default ceiling when --max-calls is omitted: unchanged, so a bare run never spends more than before. */
 export const DEFAULT_MAX_CALLS = 80;
-/** Compressor admissions a host may dispatch per phase. The seed build is bounded so it cannot take the whole pool. */
-export const SEED_COMPRESSOR_ALLOWANCE = 90;
-/** Every non-seed, non-restart phase is bounded and leaves RESTART_RESERVE_CALLS for restart. */
-export const PHASE_COMPRESSOR_ALLOWANCE = 50;
+/** Calls every non-restart host leaves unclaimed so a later restart phase can still settle. */
 export const RESTART_RESERVE_CALLS = 60;
 
 /**
  * Compressor admissions one host may dispatch, from the calls spare after the main-prompt reserve. Restart takes
- * what remains so it can settle; seed and other phases never take the reserve. `share` splits one phase's
- * allowance across concurrent hosts.
+ * what remains so it can settle; every other host leaves RESTART_RESERVE_CALLS. Hosts run one at a time and claim
+ * only what they dispatch, so the ceiling scales with --max-calls; the dollar cap bounds spend. A fixed per-host
+ * count starved long corpora: a refused admission fails the summary and OptChat then refuses the next turn.
+ * `share` splits one phase's allowance across concurrent hosts.
  */
 export function phaseCompressorAllowance(label: string, spare: number, share: number): number {
-	const bound = label === "seed" ? SEED_COMPRESSOR_ALLOWANCE : label === "restart" ? spare : Math.min(PHASE_COMPRESSOR_ALLOWANCE, spare - RESTART_RESERVE_CALLS);
+	const bound = label === "restart" ? spare : spare - RESTART_RESERVE_CALLS;
 	return Math.max(0, Math.floor(Math.min(bound, spare) / share));
 }
 export const MAX_COMPRESSOR_OUTPUT_TOKENS = 512;

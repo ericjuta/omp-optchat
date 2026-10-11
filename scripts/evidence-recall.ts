@@ -65,6 +65,7 @@ import {
 	readEffectivePrompt,
 	queryAvailableModels,
 	readAdmissionDispatched,
+	readAdmissionCounts,
 	readDurableRecords,
 	readMetricLines,
 	compressorFailures,
@@ -973,7 +974,8 @@ async function awaitSettled(context: Context, slot: HostSlot, memory: string): P
 		const covered = durable === 0 || (tree !== null && tree.mainLength === durable && tree.compactorLength === durable);
 		if (quiet && covered) return null;
 		const failures = compressorFailures(lines);
-		const observed = `durable=${durable} treeMain=${tree?.mainLength ?? "none"} treeCompactor=${tree?.compactorLength ?? "none"} metricLines=${lines?.length ?? "none"} dispatched=${dispatched}${failures ? ` compressorFailures=${failures}` : ""}`;
+		const { refused } = await readAdmissionCounts(slot.admission);
+		const observed = `durable=${durable} treeMain=${tree?.mainLength ?? "none"} treeCompactor=${tree?.compactorLength ?? "none"} metricLines=${lines?.length ?? "none"} dispatched=${dispatched}${refused > 0 ? ` admissionsRefused=${refused}` : ""}${failures ? ` compressorFailures=${failures}` : ""}`;
 		if (Date.now() >= deadline) return observed;
 		await pause(context, TREE_POLL_MS);
 	}
@@ -1046,7 +1048,15 @@ async function answerGroup(context: Context, slot: HostSlot, name: string, quest
 		draft.latencies.push(latency);
 		draft.latencyMs = perQuestion ? (draft.latencyMs ?? 0) + latency : latency;
 		const before = draft.records.length;
-		const turnError = recordPrompt(context, draft, slot.arm, group, outcome, latency, viewText);
+		const recorded = recordPrompt(context, draft, slot.arm, group, outcome, latency, viewText);
+		// OptChat refuses a turn by aborting it; failed compressor calls are the usual cause and are otherwise invisible here.
+		let cause = "";
+		if (recorded.error !== null && slot.arm === "on") {
+			const failures = compressorFailures(await readMetricLines(slot.metrics));
+			const { refused } = await readAdmissionCounts(slot.admission);
+			cause = [refused > 0 ? `admissionsRefused=${refused}` : "", failures ? `compressorFailures=${failures}` : ""].filter(Boolean).join(" ");
+		}
+		const turnError = cause ? { ...recorded, error: `${recorded.error}; ${cause}` } : recorded;
 		if (turnError.error !== null && draft.error === null) draft.error = turnError.error;
 		if (turnError.refusal !== null) {
 			draft.refusal = turnError.refusal;

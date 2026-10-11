@@ -245,42 +245,43 @@ describe("dollar admission and spend ledger", () => {
 
 describe("admission ledger", () => {
 	test("a fresh ledger reserves nothing", () => {
-		expect(initialAdmission()).toEqual({ dispatched: 0, reservedUsd: 0 });
+		expect(initialAdmission()).toEqual({ dispatched: 0, reservedUsd: 0, refused: 0 });
 	});
 
 	test("admission counts the call and reserves its worst case, returning the next state", () => {
-		const decision = admitCompressorCall({ dispatched: 0, reservedUsd: 0 }, 2, 0.25, 1);
-		expect(decision).toEqual({ admitted: true, state: { dispatched: 1, reservedUsd: 0.25 } });
+		const decision = admitCompressorCall({ dispatched: 0, reservedUsd: 0, refused: 0 }, 2, 0.25, 1);
+		expect(decision).toEqual({ admitted: true, state: { dispatched: 1, reservedUsd: 0.25, refused: 0 } });
 	});
 
-	test("the call allowance refuses before any dollar check", () => {
-		const decision = admitCompressorCall({ dispatched: 2, reservedUsd: 0.5 }, 2, 0.25, 10);
-		expect(decision).toEqual({ admitted: false, reason: "call-cap", state: { dispatched: 2, reservedUsd: 0.5 } });
+	test("the call allowance refuses before any dollar check and records the refusal", () => {
+		const decision = admitCompressorCall({ dispatched: 2, reservedUsd: 0.5, refused: 0 }, 2, 0.25, 10);
+		expect(decision).toEqual({ admitted: false, reason: "call-cap", state: { dispatched: 2, reservedUsd: 0.5, refused: 1 } });
 	});
 
 	test("dollar overflow refuses as cost-cap, and a reservation landing exactly on the allowance is admitted", () => {
-		expect(admitCompressorCall({ dispatched: 1, reservedUsd: 0.5 }, 5, 0.5, 1).admitted).toBe(true);
-		const refused = admitCompressorCall({ dispatched: 1, reservedUsd: 0.75 }, 5, 0.5, 1);
-		expect(refused).toEqual({ admitted: false, reason: "cost-cap", state: { dispatched: 1, reservedUsd: 0.75 } });
+		expect(admitCompressorCall({ dispatched: 1, reservedUsd: 0.5, refused: 0 }, 5, 0.5, 1).admitted).toBe(true);
+		const refused = admitCompressorCall({ dispatched: 1, reservedUsd: 0.75, refused: 2 }, 5, 0.5, 1);
+		expect(refused).toEqual({ admitted: false, reason: "cost-cap", state: { dispatched: 1, reservedUsd: 0.75, refused: 3 } });
 	});
 
 	test("a zero per-call worst case admits until the call allowance", () => {
-		expect(admitCompressorCall({ dispatched: 0, reservedUsd: 0 }, 1, 0, 0).admitted).toBe(true);
+		expect(admitCompressorCall({ dispatched: 0, reservedUsd: 0, refused: 0 }, 1, 0, 0).admitted).toBe(true);
 	});
 
 	test("the state parse is strict: missing, extra, and negative fields throw", () => {
-		expect(() => parseAdmissionState({ dispatched: 0 })).toThrow("unexpected or missing fields");
-		expect(() => parseAdmissionState({ dispatched: 0, reservedUsd: 0, extra: 1 })).toThrow("unexpected or missing fields");
-		expect(() => parseAdmissionState({ dispatched: -1, reservedUsd: 0 })).toThrow("dispatched");
-		expect(() => parseAdmissionState({ dispatched: 0, reservedUsd: -0.1 })).toThrow("reservedUsd");
+		expect(() => parseAdmissionState({ dispatched: 0, reservedUsd: 0 })).toThrow("unexpected or missing fields");
+		expect(() => parseAdmissionState({ dispatched: 0, reservedUsd: 0, refused: 0, extra: 1 })).toThrow("unexpected or missing fields");
+		expect(() => parseAdmissionState({ dispatched: -1, reservedUsd: 0, refused: 0 })).toThrow("dispatched");
+		expect(() => parseAdmissionState({ dispatched: 0, reservedUsd: -0.1, refused: 0 })).toThrow("reservedUsd");
+		expect(() => parseAdmissionState({ dispatched: 0, reservedUsd: 0, refused: 1.5 })).toThrow("refused");
 		expect(() => parseAdmissionState([])).toThrow("malformed");
 		expect(() => parseAdmissionState(null)).toThrow("malformed");
 	});
 
 	test("admission arguments are validated, not trusted", () => {
-		expect(() => admitCompressorCall({ dispatched: 0, reservedUsd: 0 }, -1, 0.1, 1)).toThrow("call allowance");
-		expect(() => admitCompressorCall({ dispatched: 0, reservedUsd: 0 }, 1, Number.NaN, 1)).toThrow("per-call USD");
-		expect(() => admitCompressorCall({ dispatched: 0, reservedUsd: 0 }, 1, 0.1, Number.POSITIVE_INFINITY)).toThrow("USD allowance");
+		expect(() => admitCompressorCall({ dispatched: 0, reservedUsd: 0, refused: 0 }, -1, 0.1, 1)).toThrow("call allowance");
+		expect(() => admitCompressorCall({ dispatched: 0, reservedUsd: 0, refused: 0 }, 1, Number.NaN, 1)).toThrow("per-call USD");
+		expect(() => admitCompressorCall({ dispatched: 0, reservedUsd: 0, refused: 0 }, 1, 0.1, Number.POSITIVE_INFINITY)).toThrow("USD allowance");
 	});
 
 	test("the environment decimal parser accepts plain decimals and rejects signs, exponents, and overflow", () => {

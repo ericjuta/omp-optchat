@@ -522,11 +522,17 @@ export async function readTreeStructure(directory: string): Promise<TreeStructur
  * before each provider attempt, so this counts attempts including failed and shutdown work.
  */
 export async function readAdmissionDispatched(file: string): Promise<number> {
+	return (await readAdmissionCounts(file)).dispatched;
+}
+
+/** Dispatched and refused compressor admissions from the per-host counter file; malformed counters fail closed. */
+export async function readAdmissionCounts(file: string): Promise<{ readonly dispatched: number; readonly refused: number }> {
 	const parsed = asFrame(JSON.parse(await readFile(file, "utf8")));
-	if (!parsed || typeof parsed.dispatched !== "number" || !Number.isSafeInteger(parsed.dispatched) || parsed.dispatched < 0) {
+	const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+	if (!parsed || !count(parsed.dispatched) || (parsed.refused !== undefined && !count(parsed.refused))) {
 		throw new Error("admission counter is malformed");
 	}
-	return parsed.dispatched;
+	return { dispatched: parsed.dispatched, refused: parsed.refused ?? 0 };
 }
 
 export interface MetricLine {
