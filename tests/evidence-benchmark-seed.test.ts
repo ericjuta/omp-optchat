@@ -209,7 +209,7 @@ const START = { type: "auto_compaction_start" };
 
 describe("maintenance estimate", () => {
 	test("zero observed compactions cost zero and are not estimated", () => {
-		expect(estimateMaintenanceUsage({ compactionEntries: 0, events: [], mainModel: "main-model", prices: PRICES })).toEqual({
+		expect(estimateMaintenanceUsage({ compactionEntries: 0, events: [], mainModel: "main-model", prices: PRICES, inputTokensCeiling: 200_000 })).toEqual({
 			compactions: 0,
 			estimated: false,
 			costUsdLow: 0,
@@ -220,7 +220,7 @@ describe("maintenance estimate", () => {
 	test("bounds a complete frame between cache-read and input rates plus output", () => {
 		// "abcdefghi" is 9 UTF-8 bytes, so 3 output tokens.
 		const events = [START, { type: "auto_compaction_end", result: { tokensBefore: 1000, summary: "abcdefghi" } }];
-		const estimate = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES });
+		const estimate = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES, inputTokensCeiling: 200_000 });
 		expect(estimate).toMatchObject({ compactions: 1, estimated: true });
 		expect(estimate.costUsdLow).toBeCloseTo((1000 * 1 + 3 * 20) / 1e6, 12);
 		expect(estimate.costUsdHigh).toBeCloseTo((1000 * 10 + 3 * 20) / 1e6, 12);
@@ -228,40 +228,50 @@ describe("maintenance estimate", () => {
 
 	test("counts summary output as ceil of UTF-8 bytes over four", () => {
 		// "ééééé" is 5 characters but 10 UTF-8 bytes, so ceil(10 / 4) = 3 output tokens.
-		const events = [START, { type: "auto_compaction_end", result: { tokensBefore: 0, summary: "ééééé" } }];
-		const estimate = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES });
-		expect(estimate.costUsdLow).toBeCloseTo((3 * 20) / 1e6, 12);
-		expect(estimate.costUsdHigh).toBeCloseTo((3 * 20) / 1e6, 12);
+		const events = [START, { type: "auto_compaction_end", result: { tokensBefore: 1, summary: "ééééé" } }];
+		const estimate = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES, inputTokensCeiling: 200_000 });
+		expect(estimate.costUsdLow).toBeCloseTo((1 * 1 + 3 * 20) / 1e6, 12);
+		expect(estimate.costUsdHigh).toBeCloseTo((1 * 10 + 3 * 20) / 1e6, 12);
+	});
+
+	test("a reported tokensBefore of zero is not a measurement: input is bounded by the context window, or unavailable", () => {
+		const events = [START, { type: "auto_compaction_end", result: { tokensBefore: 0, summary: "abcdefghi" } }];
+		const bounded = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES, inputTokensCeiling: 200_000 });
+		expect(bounded).toMatchObject({ compactions: 1, estimated: true });
+		expect(bounded.costUsdLow).toBeCloseTo((3 * 20) / 1e6, 12);
+		expect(bounded.costUsdHigh).toBeCloseTo((200_000 * 12.5 + 3 * 20) / 1e6, 12);
+		const unknown = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES, inputTokensCeiling: null });
+		expect(unknown).toMatchObject({ estimated: false, costUsdLow: null, costUsdHigh: null });
 	});
 
 	test("a frame naming a known model is priced at that model", () => {
 		const events = [START, { type: "auto_compaction_end", model: "other-model", result: { tokensBefore: 1000, summary: "abcdefghi" } }];
-		const estimate = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES });
+		const estimate = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES, inputTokensCeiling: 200_000 });
 		expect(estimate.costUsdLow).toBeCloseTo((1000 * 0.3 + 3 * 6) / 1e6, 12);
 		expect(estimate.costUsdHigh).toBeCloseTo((1000 * 3 + 3 * 6) / 1e6, 12);
 	});
 
 	test("a frame naming an unknown model refuses the estimate", () => {
 		const events = [START, { type: "auto_compaction_end", model: "mystery", result: { tokensBefore: 1000, summary: "x" } }];
-		const estimate = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES });
+		const estimate = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES, inputTokensCeiling: 200_000 });
 		expect(estimate).toMatchObject({ compactions: 1, estimated: false, costUsdLow: null, costUsdHigh: null });
 		expect(estimate.reason).toMatch(/mystery/);
 	});
 
 	test("an unpaired start is unobserved", () => {
-		const estimate = estimateMaintenanceUsage({ compactionEntries: 0, events: [START], mainModel: "main-model", prices: PRICES });
+		const estimate = estimateMaintenanceUsage({ compactionEntries: 0, events: [START], mainModel: "main-model", prices: PRICES, inputTokensCeiling: 200_000 });
 		expect(estimate).toMatchObject({ compactions: 1, estimated: false, costUsdLow: null, costUsdHigh: null });
 	});
 
 	test("a frame without numeric tokensBefore or string summary is unobserved", () => {
 		const events = [START, { type: "auto_compaction_end", result: { tokensBefore: "1000", summary: "x" } }];
-		const estimate = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES });
+		const estimate = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES, inputTokensCeiling: 200_000 });
 		expect(estimate).toMatchObject({ estimated: false, costUsdLow: null, costUsdHigh: null });
 	});
 
 	test("frames that disagree with session compaction entries are unobserved", () => {
 		const events = [START, { type: "auto_compaction_end", result: { tokensBefore: 1000, summary: "x" } }];
-		const estimate = estimateMaintenanceUsage({ compactionEntries: 2, events, mainModel: "main-model", prices: PRICES });
+		const estimate = estimateMaintenanceUsage({ compactionEntries: 2, events, mainModel: "main-model", prices: PRICES, inputTokensCeiling: 200_000 });
 		expect(estimate).toMatchObject({ estimated: false, costUsdLow: null, costUsdHigh: null });
 	});
 });

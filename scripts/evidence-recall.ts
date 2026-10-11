@@ -549,7 +549,13 @@ async function collectSideUsage(context: Context, slot: HostSlot, events: readon
 	const auxiliary = records.slice(slot.auxCursor);
 	slot.auxCursor = records.length;
 	const entries = await compactionEntriesIn(slot.sessionDir);
-	const maintenance = estimateMaintenanceUsage({ compactionEntries: entries - slot.compactionCursor, events, mainModel: slot.model, prices: priceRecord(context) });
+	const maintenance = estimateMaintenanceUsage({
+		compactionEntries: entries - slot.compactionCursor,
+		events,
+		mainModel: slot.model,
+		prices: priceRecord(context),
+		inputTokensCeiling: context.rates.get(slot.model)?.contextWindow ?? null,
+	});
 	slot.compactionCursor = entries;
 	context.reservations.recordSpend(spendOf(auxiliary));
 	context.reservations.recordSpend(maintenance.costUsdHigh);

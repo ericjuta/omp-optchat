@@ -139,12 +139,18 @@ export interface MaintenanceEstimate {
  * optional `model` string prices that frame when known; otherwise mainModel prices it. Any unpaired,
  * incomplete, unpriceable, or count-mismatched frame yields an unavailable estimate with null bounds.
  * Zero observed compactions cost zero.
+ *
+ * OMP 18.9.1 can report `tokensBefore: 0` for a compaction that summarized real history. A zero is then
+ * not a measurement: the low bound bills no input and the high bound bills `inputTokensCeiling` (the
+ * compaction model's context window, which its request cannot exceed) at the dearest input-side rate.
+ * Without a ceiling such a frame is unavailable.
  */
 export function estimateMaintenanceUsage(input: {
 	readonly compactionEntries: number;
 	readonly events: readonly Record<string, unknown>[];
 	readonly mainModel: string;
 	readonly prices: Readonly<Record<string, Price>>;
+	readonly inputTokensCeiling: number | null;
 }): MaintenanceEstimate {
 	const starts = input.events.filter(event => event.type === "auto_compaction_start").length;
 	const ends = input.events.filter(event => event.type === "auto_compaction_end");
@@ -196,6 +202,12 @@ export function estimateMaintenanceUsage(input: {
 			return unavailable(`no usable price for compaction model ${model}`);
 		}
 		const outputTokens = Math.ceil(Buffer.byteLength(result.summary, "utf8") / UTF8_BYTES_PER_TOKEN);
+		if (result.tokensBefore === 0) {
+			if (input.inputTokensCeiling === null) return unavailable("compaction end reports tokensBefore 0 and the input ceiling is unknown");
+			low += (outputTokens * price.output) / 1e6;
+			high += (input.inputTokensCeiling * Math.max(price.input, price.cacheWrite) + outputTokens * price.output) / 1e6;
+			continue;
+		}
 		low += (result.tokensBefore * price.cacheRead + outputTokens * price.output) / 1e6;
 		high += (result.tokensBefore * price.input + outputTokens * price.output) / 1e6;
 	}
