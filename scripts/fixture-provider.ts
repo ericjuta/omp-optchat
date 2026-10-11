@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { ASYNC_ID, ASYNC_PREVIEW, ASYNC_SCHEMA } from "./smoke-fixtures.ts";
 
 /**
  * Driver-owned Chat Completions SSE endpoint; no server or SDK runtime here.
@@ -26,15 +27,28 @@ export default function fixtureProvider(pi: ExtensionAPI): void {
 		throw new Error("OPTCHAT_SMOKE_BASE_URL must be an HTTP loopback /v1 URL without credentials, query, or fragment.");
 	}
 
+	pi.registerCommand("optchat-smoke-report", {
+		description: "Deliver a full synthetic structured background report through the host message path",
+		handler: async () => {
+			pi.sendMessage({
+				customType: "async-result",
+				content: ASYNC_PREVIEW,
+				display: true,
+				attribution: "agent",
+				details: { jobs: [{ jobId: ASYNC_ID, agentId: ASYNC_ID, type: "task", status: "completed", label: ASYNC_ID, schema: ASYNC_SCHEMA }] },
+			}, { triggerTurn: false });
+		},
+	});
+
 	pi.registerProvider("optchat-smoke", {
 		baseUrl: baseUrl.href.replace(/\/$/, ""),
 		apiKey: "optchat-smoke-fixture-key",
 		api: "openai-completions",
-		models: ["optchat-smoke-chat", "optchat-smoke-compact"].map((id) => ({
+		models: ["optchat-smoke-chat", "optchat-smoke-compact", "optchat-smoke-child"].map((id) => ({
 			id,
 			name: id,
 			reasoning: true,
-			input: ["text"],
+			input: ["text", "image"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 128_000,
 			maxTokens: 16_384,
