@@ -10,7 +10,7 @@ An OMP extension implementing [Victor Taelin's OptChat specification](https://gi
 Install the tagged release:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.4.0'
+omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.4.1'
 PI_OPENAI_STATEFUL=0 omp
 ```
 
@@ -127,6 +127,8 @@ bun run smoke
 CI runs this sequence with the pinned SDK cohort and with the latest published cohort, on every push and pull request, weekly, and on demand.
 
 `bun run evidence:recall` is an opt-in recall and usage experiment against real models with a synthetic corpus. Without `--confirm-live-provider-calls` it checks prerequisites and prints its plan. It runs the host with private HOME and agent directories that hold only the selected credentials, so no global context files reach a provider. Call count, compressor output, and wall time are capped. The artifact separates main and compressor usage and records unobserved fields as `null`, never zero. It never reports savings it did not measure. `OPTCHAT_METRICS_FILE=/path` appends one content-free JSON line per compressor call.
+
+Before copying credentials or starting host discovery, the runner parses the source agent directory's `models.yml`, `models.yaml`, and legacy `models.json` (JSONC). Any selected provider entry blocks the run: copying its credential without its routing could send it to a different endpoint. Read failures, parse errors, and invalid root or provider-map shapes also block, without exposing config contents in diagnostics. This check deliberately includes shadowed files rather than following OMP's first-file precedence; unrelated provider entries are allowed. Source configuration is never migrated, evaluated, or copied.
 
 The smoke harness links the plugin into an isolated fresh host environment, then exercises automatic discovery and activation without `--optchat` or an explicit plugin extension path. It uses the actual OMP host with a local deterministic model endpoint, captures inference requests, and checks fresh turns, shared main/compactor prompt and tools, the dash ruler, lossless retrieval, saved-view stability, and restart persistence. Separate opt-out processes prove ordinary history remains intact, no memory store or tools are created, and no compressor requests occur, including both positive/negative flag orders. Set `OPTCHAT_SMOKE_OMP` to a compiled OMP executable and `OPTCHAT_SMOKE_PLUGIN` to an installed plugin directory to verify that artifact rather than the checkout. It is not a measurement of summary quality or real-provider cache hit rates.
 

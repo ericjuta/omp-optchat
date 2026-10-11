@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ARTIFACT_SCHEMA, estimateCostUsd, summarizeUsage, validateArtifact, type UsageRecord } from "../scripts/evidence/artifact.ts";
@@ -769,17 +769,103 @@ describe("live instrument regressions", () => {
 		expect(compressorReasoning({} as Parameters<typeof compressorReasoning>[0], 512)).toBeUndefined();
 	});
 
-	test("F: a source models.yml that names a selected provider blocks the run before any credential copy", async () => {
-		const directory = await mkdtemp(join(tmpdir(), "optchat-routing-"));
-		try {
-			expect(await routingBlockers(directory, ["anthropic"])).toEqual([]);
-			await writeFile(join(directory, "models.yml"), "providers:\n  anthropic:\n    baseUrl: https://gateway.example\n");
-			const blockers = await routingBlockers(directory, ["anthropic", "openai"]);
-			expect(blockers).toHaveLength(1);
-			expect(blockers[0]).toContain("anthropic");
-		} finally {
-			await rm(directory, { recursive: true, force: true });
+	describe("F: routingBlockers fails closed on selected providers and uncertainty", () => {
+		const sourceCanary = "optchat-routing-source-canary";
+		const valueCanary = "optchat-routing-value-canary";
+		const pathCanary = "optchat-routing-path-canary";
+		type Fixture = readonly [filename: string, contents: string | null];
+		type Blocker = readonly [filename: string, provider?: string];
+		const yaml = (body: string) => `source: "${sourceCanary}"\nvalue: "${valueCanary}"\n${body}\n`;
+		const json = (body: string) => `{"source":"${sourceCanary}","value":"${valueCanary}",${body}}`;
+
+		/**
+		 * Writes fixtures (null = a directory at the filename), requires the directory to be byte-for-byte
+		 * unchanged after the check, and requires each expected blocker to name its file (and provider) without
+		 * leaking the source, value, or path canaries.
+		 */
+		async function checkRouting(fixtures: readonly Fixture[], expected: readonly Blocker[] = []): Promise<void> {
+			const directory = await mkdtemp(join(tmpdir(), `${pathCanary}-`));
+			try {
+				for (const [filename, contents] of fixtures) {
+					if (contents === null) await mkdir(join(directory, filename));
+					else await writeFile(join(directory, filename), contents);
+				}
+				const snapshot = async () => {
+					const entries: [string, string][] = [];
+					const visit = async (relative: string): Promise<void> => {
+						for (const entry of await readdir(join(directory, relative), { withFileTypes: true })) {
+							const name = join(relative, entry.name);
+							entries.push([name, entry.isDirectory() ? "directory" : entry.isFile() ? "file" : "other"]);
+							if (entry.isFile()) entries.push([name, (await readFile(join(directory, name))).toString("base64")]);
+							if (entry.isDirectory()) await visit(name);
+						}
+					};
+					await visit("");
+					return entries.sort(([a], [b]) => a.localeCompare(b));
+				};
+				const before = await snapshot();
+				let blockers: string[];
+				try {
+					blockers = await routingBlockers(directory, ["anthropic", "openai"]);
+				} finally {
+					expect(await snapshot()).toEqual(before);
+				}
+				for (const blocker of blockers) {
+					for (const secret of [sourceCanary, valueCanary, pathCanary, directory]) expect(blocker).not.toContain(secret);
+				}
+				if (expected.length === 0) expect(blockers).toEqual([]);
+				else {
+					expect(blockers.length).toBeGreaterThanOrEqual(expected.length);
+					for (const [filename, provider] of expected) {
+						const named = new RegExp(`(^|[^\\w.])${filename.replace(/\./g, "\\.")}(?!\\w)`);
+						expect(blockers.some((blocker) => named.test(blocker) && (provider === undefined || blocker.includes(provider)))).toBe(true);
+					}
+				}
+			} finally {
+				await rm(directory, { recursive: true, force: true });
+			}
 		}
+
+		const cases: [name: string, fixtures: Fixture[], expected: Blocker[]][] = [
+			// Selected provider mappings, one per supported format.
+			["YAML models.yml names a selected provider", [["models.yml", yaml(`providers:\n  anthropic:\n    baseUrl: "${valueCanary}"`)]], [["models.yml", "anthropic"]]],
+			["YAML models.yaml names a selected provider", [["models.yaml", yaml(`providers:\n  openai:\n    apiKey: "${valueCanary}"`)]], [["models.yaml", "openai"]]],
+			["JSON models.json with comments and trailing commas", [["models.json", json(`/* gateway */ "providers": {"anthropic": {"apiKey": "${valueCanary}",},}`)]], [["models.json", "anthropic"]]],
+			// A selected key blocks regardless of its value.
+			["selected false value still blocks", [["models.yml", yaml(`providers:\n  anthropic: false`)]], [["models.yml", "anthropic"]]],
+			["selected null value still blocks", [["models.json", json(`"providers": {"openai": null}`)]], [["models.json", "openai"]]],
+			// Escaped keys decode to the selected provider name.
+			["YAML escaped selected key", [["models.yml", yaml(`providers:\n  "anthro\\u0070ic":\n    apiKey: "${valueCanary}"`)]], [["models.yml", "anthropic"]]],
+			["JSON escaped selected key", [["models.json", json(`"providers": {"opena\\u0069": {"apiKey": "${valueCanary}"}}`)]], [["models.json", "openai"]]],
+			// YAML aliases and merges: the selected provider may arrive through resolution.
+			["providers aliased to a mapping naming a selected provider", [["models.yml", yaml(`routing: &routing\n  anthropic:\n    apiKey: "${valueCanary}"\nproviders: *routing`)]], [["models.yml", "anthropic"]]],
+			["root merge supplying providers", [["models.yaml", yaml(`base: &base\n  providers:\n    openai:\n      apiKey: "${valueCanary}"\n<<: *base`)]], [["models.yaml"]]],
+			["providers merge supplying a selected provider", [["models.yml", yaml(`base: &base\n  anthropic:\n    apiKey: "${valueCanary}"\nproviders:\n  <<: *base`)]], [["models.yml"]]],
+			// Invalid root and providers shapes, including an empty file.
+			["empty models.yml has a null root", [["models.yml", ""]], [["models.yml"]]],
+			["models.json with an array root", [["models.json", `["${sourceCanary}","${valueCanary}"]`]], [["models.json"]]],
+			["YAML providers null", [["models.yml", yaml("providers: null")]], [["models.yml"]]],
+			["JSON providers array", [["models.json", json(`"providers": []`)]], [["models.json"]]],
+			// Parse failures, reported by filename without the parser excerpt.
+			["malformed YAML", [["models.yaml", yaml(`providers:\n  openai: ["${valueCanary}"`)]], [["models.yaml"]]],
+			["JSON with a missing comma", [["models.json", json(`"providers": {"anthropic": {"apiKey": "${valueCanary}" "x": true}}`)]], [["models.json"]]],
+			// Multiple YAML documents must not be treated as a clean first document.
+			["multi-document YAML with a clean first document", [["models.yml", `${yaml("providers: {}")}---\n${yaml(`providers:\n  openai:\n    apiKey: "${valueCanary}"`)}`]], [["models.yml"]]],
+			// Non-ENOENT read failures block; absence does not.
+			["models.json as a directory is a read failure", [["models.json", null]], [["models.json"]]],
+			["no routing files at all is accepted without creating any", [], []],
+			// Unrelated names, comments, values, and nested keys are accepted.
+			["YAML comments, substrings, and nested keys are not provider keys", [["models.yml", yaml(`# anthropic: openai:\nproviders:\n  anthropic-shadow: false\n  unrelated:\n    note: "providers: openai"\n    nested: {openai: null}\n    apiKey: "${valueCanary}"`)]], []],
+			["JSONC comments and unrelated provider content are accepted", [["models.json", json(`// anthropic:\n"note": "openai", "providers": {/* openai: */"unrelated": {"model": "anthropic",},},`)]], []],
+			["missing or empty providers are accepted", [["models.yml", yaml(`note: "anthropic openai"`)], ["models.json", json(`"providers": {}`)]], []],
+			// models.jsonc is not a default-discovered file and is not inspected.
+			["models.jsonc is not inspected", [["models.jsonc", json(`"providers": {"anthropic": {"apiKey": "${valueCanary}"}}`)]], []],
+			// A clean higher-precedence file does not hide a selected lower-precedence sibling.
+			["clean models.yml does not hide a selected models.json", [["models.yml", yaml("providers: {}")], ["models.json", json(`"providers": {"openai": {"apiKey": "${valueCanary}"}}`)]], [["models.json", "openai"]]],
+		];
+		test.each(cases)("%s", async (_name, fixtures, expected) => {
+			await checkRouting(fixtures, expected);
+		});
 	});
 
 	test("D: the isolated workspace is its own discovery boundary; a project SYSTEM.md inside it fails the preflight", async () => {

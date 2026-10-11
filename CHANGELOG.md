@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1 — 2026-10-11
+
+- Fix the evidence runner's credential-routing guard: parse all three source model-config formats instead of substring-matching only `models.yml`. Escaped or aliased selected provider keys, shadowed overrides, and unreadable or invalid configurations now block before credential copying or host discovery. Diagnostics omit config contents; unrelated provider settings remain usable.
+
 ## 0.4.0 — 2026-10-11
 
 Tracks Wayfinder map [#2](https://github.com/ericjuta/omp-optchat/issues/2).

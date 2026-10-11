@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseOptions } from "../scripts/evidence/options.ts";
 import { childEnvironment, copySelectedAuth, createIsolatedDirs } from "../scripts/evidence/isolation.ts";
 import { findPrivateContextMarkers, parseParentSubstrings } from "../scripts/evidence/preflight.ts";
@@ -230,4 +232,142 @@ describe("admission counter", () => {
 			await expect(readAdmissionDispatched(file)).rejects.toThrow();
 		});
 	});
+});
+
+describe("evidence-recall CLI routing gate", () => {
+	const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+	const CLI = join(REPO_ROOT, "scripts", "evidence-recall.ts");
+	const CANARY = "ROUTING-CANARY-7f3a9c";
+	const SPAWN_MS = 60_000;
+
+	interface RoutingCase {
+		readonly name: string;
+		readonly files: Readonly<Record<string, string>>;
+		readonly directories: readonly string[];
+		readonly confirm: boolean;
+		readonly blocker: string;
+	}
+
+	const cases: readonly RoutingCase[] = [
+		{
+			name: "an escaped selected provider key in models.yml blocks before the store opens, even with confirmation",
+			files: { "models.yml": `providers:\n  "openro\\x75ter":\n    baseUrl: https://${CANARY}.invalid/v1\n` },
+			directories: [],
+			confirm: true,
+			blocker: "source models.yml names provider openrouter",
+		},
+		{
+			name: "an escaped selected provider key in commented models.json blocks without confirmation",
+			files: { "models.json": `// synthetic\n{ /* routing */ "providers": { "openro\\u0075ter": { "baseUrl": "https://${CANARY}.invalid/v1" } } }\n` },
+			directories: [],
+			confirm: false,
+			blocker: "source models.json names provider openrouter",
+		},
+		{
+			name: "an unreadable models.yml fails closed before the store opens",
+			files: {},
+			directories: ["models.yml"],
+			confirm: true,
+			blocker: "source models.yml could not be read",
+		},
+		{
+			name: "a malformed models.yaml fails closed without echoing its contents",
+			files: { "models.yaml": `providers: [${CANARY}\n` },
+			directories: [],
+			confirm: false,
+			blocker: "source models.yaml could not be parsed",
+		},
+	];
+
+	/** Relative paths with content digests: any write, creation, deletion, or migration changes the inventory. */
+	async function inventory(directory: string, relative = ""): Promise<string[]> {
+		const entries = await readdir(join(directory, relative), { withFileTypes: true });
+		entries.sort((left, right) => left.name.localeCompare(right.name));
+		const lines: string[] = [];
+		for (const entry of entries) {
+			const path = join(relative, entry.name);
+			if (entry.isDirectory()) lines.push(`${path}/`, ...(await inventory(directory, path)));
+			else lines.push(`${path}\t${createHash("sha256").update(await readFile(join(directory, path))).digest("hex")}`);
+		}
+		return lines;
+	}
+
+	/** Bun.spawn `env` replaces the whole environment: no operator home, agent dir, or provider credentials. */
+	function sanitizedEnvironment(root: string): Record<string, string> {
+		const home = join(root, "home");
+		return {
+			PATH: process.env.PATH ?? "/usr/bin:/bin",
+			LANG: "C.UTF-8",
+			TERM: "dumb",
+			NO_COLOR: "1",
+			HOME: home,
+			TMPDIR: join(root, "tmp"),
+			XDG_CONFIG_HOME: join(home, ".config"),
+			XDG_CACHE_HOME: join(home, ".cache"),
+			XDG_DATA_HOME: join(home, ".local", "share"),
+			PI_NO_TITLE: "1",
+		};
+	}
+
+	async function runBlockedCase(routing: RoutingCase): Promise<void> {
+		const root = await mkdtemp(join(tmpdir(), "evidence-routing-cli-"));
+		const source = join(root, "source-agent");
+		const marker = join(root, "host-invoked");
+		const omp = join(root, "fake-omp");
+		const out = join(root, "evidence.json");
+		let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined;
+		try {
+			for (const directory of [source, join(root, "home", ".config"), join(root, "home", ".cache"), join(root, "home", ".local", "share"), join(root, "tmp")]) {
+				await mkdir(directory, { recursive: true });
+			}
+			// Not a SQLite file: opening it before routing rejection would fail with a generic database error.
+			await writeFile(join(source, "agent.db"), `not sqlite: ${CANARY}\n`);
+			for (const [name, text] of Object.entries(routing.files)) await writeFile(join(source, name), text);
+			for (const name of routing.directories) await mkdir(join(source, name));
+			// Writes the marker only if the host is ever invoked.
+			await writeFile(omp, `#!/bin/sh\n: > '${marker}'\n`, { mode: 0o755 });
+			const before = await inventory(source);
+
+			const args = ["--main", "openrouter/main-model", "--compressor", "openrouter/compressor-model", "--agent-dir", source, "--omp", omp, "--out", out];
+			if (routing.confirm) args.push("--confirm-live-provider-calls");
+			child = Bun.spawn({
+				cmd: [process.execPath, CLI, ...args],
+				cwd: REPO_ROOT,
+				env: sanitizedEnvironment(root),
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				timeout: SPAWN_MS,
+				killSignal: "SIGKILL",
+			});
+			const [stdout, stderr] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
+			const exitCode = await child.exited;
+
+			expect(child.signalCode).toBeNull();
+			expect(exitCode).toBe(1);
+			const result = JSON.parse(stdout.trim()) as { status?: unknown; reason?: unknown; blockers?: unknown };
+			expect(result.status).toBe("blocked");
+			expect(result.reason).toBe("prerequisites not satisfied");
+			expect(Array.isArray(result.blockers)).toBe(true);
+			const blockers = result.blockers as unknown[];
+			expect(blockers.every((blocker) => typeof blocker === "string")).toBe(true);
+			expect(blockers.some((blocker) => typeof blocker === "string" && blocker.includes(routing.blocker))).toBe(true);
+
+			const diagnostics = `${stdout}\n${stderr}`;
+			expect(diagnostics).not.toContain(CANARY);
+			expect(diagnostics).not.toContain(root);
+			expect(diagnostics.toLowerCase()).not.toContain("sqlite");
+			expect(stderr).not.toContain("Usage:");
+
+			expect(existsSync(marker)).toBe(false);
+			expect(existsSync(out)).toBe(false);
+			expect(await inventory(source)).toEqual(before);
+		} finally {
+			if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			if (child) await child.exited;
+			await rm(root, { recursive: true, force: true });
+		}
+	}
+
+	for (const routing of cases) test(routing.name, () => runBlockedCase(routing), 90_000);
 });

@@ -239,7 +239,7 @@ const LIMITATIONS = [
 	"compressor calls are admitted inside the host through a per-host allowance; attempts include failed and shutdown work, and observed counts come from the metric sink",
 	"an absent metric sink is reported unavailable, never zero; an empty sink is zero completed calls",
 	"authentication is isolated: only the selected providers' stored credentials are copied into a temporary auth store, and provider environment variables pass only when named with --allow-env",
-	"custom providers configured in a models.json file are not copied into the isolated agent directory and are unsupported by this runner",
+	"source models.yml, models.yaml, and models.json are inspected read-only with the SDK's Bun YAML/JSON parsers; model configuration is not copied or migrated into the isolated agent directory",
 	"the effective-prompt preflight is a marker check for private context, not a proof of the base prompt's content",
 	"the batch prompt answers all selected questions together; per-question zoom attribution is aggregate",
 	"the structured answer set is scored strictly; a schema failure is an incorrect outcome for every selected question",
@@ -248,7 +248,7 @@ const LIMITATIONS = [
 	"the evidence hosts run with a runner-only view budget (--optchat-view-bytes 4096) so the tree coarsens within the call budget; the product default is 128000 and is not changed",
 	"compressor calls run with reasoning off when a compressor output cap is set, so the cap binds; provider usage.output counts reasoning tokens whenever reasoning is on",
 	"a compressor attempt refused by admission is never sent and writes no metric line; completed calls without an admission are charged against the ceiling and reported as violations",
-	"credentials are copied only for providers that the source models.yml does not name; routing overrides of selected providers block the run before any copy",
+	"routing admission conservatively checks every default sibling, including shadowed files; selected provider keys (even false/null), unreadable non-absent files, parse failures, malformed root/providers shapes, or unresolved routing merge keys block before credential copying",
 ];
 
 function safeMessage(error: unknown): string {
