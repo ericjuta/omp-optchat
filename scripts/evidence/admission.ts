@@ -21,6 +21,18 @@ export function initialAdmission(): AdmissionState {
 	return { dispatched: 0, reservedUsd: 0, refused: 0 };
 }
 
+/**
+ * Dollars a host has committed: each completed call at its reported cost (its worst case when unreported) plus every
+ * dispatched call without a completion line at the worst case. Completed calls stop holding their worst-case
+ * reservation, so a pessimistic per-call bound no longer starves a long build, while the total stays a hard bound.
+ */
+export function committedUsd(completedCosts: readonly (number | null)[], dispatched: number, worstPerCallUsd: number): number {
+	if (!Number.isSafeInteger(dispatched) || dispatched < 0) throw new Error("dispatched must be a non-negative integer");
+	if (!Number.isFinite(worstPerCallUsd) || worstPerCallUsd < 0) throw new Error("worst per-call USD must be a non-negative finite number");
+	const completed = completedCosts.reduce<number>((sum, cost) => sum + (cost !== null && Number.isFinite(cost) && cost >= 0 ? cost : worstPerCallUsd), 0);
+	return completed + Math.max(0, dispatched - completedCosts.length) * worstPerCallUsd;
+}
+
 /** Parses a non-negative decimal dollar amount from an environment value. Scientific notation and signs are rejected. */
 export function parseUsdDecimal(raw: string, name: string): number {
 	if (!USD_DECIMAL.test(raw)) throw new Error(`${name} must be a non-negative decimal`);

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { admitCompressorCall, initialAdmission, parseAdmissionState, parseUsdDecimal } from "../scripts/evidence/admission.ts";
+import { admitCompressorCall, committedUsd, initialAdmission, parseAdmissionState, parseUsdDecimal } from "../scripts/evidence/admission.ts";
 import { dollarAdmission, initialSpend, recordSpend, worstCaseCallUsd, type ModelRates } from "../scripts/evidence/cost.ts";
 import { parseOptions, USAGE } from "../scripts/evidence/options.ts";
 import { factRecordCount, questionCount } from "../scripts/evidence/corpus.ts";
@@ -262,6 +262,16 @@ describe("admission ledger", () => {
 		expect(admitCompressorCall({ dispatched: 1, reservedUsd: 0.5, refused: 0 }, 5, 0.5, 1).admitted).toBe(true);
 		const refused = admitCompressorCall({ dispatched: 1, reservedUsd: 0.75, refused: 2 }, 5, 0.5, 1);
 		expect(refused).toEqual({ admitted: false, reason: "cost-cap", state: { dispatched: 1, reservedUsd: 0.75, refused: 3 } });
+	});
+
+	test("committed spend counts completed calls at their observed cost and only in-flight calls at the worst case", () => {
+		// Two completed calls ($0.01, unreported → worst) and one in flight: 0.01 + 0.5 + 0.5.
+		expect(committedUsd([0.01, null], 3, 0.5)).toBeCloseTo(1.01, 12);
+		// A long build of cheap calls stays far below dispatched × worst case.
+		expect(committedUsd(Array.from({ length: 100 }, () => 0.003), 101, 0.13)).toBeCloseTo(0.43, 12);
+		// More completion lines than dispatches (SDK retries share one reply) never yield negative in-flight work.
+		expect(committedUsd([0.01, 0.01], 1, 0.5)).toBeCloseTo(0.02, 12);
+		expect(() => committedUsd([], -1, 0.5)).toThrow("dispatched");
 	});
 
 	test("a zero per-call worst case admits until the call allowance", () => {
