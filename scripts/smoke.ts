@@ -21,7 +21,6 @@ const TOTAL_MS = 240_000;
 const FIRST_USER = "OPTCHAT_SMOKE_OLD_USER: Remember the public archive, then finish.";
 const SECOND_USER = "OPTCHAT_SMOKE_CURRENT_USER: Retrieve the entire previous reply and its date.";
 const RESTART_USER = "OPTCHAT_SMOKE_RESTART_USER: Report that the public archive is restored.";
-const LOCK_USER = "OPTCHAT_SMOKE_REJECTED_WRITER: This must never reach a model.";
 const INACTIVE_USER = "OPTCHAT_SMOKE_INACTIVE_USER: Return the public archive without memory.";
 const INACTIVE_NEXT_USER = "OPTCHAT_SMOKE_INACTIVE_NEXT_USER: Finish this ordinary conversation.";
 const INACTIVE_FINISHED = "OPTCHAT_SMOKE_INACTIVE_FINISHED";
@@ -298,7 +297,6 @@ function answer(body: ObjectValue): Response {
     assert(content(workResult).includes(CHILD_REPORT), "parent must retrieve the actual completed child's durable report by name");
     return sse(model, capture.sequence, CHILD_DONE);
   }
-  assert.notEqual(prompt, LOCK_USER, "second writer reached model instead of rejecting its memory lock");
   throw new Error("Unexpected synthetic fixture prompt");
 }
 
@@ -626,16 +624,18 @@ async function main(): Promise<void> {
     assert.deepEqual(system(oldRecordCompaction.body), system(firstRequest.body), "compactor must share the stable main-turn system prefix");
     assert.match(compactText, /-{512}/, "compaction must use the dash ruler rather than example content");
 
-    currentPhase = "second-writer rejection";
+    // The "inactive " phase prefix selects the inactive fixture branch: this writer is an ordinary turn without memory.
+    const contenderStart = captures.length;
+    currentPhase = "inactive second writer";
     const beforeContender = captures.filter((capture) => capture.body.model === "optchat-smoke-chat").length;
     const contender = new Host(executable, args, workspace, env);
     await contender.until("contender RPC ready", () => contender.events.some((event) => event.type === "ready"));
-    const rejected = await contender.command("prompt", { message: LOCK_USER });
-    if (rejected.success === true) await contender.finishPrompt(rejected.id);
-    // The integration reports a UI warning and aborts rather than dispatching without memory.
-    assert.match(JSON.stringify(contender.events) + contender.diagnostics, /lock|active writer|another writer|already.*open/i, "rejection must identify the held memory lock");
-    assert.equal(captures.filter((capture) => capture.body.model === "optchat-smoke-chat").length, beforeContender, "rejected writer must not dispatch an inference request");
-    assert.deepEqual(await diskMessages(memory), completed, "rejected writer must not append durable history");
+    const accepted = await contender.command("prompt", { message: INACTIVE_USER });
+    assert.equal(accepted.success, true, "an inactive second writer accepts ordinary prompts");
+    await contender.finishPrompt(accepted.id);
+    const contenderEnd = captures.length;
+    assert.equal(captures.filter((capture) => capture.body.model === "optchat-smoke-chat").length, beforeContender + 1, "the inactive writer sends exactly one ordinary request");
+    assert.deepEqual(await diskMessages(memory), completed, "the inactive writer must not append durable history");
     await bounded("contender host shutdown", contender.stop());
 
     currentPhase = "graceful process shutdown";
@@ -654,7 +654,8 @@ async function main(): Promise<void> {
     assert.equal(restored.filter((record) => record.kind === "talk" && record.text === LONG_REPLY).length, 1, "restart must not reappend old assistant turns");
     await bounded("restored host shutdown", restarted.stop());
     assert.equal((await restarted.exited).code, 0, "restored host must finish graceful session_shutdown");
-    const activeCaptures = captures.slice();
+    // The inactive writer's single ordinary request is excluded from the active-session count below.
+    const activeCaptures = [...captures.slice(0, contenderStart), ...captures.slice(contenderEnd)];
     const inactiveEvidence: { flags: string[]; chatRequests: number; compactorRequests: number; storeCreated: boolean }[] = [];
     for (const flags of [["--no-optchat"], ["--optchat", "--no-optchat"], ["--no-optchat", "--optchat"]]) {
       currentPhase = `inactive ${flags.join(" ")}`;
@@ -705,7 +706,7 @@ async function main(): Promise<void> {
       childRequests: captures.filter((entry) => entry.body.model === "optchat-smoke-child").length,
       compactorRequests: captures.filter((entry) => entry.body.model === "optchat-smoke-compact").length,
       durableMessages: restored.length, retrievedBytes: Buffer.byteLength(LONG_REPLY),
-      checks: ["automatic installed package discovery", "default activation without enable flag", "explicit opt-out and both flag-order precedences", "inactive store absence through shutdown", "inactive ordinary history without memory system/view/tools", "zero inactive compactor requests", "same-process history replacement", "pre-user settled snapshot", "contextual past-record compaction", "shared main/compactor prompt and tools", "dash compression ruler", "active reasoning and tool-loop retention", "real zoom/date tools", "cursor-walked paged oversized retrieval", "durable history excludes reasoning", "second-writer rejection", "persisted view stability", "new-process restoration"],
+      checks: ["automatic installed package discovery", "default activation without enable flag", "explicit opt-out and both flag-order precedences", "inactive store absence through shutdown", "inactive ordinary history without memory system/view/tools", "zero inactive compactor requests", "same-process history replacement", "pre-user settled snapshot", "contextual past-record compaction", "shared main/compactor prompt and tools", "dash compression ruler", "active reasoning and tool-loop retention", "real zoom/date tools", "cursor-walked paged oversized retrieval", "durable history excludes reasoning", "second-writer inactive ordinary turn", "persisted view stability", "new-process restoration"],
     }, null, 2));
   } finally {
     clearTimeout(deadline);

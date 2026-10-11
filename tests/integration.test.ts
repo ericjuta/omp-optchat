@@ -37,7 +37,7 @@ import { describe, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { deflateSync } from "node:zlib";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -97,7 +97,9 @@ const CASE_TITLES = {
   "reasoning-tools-compressor": "with disableReasoningWithTools the tool-bearing main request reasons none; the compressor stays medium and tool-free",
   "reasoning-tools-compressor-when-thinking": "with base disableReasoningWithTools false and whenThinking true the tool-bearing main request reasons none; the compressor stays medium and tool-free",
   "tool-cap-zoom": "ordinary tool output is capped live but stored whole; zoom pages the original record",
-  "lock-held": "a store held by another writer refuses prompts with zero chat requests",
+  "lock-held": "a store held by another writer activates inactive: prompts reach the model without memory tools or a compaction veto",
+  "lock-held-hooks": "a session inactive on a lease conflict passes context, provider and compaction hooks through and writes no log",
+  "corrupt-store": "a corrupt store still refuses prompts with zero chat requests",
   "missing-compressor": "an unresolvable compressor selector refuses prompts with zero chat requests",
   "settle-timeout": "the settle deadline refuses the request and keeps the prompt durable and unanswered",
   "abort-while-settling": "aborting during the settle wait sends nothing and keeps the prompt durable and unanswered",
@@ -1585,7 +1587,11 @@ async function toolCapZoom(ctx: CaseContext): Promise<Evidence> {
 // ---------------------------------------------------------------------------
 
 const HOLDER_SEED = "OPTCHAT_IT_HOLDER_SEED";
-const LOCK_USER = "OPTCHAT_IT_LOCK_USER: this must never reach a model.";
+const LOCK_USER = "OPTCHAT_IT_LOCK_USER: an ordinary turn while another writer holds the memory.";
+const LOCK_TALK = "OPTCHAT_IT_LOCK_TALK: answered without memory.";
+const LOCK_NEXT_USER = "OPTCHAT_IT_LOCK_NEXT_USER: a later ordinary turn.";
+const LOCK_NEXT_TALK = "OPTCHAT_IT_LOCK_NEXT_TALK: answered again without memory.";
+const CORRUPT_USER = "OPTCHAT_IT_CORRUPT_USER: this must never reach a model.";
 const MISSING_SELECTOR = "optchat-missing-provider/optchat-missing-model";
 const MISSING_USER = "OPTCHAT_IT_MISSING_USER: this must never reach a model.";
 const SEED_MARK = "OPTCHAT_IT_SEED_HANG";
@@ -1601,20 +1607,49 @@ async function lockHeld(ctx: CaseContext): Promise<Evidence> {
   try {
     holder.append("user", HOLDER_SEED);
     const evidence = await withHost(ctx, { notices: true }, async (host) => {
-      const outcome = await bounded("contender prompt", host.prompt(LOCK_USER), STEP_MS, fixture.fatal);
+      fixture.queueChat("inactive contender reply", { text: LOCK_TALK });
+      expectCompleted(await bounded("contender prompt", host.prompt(LOCK_USER), STEP_MS, fixture.fatal), "contender prompt");
       await host.idle();
-      const off = host.notices.find((notice) => notice.message.includes("Store is already open by another writer"));
-      assert(off, `startup reports the held lock; notices: ${JSON.stringify(host.notices)}`);
-      assert(off.message.includes("OptChat is off for this session"));
-      return { outcome: outcome.ok ? "resolved" : "rejected", notices: host.notices.length };
+      const inactive = `OptChat is inactive: ${memory} is in use by another session. Use --optchat-dir for a separate memory.`;
+      assert(host.notices.some((notice) => notice.type === "warning" && notice.message === inactive), `startup reports the inactive session; notices: ${JSON.stringify(host.notices)}`);
+      fixture.queueChat("inactive later reply", { text: LOCK_NEXT_TALK });
+      expectCompleted(await bounded("later prompt", host.prompt(LOCK_NEXT_USER), STEP_MS, fixture.fatal), "later prompt");
+      await host.idle();
+      return { notices: host.notices.length };
     });
-    assert.equal(fixture.chat().length, 0, "zero chat requests");
+    const requests = fixture.chat();
+    assert.equal(requests.length, 2, "each ordinary turn reaches the model exactly once");
     assert.equal(fixture.compact().length, 0, "zero compressor requests");
-    assert.deepEqual(pairs(mainRows(memory)), [["user", HOLDER_SEED]], "the contender's prompt never reaches the holder's log");
+    const { SYSTEM_BLOCK } = ctx.lib.optchat;
+    for (const request of requests) {
+      assert(!systemText(request.body).includes(SYSTEM_BLOCK), "an inactive session appends no OptChat system block");
+      assert(!JSON.stringify(request.body).includes("<chat>"), "an inactive session sends no memory view");
+      assert.deepEqual(toolNames(request.body).filter((name) => ["zoom", "date", "work"].includes(name)), [], "memory tools are absent");
+    }
+    assert.deepEqual(pairs(mainRows(memory)), [["user", HOLDER_SEED]], "the inactive session never writes to the holder's log");
     return evidence;
   } finally {
     await holder.close();
   }
+}
+
+/** A malformed store is not a lease conflict: startup fails closed and every prompt is refused. */
+async function corruptStore(ctx: CaseContext): Promise<Evidence> {
+  const { fixture, memory } = ctx;
+  // A stray entry in the daily-log directory is unexpected Store content, so open must reject it.
+  await mkdir(join(memory, "main"), { recursive: true });
+  await writeFile(join(memory, "main", "stray.txt"), "not a daily log\n");
+  const evidence = await withHost(ctx, { notices: true }, async (host) => {
+    const outcome = await bounded("corrupt-store prompt", host.prompt(CORRUPT_USER), STEP_MS, fixture.fatal);
+    await host.idle();
+    const off = host.notices.find((notice) => notice.message.includes("OptChat is off for this session"));
+    assert(off, `startup refuses the corrupt store; notices: ${JSON.stringify(host.notices)}`);
+    assert(!off.message.includes("in use by another session"), "corruption is not reported as a lease conflict");
+    return { outcome: outcome.ok ? "resolved" : "rejected", notices: host.notices.length };
+  });
+  assert.equal(fixture.chat().length, 0, "zero chat requests");
+  assert.equal(fixture.compact().length, 0, "zero compressor requests");
+  return evidence;
 }
 
 async function missingCompressor(ctx: CaseContext): Promise<Evidence> {
@@ -2188,7 +2223,8 @@ type FakeHostEvent =
   | { type: "agent_end"; messages: FakeHostMessage[]; willContinue: boolean }
   | { type: "before_provider_request"; payload: unknown }
   | { type: "session_switch" }
-  | { type: "before_agent_start"; systemPrompt: string[] };
+  | { type: "before_agent_start"; systemPrompt: string[] }
+  | { type: "session_before_compact" };
 type FakeHostHandler = (event: FakeHostEvent, ctx: OmpSdk.ExtensionContext) => unknown;
 
 interface FakeHost {
@@ -2202,6 +2238,10 @@ interface FakeHost {
   setBranch(messages: FakeHostMessage[]): void;
   /** Switches the session's artifact manager and branch, then fires session_switch. */
   switchSession(artifactManager: object | undefined, messages?: FakeHostMessage[]): Promise<unknown[]>;
+  /** Every notice the session delivered to the UI, in order. */
+  notices: Notice[];
+  /** Names of the tools the session registered at startup. */
+  registeredTools: string[];
 }
 
 interface FakeHostOptions {
@@ -2215,6 +2255,8 @@ interface FakeHostOptions {
   artifactManager?: object;
   /** Enables the child-view flag on this host. */
   childView?: boolean;
+  /** Holds the memory directory with another Store before session_start, so the session starts inactive. */
+  holdStore?: boolean;
 }
 
 /**
@@ -2270,6 +2312,7 @@ async function withFakeHost(
     pi: { getAgentDir: () => memory },
   } as unknown as ExtensionAPI;
   const fakeCtx = {
+    cwd: ctx.cwd,
     getSystemPrompt: () => options.systemPrompt ?? [ctx.lib.optchat.SYSTEM_BLOCK],
     isIdle: () => false,
     abort: () => { abortCalls++; },
@@ -2288,16 +2331,20 @@ async function withFakeHost(
     for (const handler of handlers.get(event.type) ?? []) results.push(await handler(event, fakeCtx));
     return results;
   })(), event.type === "session_shutdown" ? CLEANUP_STEP_MS : STEP_MS);
+  let holder: Store | undefined;
   try {
+    holder = options.holdStore ? await ctx.lib.Store.open(memory) : undefined;
     ctx.lib.optchat.createOptChat({ settleTimeoutMs: 500 })(fakePi);
     await fire({ type: "session_start" });
     // Strictly after start's Date.now cutoff, even when startup finishes in the same millisecond.
     lastTimestamp = Date.now();
-    if ((options.agentKind ?? "main") === "main") {
+    if ((options.agentKind ?? "main") === "main" && !holder) {
       assert(notices.some((notice) => notice.message.startsWith("OptChat active:")), "awaited startup opens the store");
     }
     const evidence = await run({
       ctx: fakeCase,
+      notices,
+      registeredTools: registeredTools.map((tool) => tool.name),
       fire,
       timestamp,
       context: async (messages) => {
@@ -2325,15 +2372,43 @@ async function withFakeHost(
       }),
     });
     assert.equal(abortCalls, 0, "no fake-host request was refused");
-    assert.deepEqual(notices.filter((notice) => notice.type !== "info"), [], "no startup, logging or compressor failures");
+    const expectedWarning = (notice: Notice) => Boolean(holder) && notice.message.startsWith("OptChat is inactive:");
+    assert.deepEqual(notices.filter((notice) => notice.type !== "info" && !expectedWarning(notice)), [], "no startup, logging or compressor failures");
     return { ...evidence, registeredTools: registeredTools.map((tool) => tool.name) };
   } finally {
     try {
       await fire({ type: "session_shutdown" });
     } finally {
-      await rm(memory, { recursive: true, force: true });
+      try {
+        await holder?.close();
+      } finally {
+        await rm(memory, { recursive: true, force: true });
+      }
     }
   }
+}
+
+/**
+ * A startup lease conflict at the handler level: no memory tools, no context, provider, system-prompt or
+ * compaction change, and later ordinary turns still pass through without writing a log.
+ */
+async function lockHeldHooks(ctx: CaseContext): Promise<Evidence> {
+  return withFakeHost(ctx, async (host) => {
+    const inactive = `OptChat is inactive: ${host.ctx.memory} is in use by another session. Use --optchat-dir for a separate memory.`;
+    assert(host.notices.some((notice) => notice.type === "warning" && notice.message === inactive), `startup reports the inactive session; notices: ${JSON.stringify(host.notices)}`);
+    assert.deepEqual(host.registeredTools, [], "an inactive session registers no memory tools");
+    const user = host.user("U1");
+    assert.equal(await host.context([user]), undefined, "the first request passes through untouched");
+    assert.deepEqual(await host.fire({ type: "before_agent_start", systemPrompt: ["base"] }), [undefined], "no OptChat system block is appended");
+    assert.deepEqual(await host.fire({ type: "before_provider_request", payload: { model: "fake" } }), [undefined], "provider payloads pass through");
+    assert.deepEqual(await host.fire({ type: "session_before_compact" }), [undefined], "host compaction is not vetoed");
+    const talk = host.assistant([{ type: "text", text: "T1" }]);
+    await host.fire({ type: "message_end", message: talk });
+    await host.fire({ type: "agent_end", messages: [user, talk], willContinue: false });
+    assert.equal(await host.context([user, talk, host.user("U2")]), undefined, "a later ordinary turn also passes through");
+    assert.deepEqual(readdirSync(join(host.ctx.memory, "main")), [], "the inactive session writes no daily log");
+    return { registeredTools: host.registeredTools.length, notices: host.notices.length };
+  }, { holdStore: true });
 }
 
 async function fakeSteeringBatch(ctx: CaseContext): Promise<Evidence> {
@@ -3069,6 +3144,8 @@ const CASES: Record<CaseName, (ctx: CaseContext) => Promise<Evidence>> = {
   }),
   "tool-cap-zoom": toolCapZoom,
   "lock-held": lockHeld,
+  "lock-held-hooks": lockHeldHooks,
+  "corrupt-store": corruptStore,
   "missing-compressor": missingCompressor,
   "settle-timeout": settleTimeout,
   "abort-while-settling": abortWhileSettling,

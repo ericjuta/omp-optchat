@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 
 export const DEFAULTS = Object.freeze({
   enabled: true,
@@ -41,7 +43,7 @@ export function registerFlags(api: FlagRegistrar): void {
   });
   api.registerFlag("optchat-dir", {
     type: "string",
-    description: "Private memory directory (default: optchat under the active OMP agent directory)",
+    description: "Private memory directory (default: one per git worktree under optchat-worktrees, else optchat, both under the OMP agent directory)",
   });
   api.registerFlag("optchat-model", {
     type: "string",
@@ -147,4 +149,36 @@ export function readConfig(api: FlagReader, defaultDirectory: string): OptChatCo
     toolCap: integer(api, "optchat-tool-cap", DEFAULTS.toolCap, 128),
     childView: boolean(api.getFlag("optchat-child-view"), "optchat-child-view", DEFAULTS.childView),
   };
+}
+
+function canonical(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+/** Nearest ancestor (or cwd itself) holding a `.git` entry: a directory, or a file for linked worktrees and submodules. */
+function gitRoot(cwd: string): string | undefined {
+  let directory = canonical(cwd);
+  for (;;) {
+    if (existsSync(join(directory, ".git"))) return directory;
+    const parent = dirname(directory);
+    if (parent === directory) return undefined;
+    directory = parent;
+  }
+}
+
+/**
+ * Default memory directory when --optchat-dir is absent: one per git worktree, keyed by the canonical
+ * root, so concurrent worktrees never contend for one writer lease. Outside git, the global store.
+ * Pure apart from filesystem lookups, runs no subprocess and never throws.
+ */
+export function defaultStoreDirectory(agentDirectory: string, cwd: string): string {
+  const root = gitRoot(cwd);
+  if (root === undefined) return join(agentDirectory, "optchat");
+  const slug = basename(root).toLowerCase().replace(/[^a-z0-9._-]/g, "-").slice(0, 40) || "repo";
+  const key = createHash("sha256").update(root).digest("hex").slice(0, 16);
+  return join(agentDirectory, "optchat-worktrees", `${slug}-${key}`);
 }

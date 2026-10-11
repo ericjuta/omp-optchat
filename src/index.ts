@@ -1,5 +1,5 @@
-import { openSync, closeSync, fsyncSync, readFileSync, writeSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { clampThinkingLevelForModel, Effort } from "@oh-my-pi/pi-catalog";
 import { requiresNativeTools } from "@oh-my-pi/pi-catalog/compat/tools";
 import {
@@ -30,15 +30,16 @@ import {
 	type ViewPartition,
 } from "./cache.js";
 import { dialectKey, sharedToolsAllowed } from "./dialect.js";
-import { readConfig, readEnabled, registerFlags, type OptChatConfig } from "./config.js";
+import { defaultStoreDirectory, readConfig, readEnabled, registerFlags, type OptChatConfig } from "./config.js";
 import { exportHtml, importHistory } from "./history.js";
+import { writeExportFile } from "./export-file.js";
 import { attachChildView, publishChildSource, registerMemoryTools, UNGUARDED, type ChildView, type PageEnvelope, type WorkEnvelope } from "./handoff.js";
 import { appendMetric, type CompressorUsage } from "./metrics.js";
 import { captureWorkReports, type ArtifactPathSource } from "./reports.js";
 import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } from "./archive.js";
 import { Memory, type CompactionRequest, type Summarize } from "./memory.js";
 import { VIEW_DOC } from "./prompts.js";
-import { Store, type Kind, type Message } from "./store.js";
+import { Store, StoreLeaseConflictError, type Kind, type Message } from "./store.js";
 
 type AgentMessage = ContextEvent["messages"][number];
 
@@ -383,6 +384,8 @@ type State =
 	| { kind: "starting" }
 	| { kind: "ready" }
 	| { kind: "failed"; reason: string }
+	/** Lease conflict at startup: no memory and no host changes; the reason names the directory. */
+	| { kind: "inactive"; reason: string }
 	| { kind: "closed" };
 
 type WireObject = Record<string, unknown>;
@@ -485,6 +488,11 @@ class OptChat {
 		private readonly policy: CompressorPolicy = {},
 	) {}
 
+	/** Inactive sessions pass every host hook through unchanged: no view, no capture, no compaction veto. */
+	get passive(): boolean {
+		return this.state.kind === "inactive";
+	}
+
 	start(ctx: ExtensionContext): Promise<void> {
 		this.ctx = ctx;
 		this.cutoff = Date.now();
@@ -495,7 +503,7 @@ class OptChat {
 	}
 
 	private async open(ctx: ExtensionContext): Promise<void> {
-		const config = readConfig(this.pi, join(this.pi.pi.getAgentDir(), "optchat"));
+		const config = readConfig(this.pi, defaultStoreDirectory(this.pi.pi.getAgentDir(), ctx.cwd));
 		this.config = config;
 		const model = ctx.models.resolve(config.model);
 		if (!model) {
@@ -505,11 +513,26 @@ class OptChat {
 			throw new Error(`compressor model "${config.model}" requires native tools that cannot be disabled; choose a model with tool-free inference`);
 		}
 		this.compressor = model;
-		this.registerTools();
-		const store = await Store.open(config.directory, (message) => this.notify(message, "warning"));
+		let store: Store;
+		try {
+			store = await Store.open(config.directory, (message) => this.notify(message, "warning"));
+		} catch (error) {
+			// A live writer owns this directory: run without memory, as --no-optchat does. Other failures stay fail-closed.
+			if (error instanceof StoreLeaseConflictError && this.state.kind === "starting") {
+				this.inactivate(`${config.directory} is in use by another session`);
+				return;
+			}
+			throw error;
+		}
 		if (this.state.kind !== "starting") {
 			await store.close();
 			return;
+		}
+		try {
+			this.registerTools();
+		} catch (error) {
+			await store.close();
+			throw error;
 		}
 		this.store = store;
 		this.memory = new Memory(store, this.summarize, {
@@ -847,6 +870,12 @@ class OptChat {
 		this.notify(reason, "error");
 	}
 
+	/** Lease conflict at startup: the session runs without memory, exactly like --no-optchat, and says why once. */
+	private inactivate(reason: string): void {
+		this.state = { kind: "inactive", reason };
+		this.notify(`OptChat is inactive: ${reason}. Use --optchat-dir for a separate memory.`, "warning");
+	}
+
 	/** The only supported way to stop a request from a context hook: abort the run, send nothing. */
 	private refuse(ctx: ExtensionContext, reason: string): ContextEventResult {
 		ctx.abort();
@@ -897,6 +926,8 @@ class OptChat {
 			// A side turn is not this chat's turn: it passes through before any turn, pending, log or cutoff use.
 			if (this.state.kind === "ready" && this.isSideTurn(messages, ctx)) return undefined;
 			if (this.state.kind === "starting") await this.waitForStart(deadline);
+			// Inactive (startup lease conflict): the request passes through untouched.
+			if (this.state.kind === "inactive") return undefined;
 			const memory = this.requireReady();
 			const active = new Set(this.pi.getActiveTools());
 			if (!TOOL_NAMES.every((name) => active.has(name))) {
@@ -987,6 +1018,8 @@ class OptChat {
 				break;
 			case "failed":
 				throw new Refusal(this.state.reason);
+			case "inactive":
+				throw new Refusal(`OptChat refused the request: ${this.state.reason}.`);
 			case "starting":
 				throw new Refusal("OptChat refused the request: memory is still opening.");
 			case "closed":
@@ -1239,7 +1272,7 @@ class OptChat {
 
 	private statusText(): string {
 		const state = this.state;
-		const lines = [`OptChat: ${state.kind === "failed" ? `failed: ${state.reason}` : state.kind}`];
+		const lines = [`OptChat: ${state.kind === "failed" || state.kind === "inactive" ? `${state.kind}: ${state.reason}` : state.kind}`];
 		if (this.config) {
 			lines.push(`directory: ${this.store?.directory ?? this.config.directory}`);
 			lines.push(`compressor: ${this.compressor ? `${this.compressor.provider}/${this.compressor.id}` : this.config.model}`);
@@ -1265,17 +1298,7 @@ class OptChat {
 	private exportTo(argument: string, cwd: string): string {
 		const memory = this.openMemory();
 		const path = this.pathArgument(argument, cwd);
-		const html = exportHtml(memory);
-		// "wx": never overwrite an existing file.
-		const fd = openSync(path, "wx", 0o600);
-		try {
-			const bytes = Buffer.from(html, "utf8");
-			let written = 0;
-			while (written < bytes.length) written += writeSync(fd, bytes, written, bytes.length - written);
-			fsyncSync(fd);
-		} finally {
-			closeSync(fd);
-		}
+		writeExportFile(path, Buffer.from(exportHtml(memory), "utf8"));
 		return `OptChat exported ${memory.status().messages} messages to ${path}`;
 	}
 
@@ -1339,16 +1362,16 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 			}
 			const active = new OptChat(pi, settleTimeoutMs, observe, policy);
 			chat = active;
-			// Registered only for an activated session: these hooks change host behavior even as no-ops.
-			pi.on("before_agent_start", (event) => active.beforeAgentStart(event.systemPrompt));
+			// Registered for every opted-in main session. An inactive one (startup lease conflict) passes through.
+			pi.on("before_agent_start", (event) => (active.passive ? undefined : active.beforeAgentStart(event.systemPrompt)));
 			pi.on("context", (event, handlerCtx) => active.context(event.messages, handlerCtx));
-			pi.on("before_provider_request", (event, handlerCtx) => active.beforeProviderRequest(event.payload, handlerCtx));
+			pi.on("before_provider_request", (event, handlerCtx) => (active.passive ? undefined : active.beforeProviderRequest(event.payload, handlerCtx)));
 			pi.on("credential_disabled", () => active.resetCacheFence());
 			pi.on("tool_result", (event) => active.toolResult(event));
 			pi.on("message_end", (event) => active.messageEnd(event.message));
 			pi.on("agent_end", (event) => active.agentEnd(event.messages, event.willContinue === true));
 			// The current turn's tool loop must reach the model verbatim: no host compaction.
-			pi.on("session_before_compact", () => ({ cancel: true }));
+			pi.on("session_before_compact", () => (active.passive ? undefined : { cancel: true }));
 			pi.on("session_switch", (_event, switchCtx) => active.sessionChanged(switchCtx));
 			pi.on("session_branch", (_event, branchCtx) => active.sessionChanged(branchCtx));
 			pi.on("session_tree", (_event, treeCtx) => active.sessionChanged(treeCtx));
