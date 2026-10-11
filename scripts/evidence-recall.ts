@@ -596,20 +596,17 @@ function reserveHostAllowance(context: Context, hostId: string, usdPerCall: numb
 }
 
 /**
- * Worst case for one compaction call on this host, from the measured prompt bytes and the compactor layout. OptChat retries a refused compaction once on the main model with the
- * same prompt and output cap, and every attempt passes the same admission, so each call is priced at the dearer model.
+ * Worst case for one compaction call sent by `model`, from the measured prompt bytes and the compactor layout. The
+ * extension charges each admitted attempt at its sending model's bound: the compressor, or the main model when OptChat
+ * retries a refused compaction there with the same prompt and output cap.
  */
-function hostUsdPerCall(context: Context, compressor: string, main: string): number {
+function hostUsdPerCall(context: Context, model: string): number {
 	if (context.capUsd === null) return 0;
 	const system = effectiveSystemBytes(context.systemBytes);
 	if (system === null) throw new BudgetStop("unknown-cost", "effective prompt bytes are not measured");
-	let worst = 0;
-	for (const model of new Set([compressor, main])) {
-		const bound = compressorCallBoundUsd(context.rates.get(model) ?? null, system, COMPACTOR_LAYOUT, context.limits.maxCompressorOutputTokens);
-		if (bound === null) throw new BudgetStop("unknown-cost", `rate or context window for ${model} is unknown`);
-		worst = Math.max(worst, bound);
-	}
-	return worst;
+	const bound = compressorCallBoundUsd(context.rates.get(model) ?? null, system, COMPACTOR_LAYOUT, context.limits.maxCompressorOutputTokens);
+	if (bound === null) throw new BudgetStop("unknown-cost", `rate or context window for ${model} is unknown`);
+	return bound;
 }
 
 /** Adds an observed USD amount to a running total; null on either side keeps the total unobserved. */
@@ -688,7 +685,8 @@ async function openHost(context: Context, spec: HostSpec): Promise<HostSlot> {
 	const on = spec.arm === "on";
 	const compressor = spec.compressor ?? context.options.compressor;
 	const callAllowance = on ? callAllowanceFor(context, spec.kind, spec.share) : 0;
-	const usdPerCall = on ? hostUsdPerCall(context, compressor, spec.model) : 0;
+	const usdPerCall = on ? hostUsdPerCall(context, compressor) : 0;
+	const usdPerFallbackCall = on ? hostUsdPerCall(context, spec.model) : 0;
 	const extraArgs: string[] = [];
 	let historyBytes = 0;
 	if (!on) {
@@ -720,6 +718,7 @@ async function openHost(context: Context, spec: HostSpec): Promise<HostSlot> {
 			allowance: callAllowance,
 			usdAllowance,
 			usdPerCall,
+			usdPerFallbackCall,
 			compressorMaxTokens: context.limits.maxCompressorOutputTokens,
 			viewBytes: context.options.viewBytes,
 			env: context.env,
@@ -1276,6 +1275,7 @@ async function runChildExperiment(context: Context): Promise<ChildExperiment | n
 			allowance: 0,
 			usdAllowance: 0,
 			usdPerCall: 0,
+			usdPerFallbackCall: 0,
 			compressorMaxTokens: context.limits.maxCompressorOutputTokens,
 			viewBytes: context.options.viewBytes,
 			env: context.env,
@@ -1458,6 +1458,7 @@ async function effectivePromptPreflight(options: Options, dirs: IsolatedDirs, en
 			allowance: 0,
 			usdAllowance: 0,
 			usdPerCall: 0,
+			usdPerFallbackCall: 0,
 			compressorMaxTokens: options.limits.maxCompressorOutputTokens,
 			viewBytes: options.viewBytes,
 			env,
@@ -1580,6 +1581,8 @@ function budgetPlan(options: Options, questions: readonly Question[], rates: Rea
 		systemBytes: system,
 		mainPromptUsd: Object.fromEntries(mains.map((model) => [model, mainBoundUsd(rates.get(model) ?? null, measuredSystemBytes, options, "on", 0, 0, questionBytes)])),
 		compressorCallUsd: Object.fromEntries(options.compressors.map((compressor) => [compressor, system === null ? null : compressorCallBoundUsd(rates.get(compressor) ?? null, system, COMPACTOR_LAYOUT, options.limits.maxCompressorOutputTokens)])),
+		// A refused compaction is retried once on the main model; that attempt is charged at this bound.
+		fallbackCallUsd: system === null ? null : compressorCallBoundUsd(rates.get(options.main) ?? null, system, COMPACTOR_LAYOUT, options.limits.maxCompressorOutputTokens),
 		hostAllowanceUsd: options.maxCostUsd === null ? null : options.maxCostUsd * options.compressorShare,
 		basis: [
 			"main prompt: tokens bounded by UTF-8 bytes (system, tools, view, prior turns, four zoom pages, question), clamped to the context window; output at the pinned cap; times the prompt's call bound",

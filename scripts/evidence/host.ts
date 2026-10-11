@@ -23,6 +23,8 @@ export interface HostLaunch {
 	readonly usdAllowance: number;
 	/** Worst-case USD charged per compressor admission (OPTCHAT_EVIDENCE_USD_PER_CALL), computed by the runner. */
 	readonly usdPerCall: number;
+	/** Worst-case USD per compaction call sent by any other model, i.e. OptChat's main-model refusal fallback. */
+	readonly usdPerFallbackCall: number;
 	readonly compressorMaxTokens: number;
 	/** The host's view budget in bytes (--optchat-view-bytes). The product default is larger; see EVIDENCE_VIEW_BYTES. */
 	readonly viewBytes: number;
@@ -116,6 +118,8 @@ export class RpcHost {
 				// Plain decimals only: the extension's parser rejects exponent notation.
 				OPTCHAT_EVIDENCE_USD_ALLOWANCE: launch.usdAllowance.toFixed(12),
 				OPTCHAT_EVIDENCE_USD_PER_CALL: launch.usdPerCall.toFixed(12),
+				OPTCHAT_EVIDENCE_COMPRESSOR: launch.compressor,
+				OPTCHAT_EVIDENCE_USD_PER_FALLBACK_CALL: launch.usdPerFallbackCall.toFixed(12),
 				OPTCHAT_EVIDENCE_COMPRESSOR_MAX_TOKENS: String(launch.compressorMaxTokens),
 			},
 			stdio: "pipe",

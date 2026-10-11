@@ -17,6 +17,7 @@ const LAUNCH: HostLaunch = {
 	allowance: 80,
 	usdAllowance: 1,
 	usdPerCall: 0.01,
+	usdPerFallbackCall: 0.2,
 	compressorMaxTokens: 512,
 	viewBytes: 4096,
 	env: {},

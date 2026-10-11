@@ -8,7 +8,9 @@
  *   OPTCHAT_EVIDENCE_ADMISSION_FILE  per-host JSON admission file: { dispatched, reservedUsd }
  *   OPTCHAT_EVIDENCE_ALLOWANCE       integer compressor calls this host may dispatch
  *   OPTCHAT_EVIDENCE_USD_ALLOWANCE   decimal dollars this host may reserve in worst-case compressor bounds
- *   OPTCHAT_EVIDENCE_USD_PER_CALL    decimal worst-case dollars charged per compressor call
+ *   OPTCHAT_EVIDENCE_USD_PER_CALL    decimal worst-case dollars charged per call sent by the compressor
+ *   OPTCHAT_EVIDENCE_COMPRESSOR      compressor `provider/id`; any other sending model is OptChat's main-model refusal fallback
+ *   OPTCHAT_EVIDENCE_USD_PER_FALLBACK_CALL  decimal worst-case dollars charged per call sent by any other model
  *   OPTCHAT_EVIDENCE_COMPRESSOR_MAX_TOKENS  integer 1..512 output cap per compressor call
  *   OPTCHAT_EVIDENCE_PARENT_PATHS    optional JSON string array of runner host paths that must not appear in the prompt
  */
@@ -40,6 +42,8 @@ export default function evidenceExtension(pi: ExtensionAPI): void {
 	if (!Number.isInteger(allowance) || allowance < 0) throw new Error("OPTCHAT_EVIDENCE_ALLOWANCE must be a nonnegative integer");
 	const usdAllowance = parseUsdDecimal(required("OPTCHAT_EVIDENCE_USD_ALLOWANCE"), "OPTCHAT_EVIDENCE_USD_ALLOWANCE");
 	const perCallUsd = parseUsdDecimal(required("OPTCHAT_EVIDENCE_USD_PER_CALL"), "OPTCHAT_EVIDENCE_USD_PER_CALL");
+	const compressor = required("OPTCHAT_EVIDENCE_COMPRESSOR");
+	const perFallbackUsd = parseUsdDecimal(required("OPTCHAT_EVIDENCE_USD_PER_FALLBACK_CALL"), "OPTCHAT_EVIDENCE_USD_PER_FALLBACK_CALL");
 	const maxTokens = positiveInteger("OPTCHAT_EVIDENCE_COMPRESSOR_MAX_TOKENS", MAX_OUTPUT);
 	const parentPaths = parseParentSubstrings(process.env.OPTCHAT_EVIDENCE_PARENT_PATHS);
 	// Every turn: the effective system prompt must carry no private ambient context, before any call.
@@ -49,8 +53,9 @@ export default function evidenceExtension(pi: ExtensionAPI): void {
 	});
 	createOptChat({
 		compressorMaxTokens: maxTokens,
-		admitCompressorCall: () => {
-			const decision = admitCompressorCall(JSON.parse(readFileSync(file, "utf8")), allowance, perCallUsd, usdAllowance);
+		admitCompressorCall: (model) => {
+			const price = model === compressor ? perCallUsd : perFallbackUsd;
+			const decision = admitCompressorCall(JSON.parse(readFileSync(file, "utf8")), allowance, price, usdAllowance);
 			if (!decision.admitted) return false;
 			// Written before the request is sent: a crash after this point over-counts, never under-counts.
 			writeFileSync(file, JSON.stringify(decision.state));

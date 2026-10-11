@@ -117,6 +117,7 @@ describe("childLaunch and overlay", () => {
 		allowance: 0,
 		usdAllowance: 0,
 		usdPerCall: 0,
+		usdPerFallbackCall: 0,
 		compressorMaxTokens: 512,
 		viewBytes: 4096,
 		env: {},

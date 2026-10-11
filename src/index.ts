@@ -69,7 +69,8 @@ export interface OptChatOptions {
 	 * Checked before every compressor provider attempt, including retries. `false`, or a throw, fails that
 	 * call closed: nothing is sent and no summary is published.
 	 */
-	admitCompressorCall?: () => boolean | Promise<boolean>;
+	/** Called before every compaction provider attempt with the sending model's `provider/id`; false refuses the attempt. */
+	admitCompressorCall?: (model: string) => boolean | Promise<boolean>;
 	/** Output cap for compressor requests, an integer from 1 to 512. Unset: the model's own maximum. */
 	compressorMaxTokens?: number;
 }
@@ -85,7 +86,7 @@ export function compressorReasoning(model: Model, maxTokens: number | undefined)
 
 /** Compressor-call policy: admission before each provider attempt and an optional output cap. */
 interface CompressorPolicy {
-	readonly admit?: () => boolean | Promise<boolean>;
+	readonly admit?: (model: string) => boolean | Promise<boolean>;
 	readonly maxTokens?: number;
 }
 
@@ -752,7 +753,8 @@ class OptChat {
 		const started = performance.now();
 		// Admission precedes every send. The first attempt is admitted here, before the request can be
 		// dispatched on any provider path; later payloads (SDK retries) are admitted by onPayload.
-		if (this.policy.admit && !(await this.policy.admit())) throw new Error("compressor call was not admitted");
+		const selector = `${model.provider}/${model.id}`;
+		if (this.policy.admit && !(await this.policy.admit(selector))) throw new Error("compressor call was not admitted");
 		let admitted = true;
 		let sends = 0;
 		const reply = await completeSimple(
@@ -776,7 +778,7 @@ class OptChat {
 					// The first payload is the attempt admitted above; each retry is admitted before its send.
 					sends += 1;
 					if (sends > 1) {
-						admitted = this.policy.admit ? await this.policy.admit() : true;
+						admitted = this.policy.admit ? await this.policy.admit(selector) : true;
 						if (!admitted) throw new Error("compressor call was not admitted");
 					}
 					const actualModel = payloadModel ?? model;
