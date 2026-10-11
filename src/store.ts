@@ -77,10 +77,19 @@ type Stream = {
   writer?: { day: string; fd: number };
 };
 type Lease = { server: Server; failure?: Error };
+/** Another live writer holds this directory's lease. Nothing was read or changed in the directory. */
+export class StoreLeaseConflictError extends Error {
+  override name = "StoreLeaseConflictError";
+}
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const filePattern = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
 const nodeFields = ["l", "i", "text", "size"];
 const viewName = "view.json";
+const digestName = /^[0-9a-f]{64}$/;
+// randomUUID() emits lowercase RFC 4122 version-4 strings; nothing else is ours.
+const uuidV4 = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+const imageTempName = new RegExp(`^\\.image-${uuidV4}\\.tmp$`);
+const viewTempName = new RegExp(`^\\.view-${uuidV4}\\.tmp$`);
 
 function hasCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
@@ -352,7 +361,7 @@ async function acquireLease(rootFd: number): Promise<Lease> {
     lease.failure = error;
     if (!listening) {
       ready.reject(hasCode(error, "EADDRINUSE")
-        ? new Error("Store is already open by another writer", { cause: error })
+        ? new StoreLeaseConflictError("Store is already open by another writer", { cause: error })
         : error);
     }
   });
@@ -436,8 +445,8 @@ function loadView(
 
 // Commits the view only after its complete private file is durable. Every name
 // resolves against the leased root inode, even if the public root path moves.
-// Only the exclusively created temporary is ever unlinked; a crash may leave an
-// inert `.view-<uuid>.tmp` (0600, no text) that is never read or removed.
+// A failed write unlinks its own temporary; a crash may leave an inert
+// `.view-<uuid>.tmp` (0600, no text), which the next Store.open reclaims.
 function replaceView(rootFd: number, directory: string, text: string): void {
   const target = at(rootFd, viewName);
   try {
@@ -553,6 +562,68 @@ function reportSafely(report: Report | undefined, message: string): void {
   try { (report ?? console.warn)(message); } catch { /* Diagnostics must not change replay semantics. */ }
 }
 
+// Opens without following links; only an owned regular file is eligible for GC.
+function isRegularFile(path: string): boolean {
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    if (hasCode(error, "ELOOP") || hasCode(error, "ENOENT")) return false;
+    throw error;
+  }
+  try {
+    const info = fstatSync(fd);
+    return info.isFile() && info.uid === process.getuid!();
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// Startup-only reclamation, called by Store.open after the complete history and
+// view snapshot validated, under the writer lease, so no save can be in flight.
+// Replayed message metadata is the sole reference set. Only exact-name regular
+// files are unlinked; symlinks, directories, and unknown entries are left alone.
+// Each directory with successful unlinks is fsynced once, even after partial
+// failures. Never throws: the Store stays usable and the outcome is reported once.
+function collectGarbage(rootFd: number, images: Stream, messages: readonly Message[], report?: Report): void {
+  const referenced = new Set<string>();
+  for (const message of messages) {
+    for (const image of message.metadata?.images ?? []) referenced.add(image.sha256);
+  }
+  let collected = 0;
+  let failed = 0;
+  const sweep = (dirFd: number, eligible: (name: string) => boolean): void => {
+    let removed = 0;
+    try {
+      for (const name of readdirSync(descriptorPath(dirFd))) {
+        if (!eligible(name)) continue;
+        const path = at(dirFd, name);
+        try {
+          if (!isRegularFile(path)) continue;
+          unlinkSync(path);
+          removed++;
+        } catch {
+          failed++;
+        }
+      }
+    } catch {
+      failed++;
+    }
+    collected += removed;
+    if (removed === 0) return;
+    try {
+      fsyncSync(dirFd);
+    } catch {
+      failed++;
+    }
+  };
+  sweep(rootFd, (name) => viewTempName.test(name));
+  sweep(images.fd, (name) => imageTempName.test(name) || (digestName.test(name) && !referenced.has(name)));
+  if (collected === 0 && failed === 0) return;
+  const warning = failed === 0 ? "" : `; warning: ${failed} cleanup operation(s) failed`;
+  reportSafely(report, `Store garbage collection: collected ${collected} file(s)${warning}`);
+}
+
 /**
  * Private append-only storage on a local Linux filesystem supporting fsync.
  * The abstract Unix socket owns the lock until close/process death; there is no
@@ -608,6 +679,7 @@ export class Store {
         store.images = openStream(rootFd, canonical, "images");
         streams.push(store.images);
       }
+      collectGarbage(rootFd, store.images, store.messages, report);
       return store;
     } catch (error) {
       try {

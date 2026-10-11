@@ -4,7 +4,7 @@ import { appendFile, chmod, link, mkdir, mkdtemp, readFile, readdir, realpath, r
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { DEFAULT_PAGE_BYTES, MAX_PAGE_BYTES, type ImageDescriptor, type ImageMimeType } from "../src/archive.ts";
 import { Store, nodeKey, type Kind, type Message, type TreeNode } from "../src/store.ts";
@@ -749,25 +749,60 @@ describe("Store view snapshot persistence", () => {
     });
   });
 
-  test("an abandoned malformed snapshot temporary stays inert and is not owned by later saves", async () => {
+  test("reopen reclaims only canonical stale view temporaries; malformed names and symlinks stay inert", async () => {
     await withFixture(async (fixture) => {
       const store = await fixture.open();
       store.append("user", "source");
       store.saveView(rawView(1, true));
-      const abandoned = join(fixture.directory, ".view-00000000-0000-0000-0000-000000000000.tmp");
-      const malformed = Buffer.from([0x7b, 0x22, 0xff, 0xfe]);
-      await writeFile(abandoned, malformed, { mode: 0o600 });
       await store.close();
+
+      const canonical = "6f1d2c3b-4a5e-4b7c-9d8e-0f1a2b3c4d5e";
+      const stale = `.view-${randomUUID()}.tmp`;
+      const malformedNames = [
+        `.view-${canonical.toUpperCase()}.tmp`,
+        `.view-${canonical.replace("-4b7c", "-1b7c")}.tmp`,
+        `.view-${canonical.replace("-9d8e", "-0d8e")}.tmp`,
+        `.view-${canonical.replace("-9d8e", "-cd8e")}.tmp`,
+        `.view-${canonical}.tmp.bak`,
+        `view-${canonical}.tmp`,
+        `.view-${canonical}.tmp\n`,
+        `.view-${canonical}.tm`,
+        ".view-00000000-0000-0000-0000-000000000000.tmp",
+      ];
+      const malformed = new Map(malformedNames.map((name) => [name, Buffer.from([0x7b, 0x22, 0xff, 0xfe, ...Buffer.from(name)])] as const));
+      for (const [name, bytes] of malformed) await writeFile(join(fixture.directory, name), bytes, { mode: 0o600 });
+
+      const linkName = `.view-${randomUUID()}.tmp`;
+      const target = join(fixture.root, "view-target");
+      const targetBytes = Buffer.from("symlink target bytes\n");
+      await writeFile(target, targetBytes, { mode: 0o600 });
+      await symlink(target, join(fixture.directory, linkName));
+      await writeFile(join(fixture.directory, stale), Buffer.from("{}"), { mode: 0o600 });
+
+      const viewNames = async () => (await readdir(fixture.directory)).filter((name) => name.includes("view-")).sort();
+      const expectedNames = [...malformedNames, linkName].sort();
+      expect(await viewNames()).toEqual([...expectedNames, stale].sort());
+
       const recovered = await fixture.open();
       expect(recovered.viewSnapshot).toEqual(rawView(1, true));
-      expect(await readFile(abandoned)).toEqual(malformed);
+      expect(await viewNames()).toEqual(expectedNames);
+      for (const [name, bytes] of malformed) expect(await readFile(join(fixture.directory, name))).toEqual(bytes);
+      const entries = await readdir(fixture.directory, { withFileTypes: true });
+      expect(entries.find((entry) => entry.name === linkName)?.isSymbolicLink()).toBe(true);
+      expect(await readFile(join(fixture.directory, linkName))).toEqual(targetBytes);
+      expect(await readFile(target)).toEqual(targetBytes);
+
       recovered.saveView(rawView(0));
-      expect(await readFile(abandoned)).toEqual(malformed);
-      expect((await readdir(fixture.directory)).filter((name) => name.startsWith(".view-")))
-        .toEqual([".view-00000000-0000-0000-0000-000000000000.tmp"]);
+      expect(recovered.viewSnapshot).toEqual(rawView(0));
+      expect(await viewNames()).toEqual(expectedNames);
       await recovered.close();
-      expect((await fixture.open()).viewSnapshot).toEqual(rawView(0));
-      expect(await readFile(abandoned)).toEqual(malformed);
+
+      const reopened = await fixture.open();
+      expect(reopened.viewSnapshot).toEqual(rawView(0));
+      expect(await viewNames()).toEqual(expectedNames);
+      for (const [name, bytes] of malformed) expect(await readFile(join(fixture.directory, name))).toEqual(bytes);
+      expect(await readFile(join(fixture.directory, linkName))).toEqual(targetBytes);
+      expect(await readFile(target)).toEqual(targetBytes);
     });
   });
 });
@@ -1694,6 +1729,7 @@ describe("Store image storage and message attachments", () => {
       expect((await stat(path)).mode & 0o777).toBe(0o600);
       expect((await readFile(path)).toString("base64")).toBe(image.base64);
       expect(store.readImage(descriptor)).toEqual({ descriptor, data: image.base64 });
+      store.append("user", "keeps image", undefined, { images: [{ ...descriptor, order: 0 }] });
       await store.close();
       const restarted = await fixture.open();
       expect(restarted.readImage(descriptor)).toEqual({ descriptor, data: image.base64 });
@@ -1724,7 +1760,7 @@ describe("Store image storage and message attachments", () => {
   });
 
   test.each(["temporary fsync", "short write", "rename", "directory fsync after publish"] as const)(
-    "saveImage %s failure is uncertain: it throws, poisons writes, and restarts from exactly the durable entries",
+    "saveImage %s failure is uncertain: it throws, poisons writes, and reopen reclaims unreferenced published bytes",
     async (fault) => {
       await withFixture(async (fixture) => {
         const store = await fixture.open();
@@ -1774,8 +1810,9 @@ describe("Store image storage and message attachments", () => {
 
         const recovered = await fixture.open();
         expect(recovered.messages).toEqual([]);
-        if (published) expect(recovered.readImage(image.descriptor).data).toBe(image.base64);
-        else expect(() => recovered.readImage(image.descriptor)).toThrow();
+        // A published image with no message reference is an orphan: reopen reclaims it.
+        expect(() => recovered.readImage(image.descriptor)).toThrow();
+        expect(await readdir(images)).toEqual([]);
         expect(recovered.saveImage(image.base64, "image/png")).toEqual(image.descriptor);
         expect(recovered.readImage(image.descriptor).data).toBe(image.base64);
         expect(await readdir(images)).toEqual([image.descriptor.sha256]);
@@ -1903,6 +1940,8 @@ describe("Store image storage and message attachments", () => {
         expect(await readdir(join(fixture.directory, "images"))).toEqual([]);
         expect(await readFile(join(fixture.directory, "sentinel"), "utf8")).toBe("fresh");
         expect(store.readImage(held).data).toBe(first.base64);
+        store.append("user", "held", undefined, { images: [{ ...held, order: 0 }] });
+        store.append("user", "added", undefined, { images: [{ ...added, order: 0 }] });
         await store.close();
         const recovered = await fixture.open(undefined, moved);
         expect(recovered.readImage(added).data).toBe(second.base64);
@@ -1917,6 +1956,8 @@ describe("Store image storage and message attachments", () => {
         expect(await readdir(outside)).toEqual([]);
         expect((await readdir(heldDirectory)).sort()).toEqual([held.sha256, added.sha256].sort());
         expect(store.readImage(held).data).toBe(first.base64);
+        store.append("user", "held", undefined, { images: [{ ...held, order: 0 }] });
+        store.append("user", "added", undefined, { images: [{ ...added, order: 0 }] });
         await store.close();
         await rm(join(fixture.directory, "images"));
         await rename(heldDirectory, join(fixture.directory, "images"));
@@ -1933,7 +1974,9 @@ describe("Store image storage and message attachments", () => {
         const image = pngFixture(11);
         const store = await fixture.open();
         const descriptor = store.saveImage(image.base64, "image/png");
+        store.append("user", "keeps image", undefined, { images: [{ ...descriptor, order: 0 }] });
         await store.close();
+        const attacked = await fixture.open();
         const entry = join(fixture.directory, "images", descriptor.sha256);
         const outside = join(fixture.root, "outside.png");
         await writeFile(outside, image.png, { mode: 0o644 });
@@ -1941,12 +1984,12 @@ describe("Store image storage and message attachments", () => {
         await rm(entry);
         if (linkType === "symbolic") await symlink(outside, entry);
         else await link(outside, entry);
-        const attacked = await fixture.open();
         expect(() => attacked.readImage(descriptor)).toThrow();
         expect(() => attacked.saveImage(image.base64, "image/png")).toThrow();
         expect((await readFile(outside)).toString("base64")).toBe(image.base64);
         expect((await stat(outside)).mode & 0o777).toBe(0o644);
         await attacked.close();
+        await expect(fixture.open()).rejects.toThrow();
       });
     });
   }
@@ -1987,4 +2030,224 @@ describe("Store image storage and message attachments", () => {
       await store.close();
     });
   });
+
+  const hexName = (seed: string) => createHash("sha256").update(seed).digest("hex");
+  // Replaces one character of a fresh UUID to build version and variant negatives.
+  const uuidWith = (index: number, character: string) => {
+    const id = randomUUID();
+    return `${id.slice(0, index)}${character}${id.slice(index + 1)}`;
+  };
+  // Counts only root and images directory fsyncs; startup GC is the delta over an idle open.
+  async function openCountingDirectorySyncs(open: () => Promise<Store>, root: string, images: string) {
+    const counts = { root: 0, images: 0 };
+    const nativeFsync = fs.fsyncSync;
+    const fsyncSpy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+      const target = fs.readlinkSync(`/proc/self/fd/${fd}`);
+      if (target === root) counts.root++;
+      else if (target === images) counts.images++;
+      nativeFsync(fd);
+    });
+    try {
+      return { store: await open(), counts };
+    } finally {
+      fsyncSpy.mockRestore();
+    }
+  }
+
+  test("startup GC keeps a digest referenced twice and a digest referenced only by an older day", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const shared = pngFixture(50);
+      const older = pngFixture(51);
+      const sharedDescriptor = store.saveImage(shared.base64, "image/png");
+      const olderDescriptor = store.saveImage(older.base64, "image/png");
+      atClock(new Date(2026, 0, 10, 12), () => {
+        store.append("user", "older only", undefined, { images: [{ ...olderDescriptor, order: 0 }] });
+        store.append("user", "shared first", undefined, { images: [{ ...sharedDescriptor, order: 0 }] });
+      });
+      atClock(new Date(2026, 0, 12, 12), () => {
+        store.append("talk", "shared second", undefined, { images: [{ ...sharedDescriptor, order: 0 }] });
+        store.append("note", "text only");
+      });
+      await store.close();
+      const restarted = await fixture.open();
+      expect(restarted.messages.map((record) => record.text))
+        .toEqual(["older only", "shared first", "shared second", "text only"]);
+      expect((await readdir(imagesOf(restarted))).sort()).toEqual([sharedDescriptor.sha256, olderDescriptor.sha256].sort());
+      expect(restarted.readMessageImages(0)).toEqual([{ attachment: { ...olderDescriptor, order: 0 }, data: older.base64 }]);
+      expect(restarted.readImage(sharedDescriptor).data).toBe(shared.base64);
+      await restarted.close();
+    });
+  });
+
+  test("startup GC removes unreferenced digests and valid stale temporaries while retaining referenced bytes", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const kept = pngFixture(52);
+      const orphan = pngFixture(53);
+      const keptDescriptor = store.saveImage(kept.base64, "image/png");
+      const orphanDescriptor = store.saveImage(orphan.base64, "image/png");
+      store.append("user", "keeps image", undefined, { images: [{ ...keptDescriptor, order: 0 }] });
+      const images = imagesOf(store);
+      await store.close();
+      await writeFile(join(images, `.image-${randomUUID()}.tmp`), "partial image", { mode: 0o600 });
+      await writeFile(join(fixture.directory, `.view-${randomUUID()}.tmp`), "partial view", { mode: 0o600 });
+      const restarted = await fixture.open();
+      expect(await readdir(images)).toEqual([keptDescriptor.sha256]);
+      expect((await readdir(fixture.directory)).filter((name) => name.startsWith(".view-"))).toEqual([]);
+      expect(() => restarted.readImage(orphanDescriptor)).toThrow();
+      expect(restarted.readMessageImages(0)).toEqual([{ attachment: { ...keptDescriptor, order: 0 }, data: kept.base64 }]);
+      await restarted.close();
+    });
+  });
+
+  test("startup GC removes only exact unreferenced digest files and canonical stale temporaries, ignoring all other names", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const images = imagesOf(store);
+      await store.close();
+      const outside = join(fixture.root, "outside.bin");
+      await writeFile(outside, "outside bytes", { mode: 0o600 });
+      const candidate = hexName("candidate");
+      const directory = hexName("directory");
+      const link = hexName("link");
+      const linkTemporary = `.image-${randomUUID()}.tmp`;
+      const ignoredFiles = [
+        candidate.toUpperCase(),
+        candidate.slice(1),
+        `${candidate}\n`,
+        `.image-${randomUUID().toUpperCase()}.tmp`,
+        `.image-${uuidWith(14, "1")}.tmp`,
+        `.image-${uuidWith(19, "7")}.tmp`,
+        `.image-${randomUUID()}.tmp.bak`,
+        `x.image-${randomUUID()}.tmp`,
+        `.image-${randomUUID()}.tmp\n`,
+      ];
+      await writeFile(join(images, "notes.txt"), "unrelated", { mode: 0o600 });
+      await mkdir(join(images, directory));
+      await symlink(outside, join(images, link));
+      await symlink(outside, join(images, linkTemporary));
+      for (const name of ignoredFiles) await writeFile(join(images, name), "ignored", { mode: 0o600 });
+      await writeFile(join(images, candidate), "unreferenced", { mode: 0o600 });
+      const reports: string[] = [];
+      const restarted = await fixture.open((report) => reports.push(report));
+      expect(reports).toEqual(["Store garbage collection: collected 1 file(s)"]);
+      expect((await readdir(images)).sort()).toEqual(["notes.txt", directory, link, linkTemporary, ...ignoredFiles].sort());
+      const entries = await readdir(images, { withFileTypes: true });
+      expect(entries.find((entry) => entry.name === link)?.isSymbolicLink()).toBe(true);
+      expect(entries.find((entry) => entry.name === linkTemporary)?.isSymbolicLink()).toBe(true);
+      expect(entries.find((entry) => entry.name === directory)?.isDirectory()).toBe(true);
+      expect(await readFile(outside, "utf8")).toBe("outside bytes");
+      await restarted.close();
+    });
+  });
+
+  test("an unlink failure keeps other collections, reports one warning, and leaves the store writable", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      store.append("user", "live");
+      const images = imagesOf(store);
+      await store.close();
+      const failingName = `.image-${randomUUID()}.tmp`;
+      await writeFile(join(images, failingName), "stuck", { mode: 0o600 });
+      await writeFile(join(images, hexName("orphan")), "orphan", { mode: 0o600 });
+      await writeFile(join(fixture.directory, `.view-${randomUUID()}.tmp`), "view", { mode: 0o600 });
+      const failure = Object.assign(new Error("injected unlink failure"), { code: "EIO" });
+      const nativeUnlink = fs.unlinkSync;
+      const unlinkSpy = spyOn(fs, "unlinkSync").mockImplementation((path) => {
+        if (String(path).endsWith(`/${failingName}`)) throw failure;
+        nativeUnlink(path);
+      });
+      const reports: string[] = [];
+      let restarted: Store;
+      try {
+        restarted = await fixture.open((report) => reports.push(report));
+      } finally {
+        unlinkSpy.mockRestore();
+      }
+      expect(reports).toEqual(["Store garbage collection: collected 2 file(s); warning: 1 cleanup operation(s) failed"]);
+      expect(await readdir(images)).toEqual([failingName]);
+      expect((await readdir(fixture.directory)).filter((name) => name.startsWith(".view-"))).toEqual([]);
+      expect(restarted.messages.map((record) => record.text)).toEqual(["live"]);
+      expect(restarted.append("talk", "still writable").i).toBe(1);
+      await restarted.close();
+      const next: string[] = [];
+      const retried = await fixture.open((report) => next.push(report));
+      expect(next).toEqual(["Store garbage collection: collected 1 file(s)"]);
+      expect(await readdir(images)).toEqual([]);
+      await retried.close();
+    });
+  });
+
+  test("startup GC fsyncs each changed directory once and stays silent when nothing is collected", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const kept = store.saveImage(pngFixture(60).base64, "image/png");
+      store.append("user", "kept", undefined, { images: [{ ...kept, order: 0 }] });
+      await store.close();
+      const root = await realpath(fixture.directory);
+      const images = join(root, "images");
+      const idleReports: string[] = [];
+      const idle = await openCountingDirectorySyncs(() => fixture.open((report) => idleReports.push(report)), root, images);
+      await idle.store.close();
+      expect(idleReports).toEqual([]);
+      await writeFile(join(images, hexName("orphan-a")), "a", { mode: 0o600 });
+      await writeFile(join(images, hexName("orphan-b")), "b", { mode: 0o600 });
+      await writeFile(join(images, `.image-${randomUUID()}.tmp`), "c", { mode: 0o600 });
+      await writeFile(join(root, `.view-${randomUUID()}.tmp`), "d", { mode: 0o600 });
+      await writeFile(join(root, `.view-${randomUUID()}.tmp`), "e", { mode: 0o600 });
+      const collectingReports: string[] = [];
+      const collecting = await openCountingDirectorySyncs(() => fixture.open((report) => collectingReports.push(report)), root, images);
+      expect(collectingReports).toEqual(["Store garbage collection: collected 5 file(s)"]);
+      expect(collecting.counts).toEqual({ root: idle.counts.root + 1, images: idle.counts.images + 1 });
+      await collecting.store.close();
+      const quietReports: string[] = [];
+      const quiet = await openCountingDirectorySyncs(() => fixture.open((report) => quietReports.push(report)), root, images);
+      expect(quietReports).toEqual([]);
+      expect(quiet.counts).toEqual(idle.counts);
+      await quiet.store.close();
+    });
+  });
+
+  test.each(["replay", "image", "snapshot"] as const)(
+    "startup GC does not run when %s validation rejects the open, and runs after repair",
+    async (damage) => {
+      await withFixture(async (fixture) => {
+        const store = await fixture.open();
+        const referenced = pngFixture(70);
+        const descriptor = store.saveImage(referenced.base64, "image/png");
+        store.append("user", "needs image", undefined, { images: [{ ...descriptor, order: 0 }] });
+        store.saveView(rawView(1));
+        const images = imagesOf(store);
+        await store.close();
+        const mainPath = join(fixture.directory, "main", (await readdir(join(fixture.directory, "main")))[0]!);
+        const viewPath = join(fixture.directory, "view.json");
+        const imagePath = join(images, descriptor.sha256);
+        const originals = { main: await readFile(mainPath), view: await readFile(viewPath) };
+        const candidates = [
+          join(images, hexName("garbage")),
+          join(images, `.image-${randomUUID()}.tmp`),
+          join(fixture.directory, `.view-${randomUUID()}.tmp`),
+        ];
+        for (const path of candidates) await writeFile(path, "garbage", { mode: 0o600 });
+        if (damage === "replay") await appendFile(mainPath, `${JSON.stringify(message(2))}\n`);
+        if (damage === "image") await rm(imagePath);
+        if (damage === "snapshot") await writeFile(viewPath, "{");
+        const rejectedReports: string[] = [];
+        await expect(fixture.open((report) => rejectedReports.push(report))).rejects.toThrow();
+        expect(rejectedReports).toEqual([]);
+        for (const path of candidates) expect((await stat(path)).isFile()).toBe(true);
+        if (damage === "replay") await writeFile(mainPath, originals.main);
+        if (damage === "image") await writeFile(imagePath, referenced.png, { mode: 0o600 });
+        if (damage === "snapshot") await writeFile(viewPath, originals.view);
+        const repairedReports: string[] = [];
+        const recovered = await fixture.open((report) => repairedReports.push(report));
+        expect(repairedReports).toEqual(["Store garbage collection: collected 3 file(s)"]);
+        for (const path of candidates) await expect(stat(path)).rejects.toThrow();
+        expect(await readdir(images)).toEqual([descriptor.sha256]);
+        expect(recovered.readMessageImages(0)).toEqual([{ attachment: { ...descriptor, order: 0 }, data: referenced.base64 }]);
+        await recovered.close();
+      });
+    },
+  );
 });
