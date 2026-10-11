@@ -10,7 +10,7 @@ An OMP extension implementing [Victor Taelin's OptChat specification](https://gi
 Install the tagged release:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.4.1'
+omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.5.0'
 PI_OPENAI_STATEFUL=0 omp
 ```
 
@@ -144,6 +144,8 @@ The dollar bound prices input by UTF-8 bytes, not tokens: a prompt's tokens neve
 
 Limits of this bound: the four-call prompt limit is not an enforced tool-loop cap, and the output cap is trusted from the pinned `models.yml` entry (verified for built-in catalog models through `omp models --json`; the offline fixture provider ignores it). On-arm native compaction of the main session is observed but not bounded in advance.
 
+The runner waits for memory to settle before each prompt for as long as compressor calls, dispatches, or tree growth keep progressing, within the run deadline (`--deadline-ms`, at most 30 minutes). It reports a stall after 120 s without progress. A completed compressor call holds its observed cost against the host's dollar allowance; only calls still in flight hold their worst case. Admissions refused by either ceiling are counted and reported, because a refused admission fails that summary and OptChat then refuses the next turn.
+
 `--fixture-provider` swaps in the loopback `optchat-smoke/*` models, which are priced at zero. The whole pipeline, including both arms, the compressors, and the child experiment, then runs without provider calls or credentials. It is for testing the runner, requires `optchat-smoke/*` selectors, and is mutually exclusive with `--confirm-live-provider-calls`. `tests/evidence-benchmark.test.ts` drives it end to end and skips when no `omp` executable is found (set `OPTCHAT_EVIDENCE_OMP` to choose one).
 
 Before copying credentials or starting host discovery, the runner parses the source agent directory's `models.yml`, `models.yaml`, and legacy `models.json` (JSONC). Any selected provider entry blocks the run: copying its credential without its routing could send it to a different endpoint. Read failures, parse errors, and invalid root or provider-map shapes also block, without exposing config contents in diagnostics. This check deliberately includes shadowed files rather than following OMP's first-file precedence; unrelated provider entries are allowed. Source configuration is never migrated, evaluated, or copied.
@@ -151,6 +153,37 @@ Before copying credentials or starting host discovery, the runner parses the sou
 The smoke harness links the plugin into an isolated fresh host environment, then exercises automatic discovery and activation without `--optchat` or an explicit plugin extension path. It uses the actual OMP host with a local deterministic model endpoint, captures inference requests, and checks fresh turns, shared main/compactor prompt and tools, the dash ruler, lossless retrieval, saved-view stability, and restart persistence. Separate opt-out processes prove ordinary history remains intact, no memory store or tools are created, and no compressor requests occur, including both positive/negative flag orders. Set `OPTCHAT_SMOKE_OMP` to a compiled OMP executable and `OPTCHAT_SMOKE_PLUGIN` to an installed plugin directory to verify that artifact rather than the checkout. It is not a measurement of summary quality or real-provider cache hit rates.
 
 The 0.4.0 release was exercised on compiled OMP 18.9.0. Beyond the checks above, the smoke drives a `/btw` side turn followed by an ordinary prompt, a 54 KB structured async report, two images retrieved after a restart, `work` retrieval after a restart, and a real `task` child that reads the parent view without writing. A deterministic restart probe confirmed that reopening a fully built 200-message chat makes no compressor calls and leaves all 397 nodes unchanged, and that one new message costs one call.
+
+### 0.5.0 measurements
+
+Paired runs on OMP 18.9.1 used Claude Sonnet 5.5 as the main model and Claude Haiku 5.5 as the compressor, with per-question turns and adversarial questions: multi-step and reverted corrections, late distractors, near-duplicate names, and an unanswerable fact. Each run asked 8 questions. "On" is OptChat; "off" is plain OMP resuming a session that holds the same records as ordinary messages. Costs are provider-reported; compressor cost includes building the memory. These are small samples (n = 3 per setting), not savings claims.
+
+**History that fits the context window** (48 records of 4 KB, about 74k tokens, 64 KB view; seeds 1–3):
+
+| Arm | Correct | Grounded | Main cost | Compressor cost | Main prompt tokens | Main cache-read share |
+|---|---|---|---|---|---|---|
+| On | 24/24 | 24/24 | $0.41–0.43 | $0.04–0.09 | ~218k | 56–57% |
+| Off | 24/24 | 24/24 | $0.32 | — | ~539k | 88% |
+
+When everything fits, OptChat costs more: about $0.13–0.20 per run. The main model reads 60% fewer prompt tokens, but each turn's fresh view is written to the cache instead of read from it, and zooming adds a round trip per question.
+
+**History past the context window** (160 records of 4 KB, about 650 KB; main model pinned to a 200k window with `--main-context-window`; 128 KB view; plain OMP compacted once in every off run):
+
+| Seed | On: correct / grounded | On: total cost | Off: correct value / grounded | Off: total cost |
+|---|---|---|---|---|
+| 1 | 8/8, 8/8 | $1.13 | 1/8, 1/8 (7 abstained) | $0.05–0.55 |
+| 2 | 8/8, 8/8 | $1.10 | 7/8, 7/8 | $0.06–0.56 |
+| 3 | 8/8, 8/8 | $1.18 | 8/8, 2/8 | $0.05–0.55 |
+
+Seed 3's on arm comes from a separate on-only run (`long-s3-on`), after the runner's settle wait was fixed; its paired run stopped while the build was still progressing. Off-arm cost is an interval because OMP 18.9.1 reported `tokensBefore: 0` for its compactions: the high bound bills the whole 200k window at the input rate. After compaction, plain OMP sometimes still names the right value but can no longer quote the original record. In one of three seeds it abstained on most questions. OptChat answered every question correctly with an exact quote, at roughly twice the cost of the worst off-arm case.
+
+**Compressors** (48-record build, seed 4): Haiku 5.5 needed 103 calls (17 shortening retries), $0.034, and 211 s of summed call time, and the run then answered 8/8. Haiku 4.5 needed 303 calls (230 shortening retries, because it overshoots the byte limit), $0.76, and 961 s, and had not settled when the run stopped.
+
+**Subagent memory** (`--experiments child`, 24 records, 4 delegated tasks per arm): with `--optchat-child-view`, children answered 4/4 correctly after 2–4 `zoom` calls each (child cost $0.20 in total); without it, children answered 0/4, saying the facts were not available to them (child cost $0.09).
+
+**Refusals:** Claude 5.x models sometimes reject benign summarization requests with `Refusal (bio)`. An early corpus padded with word lists (words such as replica, vector, probe, drift) triggered it on most long prompts; natural prose padding reduced it to about 1 in 100 compressor calls. The refusal fallback above keeps memory settling when it happens.
+
+### 0.4.0 measurements
 
 A bounded `evidence:recall` run used real models: Claude Sonnet 4.6 for the main chat, Claude Haiku 4.5 as the compressor, and a synthetic 24-source corpus. It ran a cold phase and a fresh-process restart phase; the deepest summary level was 5 in the cold phase and 6 after restart. Results:
 

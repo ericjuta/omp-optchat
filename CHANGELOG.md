@@ -1,11 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-10-11
+
+Tracks Wayfinder map [#9](https://github.com/ericjuta/omp-optchat/issues/9). SDK packages pinned to 18.9.1 (peers stay `>=18.9.0`).
 
 - **Durability (#11):** Add real-subprocess SIGKILL recovery coverage for image-bearing appends, summary commits, and history imports; publish HTML exports from fsynced private staging files without overwriting existing targets, then fsync the parent directory.
 - **Archive GC (#12):** Reclaim unreferenced image blobs and abandoned image/view staging files after validated writer startup, preserving replayed references and reporting nonfatal cleanup failures.
 - **Behavior change:** Sessions inside git repositories no longer use `~/.omp/agent/optchat`. Each worktree gets its own memory under `optchat-worktrees/` beside that directory, and a new worktree starts empty. Sessions outside git keep the global store. `--optchat-dir ~/.omp/agent/optchat` restores the old single shared memory.
 - A startup lock conflict (another live session holds the store directory) now deactivates OptChat for that session, as `--no-optchat` does, with one warning, instead of refusing every prompt. Corrupt or otherwise unreadable stores still refuse prompts.
+- **Benchmark (#10, #13):** `bun run evidence:recall` gains paired OptChat on/off arms (`--arms on,off`), compressor comparison (`--compressors`), per-question turns, adversarial and long corpora (up to 40 projects and 512 records), a subagent-memory experiment (`--experiments child`), `--main-context-window`, and a hard dollar ceiling (`--max-cost-usd`, at most $30). The dollar ceiling uses byte-based bounds, a pinned main output cap, per-host compressor reservations that release completed calls at their observed cost, and main-model pricing for refusal fallbacks. Artifacts are schema `optchat-evidence-recall/3`, with main, compressor, auxiliary, and estimated maintenance usage. The `--max-calls` ceiling is 2000 and the `--deadline-ms` ceiling is 30 minutes. Measured on Sonnet 5.5 and Haiku 5.5 (see README "0.5.0 measurements", n = 3 per setting):
+  - When history fits the context, both arms answered 24/24, and OptChat cost $0.13–0.20 more per run.
+  - Past the context window, OptChat answered 24/24 with exact quotes. Plain OMP, after compacting, named 16/24 correct values and quoted 10/24. OptChat cost about $1.10–1.18 per run, against $0.05–0.56 for plain OMP.
+  - Subagents with `--optchat-child-view` answered 4/4; blind subagents answered 0/4.
+- **Upstream (#14):** API proposals for context-event purpose, cancellation and correlation ([can1357/oh-my-pi#15365](https://github.com/can1357/oh-my-pi/issues/15365)), complete async-output references, maintenance ownership, and audio/video ingress, posted on the matching upstream issues.
+- Failed compressor calls record the provider's stop reason and error text in `OPTCHAT_METRICS_FILE`, and the thrown error includes it.
+- Evidence corpus padding is natural prose. Word-list padding made Claude 5.x refuse summarization with `Refusal (bio)`.
 - **Refusal fallback:** A compressor refusal (`stopReason` error starting `Refusal`) is retried once with the session's main model. The fallback has a 30-second wall deadline; if it lapses, OptChat cancels it. If the main model also refuses or lapses, OptChat commits a marked, source-derived excerpt for the node so the tree settles and later prompts are not refused. The "not ready after 25 s" notice now appears only for real timeouts; a summary that failed without retry says so. `/optchat status` counts main-model retries and stand-ins.
 
 ## 0.4.1 — 2026-10-11
