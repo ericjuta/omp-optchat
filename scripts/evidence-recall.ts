@@ -67,6 +67,7 @@ import {
 	readAdmissionDispatched,
 	readDurableRecords,
 	readMetricLines,
+	compressorFailures,
 	readTreeStructure,
 	RpcHost,
 	type MetricLine,
@@ -965,7 +966,8 @@ async function awaitSettled(context: Context, slot: HostSlot, memory: string): P
 		const quiet = (lines?.length ?? 0) === dispatched;
 		const covered = durable === 0 || (tree !== null && tree.mainLength === durable && tree.compactorLength === durable);
 		if (quiet && covered) return null;
-		const observed = `durable=${durable} treeMain=${tree?.mainLength ?? "none"} treeCompactor=${tree?.compactorLength ?? "none"} metricLines=${lines?.length ?? "none"} dispatched=${dispatched}`;
+		const failures = compressorFailures(lines);
+		const observed = `durable=${durable} treeMain=${tree?.mainLength ?? "none"} treeCompactor=${tree?.compactorLength ?? "none"} metricLines=${lines?.length ?? "none"} dispatched=${dispatched}${failures ? ` compressorFailures=${failures}` : ""}`;
 		if (Date.now() >= deadline) return observed;
 		await pause(context, TREE_POLL_MS);
 	}

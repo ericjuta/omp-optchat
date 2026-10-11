@@ -15,6 +15,17 @@ export interface CompressorUsage {
 	readonly latencyMs: number;
 	/** The host's reported cost, or null when the host reports none. */
 	readonly costUsd: number | null;
+	/** Provider stop reason of the reply ("stop", "length", "error", ...). */
+	readonly stopReason: string;
+	/** Provider error text when the call failed, without control characters and at most 200 characters; never request content. */
+	readonly error: string | null;
+}
+
+/** Bounds provider error text for diagnostics: control characters removed, at most 200 characters. */
+export function boundedProviderError(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const text = value.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim();
+	return text ? text.slice(0, 200) : null;
 }
 
 /** Append one JSON line with O_APPEND. Best effort: the caller reports failures. */

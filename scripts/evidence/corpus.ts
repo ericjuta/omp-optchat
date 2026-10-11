@@ -164,10 +164,22 @@ const OWNERS = ["Ada", "Ben", "Cara", "Dev", "Eli", "Fay", "Gus", "Hana", "Iris"
 const VENDORS = ["Corvid", "Pellet", "Stratus", "Nimbly", "Ferrox", "Glyph"] as const;
 const REPORTERS = ["Mika", "Osei", "Priya", "Rafael", "Sun", "Tove"] as const;
 /**
- * Lowercase neutral office words for detail padding: no names, numbers, IDs, or fact vocabulary. Words that read as
- * life-science terms (replica, vector, probe, drift) made Claude 5.x safety classifiers refuse long corpora.
+ * Lowercase neutral office nouns for detail padding: no names, numbers, IDs, or fact vocabulary. Padding is
+ * templated prose, not word lists: Claude 5.x safety classifiers refused long word-salad corpora (and life-science
+ * words such as replica, vector, probe, drift) with "Refusal (bio)", even in summarization requests.
  */
 const PAD_WORDS = ["routine", "checkpoint", "buffer", "cursor", "ledger", "segment", "snapshot", "agenda", "folder", "queue", "memo", "column", "header", "outline", "margin", "notebook", "calendar", "draft"] as const;
+/** Neutral office-prose templates; each `@` takes one PAD_WORDS noun. */
+const PAD_TEMPLATES = [
+	"The team reviewed the @ and tidied the @.",
+	"Someone moved the @ next to the @ in the shared @.",
+	"Nothing changed in the @ this week.",
+	"The @ and the @ were both left as they were.",
+	"A reminder about the @ went out with the @.",
+	"The @ was renamed, and the old @ was archived.",
+	"Everyone agreed the @ could wait until the next @.",
+	"The weekly sync skipped the @ and spent the time on the @.",
+] as const;
 
 /**
  * Project history shape, by `index % 4`. Each family adds late correction records after the filler:
@@ -270,10 +282,7 @@ export function buildCorpus(options: CorpusOptions): Corpus {
 
 	const random = seededRandom(options.seed);
 	const pick = <T>(list: readonly T[]): T => list[Math.floor(random() * list.length)]!;
-	const detailSentence = (): string => {
-		const count = 6 + Math.floor(random() * 6);
-		return `${Array.from({ length: count }, () => pick(PAD_WORDS)).join(" ")}.`;
-	};
+	const detailSentence = (): string => pick(PAD_TEMPLATES).replace(/@/g, () => pick(PAD_WORDS));
 
 	const usedTickets = new Set<string>();
 	const projects = Array.from({ length: options.projects }, (_, index) => {

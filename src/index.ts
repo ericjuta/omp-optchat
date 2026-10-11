@@ -34,7 +34,7 @@ import { defaultStoreDirectory, readConfig, readEnabled, registerFlags, type Opt
 import { exportHtml, importHistory } from "./history.js";
 import { writeExportFile } from "./export-file.js";
 import { attachChildView, publishChildSource, registerMemoryTools, UNGUARDED, type ChildView, type PageEnvelope, type WorkEnvelope } from "./handoff.js";
-import { appendMetric, type CompressorUsage } from "./metrics.js";
+import { appendMetric, boundedProviderError, type CompressorUsage } from "./metrics.js";
 import { captureWorkReports, type ArtifactPathSource } from "./reports.js";
 import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } from "./archive.js";
 import { Memory, type CompactionRequest, type Summarize } from "./memory.js";
@@ -677,6 +677,8 @@ class OptChat {
 				purpose: feedback > 0 ? "shorten" : "leaf",
 				latencyMs: Math.round(latencyMs),
 				costUsd: Number.isFinite(total) ? total : null,
+				stopReason: reply.stopReason,
+				error: reply.stopReason === "error" || reply.stopReason === "aborted" ? boundedProviderError(reply.errorMessage) : null,
 			});
 		} catch (error) {
 			this.notify(`OptChat metrics: ${errorText(error)}`, "warning");
@@ -753,7 +755,8 @@ class OptChat {
 		this.observeUsage(model, reply, request.feedback.length, performance.now() - started);
 		if (reply.stopReason === "error" || reply.stopReason === "aborted") {
 			const status = reply.errorStatus === undefined ? "" : ` (HTTP ${reply.errorStatus})`;
-			throw new Error(`${model.provider}/${model.id} request ${reply.stopReason === "error" ? "failed" : "was aborted"}${status}`);
+			const detail = boundedProviderError(reply.errorMessage);
+			throw new Error(`${model.provider}/${model.id} request ${reply.stopReason === "error" ? "failed" : "was aborted"}${status}${detail ? `: ${detail}` : ""}`);
 		}
 		if (reply.stopReason === "toolUse" || reply.content.some((part) => part.type === "toolCall")) {
 			throw new Error("Compressor returned a tool call instead of a summary; no tool calls were dispatched");

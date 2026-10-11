@@ -535,6 +535,8 @@ export interface MetricLine {
 	readonly purpose: "leaf" | "shorten" | null;
 	readonly latencyMs: number | null;
 	readonly costUsd: number | null;
+	readonly stopReason: string | null;
+	readonly error: string | null;
 }
 
 /** Creates the metric sink empty before launch: an empty file is zero completed calls; no file is no host run. */
@@ -562,6 +564,19 @@ export async function readMetricLines(file: string): Promise<MetricLine[] | null
 			purpose: value.purpose === "leaf" || value.purpose === "shorten" ? value.purpose : null,
 			latencyMs: numberOrNull(value.latencyMs),
 			costUsd: numberOrNull(value.costUsd),
+			stopReason: typeof value.stopReason === "string" ? value.stopReason : null,
+			error: typeof value.error === "string" ? value.error : null,
 		};
 	});
+}
+
+/** Failed compressor calls grouped by provider error text, for diagnostics; empty when none failed. */
+export function compressorFailures(lines: readonly MetricLine[] | null): string {
+	const counts = new Map<string, number>();
+	for (const line of lines ?? []) {
+		if (line.stopReason !== "error" && line.stopReason !== "aborted") continue;
+		const key = line.error ?? `stopReason ${line.stopReason}`;
+		counts.set(key, (counts.get(key) ?? 0) + 1);
+	}
+	return [...counts].map(([error, count]) => `${count}× ${error}`).join("; ");
 }
