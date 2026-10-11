@@ -46,7 +46,7 @@ import {
 } from "./evidence/artifact.ts";
 import { initialAdmission } from "./evidence/admission.ts";
 import { buildCorpus, type Corpus, type Question, type QuestionKind } from "./evidence/corpus.ts";
-import { dollarAdmission, offCompactionBoundUsd, recordSpend, type ModelRates, type SpendLedger, initialSpend, worstCaseCallUsd } from "./evidence/cost.ts";
+import { compressorCallBoundUsd, type CompactorLayout, DollarReservations, mainPromptBoundUsd, type MainPromptBytes, type ModelRates, offCompactionBoundUsd, SYSTEM_BLOCK_BYTES, TOOL_SCHEMA_BYTES } from "./evidence/cost.ts";
 import {
 	type ArmBase,
 	type ChildArmResult,
@@ -93,7 +93,7 @@ import { routingBlockers } from "./evidence/routing.ts";
 import { parseOptions, SCENARIOS, USAGE, type Arm, type Options, type ScenarioName } from "./evidence/options.ts";
 import { answerInstruction, armTotals, type Judgement, scoreAnswers, type ArmTotals } from "./evidence/scoring.ts";
 import { estimateMaintenanceUsage, type MaintenanceEstimate, readAuxiliaryUsage, readCompactionEvidence, type SeedRecord, writeSeededSession } from "./evidence/seed.ts";
-import { type OfflineServer, startOfflineServer } from "./evidence/offline-server.ts";
+import { type FixtureRequest, type OfflineServer, startOfflineServer } from "./evidence/offline-server.ts";
 import { BATCH_MARKER, type FixtureState, fixtureReply } from "./evidence/fixture-replies.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -113,6 +113,12 @@ const SETTLE_WAIT_MS = 120_000;
 const ANSWER_PREVIEW_CHARS = 240;
 /** Stand-in ceiling for a host whose dollar cap is not enforced (no --max-cost-usd): effectively unbounded. */
 const UNBOUNDED_USD = 1e12;
+
+/** Compactor layout at product defaults: nodeBytes (src/config.ts) and compactionViewBytes (src/memory.ts). */
+const COMPACTOR_LAYOUT: CompactorLayout = { nodeBytes: 512, pageBytes: 16_384, compactionViewBytes: 32_000 };
+
+/** UTF-8 bytes of one retrieved zoom page, matching src/archive.ts DEFAULT_PAGE_BYTES. */
+const PAGE_BYTES = 16_384;
 /**
  * A child task reserves this multiple of one main prompt's worst case: the parent turn plus the child
  * run, with the child's own calls not separately bounded. The factor is generous on purpose; the
@@ -235,6 +241,12 @@ interface HostSlot {
 	readonly sessionDir: string;
 	/** Off arm: the seeded history's UTF-8 bytes at open; zero on the on arm. */
 	readonly historyBytes: number;
+	/** UTF-8 bytes of earlier turns (question, answer, retrieved text) that stay in this host's prompt. */
+	priorBytes: number;
+	/** Observed compressor USD of this host; null once any record is unobserved. */
+	compressorUsd: number | null;
+	/** Ledger id of this host's compressor allowance; null when the cap is unbounded or the arm is off. */
+	reservationId: string | null;
 	readonly segments: Segment[];
 	readonly phases: PhaseDraft[];
 	metricCursor: number;
@@ -329,14 +341,17 @@ interface Context {
 	readonly rates: ReadonlyMap<string, ModelRates | null>;
 	readonly limits: Limits;
 	readonly capUsd: number | null;
+	/** Measured effective prompt bytes, or null when the preflight did not measure them. */
+	readonly systemBytes: number | null;
 	readonly deadlineAt: number;
 	readonly aborted: AbortController;
 	readonly hosts: Set<RpcHost>;
 	readonly violations: string[];
 	readonly units: Unit[];
 	state: AccountingState;
-	spend: SpendLedger;
+	readonly reservations: DollarReservations;
 	hostSeq: number;
+	reservationSeq: number;
 	child: ChildExperiment | null;
 }
 
@@ -473,34 +488,36 @@ function ratesOf(entry: CatalogEntry | undefined): ModelRates | null {
 }
 
 /**
- * Worst case for one main prompt: the model's context window as the prompt, and its context window as the output
- * (a turn cannot emit more than its window), priced at the catalog's dearest rate, times the prompt's call bound.
- * Null when the model's rates or window are unknown; the caller refuses.
+ * Effective system bytes of a host's prompt: the measured preflight bytes plus the OptChat system block. The block is
+ * added even when the measurement already contains it, which only over-bounds.
  */
-function promptBoundUsd(context: Context, model: string): number | null {
-	const rates = context.rates.get(model) ?? null;
-	if (rates === null || rates.contextWindow === null) return null;
-	// The on arm never clamps output to the catalog ceiling, so its admission is unchanged by catalog maxTokens.
-	const perCall = worstCaseCallUsd({ ...rates, maxOutput: null }, rates.contextWindow, rates.contextWindow);
-	return perCall === null ? null : perCall * DEFAULT_PROMPT_CALLS;
-}
-
-/** Worst case for one compressor call: its context window as the prompt and the runner's output cap. */
-function compressorCallBoundUsd(context: Context, compressor: string): number | null {
-	const rates = context.rates.get(compressor) ?? null;
-	if (rates === null || rates.contextWindow === null) return null;
-	return worstCaseCallUsd({ ...rates, maxOutput: null }, rates.contextWindow, context.limits.maxCompressorOutputTokens);
+function effectiveSystemBytes(measured: number | null): number | null {
+	return measured === null ? null : measured + SYSTEM_BLOCK_BYTES;
 }
 
 /**
- * Worst case for one admitted prompt. The on arm admits by its main bound alone. The off arm also prices the native
- * compaction it may run inside the seeded session: the whole seeded history and this prompt, each as UTF-8 bytes / 4,
- * plus 4096 tokens of overhead, at the dearest input-side rate, and the catalog's output ceiling. An unknown ceiling is null.
+ * Worst case for one main prompt. Tokens are bounded by the prompt's UTF-8 bytes, clamped to the window; the output
+ * is the pinned cap. History is the view on the on arm and the seeded history on the off arm, plus prior turns on both.
+ * The per-call bound is multiplied by the prompt's call bound only, never by the number of prompts. Null when unknown.
+ */
+function mainBoundUsd(rates: ModelRates | null, systemBytes: number | null, options: Options, arm: Arm, historyBytes: number, priorBytes: number, questionBytes: number): number | null {
+	const system = effectiveSystemBytes(systemBytes);
+	if (system === null) return null;
+	const history = (arm === "on" ? options.viewBytes : historyBytes) + priorBytes;
+	const bytes: MainPromptBytes = { system, tools: TOOL_SCHEMA_BYTES, history, question: questionBytes, retrieval: DEFAULT_PROMPT_CALLS * PAGE_BYTES };
+	return mainPromptBoundUsd(rates, bytes, options.maxMainOutputTokens, DEFAULT_PROMPT_CALLS);
+}
+
+/**
+ * Worst case for one admitted prompt. The on arm admits by its main bound alone. The off arm also adds the native
+ * compaction bound over the seeded history, the prior turns, and this question, priced at the pinned output cap.
  */
 function admissionBoundUsd(context: Context, slot: HostSlot, message: string): number | null {
-	const main = promptBoundUsd(context, slot.model);
+	const rates = context.rates.get(slot.model) ?? null;
+	const questionBytes = Buffer.byteLength(message, "utf8");
+	const main = mainBoundUsd(rates, context.systemBytes, context.options, slot.arm, slot.historyBytes, slot.priorBytes, questionBytes);
 	if (main === null || slot.arm === "on") return main;
-	const compaction = offCompactionBoundUsd(context.rates.get(slot.model) ?? null, slot.historyBytes, Buffer.byteLength(message, "utf8"));
+	const compaction = offCompactionBoundUsd(rates, slot.historyBytes + slot.priorBytes, questionBytes, context.options.maxMainOutputTokens);
 	return compaction === null ? null : main + compaction;
 }
 
@@ -532,8 +549,8 @@ async function collectSideUsage(context: Context, slot: HostSlot, events: readon
 	const entries = await compactionEntriesIn(slot.sessionDir);
 	const maintenance = estimateMaintenanceUsage({ compactionEntries: entries - slot.compactionCursor, events, mainModel: slot.model, prices: priceRecord(context) });
 	slot.compactionCursor = entries;
-	context.spend = recordSpend(context.spend, spendOf(auxiliary));
-	context.spend = recordSpend(context.spend, maintenance.costUsdHigh);
+	context.reservations.recordSpend(spendOf(auxiliary));
+	context.reservations.recordSpend(maintenance.costUsdHigh);
 	return { auxiliary, maintenance };
 }
 
@@ -564,24 +581,78 @@ function unobservedTotalReason(roles: readonly UsageSummary[], maintenance: Main
 }
 
 /**
- * The dollar allowance for one on-arm host. The host's compressor reserves come out of the cap only after its own
- * main prompts' worst case, so a host can never push the run past the cap whatever its compressor spends.
+ * Reserves one on-arm host's compressor allowance: the share of the uncommitted cap. Refuses, and releases the
+ * reservation, when that allowance cannot cover a single compressor call.
  */
-function hostUsdAllowance(context: Context, model: string, prompts: number): number {
-	if (context.capUsd === null) return UNBOUNDED_USD;
-	if (context.spend.observedUsd === null) throw new BudgetStop("unknown-cost", "observed spend is unknown; no further live work");
-	const bound = promptBoundUsd(context, model);
-	if (bound === null) throw new BudgetStop("unknown-cost", `rate or context window for ${model} is unknown`);
-	const allowance = context.capUsd - context.spend.observedUsd - prompts * bound;
-	if (allowance < 0) throw new BudgetStop("cost-cap", "the remaining cap cannot cover this host's prompts");
+function reserveHostAllowance(context: Context, hostId: string, usdPerCall: number): number {
+	const allowance = context.reservations.reserveHost(hostId, context.options.compressorShare);
+	if (allowance === null) throw new BudgetStop("unknown-cost", "observed spend is unknown; no further live work");
+	if (allowance < usdPerCall) {
+		context.reservations.releaseHost(hostId, 0);
+		throw new BudgetStop("cost-cap", "the remaining cap cannot cover one compressor call on this host");
+	}
 	return allowance;
 }
 
+/** Worst case for one compressor call, from the measured prompt bytes and the compactor layout. */
 function hostUsdPerCall(context: Context, compressor: string): number {
 	if (context.capUsd === null) return 0;
-	const bound = compressorCallBoundUsd(context, compressor);
+	const system = effectiveSystemBytes(context.systemBytes);
+	if (system === null) throw new BudgetStop("unknown-cost", "effective prompt bytes are not measured");
+	const bound = compressorCallBoundUsd(context.rates.get(compressor) ?? null, system, COMPACTOR_LAYOUT, context.limits.maxCompressorOutputTokens);
 	if (bound === null) throw new BudgetStop("unknown-cost", `rate or context window for ${compressor} is unknown`);
 	return bound;
+}
+
+/** Adds an observed USD amount to a running total; null on either side keeps the total unobserved. */
+function addUsd(total: number | null, usd: number | null): number | null {
+	return total === null || usd === null ? null : total + usd;
+}
+
+/**
+ * Releases one reservation with its observed spend. An overspend is recorded as a violation and the release is retried
+ * as unobserved, which makes the ledger unknown so every later admission refuses. It never throws mid-run.
+ */
+function releaseSafely(context: Context, id: string, observedUsd: number | null, release: (usd: number | null) => void): void {
+	try {
+		release(observedUsd);
+	} catch (error) {
+		context.violations.push(`${id}: ${safeMessage(error)}`);
+		release(null);
+	}
+}
+
+/** Settles one host's compressor allowance with its observed compressor spend; a null spend makes the ledger unknown. */
+function releaseHostAllowance(context: Context, slot: HostSlot, observedUsd: number | null): void {
+	const id = slot.reservationId;
+	if (id === null) return;
+	releaseSafely(context, id, observedUsd, (usd) => context.reservations.releaseHost(id, usd));
+}
+
+/**
+ * Settles a child arm's prompt reservations in admission order: observed spend fills each reservation up to its bound.
+ * Spend beyond every reservation is still observed and is recorded, with a violation, so the total stays exact.
+ */
+function releaseChildReservations(context: Context, reservations: readonly { readonly id: string; readonly bound: number }[], observedUsd: number | null): void {
+	let remaining: number | null = observedUsd;
+	for (const { id, bound } of reservations) {
+		const share: number | null = remaining === null ? null : Math.min(remaining, bound);
+		releaseSafely(context, id, share, (usd) => context.reservations.releasePrompt(id, usd));
+		remaining = remaining === null || share === null ? null : remaining - share;
+	}
+	if (remaining === null) {
+		context.reservations.recordSpend(null);
+	} else if (remaining > 0) {
+		if (reservations.length > 0) context.violations.push("child arm spend exceeds its reservations");
+		context.reservations.recordSpend(remaining);
+	}
+}
+
+/** Observed USD of a child arm: each task's parent spend plus its child spend; null when any part is unobserved. */
+function childArmSpendUsd(outcomes: readonly ChildTaskOutcome[]): number | null {
+	let total: number | null = 0;
+	for (const outcome of outcomes) total = addUsd(total, addUsd(spendOf(outcome.parentUsage), childSpendUsd(outcome)));
+	return total;
 }
 
 /** Observed USD of a set of records; null when any record's cost is unobserved. */
@@ -609,7 +680,6 @@ async function openHost(context: Context, spec: HostSpec): Promise<HostSlot> {
 	const on = spec.arm === "on";
 	const compressor = spec.compressor ?? context.options.compressor;
 	const callAllowance = on ? callAllowanceFor(context, spec.kind, spec.share) : 0;
-	const usdAllowance = on ? hostUsdAllowance(context, spec.model, spec.prompts) : 0;
 	const usdPerCall = on ? hostUsdPerCall(context, compressor) : 0;
 	const extraArgs: string[] = [];
 	let historyBytes = 0;
@@ -618,6 +688,15 @@ async function openHost(context: Context, spec: HostSpec): Promise<HostSlot> {
 		// The whole seeded history in UTF-8 bytes: the off arm's compaction admission prices all of it as input.
 		historyBytes = (await stat(file)).size;
 		extraArgs.push(`--resume=${file}`);
+	}
+	let usdAllowance = 0;
+	let reservationId: string | null = null;
+	if (on) {
+		usdAllowance = UNBOUNDED_USD;
+		if (context.capUsd !== null) {
+			reservationId = `host-${label}`;
+			usdAllowance = reserveHostAllowance(context, reservationId, usdPerCall);
+		}
 	}
 	const host = new RpcHost(
 		{
@@ -653,6 +732,9 @@ async function openHost(context: Context, spec: HostSpec): Promise<HostSlot> {
 		admission,
 		sessionDir: session,
 		historyBytes,
+		priorBytes: 0,
+		compressorUsd: 0,
+		reservationId,
 		segments: [],
 		phases: [],
 		metricCursor: 0,
@@ -691,7 +773,7 @@ async function collectCompressor(context: Context, slot: HostSlot): Promise<void
 		if (estimate !== null) return { ...base, costUsd: estimate, costSource: "catalog-estimate" as const };
 		return { ...base, costUsd: null, costSource: "unavailable" as const };
 	});
-	context.spend = recordSpend(context.spend, spendOf(records));
+	slot.compressorUsd = addUsd(slot.compressorUsd, spendOf(records));
 	slot.segments.push({
 		attempted,
 		observed: fresh.length,
@@ -709,7 +791,13 @@ async function closeHost(context: Context, slot: HostSlot): Promise<void> {
 	} finally {
 		context.hosts.delete(slot.host);
 	}
-	await collectCompressor(context, slot);
+	try {
+		await collectCompressor(context, slot);
+	} catch (error) {
+		releaseHostAllowance(context, slot, null);
+		throw error;
+	}
+	releaseHostAllowance(context, slot, slot.compressorUsd);
 	const last = slot.phases.at(-1);
 	if (last) last.segmentEnd = slot.segments.length;
 	// Shutdown events belong to no prompt, so they are charged once here. With no phase there is nothing to report them against.
@@ -737,15 +825,21 @@ async function withHost(context: Context, spec: HostSpec, body: (slot: HostSlot)
  */
 async function runPrompt(context: Context, slot: HostSlot, message: string): Promise<PromptOutcome> {
 	if (context.aborted.signal.aborted) return { kind: "refused", reason: "deadline" };
+	const bound = context.capUsd === null ? null : admissionBoundUsd(context, slot, message);
 	if (context.capUsd !== null) {
-		const bound = admissionBoundUsd(context, slot, message);
 		if (bound === null) return { kind: "refused", reason: "unknown-cost" };
-		const decision = dollarAdmission(context.spend.observedUsd, bound, context.capUsd);
+		const decision = context.reservations.admitPrompt(bound);
 		if (!decision.admitted) return { kind: "refused", reason: decision.reason };
 	}
 	const admission = admitPrompt(context.state, context.limits, Date.now(), DEFAULT_PROMPT_CALLS);
 	context.state = admission.state;
 	if (!admission.admitted) return { kind: "refused", reason: admission.reason };
+	let promptId: string | null = null;
+	if (bound !== null) {
+		promptId = `prompt-${++context.reservationSeq}`;
+		// The same synchronous ledger state just admitted this bound, so the reservation cannot be refused.
+		if (!context.reservations.reservePrompt(promptId, bound).admitted) throw new Error("prompt reservation diverged from its admission");
+	}
 	const start = slot.host.events.length;
 	const remaining = Math.max(1, context.deadlineAt - Date.now());
 	let failure: string | null = null;
@@ -757,7 +851,14 @@ async function runPrompt(context: Context, slot: HostSlot, message: string): Pro
 	const events = slot.host.events.slice(start);
 	const observation = observeTurn(events, context.prices.get(slot.model) ?? null);
 	context.state = recordCalls(context.state, "main", observation.assistantMessages);
-	context.spend = recordSpend(context.spend, spendOf(observation.usage));
+	const observedMain = spendOf(observation.usage);
+	if (promptId === null) {
+		context.reservations.recordSpend(observedMain);
+	} else {
+		const id = promptId;
+		releaseSafely(context, id, observedMain, (usd) => context.reservations.releasePrompt(id, usd));
+	}
+	slot.priorBytes += Buffer.byteLength(message, "utf8") + Buffer.byteLength(observation.answer, "utf8") + observation.pages.reduce((sum, page) => sum + Buffer.byteLength(page.text, "utf8"), 0);
 	const side = await collectSideUsage(context, slot, events);
 	return { kind: "done", observation, failure, side };
 }
@@ -1146,7 +1247,8 @@ async function runChildExperiment(context: Context): Promise<ChildExperiment | n
 		return { status: "unavailable", reason: "no completed on-arm build for the default compressor", arms: { view: null, blind: null } };
 	}
 	const main = context.options.main;
-	const bound = promptBoundUsd(context, main);
+	const questionBytes = Math.max(0, ...context.questions.map((question) => Buffer.byteLength(question.prompt, "utf8")));
+	const bound = mainBoundUsd(context.rates.get(main) ?? null, context.systemBytes, context.options, "on", 0, 0, questionBytes);
 	if (bound === null && context.capUsd !== null) {
 		return { status: "unavailable", reason: "main model rate or context window is unknown; the child experiment cannot be admitted", arms: { view: null, blind: null } };
 	}
@@ -1169,17 +1271,18 @@ async function runChildExperiment(context: Context): Promise<ChildExperiment | n
 			viewBytes: context.options.viewBytes,
 			env: context.env,
 		};
-		const pending = { calls: 0, usd: 0 };
+		const pending = { calls: 0 };
+		const reservations: { readonly id: string; readonly bound: number }[] = [];
 		const admit = (reserveUsd: number): string | null => {
 			const admission = admitPrompt(recordCalls(context.state, "main", pending.calls), context.limits, Date.now(), DEFAULT_PROMPT_CALLS);
 			if (!admission.admitted) return admission.reason;
 			if (context.capUsd !== null) {
-				const spent = context.spend.observedUsd === null ? null : context.spend.observedUsd + pending.usd;
-				const decision = dollarAdmission(spent, reserveUsd, context.capUsd);
-				if (!decision.admitted) return decision.reason;
+				const id = `child-${arm}-${++context.reservationSeq}`;
+				const reserved = context.reservations.reservePrompt(id, reserveUsd);
+				if (!reserved.admitted) return reserved.reason;
+				reservations.push({ id, bound: reserveUsd });
 			}
 			pending.calls += DEFAULT_PROMPT_CALLS;
-			pending.usd += reserveUsd;
 			return null;
 		};
 		const result = await runChildArm({
@@ -1196,23 +1299,18 @@ async function runChildExperiment(context: Context): Promise<ChildExperiment | n
 			price: context.prices.get(main) ?? null,
 		});
 		arms[arm] = result;
+		releaseChildReservations(context, reservations, childArmSpendUsd(result.outcomes));
 		for (const outcome of result.outcomes) settleChildOutcome(context, outcome);
 	}
 	return { status: "completed", reason: null, arms };
 }
 
-/**
- * Observed child calls and spend, added once an arm has ended. The ledger follows `childSpendUsd`: an unobserved child
- * cost closes it for later admissions, while observed costs (including from incomplete tasks) and refused or
- * not-delegated tasks do not.
- */
+/** Observed child calls, added once an arm has ended. Spend settles separately against the arm's reservations. */
 function settleChildOutcome(context: Context, outcome: ChildTaskOutcome): void {
 	const childCalls = outcome.childUsage?.calls ?? null;
 	if (outcome.childTaskIssued && childCalls === null) context.violations.push(`child task ${outcome.taskId} reported no observed child calls`);
 	// Parent usage excludes the child's nested messages and the task result's usage, so no child cost is counted twice.
 	context.state = recordCalls(context.state, "main", outcome.parentUsage.length + (childCalls ?? 0));
-	context.spend = recordSpend(context.spend, spendOf(outcome.parentUsage));
-	context.spend = recordSpend(context.spend, childSpendUsd(outcome));
 }
 
 async function execute(context: Context): Promise<void> {
@@ -1451,6 +1549,59 @@ function childReport(experiment: ChildExperiment | null): ChildReport | null {
 	};
 }
 
+/**
+ * Dollar bounds printed before any call. The main bound is per call on the on arm, for the largest selected question and
+ * no prior turns. The compressor bound is per call. The host allowance is the most one host can reserve: the share of the
+ * whole cap. The off arm's compaction bound needs the seeded history's size, known only when a host opens, so it is added
+ * at admission rather than printed.
+ */
+function budgetPlan(options: Options, questions: readonly Question[], rates: ReadonlyMap<string, ModelRates | null>, measuredSystemBytes: number | null) {
+	const questionBytes = Math.max(0, ...questions.map((question) => Buffer.byteLength(question.prompt, "utf8")));
+	const mains = [options.main, ...(options.modelChange === null ? [] : [options.modelChange])];
+	const system = effectiveSystemBytes(measuredSystemBytes);
+	return {
+		capUsd: options.maxCostUsd,
+		compressorShare: options.compressorShare,
+		maxMainOutputTokens: options.maxMainOutputTokens,
+		systemBytes: system,
+		mainPromptUsd: Object.fromEntries(mains.map((model) => [model, mainBoundUsd(rates.get(model) ?? null, measuredSystemBytes, options, "on", 0, 0, questionBytes)])),
+		compressorCallUsd: Object.fromEntries(options.compressors.map((compressor) => [compressor, system === null ? null : compressorCallBoundUsd(rates.get(compressor) ?? null, system, COMPACTOR_LAYOUT, options.limits.maxCompressorOutputTokens)])),
+		hostAllowanceUsd: options.maxCostUsd === null ? null : options.maxCostUsd * options.compressorShare,
+		basis: [
+			"main prompt: tokens bounded by UTF-8 bytes (system, tools, view, prior turns, four zoom pages, question), clamped to the context window; output at the pinned cap; times the prompt's call bound",
+			"off arm adds the native compaction bound over the seeded history, prior turns, and the question, at the pinned cap",
+			"compressor call: system plus compactor view, batch input, and shorten step bytes; output at the compressor cap",
+		],
+	};
+}
+
+/**
+ * Fixture-mode check of the pinned output cap: every request to a main model must carry `max_tokens` equal to the pin.
+ * The fixture registers its models with the same cap, so a mismatch means the cap did not reach the request.
+ */
+function checkMainOutputCap(requests: readonly FixtureRequest[], options: Options, violations: string[]): void {
+	const mains = new Set([options.main, options.modelChange].filter((selector): selector is string => selector !== null).map((selector) => selector.slice(providerOf(selector).length + 1)));
+	for (const request of requests) {
+		if (request.model === null || !mains.has(request.model)) continue;
+		const sent: unknown = request.body?.max_tokens;
+		if (sent !== options.maxMainOutputTokens) violations.push(`main request max_tokens ${JSON.stringify(sent ?? null)} differs from the pinned ${options.maxMainOutputTokens}`);
+	}
+}
+
+/** Pins each main model's output ceiling in the isolated agent directory. The source directory is never written. */
+async function pinMainOutput(agentDir: string, mains: readonly string[], maxTokens: number): Promise<void> {
+	const providers: Record<string, { modelOverrides: Record<string, { maxTokens: number }> }> = {};
+	for (const selector of mains) {
+		const provider = providerOf(selector);
+		const id = selector.slice(provider.length + 1);
+		const entry = providers[provider] ?? { modelOverrides: {} };
+		entry.modelOverrides[id] = { maxTokens };
+		providers[provider] = entry;
+	}
+	// JSON is valid YAML, so the file needs no YAML writer.
+	await writeFile(join(agentDir, "models.yml"), `${JSON.stringify({ providers }, null, "\t")}\n`, { flag: "wx", mode: 0o600 });
+}
+
 async function run(options: Options, corpus: Corpus, questions: readonly Question[], root: string): Promise<void> {
 	const fixture = options.fixtureProvider;
 	const dirs = await createIsolatedDirs(root);
@@ -1471,15 +1622,26 @@ async function run(options: Options, corpus: Corpus, questions: readonly Questio
 		: null;
 	try {
 		const copied: CopiedAuth = fixture ? { copied: [], missing: [] } : await copySelectedAuth(sourceAgentDir, dirs.agentDir, providers);
+		await pinMainOutput(dirs.agentDir, [options.main, ...(options.modelChange === null ? [] : [options.modelChange])], options.maxMainOutputTokens);
 		const parentPaths = [homedir(), sourceAgentDir, ROOT].filter((path) => path.length >= MIN_PARENT_PATH_LENGTH);
 		const env: Record<string, string> = {
 			...childEnvironment(process.env, dirs, fixture ? [] : options.allowEnv),
 			OPTCHAT_EVIDENCE_PARENT_PATHS: JSON.stringify(parentPaths),
 		};
-		if (fixtureServer) env.OPTCHAT_SMOKE_BASE_URL = fixtureServer.baseUrl;
+		if (fixtureServer) {
+			env.OPTCHAT_SMOKE_BASE_URL = fixtureServer.baseUrl;
+			env.OPTCHAT_SMOKE_MAX_TOKENS = String(options.maxMainOutputTokens);
+		}
 		const hostExtension = fixture ? FIXTURE_EXTENSION : EXTENSION;
 		const discovery = fixture ? [FIXTURE_PROVIDER] : [];
 		const preflight = await prerequisites(options, selectors, dirs, env, copied, parentPaths, discovery, hostExtension);
+		const prices = new Map<string, Price | null>();
+		const rates = new Map<string, ModelRates | null>();
+		for (const selector of selectors) {
+			prices.set(selector, preflight.catalog[selector]?.price ?? null);
+			rates.set(selector, ratesOf(preflight.catalog[selector]));
+		}
+		const budget = budgetPlan(options, questions, rates, preflight.prompt?.bytes ?? null);
 		const plan = {
 			schema: ARTIFACT_SCHEMA,
 			providerMode: fixture ? "fixture" : "live",
@@ -1490,6 +1652,7 @@ async function run(options: Options, corpus: Corpus, questions: readonly Questio
 			compressors: options.compressors,
 			turnMode: options.turnMode,
 			prerequisites: preflight,
+			budget,
 		};
 		if (!fixture && (!options.confirm || preflight.blockers.length > 0)) {
 			console.log(JSON.stringify({
@@ -1507,12 +1670,6 @@ async function run(options: Options, corpus: Corpus, questions: readonly Questio
 			return;
 		}
 
-		const prices = new Map<string, Price | null>();
-		const rates = new Map<string, ModelRates | null>();
-		for (const selector of selectors) {
-			prices.set(selector, preflight.catalog[selector]?.price ?? null);
-			rates.set(selector, ratesOf(preflight.catalog[selector]));
-		}
 		const sources = [...corpus.sources].sort((a, b) => a.recordId - b.recordId);
 		const dates = new Map<number, string>(sources.map((source) => [source.recordId, new Date(Date.UTC(2026, 0, 1, 0, source.recordId)).toISOString()]));
 		const seedRecords: SeedRecord[] = sources.map((source) => ({ text: source.text, timestampMs: Date.parse(dates.get(source.recordId)!) }));
@@ -1550,7 +1707,9 @@ async function run(options: Options, corpus: Corpus, questions: readonly Questio
 			violations: [],
 			units,
 			state: initialAccounting(Date.now()),
-			spend: initialSpend(),
+			reservations: new DollarReservations(options.maxCostUsd ?? UNBOUNDED_USD),
+			systemBytes: preflight.prompt?.bytes ?? null,
+			reservationSeq: 0,
 			hostSeq: 0,
 			child: null,
 		};
@@ -1594,6 +1753,7 @@ async function run(options: Options, corpus: Corpus, questions: readonly Questio
 				const on = onSides.get(compressor);
 				return on === undefined ? [] : [pairedComparison({ compressor, on, off: offSide })];
 			});
+		if (fixtureServer) checkMainOutputCap(fixtureServer.requests, options, context.violations);
 		const violations = [
 			...accountingViolations(context.state, options.limits),
 			...context.violations,
@@ -1624,7 +1784,7 @@ async function run(options: Options, corpus: Corpus, questions: readonly Questio
 				enforcement: "prompt-admission",
 				costEnforcement: options.maxCostUsd === null ? "none" : "dollar-admission",
 				maxCostUsd: options.maxCostUsd,
-				spentUsd: context.spend.observedUsd,
+				spentUsd: context.reservations.observedUsd,
 				callsUsed: context.state.mainCalls + context.state.compressorCalls,
 				violations,
 			},

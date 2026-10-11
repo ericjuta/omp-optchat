@@ -185,6 +185,14 @@ describe("benchmark artifact v3 schema", () => {
 		expect(validateArtifact(artifact({ corpus: { ...corpusBlock, sources: 513 } })).length).toBeGreaterThan(0);
 	});
 
+	test("a phase stopped by the dollar cap or an unknown cost validates; other refusal names do not", () => {
+		const stopped = (refusal: string) =>
+			artifact({ status: "budget-stopped", scenarios: [{ name: "cold", status: "budget-stopped", reason: "a prompt was refused by admission", phases: [{ ...phase("on", "synthetic/compressor"), refusal }, phase("off", null)] }] });
+		expect(validateArtifact(stopped("cost-cap"))).toEqual([]);
+		expect(validateArtifact(stopped("unknown-cost"))).toEqual([]);
+		expect(validateArtifact(stopped("budget")).some((error) => error.endsWith(".refusal must be maxCalls, deadline, cost-cap, unknown-cost, or null"))).toBe(true);
+	});
+
 	test("the cost ceiling is at most thirty dollars and cost enforcement is named", () => {
 		expect(validateArtifact(artifact({ limits: { ...limitsBlock, maxCostUsd: 30 } }))).toEqual([]);
 		expect(validateArtifact(artifact({ limits: { ...limitsBlock, maxCostUsd: 31 } })).length).toBeGreaterThan(0);

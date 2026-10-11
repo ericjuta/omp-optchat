@@ -686,9 +686,9 @@ describe("artifact validation", () => {
 describe("off-arm compaction admission bound", () => {
 	const model = { inputRate: 1, outputRate: 2, cacheReadRate: 0.1, cacheWriteRate: 1.25, contextWindow: 100_000, maxOutput: 1000 };
 
-	test("prices the whole history and prompt at the dearest input rate, plus overhead and the catalog output ceiling", () => {
-		// 400 and 40 UTF-8 bytes are 100 and 10 tokens; 4096 tokens of overhead; the cache-write rate is the dearest input rate.
-		expect(offCompactionBoundUsd(model, 400, 40)).toBeCloseTo(((100 + 10 + 4096) * 1.25 + 1000 * 2) / 1e6, 12);
+	test("prices the whole history and prompt bytes as tokens at the dearest input rate, plus overhead and the catalog output ceiling", () => {
+		// Tokens are bounded by UTF-8 bytes: 400 and 40 bytes bound 440 tokens, plus 4096 of overhead; the cache-write rate is the dearest input rate.
+		expect(offCompactionBoundUsd(model, 400, 40)).toBeCloseTo(((400 + 40 + 4096) * 1.25 + 1000 * 2) / 1e6, 12);
 	});
 
 	test("an unknown or invalid catalog output ceiling fails closed", () => {
@@ -697,7 +697,7 @@ describe("off-arm compaction admission bound", () => {
 	});
 
 	test("a history larger than the context window is priced in full, not clamped", () => {
-		expect(offCompactionBoundUsd({ ...model, contextWindow: 10 }, 40_000, 0)).toBeCloseTo(((10_000 + 4096) * 1.25 + 1000 * 2) / 1e6, 12);
+		expect(offCompactionBoundUsd({ ...model, contextWindow: 10 }, 40_000, 0)).toBeCloseTo(((40_000 + 4096) * 1.25 + 1000 * 2) / 1e6, 12);
 	});
 });
 

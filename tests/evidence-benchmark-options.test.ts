@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { admitCompressorCall, initialAdmission, parseAdmissionState, parseUsdDecimal } from "../scripts/evidence/admission.ts";
 import { dollarAdmission, initialSpend, recordSpend, worstCaseCallUsd, type ModelRates } from "../scripts/evidence/cost.ts";
-import { parseOptions } from "../scripts/evidence/options.ts";
+import { parseOptions, USAGE } from "../scripts/evidence/options.ts";
 import { factRecordCount, questionCount } from "../scripts/evidence/corpus.ts";
 
 const BASE = ["--main", "openrouter/a", "--compressor", "openrouter/b"];
@@ -72,6 +72,40 @@ describe("view bytes, experiments, and emphasis", () => {
 	test("question emphasis is balanced or adversarial", () => {
 		expect(parseOptions([...BASE, "--question-emphasis", "adversarial"]).questionEmphasis).toBe("adversarial");
 		expect(() => parseOptions([...BASE, "--question-emphasis", "loud"])).toThrow("--question-emphasis must be one of");
+	});
+});
+
+describe("main output cap and compressor share", () => {
+	test("both default to the pinned 4096-token output cap and half the remaining cap", () => {
+		const options = parseOptions(BASE);
+		expect(options.maxMainOutputTokens).toBe(4096);
+		expect(options.compressorShare).toBe(0.5);
+	});
+
+	test("the main output cap is a strict integer from 1 to 32000", () => {
+		expect(parseOptions([...BASE, "--max-main-output", "1"]).maxMainOutputTokens).toBe(1);
+		expect(parseOptions([...BASE, "--max-main-output", "32000"]).maxMainOutputTokens).toBe(32_000);
+		for (const raw of ["0", "32001", "-1", "1.5", "1e3", "", "abc", "4096 "]) {
+			expect(() => parseOptions([...BASE, "--max-main-output", raw])).toThrow("--max-main-output");
+		}
+		expect(() => parseOptions([...BASE, "--max-main-output"])).toThrow("requires a value");
+		expect(() => parseOptions([...BASE, "--max-main-output", "4096", "--max-main-output", "4096"])).toThrow("duplicate flag");
+	});
+
+	test("the compressor share is a decimal above 0 and at most 1", () => {
+		expect(parseOptions([...BASE, "--compressor-share", "1"]).compressorShare).toBe(1);
+		expect(parseOptions([...BASE, "--compressor-share", ".25"]).compressorShare).toBe(0.25);
+		expect(parseOptions([...BASE, "--compressor-share", "0.5"]).compressorShare).toBe(0.5);
+		for (const raw of ["0", "0.0", "1.01", "-0.5", "1e-1", "abc", "1.", "2"]) {
+			expect(() => parseOptions([...BASE, "--compressor-share", raw])).toThrow("--compressor-share");
+		}
+	});
+
+	test("help documents both flags with their defaults", () => {
+		expect(USAGE).toContain("--max-main-output <n>");
+		expect(USAGE).toContain("(default 4096)");
+		expect(USAGE).toContain("--compressor-share <x>");
+		expect(USAGE).toContain("(default 0.5)");
 	});
 });
 

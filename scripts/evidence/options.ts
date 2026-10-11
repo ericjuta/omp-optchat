@@ -12,6 +12,11 @@ export const EXPERIMENTS = ["child"] as const;
 export type Experiment = (typeof EXPERIMENTS)[number];
 
 export const MAX_CONCURRENCY = 4;
+/** Main-model output ceiling, pinned as the request maxTokens; a conservative default and a hard maximum. */
+export const DEFAULT_MAX_MAIN_OUTPUT_TOKENS = 4096;
+export const MAX_MAIN_OUTPUT_TOKENS = 32_000;
+/** Default fraction of the remaining cap that each on-arm compressor host may reserve. */
+export const DEFAULT_COMPRESSOR_SHARE = 0.5;
 /** Host view budget. The product default is 128000; the evidence default stays at the historical 4096. */
 export const MIN_VIEW_BYTES = 4_096;
 export const MAX_VIEW_BYTES = 128_000;
@@ -50,6 +55,10 @@ export interface Options {
 	/** Worst-case dollar ceiling for live calls; required with --confirm-live-provider-calls, null otherwise. */
 	readonly maxCostUsd: number | null;
 	readonly fixtureProvider: boolean;
+	/** Output ceiling pinned as the main model's maxTokens (--max-main-output). */
+	readonly maxMainOutputTokens: number;
+	/** Fraction of the remaining cap each on-arm compressor host may reserve (--compressor-share). */
+	readonly compressorShare: number;
 }
 
 export const USAGE = `Usage: bun run scripts/evidence-recall.ts --main <provider/model> --compressor <provider/model> [options]
@@ -69,6 +78,8 @@ export const USAGE = `Usage: bun run scripts/evidence-recall.ts --main <provider
   --experiments <child>           optional experiment arms (default none)
   --question-emphasis <balanced|adversarial>  question selection rotation (default balanced)
   --max-cost-usd <x>              worst-case dollar ceiling, above 0 and at most ${MAX_COST_USD}; required with confirm
+  --max-main-output <n>           main model output ceiling in tokens, 1 to ${MAX_MAIN_OUTPUT_TOKENS} (default ${DEFAULT_MAX_MAIN_OUTPUT_TOKENS})
+  --compressor-share <x>          share of the remaining cap each compressor host reserves, above 0 and at most 1 (default ${DEFAULT_COMPRESSOR_SHARE})
   --fixture-provider              loopback optchat-smoke fixture models only; exclusive with confirm
   --omp <path> --agent-dir <path> --out <file> --force`;
 
@@ -77,6 +88,7 @@ const VALUE_FLAGS = new Set([
 	"main", "compressor", "model-change", "agent-dir", "scenarios", "expiry-wait-ms", "max-calls", "max-compressor-output",
 	"deadline-ms", "seed", "projects", "sources", "min-source-bytes", "questions", "concurrency", "omp", "out", "allow-env",
 	"arms", "compressors", "turn-mode", "view-bytes", "experiments", "question-emphasis", "max-cost-usd",
+	"max-main-output", "compressor-share",
 ]);
 const SELECTOR = /^[A-Za-z0-9][\w.-]*\/\S+$/;
 const DECIMAL = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
@@ -205,6 +217,11 @@ export function parseOptions(argv: readonly string[]): Options {
 	const questionLimit = inRange("questions", integer("questions", DEFAULTS.questions), 1, questionCount(projects));
 	const viewBytes = inRange("view-bytes", integer("view-bytes", MIN_VIEW_BYTES), MIN_VIEW_BYTES, MAX_VIEW_BYTES);
 	const concurrency = inRange("concurrency", integer("concurrency", DEFAULTS.concurrency), 1, MAX_CONCURRENCY);
+	const maxMainOutputTokens = inRange("max-main-output", integer("max-main-output", DEFAULT_MAX_MAIN_OUTPUT_TOKENS), 1, MAX_MAIN_OUTPUT_TOKENS);
+	const shareRaw = values.get("compressor-share") ?? String(DEFAULT_COMPRESSOR_SHARE);
+	if (!DECIMAL.test(shareRaw)) throw new Error("--compressor-share must be a decimal number");
+	const compressorShare = Number(shareRaw);
+	if (!(compressorShare > 0 && compressorShare <= 1)) throw new Error("--compressor-share must be above 0 and at most 1");
 	if (!Number.isSafeInteger(seed)) throw new Error("--seed must be a safe integer");
 	const needed = factRecordCount(projects);
 	if (needed > sourceCount) throw new Error(`--projects ${projects} needs ${needed} fact records; --sources must be at least ${needed}`);
@@ -243,5 +260,7 @@ export function parseOptions(argv: readonly string[]): Options {
 		questionEmphasis,
 		maxCostUsd,
 		fixtureProvider,
+		maxMainOutputTokens,
+		compressorShare,
 	};
 }

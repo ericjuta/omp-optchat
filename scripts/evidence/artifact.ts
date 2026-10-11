@@ -342,7 +342,7 @@ const ENFORCEMENTS = ["prompt-admission", "host-admission"] as const;
 const COST_ENFORCEMENTS = ["dollar-admission", "none"] as const;
 const OUTCOMES = ["correct", "abstained", "incorrect", "hallucinated"] as const;
 const FAILURES: readonly Failure[] = ["schema", "no-answer", "ungrounded", "wrong-value", "forbidden-value", "fabricated-id", "fabricated-citation", "ambiguous-confident", "ambiguous-incomplete", "unanswerable-asserted"];
-const REFUSALS = ["maxCalls", "deadline"] as const;
+const REFUSALS = ["maxCalls", "deadline", "cost-cap", "unknown-cost"] as const;
 const QUESTION_EMPHASES: readonly QuestionEmphasis[] = ["balanced", "adversarial"];
 const ARM_STATUSES = ["completed", "unavailable"] as const;
 const ACCURACY_KEYS = ["judged", "correct", "valueCorrect", "grounded", "abstained", "hallucinated", "incorrectSchema"] as const;
@@ -555,7 +555,7 @@ function validatePhase(node: unknown, path: string, errors: string[], turnMode: 
 	if (!ARMS.includes(node.arm as Arm)) errors.push(`${path}.arm must be on or off`);
 	if (!isNullableString(node.compressor)) errors.push(`${path}.compressor must be a string or null`);
 	if (!isNullableString(node.error)) errors.push(`${path}.error must be a string or null`);
-	if (node.refusal !== null && !REFUSALS.includes(node.refusal as (typeof REFUSALS)[number])) errors.push(`${path}.refusal must be maxCalls, deadline, or null`);
+	if (node.refusal !== null && !REFUSALS.includes(node.refusal as (typeof REFUSALS)[number])) errors.push(`${path}.refusal must be maxCalls, deadline, cost-cap, unknown-cost, or null`);
 	if (!isNullableMetric(node.latencyMs)) errors.push(`${path}.latencyMs must be a non-negative number or null`);
 	if (!isRecord(node.usage)) {
 		errors.push(`${path}.usage is required`);

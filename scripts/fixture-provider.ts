@@ -67,6 +67,9 @@ export default function fixtureProvider(pi: ExtensionAPI): void {
 		throw new Error("Set OPTCHAT_SMOKE_BASE_URL to the driver-owned loopback /v1 endpoint.");
 	}
 	const baseUrl = new URL(configuredUrl);
+	// The runner passes its pinned main output cap; unset keeps the smoke default.
+	const maxTokens = process.env.OPTCHAT_SMOKE_MAX_TOKENS === undefined ? 16_384 : Number(process.env.OPTCHAT_SMOKE_MAX_TOKENS);
+	if (!Number.isSafeInteger(maxTokens) || maxTokens < 1) throw new Error("OPTCHAT_SMOKE_MAX_TOKENS must be a positive integer");
 	if (
 		baseUrl.protocol !== "http:" ||
 		!["127.0.0.1", "localhost", "[::1]"].includes(baseUrl.hostname) ||
@@ -103,7 +106,7 @@ export default function fixtureProvider(pi: ExtensionAPI): void {
 			input: ["text", "image"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 128_000,
-			maxTokens: 16_384,
+			maxTokens,
 			compat: {
 				supportsStore: false,
 				supportsDeveloperRole: false,
