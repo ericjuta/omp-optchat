@@ -52,6 +52,8 @@ export const SYSTEM_BLOCK = `# OptChat memory\n\n${VIEW_DOC}`;
  */
 export const SETTLE_TIMEOUT_MS = 25_000;
 const HOST_HANDLER_LIMIT_MS = 30_000;
+/** Absolute wall deadline for the main-model fallback after an original compressor refusal: admission, auth, lease and response. */
+const MAIN_FALLBACK_DEADLINE_MS = 30_000;
 const IDLE_POLL_MS = 250;
 const TOOL_NAMES: readonly string[] = ["zoom", "date", "work"];
 /** Host tools whose arguments and results are the model's private thoughts: never logged. */
@@ -702,18 +704,59 @@ class OptChat {
 		if (isProviderRefusal(reply)) {
 			const main = this.mainFallback(compressor, ctx);
 			if (main) {
+				// A cancelled original call never reaches the fallback: no send, no counter, no warning.
+				signal.throwIfAborted();
 				this.mainRetries++;
 				this.notify(
 					`OptChat: the compressor ${compressor.provider}/${compressor.id} refused a compaction; retrying it once with the main model ${main.provider}/${main.id}.`,
 					"warning",
 				);
 				model = main;
-				reply = await this.compressorReply(main, ctx, request, signal);
+				reply = await this.mainFallbackReply(main, ctx, request, signal);
 			}
 			// Still refused, or no distinct main model: Memory commits a source-derived stand-in for this node.
 			if (isProviderRefusal(reply)) throw new CompressorRefusedError();
 		}
 		return this.summaryText(model, reply);
+	}
+
+	/**
+	 * The main-model fallback under one absolute wall deadline. The race is independent of the provider: an attempt
+	 * that ignores its signal cannot hold the node open. Deadline expiry is the terminal refusal; a cancelled parent
+	 * stays a cancellation and never becomes a stand-in.
+	 */
+	private async mainFallbackReply(
+		main: Model,
+		ctx: ExtensionContext,
+		request: CompactionRequest,
+		parent: AbortSignal,
+	): Promise<AssistantMessage> {
+		parent.throwIfAborted();
+		const lapse = new AbortController();
+		const signal = AbortSignal.any([parent, lapse.signal]);
+		const timer = setTimeout(() => lapse.abort(), MAIN_FALLBACK_DEADLINE_MS);
+		const stopped = new Promise<never>((_, reject) => {
+			signal.addEventListener(
+				"abort",
+				() => {
+					if (parent.aborted) {
+						reject(parent.reason);
+						return;
+					}
+					this.notify(
+						`OptChat: the main-model fallback ${main.provider}/${main.id} did not finish within ${MAIN_FALLBACK_DEADLINE_MS / 1000} s; committing an unsummarized stand-in.`,
+						"warning",
+					);
+					reject(new CompressorRefusedError());
+				},
+				{ once: true },
+			);
+		});
+		try {
+			return await Promise.race([this.compressorReply(main, ctx, request, signal), stopped]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	/** The live main model as a compaction fallback; none when it is the compressor, absent, or needs native tools. */
@@ -754,7 +797,10 @@ class OptChat {
 		// Admission precedes every send. The first attempt is admitted here, before the request can be
 		// dispatched on any provider path; later payloads (SDK retries) are admitted by onPayload.
 		const selector = `${model.provider}/${model.id}`;
+		signal.throwIfAborted();
 		if (this.policy.admit && !(await this.policy.admit(selector))) throw new Error("compressor call was not admitted");
+		// Admission may have outlived a cancellation or deadline: an abandoned call sends nothing.
+		signal.throwIfAborted();
 		let admitted = true;
 		let sends = 0;
 		const reply = await completeSimple(
@@ -775,18 +821,26 @@ class OptChat {
 				onPayload: async (payload, payloadModel, attemptSignal) => {
 					// Auth/provider retries must release their own previous attempt before waiting.
 					finish();
+					// An abandoned attempt (cancelled or lapsed) is never counted, admitted, leased, or sent.
+					signal.throwIfAborted();
 					// The first payload is the attempt admitted above; each retry is admitted before its send.
 					sends += 1;
 					if (sends > 1) {
 						admitted = this.policy.admit ? await this.policy.admit(selector) : true;
 						if (!admitted) throw new Error("compressor call was not admitted");
 					}
+					signal.throwIfAborted();
 					const actualModel = payloadModel ?? model;
 					const encoded = applyOptChatCache(this.alignPrefix(payload, actualModel, ctx), actualModel);
 					// This request's own onResponse/finally release the lease: the only correlated writer.
 					release = await this.cache.acquire(encoded, actualModel, {
 						signal: attemptSignal ? AbortSignal.any([signal, attemptSignal]) : signal,
 					});
+					// The lease wait may have outlived the attempt: give it back before any send.
+					if (signal.aborted) {
+						finish();
+						signal.throwIfAborted();
+					}
 					return encoded;
 				},
 				onResponse: (response) => finish(response.status >= 200 && response.status < 300),

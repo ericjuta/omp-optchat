@@ -83,6 +83,12 @@ const PROVIDER = "optchat-smoke";
 const CHAT_MODEL = "optchat-smoke-chat";
 const COMPACT_MODEL = "optchat-smoke-compact";
 const NO_TOOLS_COMPACT_MODEL = "optchat-smoke-compact-notools";
+// Anthropic Messages dialect, served by the same loopback fixture on /v1/messages.
+const ANTHROPIC_PROVIDER = "optchat-anthropic";
+const ANTHROPIC_CHAT = "optchat-anthropic-chat";
+const ANTHROPIC_COMPACT = "optchat-anthropic-compact";
+/** Text a held stream would send after the deadline: it must never reach the store. */
+const ANTHROPIC_LATE_TEXT = "OPTCHAT_IT_ANTHROPIC_LATE: a reply after the deadline must never be stored.";
 const TOOL_CAP = 128;
 /** Generous for success cases; still below the host's 30 s context-handler limit. */
 const POSITIVE_SETTLE_MS = 20_000;
@@ -96,6 +102,8 @@ const CASE_TITLES = {
   "compressor-refusal-standin": "a refusal by the compressor and the main model stores a bounded labelled stand-in; the next prompt is answered",
   "compressor-error-append-retry": "a non-refusal compaction error never reaches the main model or stores anything, and the next append retries it",
   "compressor-refusal-same-model": "a compressor equal to the main model refuses once, stores the stand-in directly and sends no retry",
+  "anthropic-refusal-main-retry": "an Anthropic compressor's wire refusal (stop_details bio) retries once with the main model, whose summary is stored under a 512-token cap",
+  "anthropic-refusal-deadline-standin": "an Anthropic main-model fallback that starts and never completes is cancelled at the 30 s deadline: a labelled stand-in is stored and the next prompt is answered",
   "compressor-without-tools": "a compressor without tool support never receives captured main tools",
   "side-prefix-text-mismatch": "a same-model side request's reworded system prefix never replaces the compressor's guide or adds tools",
   "reasoning-tools-compressor": "with disableReasoningWithTools the tool-bearing main request reasons none; the compressor stays medium and tool-free",
@@ -464,8 +472,11 @@ interface CompactInput {
   target: number;
 }
 
-/** A scripted compressor outcome: hang, a tool call, or an in-band provider error. */
-type CompactOutcome = "hang" | "tool" | { error: string };
+/**
+ * A scripted compressor outcome: hang, a tool call, or an in-band provider error. On the Anthropic
+ * route, `hang` starts the stream and then holds it, and `refusal` sends stop_reason refusal.
+ */
+type CompactOutcome = "hang" | "tool" | { error: string } | { refusal: string };
 
 interface Capture {
   seq: number;
@@ -505,7 +516,7 @@ function compactInput(body: WireObject): CompactInput {
 function compactionRequest(body: WireObject, model: string): CompactInput | undefined {
   const last = wireMessages(body).filter((message) => message.role === "user").at(-1);
   const compaction = last !== undefined && INSTRUCTION.test(wireText(last));
-  if (model === CHAT_MODEL && !compaction) return undefined;
+  if ((model === CHAT_MODEL || model === ANTHROPIC_CHAT) && !compaction) return undefined;
   return compactInput(body);
 }
 
@@ -552,6 +563,65 @@ function sse(model: string, seq: number, reply: Reply): Response {
   }), { headers: SSE_HEADERS });
 }
 
+/** One Anthropic Messages SSE frame. */
+function anthropicFrame(name: string, data: WireObject): string {
+  return `event: ${name}\ndata: ${JSON.stringify({ type: name, ...data })}\n\n`;
+}
+
+/** message_start: the usage block the stream reader requires. */
+function anthropicOpen(model: string, seq: number): string {
+  return anthropicFrame("message_start", {
+    message: {
+      id: `msg_optchat_it_${seq}`,
+      type: "message",
+      role: "assistant",
+      model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 64, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    },
+  });
+}
+
+/** A text block opened at `index` with `text` streamed into it; `done` also closes the block. */
+function anthropicText(index: number, text: string, done: boolean): string {
+  const open = anthropicFrame("content_block_start", { index, content_block: { type: "text", text: "" } });
+  const delta = anthropicFrame("content_block_delta", { index, delta: { type: "text_delta", text } });
+  return done ? open + delta + anthropicFrame("content_block_stop", { index }) : open + delta;
+}
+
+/** message_delta with stop_reason (and stop_details for a refusal), then message_stop. */
+function anthropicClose(stopReason: string, stopDetails?: WireObject): string {
+  const delta: WireObject = { stop_reason: stopReason, stop_sequence: null };
+  if (stopDetails) delta.stop_details = stopDetails;
+  return anthropicFrame("message_delta", { delta, usage: { output_tokens: 16 } }) + anthropicFrame("message_stop", {});
+}
+
+/** A complete text reply over the Anthropic Messages dialect. */
+function anthropicSse(model: string, seq: number, reply: Reply): Response {
+  assert(reply.thinking === undefined && (reply.calls ?? []).length === 0 && reply.hold === undefined, "the Anthropic route serves text replies only");
+  const text = reply.text === undefined ? "" : anthropicText(0, reply.text, true);
+  return new Response(anthropicOpen(model, seq) + text + anthropicClose("end_turn"), { headers: SSE_HEADERS });
+}
+
+/** A provider refusal as Anthropic sends it: stop_reason refusal with stop_details, and no content block. */
+function anthropicRefusal(model: string, seq: number, explanation: string): Response {
+  const details = { type: "refusal", category: "bio", explanation };
+  return new Response(anthropicOpen(model, seq) + anthropicClose("refusal", details), { headers: SSE_HEADERS });
+}
+
+/** One held Anthropic stream: when it started, and whether the client cancelled it or cleanup released it. */
+interface HeldStream {
+  seq: number;
+  model: string;
+  started: boolean;
+  startedAt: number;
+  cancelled: boolean;
+  cancelledAt: number;
+  released: boolean;
+}
+
 /**
  * Captures every parsed request. Chat requests consume a strict queue of
  * scripted replies; an unplanned request, endpoint, model or body is recorded
@@ -567,6 +637,10 @@ class Fixture {
   /** Scripted compressor outcome by source and model; undefined keeps the normal summary. */
   compactPolicy: ((input: CompactInput, model: string) => CompactOutcome | undefined) | undefined;
   readonly baseUrl: string;
+  /** The Anthropic route's origin: the SDK appends /v1/messages. */
+  readonly origin: string;
+  /** Every held Anthropic stream, in order. */
+  readonly streams: HeldStream[] = [];
   private readonly rejectFatal: (error: Error) => void;
   private readonly scripts: Array<{ label: string; reply: Reply }> = [];
   private readonly releases = new Set<() => void>();
@@ -582,11 +656,13 @@ class Fixture {
     // idleTimeout 0: a held or hanging stream must not be cut by Bun's 10 s default.
     this.server = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 0, fetch: (request) => this.handle(request) });
     this.baseUrl = `http://127.0.0.1:${this.server.port}/v1`;
+    this.origin = `http://127.0.0.1:${this.server.port}`;
   }
 
   /** Ordinary chat requests only: a fallback compaction on the main model is never a queued reply. */
   chat(): Capture[] {
-    return this.captures.filter((capture) => capture.model === CHAT_MODEL && capture.compact === undefined);
+    return this.captures.filter((capture) =>
+      (capture.model === CHAT_MODEL || capture.model === ANTHROPIC_CHAT) && capture.compact === undefined);
   }
 
   /** Every compaction request, from the compressor or, on a fallback, the main model. */
@@ -680,13 +756,15 @@ class Fixture {
   private async handle(request: Request): Promise<Response> {
     try {
       const url = new URL(request.url);
-      if (request.method !== "POST" || url.pathname !== "/v1/chat/completions") {
+      const anthropic = url.pathname === "/v1/messages";
+      if (request.method !== "POST" || (url.pathname !== "/v1/chat/completions" && !anthropic)) {
         throw new Error(`unexpected fixture request ${request.method} ${url.pathname}`);
       }
       const body = object((await request.json()) as Json, "request body");
       assert.equal(body.stream, true, "the fixture serves streaming adapter requests only");
       const model = typeof body.model === "string" ? body.model : "";
-      if (model !== CHAT_MODEL && model !== COMPACT_MODEL && model !== NO_TOOLS_COMPACT_MODEL) {
+      if (model !== CHAT_MODEL && model !== COMPACT_MODEL && model !== NO_TOOLS_COMPACT_MODEL &&
+        model !== ANTHROPIC_CHAT && model !== ANTHROPIC_COMPACT) {
         throw new Error(`unexpected model ${JSON.stringify(body.model)}`);
       }
       wireMessages(body);
@@ -696,16 +774,20 @@ class Fixture {
       let response: Response;
       if (compact) {
         const outcome = this.compactPolicy?.(compact, model);
-        if (outcome === "hang") {
+        if (anthropic) {
+          response = this.anthropicCompaction(model, capture.seq, compact, outcome);
+        } else if (outcome === "hang") {
           response = this.hang();
         } else if (outcome === "tool") {
           response = sse(model, capture.seq, {
             text: "COMPRESSOR_TOOL_OUTPUT_MUST_NOT_BE_SAVED",
             calls: [{ id: `compact-call-${capture.seq}`, name: "probe", args: { label: "must-not-execute" } }],
           });
-        } else if (outcome !== undefined) {
+        } else if (outcome !== undefined && "error" in outcome) {
           // An in-band provider error inside HTTP 200, as aggregators send it: an `error` member and no status.
           response = new Response(`data: ${JSON.stringify({ error: { message: outcome.error } })}\n\n`, { headers: SSE_HEADERS });
+        } else if (outcome !== undefined) {
+          throw new Error("a scripted refusal is served only on the Anthropic route");
         } else {
           const summary = compact.leaf ? LEAF_SUMMARY[compact.kind ?? ""] : MERGE_SUMMARY;
           if (summary === undefined) throw new Error(`no fixture summary for source kind ${JSON.stringify(compact.kind)}`);
@@ -714,13 +796,57 @@ class Fixture {
       } else {
         const script = this.scripts.shift();
         if (!script) throw new Error(`unplanned chat request #${this.chat().length}`);
-        response = sse(model, capture.seq, script.reply);
+        response = anthropic ? anthropicSse(model, capture.seq, script.reply) : sse(model, capture.seq, script.reply);
       }
       this.changed();
       return response;
     } catch (error) {
       return this.fail(error);
     }
+  }
+
+  /** The Anthropic route's compaction: a summary, a wire refusal, or a stream started and never completed. */
+  private anthropicCompaction(model: string, seq: number, compact: CompactInput, outcome: CompactOutcome | undefined): Response {
+    if (outcome === "hang") {
+      const tail = anthropicFrame("content_block_delta", { index: 0, delta: { type: "text_delta", text: ANTHROPIC_LATE_TEXT } }) +
+        anthropicFrame("content_block_stop", { index: 0 }) + anthropicClose("end_turn");
+      return this.held(model, seq, anthropicOpen(model, seq) + anthropicText(0, "partial summary", false), tail);
+    }
+    if (outcome === "tool" || (outcome !== undefined && "error" in outcome)) {
+      throw new Error("the Anthropic route scripts a summary, a wire refusal or a started hang");
+    }
+    if (outcome !== undefined && "refusal" in outcome) return anthropicRefusal(model, seq, outcome.refusal);
+    const summary = compact.leaf ? LEAF_SUMMARY[compact.kind ?? ""] : MERGE_SUMMARY;
+    if (summary === undefined) throw new Error(`no fixture summary for source kind ${JSON.stringify(compact.kind)}`);
+    return anthropicSse(model, seq, { text: summary });
+  }
+
+  /** Sends `head`, then holds: `tail` follows only on release; a client cancel ends the stream unsent. */
+  private held(model: string, seq: number, head: string, tail: string): Response {
+    const log: HeldStream = { seq, model, started: false, startedAt: 0, cancelled: false, cancelledAt: 0, released: false };
+    this.streams.push(log);
+    const encoder = new TextEncoder();
+    let open = true;
+    return new Response(new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        log.started = true;
+        log.startedAt = performance.now();
+        controller.enqueue(encoder.encode(head));
+        this.releases.add(() => {
+          if (!open) return;
+          open = false;
+          log.released = true;
+          controller.enqueue(encoder.encode(tail));
+          controller.close();
+        });
+      },
+      cancel: () => {
+        open = false;
+        log.cancelled = true;
+        log.cancelledAt = performance.now();
+        this.changed();
+      },
+    }), { headers: SSE_HEADERS });
   }
 
   /** A stream that sends nothing until cleanup closes it, or the client cancels. */
@@ -747,7 +873,7 @@ class Fixture {
 
 /** Settings overrides: no compaction, retry, advisor, autolearn, memory backend, goal, TTSR, titles or image side calls. */
 const HOST_SETTINGS = {
-  enabledModels: [`${PROVIDER}/*`],
+  enabledModels: [`${PROVIDER}/*`, `${ANTHROPIC_PROVIDER}/*`],
   "compaction.enabled": false,
   "compaction.midTurnEnabled": false,
   "compaction.asyncEnabled": false,
@@ -813,6 +939,26 @@ function fixtureProvider(baseUrl: string, compat?: FixtureCompat): (pi: Extensio
   };
 }
 
+/** Anthropic Messages models on the fixture origin: reasoning-capable, routed to /v1/messages. */
+function anthropicProvider(origin: string): (pi: ExtensionAPI) => void {
+  return (pi) => {
+    pi.registerProvider(ANTHROPIC_PROVIDER, {
+      baseUrl: origin,
+      apiKey: FIXTURE_API_KEY,
+      api: "anthropic-messages",
+      models: [ANTHROPIC_CHAT, ANTHROPIC_COMPACT].map((id) => ({
+        id,
+        name: id,
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 200_000,
+        maxTokens: 16_384,
+      })),
+    });
+  };
+}
+
 interface HostOptions {
   /** Injected through createOptChat; omitted means the module default. */
   settleTimeoutMs?: number;
@@ -837,6 +983,10 @@ interface HostOptions {
   afterContext?: (messages: unknown[]) => void;
   /** Compat for every fixture model; omitted means the plain fixture provider. */
   compat?: FixtureCompat;
+  /** Anthropic Messages dialect: the main model and compressor are the Anthropic fixture models. */
+  anthropic?: boolean;
+  /** compressorMaxTokens for createOptChat. */
+  compressorMaxTokens?: number;
 }
 
 function defaultFlags(memory: string): Record<string, string | boolean> {
@@ -934,8 +1084,12 @@ class Host {
       const factories: Array<(pi: ExtensionAPI) => void> = [
         fixtureProvider(ctx.fixture.baseUrl, options.compat),
         testExtension(options),
-        optchat.createOptChat(options.settleTimeoutMs === undefined ? {} : { settleTimeoutMs: options.settleTimeoutMs }),
+        optchat.createOptChat({
+          ...(options.settleTimeoutMs === undefined ? {} : { settleTimeoutMs: options.settleTimeoutMs }),
+          ...(options.compressorMaxTokens === undefined ? {} : { compressorMaxTokens: options.compressorMaxTokens }),
+        }),
       ];
+      if (options.anthropic) factories.push(anthropicProvider(ctx.fixture.origin));
       const afterContext = options.afterContext;
       if (afterContext) {
         factories.push((pi) => {
@@ -967,7 +1121,7 @@ class Host {
       for (const { name, config, sourceId } of loaded.runtime.pendingProviderRegistrations) {
         registry.registerProvider(name, config, sourceId);
       }
-      const model = registry.find(PROVIDER, CHAT_MODEL);
+      const model = options.anthropic ? registry.find(ANTHROPIC_PROVIDER, ANTHROPIC_CHAT) : registry.find(PROVIDER, CHAT_MODEL);
       assert(model, "the fixture chat model must be registered");
       const { session } = await sdk.createAgentSession({
         cwd: ctx.cwd,
@@ -1459,6 +1613,146 @@ async function compressorRefusalSameModel(ctx: CaseContext): Promise<Evidence> {
       requests: seedRequests(fixture).map((capture) => capture.model),
       metrics: lines.map((line) => [line.model, line.stopReason]),
       standInBytes: new TextEncoder().encode(standIn).byteLength,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic dialect: wire refusals and the main-model fallback deadline
+// ---------------------------------------------------------------------------
+
+const ANTHROPIC_EXPLANATION = "OPTCHAT_IT scripted safety refusal.";
+const ANTHROPIC_FLAGS: Record<string, string> = { "optchat-model": `${ANTHROPIC_PROVIDER}/${ANTHROPIC_COMPACT}` };
+/** Compressor output cap: every request, fallback included, must keep its reasoning budget valid under it. */
+const ANTHROPIC_MAX_TOKENS = 512;
+/** The main-model fallback's absolute wall deadline. */
+const FALLBACK_DEADLINE_MS = 30_000;
+/** Barrier for a step that waits out the fallback deadline plus the stand-in commit. */
+const DEADLINE_STEP_MS = FALLBACK_DEADLINE_MS + 15_000;
+const ANTHROPIC_OPTIONS: HostOptions = {
+  anthropic: true,
+  flags: ANTHROPIC_FLAGS,
+  compressorMaxTokens: ANTHROPIC_MAX_TOKENS,
+  notices: true,
+  settleTimeoutMs: POSITIVE_SETTLE_MS,
+};
+
+/** Anthropic top-level system text: the string, or the joined text of its blocks. */
+function anthropicSystemText(body: WireObject): string {
+  const system = body.system;
+  if (typeof system === "string") return system;
+  if (!Array.isArray(system)) return "";
+  return system.map((value) => {
+    const block = object(value, "system block");
+    return typeof block.text === "string" ? block.text : "";
+  }).join("");
+}
+
+/**
+ * Thinking is off (`disabled`, or `between_tools`, the lowest setting a Sonnet 5.5 class takes instead of
+ * `disabled`) or a budget strictly below this request's max_tokens; max_tokens is always sent. An absent
+ * `thinking` is not checked as off: adaptive-only models omit it and the API then defaults thinking on.
+ */
+function assertAnthropicBudget(body: WireObject, label: string): void {
+  const max = body.max_tokens;
+  assert(typeof max === "number", `${label}: max_tokens is sent`);
+  const thinking = body.thinking;
+  if (thinking === undefined) return;
+  const block = object(thinking, `${label} thinking`);
+  if (block.type === "disabled" || block.type === "between_tools") return;
+  assert.equal(block.type, "enabled", `${label}: thinking is off or a budget`);
+  const budget = block.budget_tokens;
+  assert(typeof budget === "number" && budget < max, `${label}: thinking budget ${String(budget)} must be below max_tokens ${String(max)}`);
+}
+
+/** Wire refusal (stop_reason refusal, stop_details bio) on the compressor; the main model then succeeds. */
+async function anthropicRefusalMainRetry(ctx: CaseContext): Promise<Evidence> {
+  const { fixture, memory, metrics } = ctx;
+  fixture.compactPolicy = (input, model) =>
+    input.input === SEED_SOURCE && model === ANTHROPIC_COMPACT ? { refusal: ANTHROPIC_EXPLANATION } : undefined;
+  await seedStore(ctx, [["user", SEED_USER]]);
+  return withHost(ctx, ANTHROPIC_OPTIONS, async (host) => {
+    const node = await fixture.until("seed summary persisted", () => persistedNode(memory, 0, 0));
+    assert.equal(node.text, LEAF_SUMMARY.user, "the Anthropic main model's summary is the stored node, with no stand-in");
+    const lines = await fixture.until("both seed attempts metered", () => {
+      const records = metricRecords(metrics);
+      return records.length >= 2 ? records : undefined;
+    });
+    assert.equal(lines.length, 2, "only the two seed attempts are metered before any follow-up");
+    const requests = seedRequests(fixture);
+    assert.deepEqual(requests.map((capture) => capture.model), [ANTHROPIC_COMPACT, ANTHROPIC_CHAT], "the compressor, then the main model, once each");
+    assert.deepEqual(requests.map((capture) => capture.body.max_tokens), [ANTHROPIC_MAX_TOKENS, ANTHROPIC_MAX_TOKENS], "the output cap binds the compressor and the fallback alike");
+    for (const capture of requests) assertAnthropicBudget(capture.body, capture.model);
+    assert.equal(instructionText(requests[1]!), instructionText(requests[0]!), "the fallback repeats the full compaction instruction");
+    assert(anthropicSystemText(requests[1]!.body).includes(ctx.lib.optchat.SYSTEM_BLOCK), "the fallback carries the OptChat guide");
+    assert.deepEqual(lines.map((line) => [line.model, line.attempt, line.purpose, line.stopReason]), [
+      [`${ANTHROPIC_PROVIDER}/${ANTHROPIC_COMPACT}`, 1, "leaf", "error"],
+      [`${ANTHROPIC_PROVIDER}/${ANTHROPIC_CHAT}`, 1, "leaf", "stop"],
+    ], "each attempt is metered with its own identity and outcome");
+    assert(String(lines[0]!.error).includes("Refusal (bio)"), "the compressor's metric records the wire refusal with its category");
+    assert.equal(lines[1]!.error, null, "the successful fallback records no error");
+    await fixture.until("main-model retry notice", () => host.notices.find((notice) =>
+      notice.message.includes(`${ANTHROPIC_PROVIDER}/${ANTHROPIC_COMPACT} refused a compaction`) && notice.message.includes(MAIN_RETRY_NOTICE)));
+    assert(!host.notices.some((notice) => notice.message.includes("unsummarized")), "a successful fallback stores no stand-in");
+    const followUp = await ordinaryTurn(ctx, host, "OPTCHAT_IT_ANTHROPIC_FOLLOW: say ok.", "OPTCHAT_IT_ANTHROPIC_REPLY: ok.");
+    assertAnthropicBudget(followUp.body, "the follow-up");
+    assert.equal(soleView(followUp.body, "follow-up"), "<chat>\n0+1|user: prior turn summary\n</chat>", "the settled view holds the main model's summary");
+    fixture.assertScriptsConsumed();
+    return {
+      requests: requests.map((capture) => capture.model),
+      metrics: lines.map((line) => [line.model, line.stopReason]),
+    };
+  });
+}
+
+/**
+ * Wire refusal, then a main-model fallback that starts its stream and never completes: only the
+ * 30 s deadline can end it. The client cancels the held response, a labelled stand-in is stored,
+ * the next prompt is answered, and nothing sent after the cancel overwrites the node.
+ */
+async function anthropicRefusalDeadlineStandIn(ctx: CaseContext): Promise<Evidence> {
+  const { fixture, memory, metrics } = ctx;
+  fixture.compactPolicy = (input, model) => {
+    if (input.input !== SEED_SOURCE) return undefined;
+    return model === ANTHROPIC_COMPACT ? { refusal: ANTHROPIC_EXPLANATION } : "hang";
+  };
+  await seedStore(ctx, [["user", SEED_USER]]);
+  return withHost(ctx, ANTHROPIC_OPTIONS, async (host) => {
+    const held = await fixture.until("fallback stream cancelled", () =>
+      fixture.streams.find((stream) => stream.model === ANTHROPIC_CHAT && stream.cancelled), DEADLINE_STEP_MS);
+    assert(held.started, "the fallback stream started before it was cancelled");
+    assert(!held.released, "the cancelled stream is never released with a late reply");
+    const elapsed = held.cancelledAt - held.startedAt;
+    assert(elapsed > FALLBACK_DEADLINE_MS - 5_000 && elapsed < FALLBACK_DEADLINE_MS + 5_000,
+      `the fallback was cancelled ${Math.round(elapsed)}ms after it started, not at the ${FALLBACK_DEADLINE_MS} ms deadline`);
+    const node = await fixture.until("deadline stand-in persisted", () => persistedNode(memory, 0, 0), DEADLINE_STEP_MS);
+    const standIn = standInText(node);
+    const lines = await fixture.until("compressor refusal metered", () => {
+      const records = metricRecords(metrics);
+      return records.length >= 1 ? records : undefined;
+    });
+    assert.deepEqual([lines[0]!.model, lines[0]!.attempt, lines[0]!.purpose, lines[0]!.stopReason],
+      [`${ANTHROPIC_PROVIDER}/${ANTHROPIC_COMPACT}`, 1, "leaf", "error"], "the refused compressor attempt is metered first");
+    assert(!lines.some((line) => line.model === `${ANTHROPIC_PROVIDER}/${ANTHROPIC_CHAT}` && line.stopReason === "stop"),
+      "the timed-out fallback is never a completed call");
+    const requests = seedRequests(fixture);
+    assert.deepEqual(requests.map((capture) => capture.model), [ANTHROPIC_COMPACT, ANTHROPIC_CHAT], "the compressor, then the fallback, once each");
+    for (const capture of requests) assertAnthropicBudget(capture.body, capture.model);
+    await fixture.until("deadline warning", () => host.notices.find((notice) =>
+      notice.message.includes("did not finish within 30 s; committing an unsummarized stand-in")), DEADLINE_STEP_MS);
+    assert.equal(host.notices.filter((notice) => notice.message.includes("did not finish within 30 s")).length, 1, "the deadline warning is announced once");
+    await fixture.until("stand-in notice", () => host.notices.find((notice) =>
+      notice.message.includes("unsummarized at 0+1") && notice.message.includes("stored a marked source excerpt")));
+    const followUp = await ordinaryTurn(ctx, host, "OPTCHAT_IT_DEADLINE_FOLLOW: say ok.", "OPTCHAT_IT_DEADLINE_REPLY: ok.");
+    assertAnthropicBudget(followUp.body, "the follow-up");
+    assert.deepEqual(persistedNode(memory, 0, 0), node, "nothing sent after the cancel overwrites the stand-in node");
+    assert.equal(soleView(followUp.body, "follow-up"), `<chat>\n0+1|${standIn}\n</chat>`, "the settled view holds the stand-in");
+    fixture.assertScriptsConsumed();
+    return {
+      standInBytes: new TextEncoder().encode(standIn).byteLength,
+      cancelledAfterMs: Math.round(elapsed),
+      requests: requests.map((capture) => capture.model),
+      metrics: lines.map((line) => [line.model, line.stopReason]),
     };
   });
 }
@@ -3393,6 +3687,8 @@ const CASES: Record<CaseName, (ctx: CaseContext) => Promise<Evidence>> = {
   "compressor-refusal-standin": compressorRefusalStandIn,
   "compressor-error-append-retry": compressorErrorAppendRetry,
   "compressor-refusal-same-model": compressorRefusalSameModel,
+  "anthropic-refusal-main-retry": anthropicRefusalMainRetry,
+  "anthropic-refusal-deadline-standin": anthropicRefusalDeadlineStandIn,
   "compressor-without-tools": compressorWithoutTools,
   "side-prefix-text-mismatch": sidePrefixTextMismatch,
   "reasoning-tools-compressor": (ctx) => reasoningToolsCompressor(ctx, {
