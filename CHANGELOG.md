@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Durability (#11):** Add real-subprocess SIGKILL recovery coverage for image-bearing appends, summary commits, and history imports; publish HTML exports from fsynced private staging files without overwriting existing targets, then fsync the parent directory.
+- **Archive GC (#12):** Reclaim unreferenced image blobs and abandoned image/view staging files after validated writer startup, preserving replayed references and reporting nonfatal cleanup failures.
+- **Behavior change:** Sessions inside git repositories no longer use `~/.omp/agent/optchat`. Each worktree gets its own memory under `optchat-worktrees/` beside that directory, and a new worktree starts empty. Sessions outside git keep the global store. `--optchat-dir ~/.omp/agent/optchat` restores the old single shared memory.
+- A startup lock conflict (another live session holds the store directory) now deactivates OptChat for that session, as `--no-optchat` does, with one warning, instead of refusing every prompt. Corrupt or otherwise unreadable stores still refuse prompts.
+
 ## 0.4.1 — 2026-10-11
 
 - Fix the evidence runner's credential-routing guard: parse all three source model-config formats instead of substring-matching only `models.yml`. Escaped or aliased selected provider keys, shadowed overrides, and unreadable or invalid configurations now block before credential copying or host discovery. Diagnostics omit config contents; unrelated provider settings remain usable.
