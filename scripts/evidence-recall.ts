@@ -73,7 +73,7 @@ import {
 	type MetricLine,
 	type TurnObservation,
 } from "./evidence/host.ts";
-import { assertWorkspaceBoundary, childEnvironment, copySelectedAuth, createIsolatedDirs, type CopiedAuth, type IsolatedDirs } from "./evidence/isolation.ts";
+import { assertWorkspaceBoundary, childEnvironment, copySelectedAuth, createIsolatedDirs, writeMainModelOverrides, type CopiedAuth, type IsolatedDirs } from "./evidence/isolation.ts";
 import {
 	accountingViolations,
 	admitPrompt,
@@ -89,7 +89,7 @@ import {
 	type Limits,
 	type Refusal,
 } from "./evidence/plan.ts";
-import { findPrivateContextMarkers } from "./evidence/preflight.ts";
+import { findPrivateContextMarkers, mainContextWindowBlocker } from "./evidence/preflight.ts";
 import { routingBlockers } from "./evidence/routing.ts";
 import { parseOptions, SCENARIOS, USAGE, type Arm, type Options, type ScenarioName } from "./evidence/options.ts";
 import { answerInstruction, armTotals, type Judgement, scoreAnswers, type ArmTotals } from "./evidence/scoring.ts";
@@ -1486,8 +1486,8 @@ async function effectivePromptPreflight(options: Options, dirs: IsolatedDirs, en
  * Auth, catalog, and effective-prompt prerequisites through public host surfaces only. Creates no provider request.
  * `discovery` names the extensions catalog and availability discovery may load (fixture mode only).
  */
-async function prerequisites(options: Options, selectors: readonly string[], dirs: IsolatedDirs, env: Readonly<Record<string, string>>, copied: CopiedAuth, parentPaths: readonly string[], discovery: readonly string[], hostExtension: string): Promise<Prerequisites> {
-	const blockers: string[] = [];
+async function prerequisites(options: Options, selectors: readonly string[], dirs: IsolatedDirs, env: Readonly<Record<string, string>>, copied: CopiedAuth, parentPaths: readonly string[], discovery: readonly string[], hostExtension: string, overrideBlockers: readonly string[]): Promise<Prerequisites> {
+	const blockers = [...overrideBlockers];
 	const catalog: Record<string, CatalogEntry> = {};
 	for (const selector of selectors) catalog[selector] = await readCatalogEntry(options.omp, selector, env, dirs.workspace, discovery);
 	const models = await queryAvailableModels(options.omp, env, dirs.sessions, dirs.workspace, 60_000, discovery);
@@ -1496,6 +1496,11 @@ async function prerequisites(options: Options, selectors: readonly string[], dir
 		available[selector] = isAvailable(models, selector);
 		if (!catalog[selector]!.found) blockers.push(`model is not in the local catalog: ${selector}`);
 		if (!available[selector]) blockers.push(`no configured auth for ${selector} in the isolated host`);
+	}
+	if (options.mainContextWindow !== null && overrideBlockers.length === 0) {
+		for (const selector of [options.main, ...(options.modelChange === null ? [] : [options.modelChange])]) {
+			if (catalog[selector]?.contextWindow !== options.mainContextWindow) blockers.push(`isolated catalog did not apply --main-context-window ${options.mainContextWindow} for ${selector}`);
+		}
 	}
 	const present = await stat(PLUGIN_ENTRY).then(() => true, () => false);
 	if (!present) blockers.push("plugin entry src/index.ts is missing");
@@ -1590,20 +1595,6 @@ function checkMainOutputCap(requests: readonly FixtureRequest[], options: Option
 	}
 }
 
-/** Pins each main model's output ceiling in the isolated agent directory. The source directory is never written. */
-async function pinMainOutput(agentDir: string, mains: readonly string[], maxTokens: number): Promise<void> {
-	const providers: Record<string, { modelOverrides: Record<string, { maxTokens: number }> }> = {};
-	for (const selector of mains) {
-		const provider = providerOf(selector);
-		const id = selector.slice(provider.length + 1);
-		const entry = providers[provider] ?? { modelOverrides: {} };
-		entry.modelOverrides[id] = { maxTokens };
-		providers[provider] = entry;
-	}
-	// JSON is valid YAML, so the file needs no YAML writer.
-	await writeFile(join(agentDir, "models.yml"), `${JSON.stringify({ providers }, null, "\t")}\n`, { flag: "wx", mode: 0o600 });
-}
-
 async function run(options: Options, corpus: Corpus, questions: readonly Question[], root: string): Promise<void> {
 	const fixture = options.fixtureProvider;
 	const dirs = await createIsolatedDirs(root);
@@ -1624,7 +1615,6 @@ async function run(options: Options, corpus: Corpus, questions: readonly Questio
 		: null;
 	try {
 		const copied: CopiedAuth = fixture ? { copied: [], missing: [] } : await copySelectedAuth(sourceAgentDir, dirs.agentDir, providers);
-		await pinMainOutput(dirs.agentDir, [options.main, ...(options.modelChange === null ? [] : [options.modelChange])], options.maxMainOutputTokens);
 		const parentPaths = [homedir(), sourceAgentDir, ROOT].filter((path) => path.length >= MIN_PARENT_PATH_LENGTH);
 		const env: Record<string, string> = {
 			...childEnvironment(process.env, dirs, fixture ? [] : options.allowEnv),
@@ -1636,7 +1626,17 @@ async function run(options: Options, corpus: Corpus, questions: readonly Questio
 		}
 		const hostExtension = fixture ? FIXTURE_EXTENSION : EXTENSION;
 		const discovery = fixture ? [FIXTURE_PROVIDER] : [];
-		const preflight = await prerequisites(options, selectors, dirs, env, copied, parentPaths, discovery, hostExtension);
+		const mains = [options.main, ...(options.modelChange === null ? [] : [options.modelChange])];
+		const overrideBlockers: string[] = [];
+		if (options.mainContextWindow !== null) {
+			for (const selector of mains) {
+				const original = await readCatalogEntry(options.omp, selector, env, dirs.workspace, discovery);
+				const blocker = mainContextWindowBlocker(selector, options.mainContextWindow, original.contextWindow);
+				if (blocker !== null) overrideBlockers.push(blocker);
+			}
+		}
+		await writeMainModelOverrides(dirs, mains, options.maxMainOutputTokens, overrideBlockers.length === 0 ? options.mainContextWindow : null);
+		const preflight = await prerequisites(options, selectors, dirs, env, copied, parentPaths, discovery, hostExtension, overrideBlockers);
 		const prices = new Map<string, Price | null>();
 		const rates = new Map<string, ModelRates | null>();
 		for (const selector of selectors) {
@@ -1653,6 +1653,7 @@ async function run(options: Options, corpus: Corpus, questions: readonly Questio
 			arms: options.arms,
 			compressors: options.compressors,
 			turnMode: options.turnMode,
+			mainContextWindow: options.mainContextWindow,
 			prerequisites: preflight,
 			budget,
 		};
@@ -1779,7 +1780,7 @@ async function run(options: Options, corpus: Corpus, questions: readonly Questio
 			questionEmphasis: options.questionEmphasis,
 			requestedExperiments: options.experiments,
 			builds,
-			models: { main: options.main, compressor: options.compressor, compressors: options.compressors, modelChange: options.modelChange, catalog: preflight.catalog },
+			models: { main: options.main, mainContextWindow: options.mainContextWindow, compressor: options.compressor, compressors: options.compressors, modelChange: options.modelChange, catalog: preflight.catalog },
 			auth: { checkedBy: "host get_available_models", available: preflight.available, copiedProviders: preflight.copied.copied, missingProviders: preflight.copied.missing },
 			limits: {
 				...options.limits,

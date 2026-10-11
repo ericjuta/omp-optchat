@@ -15,6 +15,8 @@ export const MAX_CONCURRENCY = 4;
 /** Main-model output ceiling, pinned as the request maxTokens; a conservative default and a hard maximum. */
 export const DEFAULT_MAX_MAIN_OUTPUT_TOKENS = 4096;
 export const MAX_MAIN_OUTPUT_TOKENS = 32_000;
+/** Smallest isolated main-model contextWindow override (--main-context-window); the runner checks the upper bound against the main catalog window. */
+export const MIN_MAIN_CONTEXT_WINDOW = 32_000;
 /** Default fraction of the remaining cap that each on-arm compressor host may reserve. */
 export const DEFAULT_COMPRESSOR_SHARE = 0.5;
 /** Host view budget. The product default is 128000; the evidence default stays at the historical 4096. */
@@ -57,6 +59,8 @@ export interface Options {
 	readonly fixtureProvider: boolean;
 	/** Output ceiling pinned as the main model's maxTokens (--max-main-output). */
 	readonly maxMainOutputTokens: number;
+	/** Optional isolated main-model contextWindow override (--main-context-window); null inherits the model catalog. */
+	readonly mainContextWindow: number | null;
 	/** Fraction of the remaining cap each on-arm compressor host may reserve (--compressor-share). */
 	readonly compressorShare: number;
 }
@@ -79,6 +83,7 @@ export const USAGE = `Usage: bun run scripts/evidence-recall.ts --main <provider
   --question-emphasis <balanced|adversarial>  question selection rotation (default balanced)
   --max-cost-usd <x>              worst-case dollar ceiling, above 0 and at most ${MAX_COST_USD}; required with confirm
   --max-main-output <n>           main model output ceiling in tokens, 1 to ${MAX_MAIN_OUTPUT_TOKENS} (default ${DEFAULT_MAX_MAIN_OUTPUT_TOKENS})
+  --main-context-window <n>       isolated main model contextWindow override, integer from ${MIN_MAIN_CONTEXT_WINDOW} up to the main catalog window (default: inherit model catalog)
   --compressor-share <x>          share of the remaining cap each compressor host reserves, above 0 and at most 1 (default ${DEFAULT_COMPRESSOR_SHARE})
   --fixture-provider              loopback optchat-smoke fixture models only; exclusive with confirm
   --omp <path> --agent-dir <path> --out <file> --force`;
@@ -88,7 +93,7 @@ const VALUE_FLAGS = new Set([
 	"main", "compressor", "model-change", "agent-dir", "scenarios", "expiry-wait-ms", "max-calls", "max-compressor-output",
 	"deadline-ms", "seed", "projects", "sources", "min-source-bytes", "questions", "concurrency", "omp", "out", "allow-env",
 	"arms", "compressors", "turn-mode", "view-bytes", "experiments", "question-emphasis", "max-cost-usd",
-	"max-main-output", "compressor-share",
+	"max-main-output", "main-context-window", "compressor-share",
 ]);
 const SELECTOR = /^[A-Za-z0-9][\w.-]*\/\S+$/;
 const DECIMAL = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
@@ -218,6 +223,10 @@ export function parseOptions(argv: readonly string[]): Options {
 	const viewBytes = inRange("view-bytes", integer("view-bytes", MIN_VIEW_BYTES), MIN_VIEW_BYTES, MAX_VIEW_BYTES);
 	const concurrency = inRange("concurrency", integer("concurrency", DEFAULTS.concurrency), 1, MAX_CONCURRENCY);
 	const maxMainOutputTokens = inRange("max-main-output", integer("max-main-output", DEFAULT_MAX_MAIN_OUTPUT_TOKENS), 1, MAX_MAIN_OUTPUT_TOKENS);
+	const mainContextWindow = integer("main-context-window", null);
+	if (mainContextWindow !== null && (!Number.isSafeInteger(mainContextWindow) || mainContextWindow < MIN_MAIN_CONTEXT_WINDOW)) {
+		throw new Error(`--main-context-window must be a safe integer of at least ${MIN_MAIN_CONTEXT_WINDOW}`);
+	}
 	const shareRaw = values.get("compressor-share") ?? String(DEFAULT_COMPRESSOR_SHARE);
 	if (!DECIMAL.test(shareRaw)) throw new Error("--compressor-share must be a decimal number");
 	const compressorShare = Number(shareRaw);
@@ -261,6 +270,7 @@ export function parseOptions(argv: readonly string[]): Options {
 		maxCostUsd,
 		fixtureProvider,
 		maxMainOutputTokens,
+		mainContextWindow,
 		compressorShare,
 	};
 }

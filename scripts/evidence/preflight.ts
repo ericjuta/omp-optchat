@@ -1,3 +1,12 @@
+import { MIN_MAIN_CONTEXT_WINDOW } from "./options.ts";
+
+/** Refuses an invalid window or a window larger than the unmodified catalog permits, before writing the override. */
+export function mainContextWindowBlocker(selector: string, requested: number, catalogWindow: number | null): string | null {
+	if (!Number.isSafeInteger(requested) || requested < MIN_MAIN_CONTEXT_WINDOW) return `--main-context-window must be an integer of at least ${MIN_MAIN_CONTEXT_WINDOW}`;
+	if (catalogWindow === null || !Number.isSafeInteger(catalogWindow) || catalogWindow <= 0) return `cannot bound --main-context-window: catalog window is unknown for ${selector}`;
+	return requested > catalogWindow ? `--main-context-window ${requested} exceeds the catalog window ${catalogWindow} for ${selector}` : null;
+}
+
 /**
  * Markers of private ambient context that must never reach an evidence run's effective system
  * prompt: instruction files from the workspace or home, and user-memory blocks. A marker check is a

@@ -2,7 +2,7 @@ import { ADVERSARIAL_KINDS, QUESTION_KINDS, type Question, type QuestionKind, ty
 import { answerInstruction } from "./scoring.ts";
 
 /** Hard ceilings for any live evidence run; the parent may lower them but never raise them. */
-export const MAX_CALLS = 200;
+export const MAX_CALLS = 2000;
 /** The default ceiling when --max-calls is omitted: unchanged, so a bare run never spends more than before. */
 export const DEFAULT_MAX_CALLS = 80;
 /** Compressor admissions a host may dispatch per phase. The seed build is bounded so it cannot take the whole pool. */

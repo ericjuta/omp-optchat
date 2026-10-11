@@ -18,6 +18,7 @@ describe("benchmark option defaults", () => {
 		expect(options.experiments).toEqual([]);
 		expect(options.questionEmphasis).toBe("balanced");
 		expect(options.maxCostUsd).toBeNull();
+		expect(options.mainContextWindow).toBeNull();
 		expect(options.fixtureProvider).toBe(false);
 		expect(options.projects).toBe(3);
 		expect(options.sourceCount).toBe(24);
@@ -72,6 +73,32 @@ describe("view bytes, experiments, and emphasis", () => {
 	test("question emphasis is balanced or adversarial", () => {
 		expect(parseOptions([...BASE, "--question-emphasis", "adversarial"]).questionEmphasis).toBe("adversarial");
 		expect(() => parseOptions([...BASE, "--question-emphasis", "loud"])).toThrow("--question-emphasis must be one of");
+	});
+});
+
+describe("main context window", () => {
+	test("accepts the 32000 minimum, a realistic window, and the safe-integer maximum", () => {
+		expect(parseOptions([...BASE, "--main-context-window", "32000"]).mainContextWindow).toBe(32_000);
+		expect(parseOptions([...BASE, "--main-context-window", "200000"]).mainContextWindow).toBe(200_000);
+		expect(parseOptions([...BASE, "--main-context-window", String(Number.MAX_SAFE_INTEGER)]).mainContextWindow).toBe(Number.MAX_SAFE_INTEGER);
+	});
+
+	test("rejects values below 32000 or that are not strict safe integers", () => {
+		for (const raw of ["0", "1", "31999", "-1", "1.5", "1e3", "9007199254740992", "", "abc", "128000 ", "+1"]) {
+			expect(() => parseOptions([...BASE, "--main-context-window", raw])).toThrow("--main-context-window");
+		}
+	});
+
+	test("requires a value and rejects duplicate flags", () => {
+		expect(() => parseOptions([...BASE, "--main-context-window"])).toThrow("requires a value");
+		expect(() => parseOptions([...BASE, "--main-context-window", "128000", "--main-context-window", "128000"])).toThrow("duplicate flag");
+	});
+});
+
+describe("call cap", () => {
+	test("accepts 2000 calls and rejects 2001", () => {
+		expect(parseOptions([...BASE, "--max-calls", "2000"]).limits.maxCalls).toBe(2_000);
+		expect(() => parseOptions([...BASE, "--max-calls", "2001"])).toThrow("maxCalls must be an integer from 1 to 2000");
 	});
 });
 

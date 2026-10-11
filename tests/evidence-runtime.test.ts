@@ -6,8 +6,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseOptions } from "../scripts/evidence/options.ts";
-import { childEnvironment, copySelectedAuth, createIsolatedDirs } from "../scripts/evidence/isolation.ts";
-import { findPrivateContextMarkers, parseParentSubstrings } from "../scripts/evidence/preflight.ts";
+import { childEnvironment, copySelectedAuth, createIsolatedDirs, writeMainModelOverrides } from "../scripts/evidence/isolation.ts";
+import { findPrivateContextMarkers, mainContextWindowBlocker, parseParentSubstrings } from "../scripts/evidence/preflight.ts";
 import { isOriginalPage, observeTurn, readAdmissionDispatched, readTreeStructure, treeLevels, type Frame } from "../scripts/evidence/host.ts";
 
 const BASE = ["--main", "openrouter/main-model", "--compressor", "openrouter/compressor-model"];
@@ -192,6 +192,36 @@ describe("child environment isolation", () => {
 		});
 	});
 
+	test("main and model-change overrides combine output and context only in the isolated agent directory", async () => {
+		await withDirectory(async (directory) => {
+			const source = join(directory, "source-agent");
+			await mkdir(source);
+			const original = '{"providers":{"operator-owned":{"models":[]}}}\n';
+			await writeFile(join(source, "models.yml"), original);
+			const options = parseOptions([...BASE, "--agent-dir", source, "--scenarios", "model-change", "--model-change", "anthropic/alternate", "--main-context-window", "128000", "--max-main-output", "2048"]);
+			const dirs = await createIsolatedDirs(join(directory, "run"));
+			await writeMainModelOverrides(dirs, [options.main, options.modelChange!], options.maxMainOutputTokens, options.mainContextWindow);
+			expect(Bun.YAML.parse(await readFile(join(dirs.agentDir, "models.yml"), "utf8"))).toEqual({
+				providers: {
+					openrouter: { modelOverrides: { "main-model": { maxTokens: 2048, contextWindow: 128_000 } } },
+					anthropic: { modelOverrides: { alternate: { maxTokens: 2048, contextWindow: 128_000 } } },
+				},
+			});
+			expect(await readFile(join(source, "models.yml"), "utf8")).toBe(original);
+		});
+	});
+
+	test("omitting the context override keeps the isolated model patch output-only", async () => {
+		await withDirectory(async (directory) => {
+			const options = parseOptions(BASE);
+			const dirs = await createIsolatedDirs(join(directory, "run"));
+			await writeMainModelOverrides(dirs, [options.main], options.maxMainOutputTokens, options.mainContextWindow);
+			expect(Bun.YAML.parse(await readFile(join(dirs.agentDir, "models.yml"), "utf8"))).toEqual({
+				providers: { openrouter: { modelOverrides: { "main-model": { maxTokens: 4096 } } } },
+			});
+		});
+	});
+
 	test("an absent source store copies nothing and reports every selected provider as missing", async () => {
 		await withDirectory(async (directory) => {
 			const target = join(directory, "target");
@@ -199,6 +229,21 @@ describe("child environment isolation", () => {
 			expect(copied).toEqual({ copied: [], missing: ["openrouter"] });
 			expect(existsSync(join(target, "agent.db"))).toBe(false);
 		});
+	});
+});
+
+describe("main context window catalog bound", () => {
+	test("accepts the minimum and exact catalog ceiling, but rejects enlarging the catalog window", () => {
+		expect(mainContextWindowBlocker("provider/main", 32_000, 200_000)).toBeNull();
+		expect(mainContextWindowBlocker("provider/main", 200_000, 200_000)).toBeNull();
+		expect(mainContextWindowBlocker("provider/main", 200_001, 200_000)).toContain("exceeds the catalog window 200000");
+		expect(mainContextWindowBlocker("provider/alternate", 128_000, 64_000)).toContain("provider/alternate");
+	});
+
+	test("unknown catalog windows and values below the minimum cannot authorize an override", () => {
+		expect(mainContextWindowBlocker("provider/main", 128_000, null)).toContain("catalog window is unknown");
+		expect(mainContextWindowBlocker("provider/main", 128_000, Number.NaN)).toContain("catalog window is unknown");
+		expect(mainContextWindowBlocker("provider/main", 31_999, 200_000)).toContain("at least 32000");
 	});
 });
 

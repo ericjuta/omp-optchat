@@ -1,7 +1,8 @@
 import { existsSync } from "node:fs";
-import { chmod, mkdir } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type AuthCredential, AuthStorage } from "@oh-my-pi/pi-ai";
+import { providerOf } from "./discovery.ts";
 
 /** Every directory the host can read or write during a run: nothing lives under the operator's home. */
 export interface IsolatedDirs {
@@ -80,6 +81,20 @@ export async function createIsolatedDirs(root: string): Promise<IsolatedDirs> {
 	}
 	await initWorkspaceBoundary(dirs);
 	return dirs;
+}
+
+/** Writes only main-model overrides in the isolated agent directory; null preserves the catalog's context window. */
+export async function writeMainModelOverrides(dirs: IsolatedDirs, mains: readonly string[], maxTokens: number, contextWindow: number | null): Promise<void> {
+	const providers: Record<string, { modelOverrides: Record<string, { maxTokens: number; contextWindow?: number }> }> = {};
+	for (const selector of mains) {
+		const provider = providerOf(selector);
+		const id = selector.slice(provider.length + 1);
+		const entry = providers[provider] ?? { modelOverrides: {} };
+		entry.modelOverrides[id] = contextWindow === null ? { maxTokens } : { maxTokens, contextWindow };
+		providers[provider] = entry;
+	}
+	// JSON is valid YAML. The source agent directory is never an input to this writer.
+	await writeFile(join(dirs.agentDir, "models.yml"), `${JSON.stringify({ providers }, null, "\t")}\n`, { flag: "wx", mode: 0o600 });
 }
 
 /** Only these host-essential variables are inherited; everything else is absent unless explicitly allowed. */

@@ -589,6 +589,7 @@ describe("artifact validation", () => {
 			experiments: { child: null },
 			questionEmphasis: "balanced",
 			viewBytes: 4096,
+			models: { mainContextWindow: null },
 			paired: [],
 			corpus: corpusBlock,
 			limits: limitsBlock,

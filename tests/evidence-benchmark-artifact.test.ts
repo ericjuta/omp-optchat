@@ -127,6 +127,7 @@ function artifact(overrides: Record<string, unknown> = {}): Record<string, unkno
 		experiments: { child: null },
 		questionEmphasis: "balanced",
 		viewBytes: 4096,
+		models: { mainContextWindow: null },
 		corpus: corpusBlock,
 		limits: limitsBlock,
 		scenarios: [{ name: "cold", status: "completed", reason: null, phases: [phase("on", "synthetic/compressor"), phase("off", null)] }],
@@ -424,6 +425,20 @@ describe("claim and bound rules", () => {
 		expect(validateArtifact(artifact({ experiments: { child: report } })).length).toBeGreaterThan(0);
 		expect(validateArtifact(artifact({ requestedExperiments: ["child"], experiments: { child: null } })).length).toBeGreaterThan(0);
 		expect(validateArtifact(artifact({ requestedExperiments: ["child"], experiments: { child: report } }))).toEqual([]);
+	});
+
+	test("the call ceiling accepts 2000 and rejects 2001", () => {
+		expect(validateArtifact(artifact({ limits: { ...limitsBlock, maxCalls: 2000 } }))).toEqual([]);
+		expect(validateArtifact(artifact({ limits: { ...limitsBlock, maxCalls: 2001 } }))).toContain("$.limits.maxCalls must be an integer from 1 to 2000");
+	});
+
+	test("the reported main context is null for catalog defaults or a safe integer of at least 32000", () => {
+		for (const mainContextWindow of [null, 32_000, 128_000]) {
+			expect(validateArtifact(artifact({ models: { mainContextWindow } }))).toEqual([]);
+		}
+		for (const mainContextWindow of [undefined, 0, -1, 31_999, 32_000.5, Number.MAX_SAFE_INTEGER + 1, "128000"]) {
+			expect(validateArtifact(artifact({ models: { mainContextWindow } }))).toContain("$.models.mainContextWindow must be null or a safe integer of at least 32000");
+		}
 	});
 
 	test("the view-bytes budget must be an integer within the host bounds", () => {

@@ -1,7 +1,7 @@
 import type { ChildStatus, ChildTaskOutcome, ChildUsage } from "./child.ts";
 import { MAX_SOURCES, MIN_SOURCES, QUESTION_KINDS, type QuestionKind } from "./corpus.ts";
 import { MAX_CALLS, MAX_COMPRESSOR_OUTPUT_TOKENS, MAX_DEADLINE_MS, MAX_EXPIRY_WAIT_MS, type QuestionEmphasis } from "./plan.ts";
-import { ARMS, EXPERIMENTS, MAX_COST_USD, MAX_VIEW_BYTES, MIN_VIEW_BYTES, TURN_MODES, type Arm, type Experiment, type TurnMode } from "./options.ts";
+import { ARMS, EXPERIMENTS, MAX_COST_USD, MAX_VIEW_BYTES, MIN_MAIN_CONTEXT_WINDOW, MIN_VIEW_BYTES, TURN_MODES, type Arm, type Experiment, type TurnMode } from "./options.ts";
 import { isRecord, type ArmTotals, type Failure } from "./scoring.ts";
 
 /** Versioned evidence artifact: observed counters only; unknown values stay null, never zero. */
@@ -864,6 +864,10 @@ export function validateArtifact(value: unknown): string[] {
 	if (!QUESTION_EMPHASES.includes(value.questionEmphasis as QuestionEmphasis)) errors.push("$.questionEmphasis must be balanced or adversarial");
 	if (!Number.isSafeInteger(value.viewBytes) || (value.viewBytes as number) < MIN_VIEW_BYTES || (value.viewBytes as number) > MAX_VIEW_BYTES) {
 		errors.push(`$.viewBytes must be an integer from ${MIN_VIEW_BYTES} to ${MAX_VIEW_BYTES}`);
+	}
+	if (!isRecord(value.models)) errors.push("$.models must be an object");
+	else if (value.models.mainContextWindow !== null && (!Number.isSafeInteger(value.models.mainContextWindow) || (value.models.mainContextWindow as number) < MIN_MAIN_CONTEXT_WINDOW)) {
+		errors.push(`$.models.mainContextWindow must be null or a safe integer of at least ${MIN_MAIN_CONTEXT_WINDOW}`);
 	}
 	validateCorpus(value.corpus, "$.corpus", errors);
 	validateLimits(value.limits, "$.limits", errors);
