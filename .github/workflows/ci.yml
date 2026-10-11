@@ -2,18 +2,37 @@ name: Verify
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   verify:
+    name: verify (${{ matrix.sdk }} SDK)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: [pinned, latest]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.0
-      - run: bun install --frozen-lockfile
+      - name: Install pinned lockfile
+        run: bun install --frozen-lockfile
+      - name: Upgrade SDK cohort to latest (ephemeral, not saved)
+        if: matrix.sdk == 'latest'
+        run: >-
+          bun add --no-save
+          @oh-my-pi/pi-ai@latest
+          @oh-my-pi/pi-catalog@latest
+          @oh-my-pi/pi-coding-agent@latest
+      - name: Record installed SDK version
+        run: >-
+          node -p "JSON.parse(require('fs').readFileSync('node_modules/@oh-my-pi/pi-coding-agent/package.json','utf8')).version"
       - run: bun run typecheck
       - run: bun test
       - run: bun run smoke
