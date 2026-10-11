@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Memory, utf8Bytes, utf8Prefix, type CompactionRequest, type MemoryOptions, type Summarize } from "../src/memory.ts";
@@ -56,8 +56,19 @@ function seedTree(
   }
 }
 
-function saveView(store: Store, parts: ReadonlyArray<readonly [number, number]>, compacting = false): void {
-  store.saveView({ version: 1, length: store.messages.length, parts, compacting });
+/** Compactor defaults to empty: restore rebuilds it from the built prefix. */
+function saveView(
+  store: Store,
+  parts: ReadonlyArray<readonly [number, number]>,
+  compacting = false,
+): void {
+  store.saveView({
+    version: 2,
+    length: store.messages.length,
+    parts,
+    compacting,
+    compactor: { length: 0, parts: [], compacting: false },
+  });
 }
 
 interface Call {
@@ -70,6 +81,9 @@ interface Call {
 
 /** Markers like [m3] (message 3), [s3] (its summary), [p0-1] (a merge reply) name a call's inputs. */
 const label = (call: Call): string => (call.request.instruction.match(/\[[a-z][\d-]*\]/g) ?? []).join("+");
+
+/** The text between the instruction's <input> tags. */
+const inputOf = (call: Call): string => /<input>\n([\s\S]*?)\n<\/input>/.exec(call.request.instruction)![1]!;
 
 /** A compactor whose replies the test controls; tracks how many calls overlap. */
 class Model {
@@ -123,33 +137,6 @@ class Model {
   }
 }
 
-interface RetryWait {
-  readonly ms: number;
-  readonly signal: AbortSignal;
-  release(): void;
-}
-
-/** Injected retry clock: waits end only when the test releases them or Memory aborts them. */
-class Clock {
-  readonly waits: RetryWait[] = [];
-
-  readonly wait = (ms: number, signal: AbortSignal): Promise<void> => {
-    const { promise, resolve, reject } = Promise.withResolvers<void>();
-    const abort = () => reject(new Error("retry wait aborted"));
-    if (signal.aborted) abort();
-    else signal.addEventListener("abort", abort, { once: true });
-    this.waits.push({
-      ms,
-      signal,
-      release: () => {
-        signal.removeEventListener("abort", abort);
-        resolve();
-      },
-    });
-    return promise;
-  };
-}
-
 function memoryFor(store: Store, model: Model, options: MemoryOptions = {}): Memory {
   const memory = new Memory(store, model.summarize, options);
   cleanups.push(async () => {
@@ -171,6 +158,10 @@ async function until(condition: () => boolean, what: string | (() => string)): P
 
 async function flush(rounds = 200): Promise<void> {
   for (let round = 0; round < rounds; round++) await Promise.resolve();
+}
+
+async function macrotasks(count: number): Promise<void> {
+  for (let round = 0; round < count; round++) await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 interface Tracked<T> {
@@ -206,8 +197,6 @@ const addresses = (memory: Memory): string[] =>
 
 const summary = (tag: string): string => `[${tag}]`.padEnd(12, ".");
 
-const coordinates = /\d+\+\d+\|/;
-
 const contextBytes = (context: string): number =>
   chatLines(context).reduce((bytes, line) => bytes + utf8Bytes(line.slice(line.indexOf("|") + 1)), 0);
 
@@ -221,42 +210,48 @@ test("UTF-8 helpers count bytes and never split a code point", () => {
   expect(utf8Prefix("short", 99)).toBe("short");
 });
 
-test("leaves compact one at a time in order while merges of finished parts run alongside", async () => {
+test("admission stops eight unbuilt leaves ahead, however many jobs are free", async () => {
   const store = await openStore();
   const model = new Model();
-  const memory = memoryFor(store, model, { nodeBytes: 16, jobs: 8, viewBytes: 100_000 });
-  for (let i = 0; i < 4; i++) memory.append("user", `[m${i}] a long user message`);
+  const memory = memoryFor(store, model, { nodeBytes: 16, jobs: 16, viewBytes: 1_000_000 });
+  for (let i = 0; i < 10; i++) memory.append("user", `[m${i}] a long user message`);
 
-  const expectOpen = async (labels: string[]) => {
-    const expected = [...labels].sort();
-    await until(() => model.labels().join() === expected.join(), () => `${expected} (open: ${model.labels()})`);
-    await flush();
-    expect(model.labels()).toEqual(expected);
-  };
+  await until(() => model.open().length === 8, "eight admitted leaves");
+  await flush();
+  expect(model.labels()).toEqual(["[m0]", "[m1]", "[m2]", "[m3]", "[m4]", "[m5]", "[m6]", "[m7]"]);
 
-  // Free job slots do not start later leaves: each waits for every earlier view line.
-  await expectOpen(["[m0]"]);
+  // Each built leaf admits exactly one more: the window counts unbuilt leaves, not jobs.
   model.take("[m0]").resolve(summary("s0"));
-  await expectOpen(["[m1]"]);
-  model.take("[m1]").resolve(summary("s1"));
-  await expectOpen(["[m2]", "[s0]+[s1]"]);
-  model.take("[m2]").resolve(summary("s2"));
-  await expectOpen(["[m3]", "[s0]+[s1]"]);
-  model.take("[m3]").resolve(summary("s3"));
-  await expectOpen(["[s0]+[s1]", "[s2]+[s3]"]);
-  model.take("[s0]", "[s1]").resolve(summary("p0-1"));
-  await expectOpen(["[s2]+[s3]"]);
-  model.take("[s2]", "[s3]").resolve(summary("p2-3"));
-  await expectOpen(["[p0-1]+[p2-3]"]);
-  model.take("[p0-1]", "[p2-3]").resolve(summary("p0-3"));
-  await until(() => store.nodes.size === 7, "complete four-message tree");
-
-  expect(model.calls.map(label).filter((name) => name.startsWith("[m"))).toEqual(["[m0]", "[m1]", "[m2]", "[m3]"]);
-  expect(model.calls).toHaveLength(7);
-  expect(model.peak).toBe(2);
+  await until(() => model.labels().includes("[m8]"), "window admits leaf 8");
+  await flush();
+  expect(model.labels()).toEqual(["[m1]", "[m2]", "[m3]", "[m4]", "[m5]", "[m6]", "[m7]", "[m8]"]);
+  expect(memory.status().pending).toBe(8);
 });
 
-test("merges run concurrently but never beyond the job cap", async () => {
+test("a failed leaf keeps its admission slot until a retry succeeds", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const reports: string[] = [];
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16,
+    jobs: 16,
+    viewBytes: 1_000_000,
+    report: (message) => reports.push(message),
+  });
+  for (let i = 0; i < 10; i++) memory.append("user", `[m${i}] a long user message`);
+  await until(() => model.open().length === 8, "eight admitted leaves");
+
+  model.take("[m0]").reject(new Error("offline"));
+  model.take("[m1]").resolve(summary("s1"));
+  await until(() => model.labels().includes("[m8]"), "window admits leaf 8");
+  await flush();
+  // Leaf 0 is still unbuilt, so leaf 9 waits behind the window.
+  expect(model.labels()).toEqual(["[m2]", "[m3]", "[m4]", "[m5]", "[m6]", "[m7]", "[m8]"]);
+  expect(reports).toHaveLength(1);
+  expect(reports[0]).toContain("offline");
+});
+
+test("the job cap bounds concurrent merges, and merges complete their parents", async () => {
   const store = await openStore();
   for (let i = 0; i < 8; i++) store.append("user", `[m${i}] seeded long message`);
   for (let i = 0; i < 8; i++) saveText(store, 0, i, summary(`s${i}`));
@@ -281,61 +276,124 @@ test("merges run concurrently but never beyond the job cap", async () => {
   expect(store.nodes.has(nodeKey(3, 0))).toBe(true);
 });
 
-test("compactor sees only addressed built summary lines and its whole input", async () => {
+test("an over-long source is summarized through every page, then reduced to one leaf", async () => {
+  const store = await openStore();
+  const model = new Model({ auto: () => "ok" });
+  const memory = memoryFor(store, model, { nodeBytes: 16, pageBytes: 4_096, jobs: 1, viewBytes: 1_000_000 });
+  const big = Array.from({ length: 600 }, (_, k) => `línea ${k}: résumé 🙂 payload`).join("\n");
+  const source = `echo: ${big}`;
+  memory.append("user", "hi");
+  memory.append("echo", big);
+  expect(await memory.settle()).toBe(true);
+
+  const calls = model.calls.filter((call) => call.request.instruction.includes("compress message 1"));
+  const pageCalls = calls.filter((call) => call.request.instruction.includes(", part "));
+  const finals = calls.filter((call) => !call.request.instruction.includes(", part "));
+  expect(pageCalls.length).toBeGreaterThan(4);
+  expect(finals).toHaveLength(1);
+  // Every source byte reaches the compactor exactly once, in order, within the page bound.
+  expect(pageCalls.map(inputOf).join("")).toBe(source);
+  for (const call of pageCalls) expect(utf8Bytes(inputOf(call))).toBeLessThanOrEqual(4_096);
+  expect(finals[0]!.request.instruction).toContain(
+    `Ordered partial summaries of the complete input:\n${Array(pageCalls.length).fill("ok").join("\n")}`,
+  );
+  // Context is the built prefix only, never the message being summarized.
+  expect(chatLines(pageCalls[0]!.request.context)).toEqual(["0+1|user: hi"]);
+  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe("ok");
+});
+
+test("reduction keeps exact order over bounded groups and rounds; each output is consumed once", async () => {
+  const store = await openStore();
+  // 16-byte ids: two summaries plus their newline are exactly the 33-byte group budget.
+  const id = (n: number): string => String(n).padStart(16, "0");
+  let produced = 0;
+  const model = new Model({ auto: () => id(++produced) });
+  const memory = memoryFor(store, model, { nodeBytes: 16, pageBytes: 16, jobs: 1, viewBytes: 1_000_000 });
+  const body = "abcdefghij".repeat(10);
+  const source = `echo: ${body}`; // 106 bytes: six full 16-byte pages, then 10 bytes
+  memory.append("echo", body);
+  expect(await memory.settle()).toBe(true);
+
+  // Seven page calls cover the source exactly once, in order.
+  const pages = model.calls.filter((call) => call.request.instruction.includes(", part "));
+  expect(pages).toHaveLength(7);
+  expect(pages.map(inputOf).join("")).toBe(source);
+
+  // Round 1: [1,2] [3,4] [5,6] [7] -> 8, 9, 10; 7 passes through alone.
+  // Round 2: [8,9] [10,7] -> 11, 12. Round 3: one group -> final leaf 13.
+  const reductions = model.calls.filter((call) => call.request.instruction.includes("merge these"));
+  expect(reductions.map(inputOf)).toEqual([
+    `${id(1)}\n${id(2)}`,
+    `${id(3)}\n${id(4)}`,
+    `${id(5)}\n${id(6)}`,
+    `${id(8)}\n${id(9)}`,
+    `${id(10)}\n${id(7)}`,
+  ]);
+  const prefix = "Ordered partial summaries of the complete input:\n";
+  const final = model.calls.at(-1)!;
+  expect(model.calls).toHaveLength(13);
+  expect(inputOf(final)).toBe(`${prefix}${id(11)}\n${id(12)}`);
+  // A merged group is exactly 16 + 1 + 16 = 33 bytes; the final leaf adds the fixed prefix on top.
+  for (const call of reductions) expect(utf8Bytes(inputOf(call))).toBe(33);
+  expect(utf8Bytes(inputOf(final))).toBe(utf8Bytes(prefix) + 33);
+
+  // Every page output and every intermediate output is consumed by exactly one later input.
+  const consumed = [...reductions, final].flatMap((call) => inputOf(call).replace(prefix, "").split("\n"));
+  expect(consumed.sort()).toEqual(Array.from({ length: 12 }, (_, k) => id(k + 1)).sort());
+  for (const call of model.calls) {
+    expect(utf8Bytes(call.request.context)).toBeLessThanOrEqual(36_096);
+    expect(utf8Bytes(inputOf(call))).toBeLessThanOrEqual(utf8Bytes(prefix) + 33);
+  }
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(id(13));
+});
+
+test("close cancels a paged summary midway and publishes no partial leaf", async () => {
   const store = await openStore();
   const model = new Model();
-  const memory = memoryFor(store, model, { nodeBytes: 16, jobs: 1, viewBytes: 1_000_000 });
-  const big = Array.from({ length: 1_500 }, (_, k) => `línea ${k}: résumé 🙂 payload`).join("\n");
-  expect(utf8Bytes(big)).toBeGreaterThan(40_000);
-  const texts = ["[m0] first request about the parser", `[m1] ${big}`, "[m2] reply about the results"];
-  memory.append("user", texts[0]!);
-  memory.append("echo", texts[1]!);
-  memory.append("talk", texts[2]!);
-  const ruler = "-".repeat(512);
+  const memory = memoryFor(store, model, { nodeBytes: 16, pageBytes: 8, jobs: 1 });
+  memory.append("echo", "x".repeat(40));
 
-  await until(() => model.calls.length === 1, "leaf 0");
-  const leaf0 = model.calls[0]!;
-  expect(chatLines(leaf0.request.context)).toEqual([]);
-  expect(leaf0.request.instruction).toContain(`<input>\nuser: ${texts[0]}\n</input>`);
-  expect(leaf0.request.instruction.split("\n")).toContain(ruler);
-  expect(leaf0.request.instruction).toContain("at most 16 bytes");
-  expect(leaf0.request.instruction).toContain("fixed 512-byte reference; the numeric limit above is authoritative");
-  expect(leaf0.request.feedback).toEqual([]);
-  leaf0.resolve("[s0] alpha\nbeta");
+  await until(() => model.open().length === 1, "page 1");
+  model.open()[0]!.resolve("ok");
+  await until(() => model.open().length === 1, "page 2");
+  const closing = track(memory.close());
+  await until(() => closing.done, "close");
+  expect(closing.error).toBeUndefined();
+  expect(model.calls).toHaveLength(2);
+  expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
+});
 
-  await until(() => model.calls.length === 2, "leaf 1");
-  const leaf1 = model.calls[1]!;
-  // Prior line uses the main view's address format, flattened without raw text.
-  expect(chatLines(leaf1.request.context)).toEqual(["0+1|[s0] alpha beta"]);
-  expect(leaf1.request.context).not.toContain("[m0]");
-  expect(leaf1.request.context).not.toContain("línea");
-  expect(leaf1.request.context).not.toContain(PLACEHOLDER);
-  // The 40 KB message arrives whole, newlines kept, never cut.
-  expect(leaf1.request.instruction).toContain(`<input>\necho: ${texts[1]}\n</input>`);
-  leaf1.resolve("[s1] gamma");
+test("close during a reduction waits for the ignored provider call and publishes nothing from its late reply", async () => {
+  const store = await openStore();
+  const model = new Model({ ignoreAbort: true });
+  const memory = memoryFor(store, model, { nodeBytes: 16, pageBytes: 16, jobs: 1 });
+  memory.append("echo", "y".repeat(40)); // three pages: 16, 16, 14 bytes
 
-  await until(() => model.calls.length === 3, "leaf 2 before the merge");
-  const leaf2 = model.calls[2]!;
-  expect(label(leaf2)).toBe("[m2]");
-  expect(chatLines(leaf2.request.context)).toEqual(["0+1|[s0] alpha beta", "1+1|[s1] gamma"]);
-  leaf2.resolve("[s2] delta");
+  await until(() => model.open().length === 1, "page 1");
+  model.open()[0]!.resolve("a".repeat(16));
+  await until(() => model.open().length === 1, "page 2");
+  model.open()[0]!.resolve("b".repeat(16));
+  await until(() => model.open().length === 1, "page 3");
+  model.open()[0]!.resolve("c".repeat(16));
+  // [a, b] form one 33-byte group; c waits as a lone pass-through.
+  await until(() => model.open().length === 1, "reduction pair");
+  const pair = model.take("merge these");
+  expect(model.calls).toHaveLength(4);
 
-  await until(() => model.calls.length === 4, "merge 0+2");
-  const merge = model.calls[3]!;
-  // Context ends at the merge's last message even though message 2 is already summarized.
-  expect(chatLines(merge.request.context)).toEqual(["0+1|[s0] alpha beta", "1+1|[s1] gamma"]);
-  expect(merge.request.instruction).toContain("<input>\n[s0] alpha beta\n[s1] gamma\n</input>");
-  expect(merge.request.instruction).toContain("merge lines 0+1 and 1+1, adjacent,");
-  expect(merge.request.instruction).toContain("take details\nof them from there too");
-  expect(merge.request.instruction).not.toContain("[s2]");
-  expect(merge.request.instruction.split("\n")).toContain(ruler);
+  const closing = track(memory.close());
+  expect(pair.signal.aborted).toBe(true);
+  await flush();
+  // The provider ignored the abort, so close must still wait on it.
+  expect(closing.done).toBe(false);
 
-  for (const call of model.calls) {
-    for (const line of chatLines(call.request.context)) expect(line).toMatch(/^\d+\+\d+\|/);
-    expect(call.request.instruction).not.toMatch(coordinates);
-  }
-  // Even a summarized message never enters the view whole.
-  expect(memory.render()).not.toContain("línea");
+  pair.resolve("m".repeat(16)); // late reply, after close
+  await until(() => closing.done, "close after the late reply");
+  expect(closing.error).toBeUndefined();
+  await flush();
+  // Nothing after the late reply: no leaf, no further call, nothing pending.
+  expect(model.calls).toHaveLength(4);
+  expect(memory.status().pending).toBe(0);
+  expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
 });
 
 test("short sources become nodes verbatim without a model call, measured in UTF-8 bytes", async () => {
@@ -356,12 +414,13 @@ test("short sources become nodes verbatim without a model call, measured in UTF-
   expect(store.nodes.get(nodeKey(0, 1))?.text).toBe(leaf1);
   expect(store.nodes.get(nodeKey(1, 0))).toEqual({ l: 1, i: 0, text: `${leaf0}\n${leaf1}`, size: 40 });
   expect(model.calls[0]!.request.instruction).toContain(`user: ${"é".repeat(18)}`);
-  // A free leaf is still gated behind the unsummarized message before it.
-  expect(store.nodes.has(nodeKey(0, 3))).toBe(false);
+  // Leaves are independent: leaf 3 builds while leaf 2 is still summarizing,
+  // but the pair that needs leaf 2 waits for it.
+  expect(store.nodes.get(nodeKey(0, 3))?.text).toBe(leaf3);
+  expect(store.nodes.has(nodeKey(1, 1))).toBe(false);
 
   model.calls[0]!.resolve("[s2] short");
   await until(() => model.calls.length === 2, "merge 0+4");
-  expect(store.nodes.get(nodeKey(0, 3))?.text).toBe(leaf3);
   expect(store.nodes.get(nodeKey(1, 1))?.text).toBe(`[s2] short\n${leaf3}`);
   const merge = model.calls[1]!;
   // 40 + 1 + 31 bytes exceeds the target, so the top merge asks the model.
@@ -369,7 +428,7 @@ test("short sources become nodes verbatim without a model call, measured in UTF-
   expect(chatLines(merge.request.context)).toEqual([`0+1|${leaf0}`, `1+1|${leaf1}`, "2+1|[s2] short", `3+1|${leaf3}`]);
 });
 
-test("size enforcement trims only, cuts feedback at the limit, keeps the shortest try, and stops early", async () => {
+test("size enforcement trims whitespace, cuts feedback to the limit, keeps the whole shortest reply, and stops early", async () => {
   const store = await openStore();
   const model = new Model();
   const memory = memoryFor(store, model, { nodeBytes: 20, tries: 3, jobs: 1 });
@@ -394,11 +453,14 @@ test("size enforcement trims only, cuts feedback at the limit, keeps the shortes
 
   await until(() => model.calls.length === 3, "third try");
   const third = model.calls[2]!;
-  expect(third.request.feedback.map((turn) => turn.reply.trim())).toEqual(["x".repeat(30), "y".repeat(25)]);
-  expect(third.request.feedback[1]!.instruction).toContain(`\n${"y".repeat(20)}| ← LIMIT`);
+  // Only the latest try is replayed: the x30 reply is no longer in feedback.
+  expect(third.request.feedback.map((turn) => turn.reply)).toEqual(["y".repeat(25)]);
+  expect(third.request.feedback[0]!.instruction).toContain("25 bytes");
+  expect(third.request.feedback[0]!.instruction).toContain(`\n${"y".repeat(20)}| ← LIMIT`);
   third.resolve("z".repeat(27));
 
-  // All tries over the target: keep the shortest whole, not the last and not a cut.
+  // Every try overflowed the 20-byte target but fit the ceiling: the shortest
+  // whole reply (25 bytes) is kept intact, never cut.
   await until(() => store.nodes.has(nodeKey(0, 0)), "leaf 0 saved");
   expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("y".repeat(25));
 
@@ -432,119 +494,407 @@ test("feedback cuts on UTF-8 boundaries and the shortest try is measured in byte
 
   model.calls[1]!.resolve("abc🙂defgh"); // 12 bytes; byte 7 ends the emoji exactly
   await until(() => model.calls.length === 3, "third try");
-  const secondCut = model.calls[2]!.request.feedback[1]!.instruction;
+  expect(model.calls[2]!.request.feedback).toHaveLength(1); // latest try only
+  const secondCut = model.calls[2]!.request.feedback[0]!.instruction;
   expect(secondCut).toContain("12 bytes");
   expect(secondCut).toContain("\nabc🙂| ← LIMIT");
 
-  model.calls[2]!.resolve("abcdefgh"); // 8 bytes but 8 units: shortest only in bytes
+  // 8 bytes versus ééééé's 10 bytes (5 UTF-16 units): bytes decide, and the
+  // whole shortest reply is kept without cutting.
+  model.calls[2]!.resolve("abcdefgh");
   await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
   expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("abcdefgh");
 });
 
-test("a failed node reports once, holds its slot through fixed retry waits, and close cancels the wait", async () => {
+test("an unresolved early leaf stalls only its ancestors; the right subtree still completes", async () => {
   const store = await openStore();
-  for (let i = 0; i < 4; i++) store.append("user", `[m${i}] seeded long message`);
-  for (let i = 0; i < 4; i++) saveText(store, 0, i, summary(`s${i}`));
   const model = new Model();
-  const clock = new Clock();
+  const reports: string[] = [];
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16,
+    jobs: 3,
+    report: (message) => reports.push(message),
+  });
+  for (let i = 0; i < 4; i++) memory.append("user", `[m${i}] a long user message`);
+  await until(() => model.labels().join() === "[m0],[m1],[m2]", "three started leaves");
+  const early = model.take("[m0]");
+
+  model.take("[m1]").resolve(summary("s1"));
+  await until(() => model.labels().join() === "[m0],[m2],[m3]", "last leaf admitted");
+  model.take("[m2]").resolve(summary("s2"));
+  await until(() => store.nodes.has(nodeKey(0, 2)), "leaf 2 saved");
+  model.take("[m3]").resolve(summary("s3"));
+  await until(() => model.labels().join() === "[m0],[s2]+[s3]", "right parent starts");
+  model.take("[s2]", "[s3]").resolve(summary("p2-3"));
+  await until(() => store.nodes.has(nodeKey(1, 1)), "right parent saved");
+
+  // m0 is still unresolved: it holds one of the three slots and blocks every ancestor.
+  await until(() => memory.status().pending === 1, "only the early leaf in flight");
+  await macrotasks(3);
+  expect(early.settled).toBe(false);
+  expect(early.signal.aborted).toBe(false);
+  expect(model.labels()).toEqual(["[m0]"]);
+  expect(model.calls.map(label)).toEqual(["[m0]", "[m1]", "[m2]", "[m3]", "[s2]+[s3]"]);
+  expect([...store.nodes.keys()].sort()).toEqual([nodeKey(0, 1), nodeKey(0, 2), nodeKey(0, 3), nodeKey(1, 1)].sort());
+  expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
+  expect(store.nodes.has(nodeKey(1, 0))).toBe(false);
+  expect(store.nodes.has(nodeKey(2, 0))).toBe(false);
+  expect(store.nodes.get(nodeKey(1, 1))?.text).toBe(summary("p2-3"));
+
+  early.resolve(summary("s0"));
+  await until(() => model.labels().join() === "[s0]+[s1]", "left parent starts");
+  model.take("[s0]", "[s1]").resolve(summary("p0-1"));
+  await until(() => store.nodes.has(nodeKey(1, 0)), "left parent saved");
+  await until(() => model.labels().join() === "[p0-1]+[p2-3]", "root starts");
+  model.take("[p0-1]", "[p2-3]").resolve(summary("root"));
+  await until(() => store.nodes.has(nodeKey(2, 0)), "root saved");
+
+  expect(model.calls.map(label)).toEqual([
+    "[m0]",
+    "[m1]",
+    "[m2]",
+    "[m3]",
+    "[s2]+[s3]",
+    "[s0]+[s1]",
+    "[p0-1]+[p2-3]",
+  ]);
+  expect(model.open()).toEqual([]);
+  expect(model.peak).toBe(3);
+  expect(reports).toEqual([]);
+  expect([...store.nodes.keys()].sort()).toEqual([
+    nodeKey(0, 0),
+    nodeKey(0, 1),
+    nodeKey(0, 2),
+    nodeKey(0, 3),
+    nodeKey(1, 0),
+    nodeKey(1, 1),
+    nodeKey(2, 0),
+  ]);
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(summary("s0"));
+  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe(summary("s1"));
+  expect(store.nodes.get(nodeKey(0, 2))?.text).toBe(summary("s2"));
+  expect(store.nodes.get(nodeKey(0, 3))?.text).toBe(summary("s3"));
+  expect(store.nodes.get(nodeKey(1, 0))?.text).toBe(summary("p0-1"));
+  expect(store.nodes.get(nodeKey(1, 1))?.text).toBe(summary("p2-3"));
+  expect(store.nodes.get(nodeKey(2, 0))?.text).toBe(summary("root"));
+});
+
+test("five giant multilingual replies publish no node, and every request stays bounded", async () => {
+  const store = await openStore();
+  const giant = [
+    "é語🙂".repeat(10), // 90 bytes, 40 UTF-16 units
+    "語".repeat(22), // 66 bytes but only 22 UTF-16 units: bytes decide
+    "🙂".repeat(20), // 80 bytes
+    "é".repeat(40), // 80 bytes
+    "語".repeat(23), // 69 bytes
+  ];
+  let produced = 0;
+  const model = new Model({ auto: () => giant[produced++]! });
+  const reports: string[] = [];
+  // Ceiling = max(nodeBytes, pageBytes) = 64 bytes; every attempt is over it.
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16,
+    pageBytes: 64,
+    jobs: 1,
+    report: (message) => reports.push(message),
+  });
+  memory.append("echo", "x".repeat(20)); // "echo: " + 20 bytes: one page, over nodeBytes
+
+  // settle resolves false once the failed job is released: failure is reported before that wake.
+  expect(await memory.settle()).toBe(false);
+  // Exactly the default five attempts, then failure: no node and no sixth call.
+  expect(model.calls).toHaveLength(5);
+  expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
+  expect(reports).toHaveLength(1);
+  expect(reports[0]).toContain("no whole summary within the 64-byte safety ceiling");
+
+  const [first] = model.calls;
+  model.calls.forEach((call, k) => {
+    expect(utf8Bytes(call.request.context)).toBeLessThanOrEqual(36_096);
+    // Only feedback changes between attempts; the leaf instruction is identical.
+    expect(call.request.instruction).toBe(first!.request.instruction);
+    expect(utf8Bytes(call.request.instruction)).toBeLessThanOrEqual(64 + 2_048);
+    expect(call.request.feedback).toHaveLength(k === 0 ? 0 : 1);
+    for (const turn of call.request.feedback) {
+      // Feedback is a byte-bounded prefix of the previous giant reply, never the whole reply.
+      expect(giant[k - 1]!.startsWith(turn.reply)).toBe(true);
+      expect(utf8Bytes(turn.reply)).toBeLessThanOrEqual(64);
+      expect(turn.reply).not.toContain("\uFFFD");
+      expect(utf8Bytes(turn.instruction)).toBeLessThanOrEqual(16 + 512);
+      expect(turn.instruction).toContain("Previous reply excerpt only");
+      expect(turn.instruction).toContain("| ← LIMIT");
+    }
+  });
+});
+
+test("the shortest whole candidate survives later larger and oversized tries, uncut", async () => {
+  const store = await openStore();
+  const replies = [
+    "A".repeat(40), // whole candidate: over nodeBytes, under the 64-byte ceiling
+    "é".repeat(40), // 80 bytes: oversized, never a candidate
+    "B".repeat(30), // the new shortest
+    "語".repeat(30), // 90 bytes: oversized
+    "C".repeat(50), // longer than B: not kept
+  ];
+  let produced = 0;
+  const model = new Model({ auto: () => replies[produced++]! });
+  // Ceiling = max(nodeBytes, pageBytes) = 64 bytes.
+  const memory = memoryFor(store, model, { nodeBytes: 16, pageBytes: 64, jobs: 1 });
+  memory.append("echo", "x".repeat(20));
+  expect(await memory.settle()).toBe(true);
+
+  expect(model.calls).toHaveLength(5);
+  expect(store.nodes.get(nodeKey(0, 0))).toEqual({ l: 0, i: 0, text: "B".repeat(30), size: 30 });
+  // Feedback is always the latest try only, excerpted to the ceiling when oversized.
+  expect(model.calls[1]!.request.feedback.map((turn) => turn.reply)).toEqual(["A".repeat(40)]);
+  expect(model.calls[2]!.request.feedback.map((turn) => turn.reply)).toEqual(["é".repeat(32)]);
+  expect(model.calls[3]!.request.feedback.map((turn) => turn.reply)).toEqual(["B".repeat(30)]);
+  expect(model.calls[4]!.request.feedback.map((turn) => turn.reply)).toEqual(["語".repeat(21)]);
+});
+
+test("a failed branch stalls only its own subtree; independent branches keep building", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const reports: string[] = [];
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16,
+    jobs: 8,
+    report: (message) => reports.push(message),
+  });
+  for (let i = 0; i < 4; i++) memory.append("user", `[m${i}] a long user message`);
+  await until(() => model.open().length === 4, "four leaves");
+
+  model.take("[m0]").reject(new Error("provider down"));
+  for (const i of [1, 2, 3]) model.take(`[m${i}]`).resolve(summary(`s${i}`));
+  await until(() => model.labels().join() === "[s2]+[s3]", "right-branch pair");
+  model.take("[s2]", "[s3]").resolve(summary("p2-3"));
+  await until(() => store.nodes.has(nodeKey(1, 1)), "right branch parent");
+
+  // Nothing can run until the next append: the left branch is stalled, not waiting.
+  await until(() => memory.status().pending === 0 && model.open().length === 0, "quiet");
+  expect(model.calls.map(label)).toEqual(["[m0]", "[m1]", "[m2]", "[m3]", "[s2]+[s3]"]);
+  expect([...store.nodes.keys()].sort()).toEqual([nodeKey(0, 1), nodeKey(0, 2), nodeKey(0, 3), nodeKey(1, 1)].sort());
+  expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
+  expect(store.nodes.has(nodeKey(1, 0))).toBe(false);
+  expect(store.nodes.has(nodeKey(2, 0))).toBe(false);
+  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe(summary("s1"));
+  expect(store.nodes.get(nodeKey(0, 2))?.text).toBe(summary("s2"));
+  expect(store.nodes.get(nodeKey(0, 3))?.text).toBe(summary("s3"));
+  expect(store.nodes.get(nodeKey(1, 1))?.text).toBe(summary("p2-3"));
+  const settled = track(memory.settle());
+  await until(() => settled.done, "settle with a stalled left branch");
+  expect(settled.value).toBe(false);
+  await macrotasks(3);
+  expect(model.calls).toHaveLength(5);
+  expect(model.open()).toEqual([]);
+  expect(reports).toEqual(["OptChat compaction failed at 0+1; retrying on the next appended message: provider down"]);
+});
+
+test("a failed call releases the only job slot to queued work without retrying until append", async () => {
+  const store = await openStore();
+  const model = new Model();
   const reports: string[] = [];
   const memory = memoryFor(store, model, {
     nodeBytes: 16,
     jobs: 1,
-    retryMs: 1_234,
-    wait: clock.wait,
-    report: (message) => reports.push(message),
-  });
-
-  await until(() => model.open().length === 1, "merge 0+2");
-  model.take("[s0]", "[s1]").reject(new Error("provider down"));
-  await until(() => clock.waits.length === 1, "first retry wait");
-  await flush();
-  expect(reports).toHaveLength(1);
-  expect(reports[0]).toContain("provider down");
-  expect(clock.waits[0]!.ms).toBe(1_234);
-  expect(memory.status().pending).toBe(1);
-  expect(model.calls).toHaveLength(1); // 2+2 is ready but the waiting retry holds the only slot
-
-  clock.waits[0]!.release();
-  await until(() => model.open().length === 1, "second try");
-  model.take("[s0]", "[s1]").resolve("  \n "); // empty after trim: a failure, not a node
-  await until(() => clock.waits.length === 2, "second retry wait");
-  await flush();
-  expect(reports).toHaveLength(1);
-  expect(clock.waits[1]!.ms).toBe(1_234);
-  expect(store.nodes.has(nodeKey(1, 0))).toBe(false);
-
-  clock.waits[1]!.release();
-  await until(() => model.open().length === 1, "third try");
-  model.take("[s0]", "[s1]").resolve(summary("p0-1"));
-  await until(() => store.nodes.has(nodeKey(1, 0)), "merge 0+2 saved");
-  await until(() => model.open().length === 1, "merge 2+2");
-  model.take("[s2]", "[s3]").reject(new Error("second node down"));
-  await until(() => clock.waits.length === 3, "retry wait for 2+2");
-  await flush();
-  expect(reports).toHaveLength(2);
-  expect(reports[1]).toContain("second node down");
-  expect(clock.waits.map((wait) => wait.ms)).toEqual([1_234, 1_234, 1_234]);
-
-  const calls = model.calls.length;
-  const closing = track(memory.close());
-  await until(() => closing.done, "close to cancel the retry wait");
-  expect(closing.error).toBeUndefined();
-  expect(clock.waits[2]!.signal.aborted).toBe(true);
-  await flush();
-  expect(model.calls).toHaveLength(calls);
-  expect(store.nodes.has(nodeKey(1, 1))).toBe(false);
-  expect(memory.status().pending).toBe(0);
-  expect(reports).toHaveLength(2);
-});
-
-test("close cancels a real retry timer instead of waiting it out", async () => {
-  const store = await openStore();
-  const model = new Model();
-  const reports: string[] = [];
-  const memory = memoryFor(store, model, {
-    nodeBytes: 16,
-    retryMs: 2_147_483_647,
     report: (message) => reports.push(message),
   });
   memory.append("user", "[m0] a long user message");
-  await until(() => model.open().length === 1, "leaf call");
-  model.take("[m0]").reject(new Error("offline"));
-  await until(() => reports.length === 1, "failure report");
-  await flush();
-  expect(memory.status().pending).toBe(1);
+  await until(() => model.calls.length === 1, "first leaf call");
+  expect(model.calls.map(label)).toEqual(["[m0]"]);
 
-  const closing = track(memory.close());
-  await until(() => closing.done, "close despite a 24-day retry timer");
-  expect(model.calls).toHaveLength(1);
+  // Let the append's pump admit m1 while m0 still owns the only job slot.
+  memory.append("talk", "[m1] a second long message");
+  await flush();
+  expect(store.messages).toHaveLength(2);
+  expect(model.calls.map(label)).toEqual(["[m0]"]);
+  expect(model.labels()).toEqual(["[m0]"]);
+  expect(store.nodes.has(nodeKey(0, 1))).toBe(false);
+  model.take("[m0]").reject(new Error("offline"));
+
+  // The failed job's own pump starts m1; no append or settle is involved.
+  await until(() => model.calls.length === 2, "queued m1 starts after m0 fails");
+  expect(model.calls.map(label)).toEqual(["[m0]", "[m1]"]);
+  expect(model.labels()).toEqual(["[m1]"]);
+  expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
+  model.take("[m1]").resolve(summary("s1"));
+  await until(() => store.nodes.has(nodeKey(0, 1)), "queued leaf saved");
+  const stalled = track(memory.settle());
+  await until(() => stalled.done, "failed branch settles without work");
+  expect(stalled.error).toBeUndefined();
+  expect(stalled.value).toBe(false);
+  await macrotasks(5);
+  expect(model.calls.map(label)).toEqual(["[m0]", "[m1]"]);
+  expect(model.open()).toEqual([]);
+  expect(memory.status().pending).toBe(0);
+  expect([...store.nodes.keys()]).toEqual([nodeKey(0, 1)]);
+  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe(summary("s1"));
+  expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
+  expect(store.nodes.has(nodeKey(1, 0))).toBe(false);
+  expect(reports).toHaveLength(1);
+  expect(reports[0]).toContain("offline");
+
+  // Append enqueues failed m0 before admitting m2; its parent queues behind m2.
+  memory.append("user", "[m2] a third long message");
+  await until(() => model.calls.length === 3, "m0 retry on new append");
+  expect(model.calls.map(label)).toEqual(["[m0]", "[m1]", "[m0]"]);
+  expect(model.labels()).toEqual(["[m0]"]);
+  model.take("[m0]").resolve(summary("s0"));
+  await until(() => model.calls.length === 4, "m2 precedes newly ready parent");
+  expect(model.calls.map(label)).toEqual(["[m0]", "[m1]", "[m0]", "[m2]"]);
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(summary("s0"));
+  model.take("[m2]").resolve(summary("s2"));
+  await until(() => model.calls.length === 5, "left parent starts after m2");
+  expect(model.calls.map(label)).toEqual(["[m0]", "[m1]", "[m0]", "[m2]", "[s0]+[s1]"]);
+  model.take("[s0]", "[s1]").resolve(summary("p0-1"));
+  await until(() => store.nodes.has(nodeKey(1, 0)), "left parent saved");
+  const recovered = track(memory.settle());
+  await until(() => recovered.done, "three-leaf recovery settles");
+  expect(recovered.error).toBeUndefined();
+  expect(recovered.value).toBe(true);
+  await macrotasks(5);
+  expect(model.calls.map(label)).toEqual(["[m0]", "[m1]", "[m0]", "[m2]", "[s0]+[s1]"]);
+  expect([...store.nodes].map(([key, node]) => [key, node.text]).sort()).toEqual([
+    [nodeKey(0, 0), summary("s0")],
+    [nodeKey(0, 1), summary("s1")],
+    [nodeKey(0, 2), summary("s2")],
+    [nodeKey(1, 0), summary("p0-1")],
+  ].sort());
+  expect(model.open()).toEqual([]);
+  expect(memory.status().pending).toBe(0);
+  expect(model.peak).toBe(1);
+  expect(reports).toHaveLength(1);
 });
 
-test("an unprintable rejection is still reported and retried", async () => {
+test("repeated failures retry only on distinct appends, report once, and recover the complete tree", async () => {
   const store = await openStore();
   const model = new Model();
-  const clock = new Clock();
   const reports: string[] = [];
   const memory = memoryFor(store, model, {
     nodeBytes: 16,
-    retryMs: 777,
-    wait: clock.wait,
+    jobs: 1,
+    report: (message) => reports.push(message),
+  });
+  memory.append("user", "[m0] a long user message");
+  await until(() => model.calls.length === 1, "initial m0 call");
+  expect(model.calls.map(label)).toEqual(["[m0]"]);
+  model.take("[m0]").reject(new Error("offline initially"));
+  const initial = track(memory.settle());
+  await until(() => initial.done, "initial failure settles");
+  expect(initial.error).toBeUndefined();
+  expect(initial.value).toBe(false);
+  await macrotasks(5);
+  expect(model.calls.map(label)).toEqual(["[m0]"]);
+  expect(model.open()).toEqual([]);
+  expect(memory.status().pending).toBe(0);
+  expect(store.nodes.size).toBe(0);
+  expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
+  expect(store.nodes.has(nodeKey(1, 0))).toBe(false);
+  expect(reports).toHaveLength(1);
+  expect(reports[0]).toContain("offline initially");
+
+  for (const { i, history } of [
+    { i: 1, history: ["[m0]", "[m0]", "[m1]"] },
+    { i: 2, history: ["[m0]", "[m0]", "[m1]", "[m0]", "[m2]"] },
+  ]) {
+    memory.append("user", `[m${i}] another long user message`);
+    await until(() => model.calls.length === history.length - 1, `m0 retry before m${i}`);
+    expect(model.calls.map(label)).toEqual(history.slice(0, -1));
+    expect(model.labels()).toEqual(["[m0]"]);
+    model.take("[m0]").reject(new Error(`offline again on append ${i}`));
+    await until(() => model.calls.length === history.length, `unrelated m${i} starts after retry failure`);
+    expect(model.calls.map(label)).toEqual(history);
+    expect(model.labels()).toEqual([`[m${i}]`]);
+    model.take(`[m${i}]`).resolve(summary(`s${i}`));
+    await until(() => store.nodes.has(nodeKey(0, i)), `unrelated leaf ${i} saved`);
+    const stalled = track(memory.settle());
+    await until(() => stalled.done, `retry failure ${i} settles`);
+    expect(stalled.error).toBeUndefined();
+    expect(stalled.value).toBe(false);
+    await macrotasks(5);
+    expect(model.calls.map(label)).toEqual(history);
+    expect(model.open()).toEqual([]);
+    expect(memory.status().pending).toBe(0);
+    expect([...store.nodes.keys()].sort()).toEqual(
+      (i === 1 ? [nodeKey(0, 1)] : [nodeKey(0, 1), nodeKey(0, 2)]).sort(),
+    );
+    for (let leaf = 1; leaf <= i; leaf++) {
+      expect(store.nodes.get(nodeKey(0, leaf))?.text).toBe(summary(`s${leaf}`));
+    }
+    expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
+    expect(store.nodes.has(nodeKey(1, 0))).toBe(false);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toContain("offline initially");
+  }
+
+  memory.append("talk", "[m3] a fourth long message");
+  const history = ["[m0]", "[m0]", "[m1]", "[m0]", "[m2]", "[m0]"];
+  await until(() => model.calls.length === history.length, "successful m0 retry on fourth append");
+  expect(model.calls.map(label)).toEqual(history);
+  expect(model.labels()).toEqual(["[m0]"]);
+  model.take("[m0]").resolve(summary("s0"));
+
+  // Saving m0 queues the left parent behind m3; saving m3 queues the right
+  // parent behind the left. Only saving both parents makes the root ready.
+  for (const { call, reply, l, i } of [
+    { call: "[m3]", reply: "s3", l: 0, i: 3 },
+    { call: "[s0]+[s1]", reply: "p0-1", l: 1, i: 0 },
+    { call: "[s2]+[s3]", reply: "p2-3", l: 1, i: 1 },
+    { call: "[p0-1]+[p2-3]", reply: "p0-3", l: 2, i: 0 },
+  ]) {
+    history.push(call);
+    await until(() => model.calls.length === history.length, `FIFO recovery call ${call}`);
+    expect(model.calls.map(label)).toEqual(history);
+    expect(model.labels()).toEqual([call]);
+    model.calls[history.length - 1]!.resolve(summary(reply));
+    await until(() => store.nodes.has(nodeKey(l, i)), `recovery node ${l}:${i} saved`);
+    expect(store.nodes.get(nodeKey(l, i))?.text).toBe(summary(reply));
+    expect(reports).toHaveLength(1);
+  }
+  const recovered = track(memory.settle());
+  await until(() => recovered.done, "complete four-leaf tree settles");
+  expect(recovered.error).toBeUndefined();
+  expect(recovered.value).toBe(true);
+  await macrotasks(5);
+  expect(model.calls.map(label)).toEqual([
+    "[m0]", "[m0]", "[m1]", "[m0]", "[m2]", "[m0]", "[m3]",
+    "[s0]+[s1]", "[s2]+[s3]", "[p0-1]+[p2-3]",
+  ]);
+  expect([...store.nodes].map(([key, node]) => [key, node.text]).sort()).toEqual([
+    [nodeKey(0, 0), summary("s0")],
+    [nodeKey(0, 1), summary("s1")],
+    [nodeKey(0, 2), summary("s2")],
+    [nodeKey(0, 3), summary("s3")],
+    [nodeKey(1, 0), summary("p0-1")],
+    [nodeKey(1, 1), summary("p2-3")],
+    [nodeKey(2, 0), summary("p0-3")],
+  ].sort());
+  expect(model.open()).toEqual([]);
+  expect(memory.status().pending).toBe(0);
+  expect(model.peak).toBe(1);
+  expect(reports).toHaveLength(1);
+  expect(reports[0]).toContain("offline initially");
+});
+
+test("an unprintable rejection is reported and retried on the next append", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const reports: string[] = [];
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16,
     report: (message) => reports.push(message),
   });
   memory.append("user", "[m0] a long user message");
   await until(() => model.open().length === 1, "leaf call");
   model.take("[m0]").reject(Object.create(null)); // String() of it throws
-  await until(() => clock.waits.length === 1, "retry wait");
-  expect(reports).toHaveLength(1);
+  await until(() => reports.length === 1, "failure report");
   expect(reports[0]).toContain("unprintable error");
-  expect(clock.waits[0]!.ms).toBe(777);
 
-  clock.waits[0]!.release();
-  await until(() => model.open().length === 1, "retry call");
+  memory.append("talk", "[m1] a second long message");
+  await until(() => model.open().some((call) => label(call) === "[m0]"), "retry call");
   model.take("[m0]").resolve(summary("s0"));
   await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
   expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(summary("s0"));
-  expect(model.calls).toHaveLength(2);
 });
 
 test("an async reporter's rejection is contained and the retry proceeds", async () => {
@@ -554,11 +904,9 @@ test("an async reporter's rejection is contained and the retry proceeds", async 
   try {
     const store = await openStore();
     const model = new Model();
-    const clock = new Clock();
     let reported = 0;
     const memory = memoryFor(store, model, {
       nodeBytes: 16,
-      wait: clock.wait,
       report: async () => {
         reported++;
         throw new Error("reporter down");
@@ -567,18 +915,15 @@ test("an async reporter's rejection is contained and the retry proceeds", async 
     memory.append("user", "[m0] a long user message");
     await until(() => model.open().length === 1, "leaf call");
     model.take("[m0]").reject(new Error("offline"));
-    await until(() => clock.waits.length === 1, "retry wait");
-    await flush();
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(reported).toBe(1);
+    await until(() => reported === 1, "report");
+    await macrotasks(2);
     expect(unhandled).toEqual([]);
 
-    clock.waits[0]!.release();
-    await until(() => model.open().length === 1, "retry call");
+    memory.append("talk", "[m1] a second long message");
+    await until(() => model.open().some((call) => label(call) === "[m0]"), "retry call");
     model.take("[m0]").resolve(summary("s0"));
     await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
-    expect(model.calls).toHaveLength(2);
+    await macrotasks(2);
     expect(unhandled).toEqual([]);
   } finally {
     process.off("unhandledRejection", listener);
@@ -589,11 +934,9 @@ for (const mode of ["discards", "returns"] as const) {
   test(`a reporter that ${mode} memory.close() does not deadlock the failing job`, async () => {
     const store = await openStore();
     const model = new Model();
-    const clock = new Clock();
     const reporter: { closing?: Tracked<void> } = {};
     const memory: Memory = memoryFor(store, model, {
       nodeBytes: 16,
-      wait: clock.wait,
       report: () => {
         const promise = memory.close();
         reporter.closing = track(promise);
@@ -606,8 +949,6 @@ for (const mode of ["discards", "returns"] as const) {
 
     await until(() => reporter.closing?.done === true, "close started inside the reporter");
     expect(reporter.closing?.error).toBeUndefined();
-    await flush();
-    expect(clock.waits.every((wait) => wait.signal.aborted)).toBe(true);
     expect(model.calls).toHaveLength(1);
     expect(store.nodes.size).toBe(0);
     expect(memory.status().pending).toBe(0);
@@ -728,6 +1069,84 @@ test("restart restores the persisted live tiling instead of replaying today's co
   expect(restoredStore.viewSnapshot?.parts).toEqual([[2, 0], [0, 4]]);
 });
 
+test("restart reproduces the compactor context of the next summary exactly", async () => {
+  const store = await openStore();
+  seedTree(store, 8);
+  const reports: string[] = [];
+  const options: MemoryOptions = {
+    nodeBytes: 16,
+    viewBytes: 1_000,
+    compactionViewBytes: 60,
+    report: (message) => reports.push(message),
+  };
+  const model = new Model();
+  const memory = memoryFor(store, model, options);
+  memory.append("user", "[m8] next long message");
+  await until(() => model.open().length === 1, "leaf 8");
+  model.take("[m8]").resolve(summary("s8"));
+  await until(() => store.nodes.has(nodeKey(0, 8)), "leaf 8 saved");
+  memory.append("talk", "[m9] another long message");
+  await until(() => model.open().length === 1, "leaf 9");
+  model.take("[m9]").resolve(summary("s9"));
+  await until(() => store.nodes.has(nodeKey(0, 9)), "leaf 9 saved");
+  await until(() => model.open().some((call) => label(call) === "[s8]+[s9]"), "pair 8+2");
+  model.take("[s8]", "[s9]").resolve(summary("p8-9"));
+  await until(() => store.nodes.has(nodeKey(1, 4)) && memory.status().pending === 0, "pair 8+2 saved and quiet");
+  expect(store.nodes.has(nodeKey(3, 0))).toBe(true);
+  expect(store.nodes.has(nodeKey(1, 4))).toBe(true);
+
+  memory.append("user", "[m10] another long user message");
+  await until(() => model.open().some((call) => label(call) === "[m10]"), "leaf 10");
+  const leaf = model.take("[m10]");
+  const before = leaf.request.context;
+  expect(chatLines(before)).toEqual([
+    `0+4|${summary("n2-0")}`,
+    `4+4|${summary("n2-1")}`,
+    `8+1|${summary("s8")}`,
+    `9+1|${summary("s9")}`,
+  ]);
+  const beforeAddresses = chatLines(before).map((line) => line.slice(0, line.indexOf("|")));
+  expect(beforeAddresses).toEqual(["0+4", "4+4", "8+1", "9+1"]);
+  expect(beforeAddresses).not.toEqual(["0+8", "8+2"]);
+  expect(contextBytes(before)).toBe(48);
+  expect(contextBytes(before)).toBeLessThan(60);
+
+  const calls = model.calls.length;
+  const failure = new Error("leaf 10 restart-context regression failure");
+  leaf.reject(failure);
+  await until(
+    () => reports.some((message) => message.includes(failure.message)) && memory.status().pending === 0,
+    "leaf 10 failure reported and quiet",
+  );
+  await macrotasks(5);
+  expect(model.calls.filter((call) => label(call) === "[m10]")).toHaveLength(1);
+  expect(model.calls).toHaveLength(calls);
+  expect(model.open()).toHaveLength(0);
+  expect(store.nodes.has(nodeKey(0, 10))).toBe(false);
+  const rendered = memory.render();
+  await memory.close();
+
+  const restoredStore = await reopen(store);
+  const restoredModel = new Model();
+  const restored = memoryFor(restoredStore, restoredModel, options);
+  await until(() => restoredModel.open().some((call) => label(call) === "[m10]"), "restored leaf 10");
+  const retry = restoredModel.take("[m10]");
+  expect(retry.request.context).toBe(before);
+  expect(chatLines(retry.request.context)).toEqual([
+    `0+4|${summary("n2-0")}`,
+    `4+4|${summary("n2-1")}`,
+    `8+1|${summary("s8")}`,
+    `9+1|${summary("s9")}`,
+  ]);
+  const retryAddresses = chatLines(retry.request.context).map((line) => line.slice(0, line.indexOf("|")));
+  expect(retryAddresses).toEqual(["0+4", "4+4", "8+1", "9+1"]);
+  expect(retryAddresses).not.toEqual(["0+8", "8+2"]);
+  expect(restored.render()).toBe(rendered);
+  retry.resolve(summary("s10"));
+  await until(() => restoredStore.nodes.has(nodeKey(0, 10)), "retried leaf 10 saved");
+  expect(restoredStore.nodes.get(nodeKey(0, 10))?.text).toBe(summary("s10"));
+});
+
 test("a stale snapshot preserves its coarse prefix and admits only the durable message suffix", async () => {
   const store = await openStore();
   seedTree(store, 4);
@@ -820,7 +1239,13 @@ test("a store without a snapshot migrates once from the complete tree and persis
   const memory = memoryFor(store, model, { viewBytes: 50 });
   expect(addresses(memory)).toEqual(["0+8", "8+2"]);
   expect(memory.status().viewBytes).toBe(24);
-  expect(store.viewSnapshot).toEqual({ version: 1, length: 10, parts: [[3, 0], [1, 4]], compacting: false });
+  expect(store.viewSnapshot).toEqual({
+    version: 2,
+    length: 10,
+    parts: [[3, 0], [1, 4]],
+    compacting: false,
+    compactor: { length: 10, parts: [[3, 0], [1, 4]], compacting: false },
+  });
   await flush();
   expect(model.calls).toHaveLength(0);
   await memory.close();
@@ -829,6 +1254,34 @@ test("a store without a snapshot migrates once from the complete tree and persis
   const restored = memoryFor(restoredStore, new Model(), { viewBytes: 1_000 });
   expect(addresses(restored)).toEqual(["0+8", "8+2"]);
   expect(restored.status().viewBytes).toBe(24);
+});
+
+test("a legacy version-1 snapshot keeps its main tiling and gains a compactor exactly once", async () => {
+  const seeded = await openStore();
+  seedTree(seeded, 4);
+  const directory = seeded.directory;
+  await seeded.close();
+  // Legacy stores have no compactor: write the version-1 file they would hold.
+  await writeFile(
+    join(directory, "view.json"),
+    `${JSON.stringify({ version: 1, length: 4, parts: [[2, 0]], compacting: false })}\n`,
+    { mode: 0o600 },
+  );
+
+  const store = await openAt(directory);
+  const memory = memoryFor(store, new Model(), { nodeBytes: 16, viewBytes: 1_000 });
+  expect(addresses(memory)).toEqual(["0+4"]);
+  expect(store.viewSnapshot).toEqual({
+    version: 2,
+    length: 4,
+    parts: [[2, 0]],
+    compacting: false,
+    compactor: { length: 4, parts: [[2, 0]], compacting: false },
+  });
+  await memory.close();
+
+  const restored = memoryFor(await reopen(store), new Model(), { nodeBytes: 16, viewBytes: 1_000 });
+  expect(addresses(restored)).toEqual(["0+4"]);
 });
 
 test("last-message age at T10 prefers 8+1|9+1 over 0+4|4+4", async () => {
@@ -871,6 +1324,7 @@ test("main bytes sawtooth from upper to half and available parents do not retile
   };
 
   await appendAndFinish(8);
+  expect(store.nodes.get(nodeKey(0, 8))?.text).toBe("l".repeat(10));
   expect(addresses(memory)).toEqual(["0+8", "8+1"]);
   expect(memory.status().viewBytes).toBe(16);
   const growth: number[] = [];
@@ -977,7 +1431,8 @@ test("default compactor context grows through 32000 bytes before a batch returns
   const store = await openStore();
   seedTree(store, 2, (l, i) => `[n${l}-${i}]`.padEnd(l === 0 ? 16_000 : 8_000, "."));
   const model = new Model();
-  const memory = memoryFor(store, model, { nodeBytes: 16_000 });
+  // Keep the 24,001-byte pair in one request: this fixture exercises tiling, not paging.
+  const memory = memoryFor(store, model, { nodeBytes: 16_000, pageBytes: 32_768 });
   const append = (i: number) => memory.append("user", `[m${i}] ${"x".repeat(16_001)}`);
   append(2);
   await until(() => model.open().length === 1, "leaf 2");
@@ -1037,13 +1492,35 @@ test("view budget counts UTF-8 bytes of summaries, not UTF-16 units", async () =
   expect(roomy.status().viewBytes).toBe(40);
 });
 
-test("zoom validates addresses and returns whole messages or both child lines; date is local time", async () => {
+test("zoom of one message returns bounded byte pages whose cursor reassembles the exact source", async () => {
   const store = await openStore();
   const big = Array.from({ length: 1_500 }, (_, k) => `línea ${k}: résumé 🙂 payload`).join("\n");
-  expect(big.length).toBeGreaterThan(30_000);
+  store.append("user", big);
+  const memory = memoryFor(store, new Model(), { nodeBytes: 16 });
+
+  const pages: string[] = [];
+  let offset = 0;
+  for (let guard = 0; guard < 100; guard++) {
+    const page = memory.zoom(0, 1, offset);
+    expect(page.offset).toBe(offset);
+    expect(page.totalBytes).toBe(utf8Bytes(big));
+    expect(utf8Bytes(page.text)).toBeLessThanOrEqual(16_384);
+    pages.push(page.text);
+    if (page.next === null) break;
+    expect(page.next).toBeGreaterThan(offset);
+    offset = page.next;
+  }
+  expect(pages.length).toBeGreaterThan(1);
+  expect(pages.join("")).toBe(big);
+  // A cursor inside a code point is an invalid boundary, not a replacement character.
+  expect(() => memory.zoom(0, 1, 2)).toThrow();
+});
+
+test("zoom returns whole short messages and both children for n>1; offsets apply only to n=1", async () => {
+  const store = await openStore();
   const dates = Array.from({ length: 6 }, (_, i) => new Date(2026, 0, 2 + i, 3, 4, 5, 6));
   const messages = [
-    ["user", big],
+    ["user", "short user"],
     ["talk", "short reply"],
     ["tool", "read file"],
     ["echo", "file body"],
@@ -1061,12 +1538,23 @@ test("zoom validates addresses and returns whole messages or both child lines; d
   saveText(store, 2, 0, "quad zero to three");
   const memory = memoryFor(store, new Model(), { nodeBytes: 16 });
 
-  expect(memory.zoom(0, 1)).toBe(`0+0|user: ${big}`);
-  expect(memory.zoom(1, 1)).toBe("1+0|talk: short reply");
-  expect(memory.zoom(5, 1)).toBe("5+0|user: [m5] unsummarized tail message");
-  expect(memory.zoom(0, 2)).toBe("0+1|user: digest second line\n1+1|leaf one");
-  expect(memory.zoom(2, 2)).toBe("2+1|leaf two\n3+1|leaf three");
-  expect(memory.zoom(0, 4)).toBe("0+2|pair zero one\n2+2|pair two three");
+  expect(memory.zoom(1, 1)).toEqual({ text: "short reply", next: null, totalBytes: 11, offset: 0 });
+  expect(memory.zoom(5, 1)).toEqual({
+    text: "[m5] unsummarized tail message",
+    next: null,
+    totalBytes: utf8Bytes("[m5] unsummarized tail message"),
+    offset: 0,
+  });
+  expect(memory.zoom(0, 2)).toEqual({
+    text: "0+1|user: digest second line\n1+1|leaf one",
+    next: null,
+    totalBytes: utf8Bytes("0+1|user: digest second line\n1+1|leaf one"),
+    offset: 0,
+  });
+  expect(memory.zoom(2, 2).text).toBe("2+1|leaf two\n3+1|leaf three");
+  expect(memory.zoom(0, 4).text).toBe("0+2|pair zero one\n2+2|pair two three");
+  expect(() => memory.zoom(0, 2, 1)).toThrow("offset applies only to single-message zoom");
+
   const invalid: Array<[number, number]> = [
     [4, 2], // message 5 has no summary yet
     [0, 8],
@@ -1080,8 +1568,20 @@ test("zoom validates addresses and returns whole messages or both child lines; d
     [2, 4],
     [1, 2],
   ];
-  for (const [id, n] of invalid) expect(memory.zoom(id, n)).toBe(`No line ${id}+${n}.`);
+  for (const [id, n] of invalid) expect(() => memory.zoom(id, n)).toThrow(`No line ${id}+${n}.`);
 
   dates.forEach((date, i) => expect(memory.date(i)).toBe(date.toLocaleString()));
   for (const id of [-1, 6, 0.5]) expect(memory.date(id)).toBe(`No message ${id}.`);
+});
+
+test("append forwards work metadata to the stored record and it survives restart", async () => {
+  const store = await openStore();
+  const memory = memoryFor(store, new Model(), { nodeBytes: 16 });
+  const metadata = { work: { source: "task", completeness: "full", id: "w1" } } as const;
+  const message = memory.append("work", "done", undefined, metadata);
+  expect(message.metadata).toEqual(metadata);
+  await memory.close();
+
+  const restored = await reopen(store);
+  expect(restored.messages[message.i]!.metadata).toEqual(metadata);
 });

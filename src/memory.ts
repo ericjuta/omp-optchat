@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
+import { DEFAULT_PAGE_BYTES, MAX_PAGE_BYTES, readTextPage, type MessageMetadata } from "./archive.js";
 import { RULER } from "./prompts.js";
-import { nodeKey, type Kind, type Message, Store, type TreeNode } from "./store.js";
+import { nodeKey, type Kind, type Message, Store, type TreeNode, type ViewSnapshot } from "./store.js";
 
 export interface CompactionRequest {
   context: string;
@@ -18,12 +19,11 @@ export interface MemoryOptions {
   viewBytes?: number;
   /** Upper compactor-context threshold; each batch targets half this size. */
   compactionViewBytes?: number;
+  /** Source bytes per summarization page of an over-long node; 4..32768. */
+  pageBytes?: number;
   jobs?: number;
   tries?: number;
-  retryMs?: number;
   report?: (message: string) => void;
-  /** Injectable retry clock; implementations must settle when signal aborts. */
-  wait?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
 export interface ViewPart {
@@ -31,10 +31,30 @@ export interface ViewPart {
   readonly i: number;
 }
 
+/** Structured zoom result. `next` is the byte offset of the following page, or null. */
+export interface ZoomPage {
+  readonly text: string;
+  readonly next: number | null;
+  readonly totalBytes: number;
+  readonly offset: number;
+}
+
 interface Job {
   controller: AbortController;
   done: Promise<void>;
 }
+
+interface Compactor {
+  /** Messages covered by `parts`; always a prefix of the built view. */
+  length: number;
+  parts: ViewPart[];
+  bytes: number;
+  pending: boolean;
+}
+
+/** Level-0 nodes admitted but not yet built, at most this many, regardless of `jobs`. */
+const ADMISSION_WINDOW = 8;
+const MIN_PAGE_BYTES = 4;
 
 export const utf8Bytes = (text: string): number => Buffer.byteLength(text, "utf8");
 
@@ -44,16 +64,59 @@ export function utf8Prefix(text: string, budget: number): string {
     throw new RangeError("UTF-8 budget must be a nonnegative safe integer");
   }
   if (utf8Bytes(text) <= budget) return text;
-  const bytes = Buffer.from(text, "utf8");
-  let end = budget;
-  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--;
+  // One UTF-16 code unit needs at least one UTF-8 byte. Encoding only this
+  // bounded prefix avoids copying a huge rejected provider reply into feedback.
+  let units = Math.min(text.length, budget);
+  const last = text.charCodeAt(units - 1);
+  if (units < text.length && last >= 0xd800 && last <= 0xdbff) units--;
+  const bytes = Buffer.from(text.slice(0, units), "utf8");
+  let end = Math.min(budget, bytes.length);
+  while (end > 0 && end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
   return bytes.subarray(0, end).toString("utf8");
+}
+
+/** Greedy packing of bounded summaries, including their separating newlines. */
+function pack(items: readonly string[], budget: number): string[][] {
+  const groups: string[][] = [];
+  let group: string[] = [];
+  let bytes = 0;
+  for (const item of items) {
+    const size = utf8Bytes(item);
+    if (group.length > 0 && bytes + 1 + size > budget) {
+      groups.push(group);
+      group = [];
+      bytes = 0;
+    }
+    bytes += size + (group.length > 0 ? 1 : 0);
+    group.push(item);
+  }
+  if (group.length > 0) groups.push(group);
+  return groups;
 }
 
 const PLACEHOLDER = "(not summarized yet: zoom it)";
 const PLACEHOLDER_BYTES = utf8Bytes(PLACEHOLDER);
 const flatten = (text: string): string => text.replace(/\r\n|\r|\n/g, " ");
 const chat = (lines: string[]): string => ["<chat>", ...lines, "</chat>"].join("\n");
+
+function samePairs(
+  a: ReadonlyArray<readonly [number, number]>,
+  b: ReadonlyArray<readonly [number, number]>,
+): boolean {
+  if (a.length !== b.length) return false;
+  return a.every(([l, i], j) => l === b[j]![0] && i === b[j]![1]);
+}
+
+/** Whether the committed snapshot already equals the one about to be written. */
+function sameSnapshot(saved: Store["viewSnapshot"], next: ViewSnapshot): boolean {
+  if (!saved || !("compactor" in saved)) return false;
+  return saved.length === next.length &&
+    saved.compacting === next.compacting &&
+    samePairs(saved.parts, next.parts) &&
+    saved.compactor.length === next.compactor.length &&
+    saved.compactor.compacting === next.compactor.compacting &&
+    samePairs(saved.compactor.parts, next.compactor.parts);
+}
 
 function positive(value: number | undefined, fallback: number, name: string): number {
   const result = value ?? fallback;
@@ -63,22 +126,15 @@ function positive(value: number | undefined, fallback: number, name: string): nu
   return result;
 }
 
-function delay(ms: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.resolve();
-  const { promise, resolve } = Promise.withResolvers<void>();
-  const finish = () => {
-    clearTimeout(timer);
-    signal.removeEventListener("abort", finish);
-    resolve();
-  };
-  const timer = setTimeout(finish, ms);
-  signal.addEventListener("abort", finish, { once: true });
-  return promise;
-}
-
 /**
  * An append-only binary summary tree with a live, never-split view. Store owns
  * durability; call close() before closing Store, even after a cancelled turn.
+ *
+ * Scheduling: a level-0 leaf is admitted while fewer than ADMISSION_WINDOW
+ * admitted leaves are unbuilt. Higher nodes enter the ready queue when both
+ * children are built, so out-of-order parents never wait on unrelated branches.
+ * A failed call releases its job slot and is retried only when the next message
+ * is appended; no timers are used.
  */
 export class Memory {
   private readonly nodeBytes: number;
@@ -86,25 +142,32 @@ export class Memory {
   private readonly target: number;
   private readonly compactionBudget: number;
   private readonly compactionTarget: number;
+  private readonly pageBytes: number;
+  /** Whole shortest candidates may exceed the target, but never this ceiling. */
+  private readonly summaryLimit: number;
+  /** Reduction groups hold at least two bounded summaries plus their separator. */
+  private readonly reduceBytes: number;
   private readonly jobs: number;
   private readonly tries: number;
-  private readonly retryMs: number;
   private readonly report: (message: string) => void;
-  private readonly wait: (ms: number, signal: AbortSignal) => Promise<void>;
   private view: ViewPart[] = [];
-  private compacting = false;
-  private compactionView: ViewPart[] = [];
-  private compactionEnd = 0;
-  private compactionBytes = 0;
-  private compactionPending = true;
-  private readonly busy = new Map<string, Job>();
-  private readonly failed = new Set<string>();
-  // Built prefixes can never become unbuilt. Skip them on subsequent scans.
-  private readonly firstMissing: number[] = [];
-  private readonly waiters = new Set<(settled: boolean) => void>();
   private bytes = 0;
+  private compacting = false;
+  private compactor: Compactor = { length: 0, parts: [], bytes: 0, pending: true };
+  private readonly busy = new Map<string, Job>();
+  /** Failed nodes awaiting the next append. */
+  private readonly failed = new Map<string, ViewPart>();
+  private readonly reported = new Set<string>();
+  private readonly ready: ViewPart[] = [];
+  private readyHead = 0;
+  private readonly queued = new Set<string>();
+  /** Level-0 indexes below `frontier` are built or admitted. */
+  private frontier = 0;
+  /** Admitted level-0 nodes not yet built, failed ones included. */
+  private unbuilt = 0;
   private first = 0;
-  private queued = false;
+  private readonly waiters = new Set<(settled: boolean) => void>();
+  private pumpQueued = false;
   private stopped = false;
   private closing: Promise<void> | undefined;
 
@@ -118,31 +181,46 @@ export class Memory {
     this.target = Math.max(1, Math.floor(this.budget / 2));
     this.compactionBudget = positive(options.compactionViewBytes, 32_000, "compactionViewBytes");
     this.compactionTarget = Math.max(1, Math.floor(this.compactionBudget / 2));
+    this.pageBytes = positive(options.pageBytes, DEFAULT_PAGE_BYTES, "pageBytes");
+    if (this.pageBytes < MIN_PAGE_BYTES || this.pageBytes > MAX_PAGE_BYTES) {
+      throw new RangeError(`pageBytes must be between ${MIN_PAGE_BYTES} and ${MAX_PAGE_BYTES}`);
+    }
+    this.summaryLimit = Math.max(this.nodeBytes, this.pageBytes);
+    this.reduceBytes = 2 * this.summaryLimit + 1;
     this.jobs = positive(options.jobs, 8, "jobs");
     this.tries = positive(options.tries, 5, "tries");
-    this.retryMs = options.retryMs ?? 10_000;
-    if (!Number.isSafeInteger(this.retryMs) || this.retryMs < 0 || this.retryMs > 2_147_483_647) {
-      throw new RangeError("retryMs must be an integer between 0 and 2147483647");
-    }
     this.report = options.report ?? ((message) => console.error(message));
-    this.wait = options.wait ?? delay;
+
     const snapshot = store.viewSnapshot;
     this.view = snapshot?.parts.map(([l, i]) => ({ l, i })) ?? [];
     this.compacting = snapshot?.compacting ?? false;
     // A crash can leave durable log records after the last view commit. Keep
-    // its exact prefix; only a store with no snapshot needs a one-time migration.
+    // its exact prefix; a missing snapshot is a one-time migration.
     for (let i = snapshot?.length ?? 0; i < store.messages.length; i++) {
       this.view.push({ l: 0, i });
     }
+    // A legacy (version 1) snapshot has no compactor: it starts from the built prefix.
+    const saved = snapshot && "compactor" in snapshot ? snapshot.compactor : undefined;
+    const compactorParts = saved?.parts.map(([l, i]) => ({ l, i })) ?? [];
+    this.compactor = {
+      length: saved?.length ?? 0,
+      parts: compactorParts,
+      bytes: compactorParts.reduce((sum, part) => sum + (this.node(part)?.size ?? 0), 0),
+      pending: saved?.compacting ?? true,
+    };
     this.advanceFirst();
-    this.fit(this.view, !snapshot || snapshot.length !== store.messages.length);
+    for (const node of store.nodes.values()) this.enqueueParent({ l: node.l, i: node.i });
+    this.commit(this.view, snapshot?.version === 1, saved !== undefined && saved.length === this.first);
     this.schedulePump();
   }
 
-  append(kind: Kind, text: string, date?: Date): Message {
+  append(kind: Kind, text: string, date?: Date, metadata?: MessageMetadata): Message {
     if (this.stopped) throw new Error("Memory is closed");
-    const message = this.store.append(kind, text, date);
-    this.fit([...this.view, { l: 0, i: message.i }], true);
+    const message = this.store.append(kind, text, date, metadata);
+    // A new message is the only trigger that retries failed calls.
+    for (const part of this.failed.values()) this.enqueue(part);
+    this.failed.clear();
+    this.commit([...this.view, { l: 0, i: message.i }]);
     this.schedulePump();
     return message;
   }
@@ -152,14 +230,20 @@ export class Memory {
     return this.view.map(({ l, i }) => ({ l, i }));
   }
 
+  /**
+   * Resolves true once every message is built, false once nothing can progress
+   * until the next append (failed calls stall their branch), or false on abort.
+   */
   settle(signal?: AbortSignal): Promise<boolean> {
     if (this.stopped || signal?.aborted) return Promise.resolve(false);
-    if (this.first === this.store.messages.length) return Promise.resolve(true);
+    this.pump();
+    const settled = this.outcome();
+    if (settled !== undefined) return Promise.resolve(settled);
     const { promise, resolve } = Promise.withResolvers<boolean>();
-    const finish = (settled: boolean) => {
+    const finish = (value: boolean) => {
       this.waiters.delete(finish);
       signal?.removeEventListener("abort", abort);
-      resolve(settled);
+      resolve(value);
     };
     const abort = () => finish(false);
     this.waiters.add(finish);
@@ -171,23 +255,34 @@ export class Memory {
     return chat(this.view.map((part) => this.renderPart(part)));
   }
 
-  zoom(id: number, n: number): string {
+  /**
+   * n=1: a bounded page of the message's exact source bytes, with a cursor.
+   * n>1: the two addressed children of the node; offset must be zero.
+   * Invalid addresses throw RangeError.
+   */
+  zoom(id: number, n: number, offset = 0): ZoomPage {
+    const length = this.store.messages.length;
     const level = Math.log2(n);
     if (
       !Number.isSafeInteger(id) || id < 0 ||
       !Number.isSafeInteger(n) || n <= 0 || 2 ** level !== n || !Number.isInteger(level) ||
-      id % n !== 0 || id > this.store.messages.length - n
+      id % n !== 0 || id > length - n
     ) {
-      return `No line ${id}+${n}.`;
+      throw new RangeError(`No line ${id}+${n}.`);
+    }
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      throw new RangeError("offset must be a nonnegative safe integer");
     }
     if (n === 1) {
-      const message = this.store.messages[id]!;
-      return `${id}+0|${message.kind}: ${message.text}`;
+      const page = this.store.readMessagePage(id, offset);
+      return { text: page.text, next: page.next, totalBytes: page.totalBytes, offset: page.offset };
     }
+    if (offset !== 0) throw new RangeError("offset applies only to single-message zoom");
     const left = { l: level - 1, i: (id / n) * 2 };
     const right = { l: level - 1, i: left.i + 1 };
-    if (!this.node(left) || !this.node(right)) return `No line ${id}+${n}.`;
-    return `${this.renderPart(left)}\n${this.renderPart(right)}`;
+    if (!this.node(left) || !this.node(right)) throw new RangeError(`No line ${id}+${n}.`);
+    const text = `${this.renderPart(left)}\n${this.renderPart(right)}`;
+    return { text, next: null, totalBytes: utf8Bytes(text), offset: 0 };
   }
 
   date(id: number): string {
@@ -266,102 +361,155 @@ export class Memory {
     while (this.first < this.store.messages.length && this.store.nodes.has(nodeKey(0, this.first))) this.first++;
   }
 
-  private fit(proposed: ViewPart[] = this.view, persist = false): void {
+  /**
+   * Publishes a main tiling and the compactor derived from it. Both are durable
+   * in one snapshot before any of them becomes the live state.
+   */
+  private commit(proposed: ViewPart[], preserveMain = false, preserveCompactor = false): void {
+    const length = this.store.messages.length;
     let bytes = this.size(proposed);
-    let compacting = this.compacting || bytes > this.budget;
+    let view = proposed;
+    let compacting = this.compacting || (!preserveMain && bytes > this.budget);
     let merged = false;
-    if (compacting) {
-      // Do not publish a changed tiling before its atomic snapshot is durable.
-      proposed = proposed.slice();
-      const count = proposed.length;
-      bytes = this.coarsen(proposed, bytes, this.target);
-      merged = proposed.length !== count;
+    if (compacting && !preserveMain) {
+      view = proposed.slice();
+      const count = view.length;
+      bytes = this.coarsen(view, bytes, this.target);
+      merged = view.length !== count;
       compacting = bytes > this.target;
     }
-    if (persist || merged || compacting !== this.compacting) {
-      this.store.saveView({
-        version: 1,
-        length: this.store.messages.length,
-        parts: proposed.map(({ l, i }) => [l, i] as const),
-        compacting,
-      });
-    }
-    this.view = proposed;
+    // Restore an unchanged compactor exactly, including its pending latch. A
+    // merely available parent is not an event that may rewrite a saved prefix.
+    const compactor = preserveCompactor && !merged
+      ? this.compactor
+      : this.advance(this.compactor, view, merged);
+    const next: ViewSnapshot = {
+      version: 2,
+      length,
+      parts: view.map(({ l, i }) => [l, i] as const),
+      compacting,
+      compactor: {
+        length: compactor.length,
+        parts: compactor.parts.map(({ l, i }) => [l, i] as const),
+        compacting: compactor.pending,
+      },
+    };
+    if (!sameSnapshot(this.store.viewSnapshot, next)) this.store.saveView(next);
+    this.view = view;
     this.bytes = bytes;
     this.compacting = compacting;
-    this.refreshCompactionView(merged);
-    if (this.first === this.store.messages.length) this.wake(true);
+    this.compactor = compactor;
   }
 
-  private refreshCompactionView(reset = false): void {
-    if (reset) {
-      this.compactionView = [];
-      this.compactionEnd = 0;
-      this.compactionBytes = 0;
-      this.compactionPending = true;
-    }
-    for (const part of this.view) {
+  /** Extends the built-prefix compactor from `previous`; pure except for node reads. */
+  private advance(previous: Compactor, view: readonly ViewPart[], reset: boolean): Compactor {
+    const next: Compactor = reset
+      ? { length: 0, parts: [], bytes: 0, pending: true }
+      : { length: previous.length, parts: previous.parts.slice(), bytes: previous.bytes, pending: previous.pending };
+    for (const part of view) {
       const width = 2 ** part.l;
       const end = (part.i + 1) * width;
-      if (end <= this.compactionEnd) continue;
+      if (end <= next.length) continue;
       if (end > this.first) break;
       const node = this.node(part);
       if (!node) break;
-      this.compactionView.push(part);
-      this.compactionEnd = end;
-      this.compactionBytes += node.size;
+      next.parts.push(part);
+      next.length = end;
+      next.bytes += node.size;
     }
-    if (this.compactionBytes > this.compactionBudget) this.compactionPending = true;
-    if (this.compactionPending) {
-      this.compactionBytes = this.coarsen(this.compactionView, this.compactionBytes, this.compactionTarget);
-      this.compactionPending = this.compactionBytes > this.compactionTarget;
+    if (next.bytes > this.compactionBudget) next.pending = true;
+    if (next.pending) {
+      next.bytes = this.coarsen(next.parts, next.bytes, this.compactionTarget);
+      next.pending = next.bytes > this.compactionTarget;
     }
+    return next;
   }
 
   private wake(settled: boolean): void {
     for (const finish of this.waiters) finish(settled);
   }
 
+  /** Settled: true when built through the end; false when nothing can run. */
+  private outcome(): boolean | undefined {
+    if (this.first === this.store.messages.length) return true;
+    if (this.busy.size === 0 && this.readyHead === this.ready.length) return false;
+    return undefined;
+  }
+
   private context(end: number): string {
     const lines: string[] = [];
-    for (const part of this.compactionView) {
+    // Coarsening can stall on an unfinished parent. Bound the actual context
+    // envelope too, without removing any bytes from the node's own source.
+    let bytes = utf8Bytes("<chat>\n</chat>");
+    const limit = this.compactionBudget + 4_096;
+    for (const part of this.compactor.parts) {
       // A coarse line that straddles the request boundary contains future
       // messages too. Omit it, rather than leaking those messages as context.
       if ((part.i + 1) * 2 ** part.l > end) break;
       const node = this.node(part);
       if (!node) break;
-      lines.push(this.renderPart(part));
+      const line = this.renderPart(part);
+      const size = utf8Bytes(line) + 1;
+      if (bytes + size > limit) break;
+      lines.push(line);
+      bytes += size;
     }
     return chat(lines);
   }
 
+  private enqueue(part: ViewPart): void {
+    const key = nodeKey(part.l, part.i);
+    if (this.queued.has(key) || this.busy.has(key) || this.store.nodes.has(key)) return;
+    this.queued.add(key);
+    this.ready.push(part);
+  }
+
+  /** Once both children of `part` exist, their parent becomes ready. */
+  private enqueueParent(part: ViewPart): void {
+    const sibling = part.i % 2 === 0 ? part.i + 1 : part.i - 1;
+    if (!this.store.nodes.has(nodeKey(part.l, sibling))) return;
+    this.enqueue({ l: part.l + 1, i: Math.floor(part.i / 2) });
+  }
+
+  /** Admits level-0 leaves while fewer than ADMISSION_WINDOW admitted leaves are unbuilt. */
+  private admit(): void {
+    const length = this.store.messages.length;
+    while (this.frontier < length && this.unbuilt < ADMISSION_WINDOW) {
+      const i = this.frontier++;
+      if (this.store.nodes.has(nodeKey(0, i))) continue;
+      this.unbuilt++;
+      this.enqueue({ l: 0, i });
+    }
+  }
+
   private schedulePump(): void {
-    if (this.queued || this.stopped) return;
-    this.queued = true;
+    if (this.pumpQueued || this.stopped) return;
+    this.pumpQueued = true;
     queueMicrotask(() => {
-      this.queued = false;
-      if (!this.stopped) this.pump();
+      this.pumpQueued = false;
+      this.pump();
     });
   }
 
   private pump(): void {
-    const length = this.store.messages.length;
-    for (let l = 0, width = 1; width <= length; l++, width *= 2) {
-      if (this.busy.size >= this.jobs) return;
-      const count = l === 0 ? Math.min(length, this.first + 1) : Math.floor(this.first / width);
-      let i = this.firstMissing[l] ?? 0;
-      while (i < count && this.store.nodes.has(nodeKey(l, i))) i++;
-      this.firstMissing[l] = i;
-      for (; i < count; i++) {
-        if (this.busy.size >= this.jobs) return;
-        const key = nodeKey(l, i);
-        if (this.store.nodes.has(key) || this.busy.has(key)) continue;
-        if (l > 0 && (
-          !this.store.nodes.has(nodeKey(l - 1, i * 2)) ||
-          !this.store.nodes.has(nodeKey(l - 1, i * 2 + 1))
-        )) continue;
-        this.start({ l, i }, key);
-      }
+    if (this.stopped) return;
+    this.admit();
+    while (this.busy.size < this.jobs && this.readyHead < this.ready.length) {
+      const part = this.ready[this.readyHead++]!;
+      const key = nodeKey(part.l, part.i);
+      this.queued.delete(key);
+      if (!this.store.nodes.has(key) && !this.busy.has(key)) this.start(part, key);
+    }
+    if (this.readyHead === this.ready.length) {
+      this.ready.length = 0;
+      this.readyHead = 0;
+    } else if (this.readyHead >= 1024 && this.readyHead * 2 >= this.ready.length) {
+      this.ready.splice(0, this.readyHead);
+      this.readyHead = 0;
+    }
+    if (this.waiters.size > 0) {
+      const settled = this.outcome();
+      if (settled !== undefined) this.wake(settled);
     }
   }
 
@@ -370,47 +518,50 @@ export class Memory {
     // Defer build until job.done is published: providers may call close during
     // their synchronous preamble, and close must await their actual promise.
     const work = Promise.resolve().then(() => this.build(part, controller.signal));
+    let failure: { error: unknown } | undefined;
     const job: Job = {
       controller,
       done: work.then(
-        () => { this.failed.delete(key); },
-        async (error: unknown) => {
-          if (this.stopped || controller.signal.aborted) return;
-          if (!this.failed.has(key)) {
-            this.failed.add(key);
-            // Rejection values are arbitrary: formatting itself may throw.
-            let detail = "unprintable error";
-            try {
-              detail = String(error instanceof Error ? error.message : error);
-            } catch {
-              // Keep the fallback; the retry must still be scheduled.
-            }
-            try {
-              // Detached, not awaited: a reporter may call close(), which awaits this job.
-              void Promise.resolve(
-                this.report(`OptChat compaction failed at ${part.i * 2 ** part.l}+${2 ** part.l}; retrying in ${this.retryMs}ms: ${detail}`),
-              ).catch(() => {});
-            } catch {
-              // Diagnostics must not break compaction or escape as unhandled work.
-            }
-          }
-          if (this.stopped || controller.signal.aborted) return;
-          try {
-            await this.wait(this.retryMs, controller.signal);
-          } catch {
-            // Aborting a retry clock may reject rather than resolve.
-          }
+        () => undefined,
+        (error: unknown) => {
+          failure = { error };
         },
       ).finally(() => {
+        // Release the slot and record the failure in one synchronous step, so no
+        // append can observe the key as both busy and failed.
         this.busy.delete(key);
-        this.schedulePump();
+        if (failure && !this.stopped && !controller.signal.aborted) this.fail(part, failure.error);
+        this.pump();
       }),
     };
     this.busy.set(key, job);
   }
 
+  private fail(part: ViewPart, error: unknown): void {
+    const key = nodeKey(part.l, part.i);
+    this.failed.set(key, part);
+    if (this.reported.has(key)) return;
+    this.reported.add(key);
+    // Rejection values are arbitrary: formatting itself may throw.
+    let detail = "unprintable error";
+    try {
+      detail = String(error instanceof Error ? error.message : error);
+    } catch {
+      // Keep the fallback; the failure is still recorded.
+    }
+    const width = 2 ** part.l;
+    try {
+      // Detached, not awaited: a reporter may call close(), which awaits this job.
+      void Promise.resolve(
+        this.report(`OptChat compaction failed at ${part.i * width}+${width}; retrying on the next appended message: ${detail}`),
+      ).catch(() => {});
+    } catch {
+      // Diagnostics must not break compaction or escape as unhandled work.
+    }
+  }
+
   private async build(part: ViewPart, signal: AbortSignal): Promise<void> {
-    if (this.stopped || signal.aborted) return;
+    if (this.stopped || signal.aborted || this.store.nodes.has(nodeKey(part.l, part.i))) return;
     let source: string;
     let left: TreeNode | undefined;
     let right: TreeNode | undefined;
@@ -423,40 +574,123 @@ export class Memory {
       source = `${left.text}\n${right.text}`;
     }
     let text = source;
-    let size = utf8Bytes(source);
-    if (size > this.nodeBytes) {
+    if (utf8Bytes(source) > this.nodeBytes) {
       const input = left && right ? `${flatten(left.text)}\n${flatten(right.text)}` : source;
-      const end = part.l === 0 ? part.i : (part.i + 1) * 2 ** part.l;
-      const context = this.context(end);
-      const id = part.i * 2 ** part.l;
-      const task = part.l === 0
-        ? `compress message ${id}`
-        : `merge lines ${id}+${2 ** (part.l - 1)} and ${id + 2 ** (part.l - 1)}+${2 ** (part.l - 1)}, adjacent,`;
-      const details = part.l === 0 ? "" : `<chat> may hold their messages, ${id} to ${end - 1}, in more detail: take details\nof them from there too.\n`;
-      const ruler = this.nodeBytes === 512
-        ? "(about 70 words), the length of this ruler:"
-        : "The ruler is a fixed 512-byte reference; the numeric limit above is authoritative:";
-      const instruction = `Compaction: ${task} into one line of at most ${this.nodeBytes} bytes\n${ruler}\n${RULER}\n${details}<input>\n${input}\n</input>`;
-      let feedback: CompactionRequest["feedback"] = [];
-      let shortest: { text: string; size: number } | undefined;
-      for (let attempt = 0; attempt < this.tries; attempt++) {
-        const reply = (await this.summarize({ context, instruction, feedback }, signal)).trim();
-        if (this.stopped || signal.aborted) return;
-        if (!reply) throw new Error("Compactor returned an empty summary");
-        const bytes = utf8Bytes(reply);
-        if (!shortest || bytes < shortest.size) shortest = { text: reply, size: bytes };
-        if (bytes <= this.nodeBytes || attempt + 1 === this.tries) break;
-        feedback = [...feedback, {
-          reply,
-          instruction: `Too long: your line is ${bytes} bytes, over the ${this.nodeBytes}-byte limit. Write\nthe whole line again for the same <input>, cutting just enough of the\nleast valuable items to fit before this cut:\n${utf8Prefix(reply, this.nodeBytes)}| ← LIMIT`,
-        }];
-      }
-      text = shortest!.text;
-      size = shortest!.size;
+      const summary = await this.summarizeLong(part, input, signal);
+      if (summary === undefined) return;
+      text = summary;
     }
     if (this.stopped || signal.aborted) return;
-    this.store.saveNode({ l: part.l, i: part.i, text, size });
+    this.store.saveNode({ l: part.l, i: part.i, text, size: utf8Bytes(text) });
+    this.reported.delete(nodeKey(part.l, part.i));
+    if (part.l === 0) this.unbuilt--;
     this.advanceFirst();
-    this.fit();
+    this.enqueueParent(part);
+    this.commit(this.view);
+  }
+
+  /**
+   * Summarizes an over-long node. Every page of the input is summarized, then
+   * summaries are reduced in bounded groups until one final line remains. The
+   * result is returned only when complete; undefined means cancelled.
+   */
+  private async summarizeLong(part: ViewPart, input: string, signal: AbortSignal): Promise<string | undefined> {
+    const width = 2 ** part.l;
+    const start = part.i * width;
+    const end = part.l === 0 ? part.i : (part.i + 1) * width;
+    const context = this.context(end);
+    const half = width / 2;
+    const task = part.l === 0
+      ? `compress message ${start}`
+      : `merge lines ${start}+${half} and ${start + half}+${half}, adjacent,`;
+    const details = part.l === 0
+      ? ""
+      : `<chat> may hold their messages, ${start} to ${end - 1}, in more detail: take details\nof them from there too.\n`;
+    const leaf = (body: string): string =>
+      `Compaction: ${task} into one line of at most ${this.nodeBytes} bytes\n${this.ruler()}\n${RULER}\n${details}<input>\n${body}\n</input>`;
+
+    if (utf8Bytes(input) <= this.pageBytes) return this.compact(context, leaf(input), signal);
+
+    // Pages are exact UTF-8 slices of the input; only bounded partial summaries
+    // are retained, never the page strings themselves.
+    const summaries: string[] = [];
+    let offset: number | null = 0;
+    let pageNumber = 0;
+    while (offset !== null) {
+      if (this.stopped || signal.aborted) return undefined;
+      const page = readTextPage(input, offset, this.pageBytes);
+      const reply = await this.compact(
+        context,
+        `Compaction: ${task}, part ${++pageNumber}, source bytes ${page.offset} to ${page.next ?? page.totalBytes} of ${page.totalBytes}, into one line of at most ${this.nodeBytes} bytes. Other parts are summarized separately: keep only what this part states.\n${this.ruler()}\n${RULER}\n${details}<input>\n${page.text}\n</input>`,
+        signal,
+      );
+      if (reply === undefined) return undefined;
+      summaries.push(reply);
+      offset = page.next;
+    }
+
+    let items = summaries;
+    while (items.length > 1) {
+      const groups = pack(items, this.reduceBytes);
+      if (groups.length === 1) {
+        return this.compact(
+          context,
+          leaf(`Ordered partial summaries of the complete input:\n${items.join("\n")}`),
+          signal,
+        );
+      }
+      const next: string[] = [];
+      for (const group of groups) {
+        if (group.length === 1) {
+          next.push(group[0]!);
+          continue;
+        }
+        const merged = await this.compact(
+          context,
+          `Compaction: ${task}; merge these ${group.length} ordered partial summaries of the complete input into one line of at most ${this.nodeBytes} bytes\n${this.ruler()}\n${RULER}\n<input>\n${group.join("\n")}\n</input>`,
+          signal,
+        );
+        if (merged === undefined) return undefined;
+        next.push(merged);
+      }
+      // Each group's first two items always fit, so every round shrinks the list.
+      items = next;
+    }
+    return items[0];
+  }
+
+  /**
+   * At most `tries` calls (five by default), keeping the shortest whole reply.
+   * Replies beyond the safety ceiling are never stored or replayed in full.
+   * If no whole candidate fits that ceiling, fail rather than truncate content.
+   */
+  private async compact(context: string, instruction: string, signal: AbortSignal): Promise<string | undefined> {
+    let feedback: CompactionRequest["feedback"] = [];
+    let shortest: { text: string; size: number } | undefined;
+    for (let attempt = 0; attempt < this.tries; attempt++) {
+      if (this.stopped || signal.aborted) return undefined;
+      const reply = (await this.summarize({ context, instruction, feedback }, signal)).trim();
+      if (this.stopped || signal.aborted) return undefined;
+      if (!reply) throw new Error("Compactor returned an empty summary");
+      const size = utf8Bytes(reply);
+      if (size <= this.nodeBytes) return reply;
+      if (size <= this.summaryLimit && (!shortest || size < shortest.size)) shortest = { text: reply, size };
+      if (attempt + 1 === this.tries) break;
+      const excerpt = utf8Prefix(reply, this.summaryLimit);
+      // Keep one bounded feedback turn, not an ever-growing history of full
+      // provider replies. The original input stays unchanged on every attempt.
+      feedback = [{
+        reply: excerpt,
+        instruction: `${size > this.summaryLimit ? "Previous reply excerpt only; omitted bytes are not a complete summary. " : ""}Too long: your line is ${size} bytes, over the ${this.nodeBytes}-byte limit. Write\nthe whole line again for the same <input>, cutting just enough of the\nleast valuable items to fit before this cut:\n${utf8Prefix(excerpt, this.nodeBytes)}| ← LIMIT`,
+      }];
+    }
+    if (!shortest) throw new Error(`Compactor returned no whole summary within the ${this.summaryLimit}-byte safety ceiling`);
+    return shortest.text;
+  }
+
+  private ruler(): string {
+    return this.nodeBytes === 512
+      ? "(about 70 words), the length of this ruler:"
+      : "The ruler is a fixed 512-byte reference; the numeric limit above is authoritative:";
   }
 }
