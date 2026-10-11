@@ -20,7 +20,8 @@ export function phaseCompressorAllowance(label: string, spare: number, share: nu
 	return Math.max(0, Math.floor(Math.min(bound, spare) / share));
 }
 export const MAX_COMPRESSOR_OUTPUT_TOKENS = 512;
-export const MAX_DEADLINE_MS = 600_000;
+/** Thirty minutes: a 160-record build issues several hundred compressor calls before the first answer. */
+export const MAX_DEADLINE_MS = 1_800_000;
 export const MAX_EXPIRY_WAIT_MS = 310_000;
 /** Default worst-case provider calls one prompt may issue (main turn plus bounded host tool loop). */
 export const DEFAULT_PROMPT_CALLS = 4;

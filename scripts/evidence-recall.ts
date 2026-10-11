@@ -112,8 +112,8 @@ const PREFLIGHT_TIMEOUT_MS = 60_000;
 const SHUTDOWN_GRACE_MS = 5_000;
 const TREE_POLL_MS = 500;
 const MIN_PARENT_PATH_LENGTH = 8;
-/** Bounded wait for the host's memory to be quiet before a prompt; the run deadline still applies. */
-const SETTLE_WAIT_MS = 120_000;
+/** Memory counts as stalled once no compressor call, dispatch, or tree change is observed for this long. */
+const SETTLE_STALL_MS = 120_000;
 const ANSWER_PREVIEW_CHARS = 240;
 /** Stand-in ceiling for a host whose dollar cap is not enforced (no --max-cost-usd): effectively unbounded. */
 const UNBOUNDED_USD = 1e12;
@@ -966,11 +966,14 @@ function judge(
 /**
  * Waits until the host's memory is quiet: no compressor call in flight (admitted attempts equal the completed metric
  * lines) and the saved tree covers every durable record. OptChat refuses a prompt sent before its summaries settle,
- * so a prompt is only sent after this. Returns null once settled; on the bounded wait, returns the last observed state.
+ * so a prompt is only sent after this. Returns null once settled. A long build keeps waiting while it progresses
+ * (completed calls, dispatches, or tree growth), bounded by the run deadline; after SETTLE_STALL_MS without progress
+ * it returns the last observed state.
  */
 async function awaitSettled(context: Context, slot: SettleFiles): Promise<string | null> {
 	const { memory } = slot;
-	const deadline = Date.now() + SETTLE_WAIT_MS;
+	let progress = "";
+	let progressAt = Date.now();
 	for (;;) {
 		assertLive(context);
 		const durable = (await readDurableRecords(memory)).length;
@@ -983,7 +986,13 @@ async function awaitSettled(context: Context, slot: SettleFiles): Promise<string
 		const failures = compressorFailures(lines);
 		const { refused } = await readAdmissionCounts(slot.admission);
 		const observed = `durable=${durable} treeMain=${tree?.mainLength ?? "none"} treeCompactor=${tree?.compactorLength ?? "none"} metricLines=${lines?.length ?? "none"} dispatched=${dispatched}${refused > 0 ? ` admissionsRefused=${refused}` : ""}${failures ? ` compressorFailures=${failures}` : ""}`;
-		if (Date.now() >= deadline) return observed;
+		const state = `${durable}/${tree?.mainLength}/${tree?.compactorLength}/${tree?.mainParts}/${tree?.compactorParts}/${lines?.length}/${dispatched}`;
+		if (state !== progress) {
+			progress = state;
+			progressAt = Date.now();
+		} else if (Date.now() - progressAt >= SETTLE_STALL_MS) {
+			return `${observed}; no progress for ${SETTLE_STALL_MS} ms`;
+		}
 		await pause(context, TREE_POLL_MS);
 	}
 }
@@ -1030,7 +1039,7 @@ async function answerGroup(context: Context, slot: HostSlot, name: string, quest
 	if (slot.arm === "on") {
 		const unsettled = await awaitSettled(context, slot);
 		if (unsettled !== null) {
-			const message = `memory did not settle within ${SETTLE_WAIT_MS} ms (${unsettled}); no prompt was sent`;
+			const message = `memory did not settle (${unsettled}); no prompt was sent`;
 			draft.error = message;
 			draft.questions.push(...questions.map((question) => unavailableQuestion(question, message)));
 			await collectCompressor(context, slot);
@@ -1120,7 +1129,7 @@ async function seed(context: Context, unit: Unit): Promise<void> {
 		if (durable.length !== count) throw new Error(`seeding stored ${durable.length} of ${count} records; /optchat import over RPC is unverified`);
 		draft.timestamps = { records: durable.length, matched: durable.filter((record) => context.dates.get(record.i) === record.date).length };
 		const unsettled = await awaitSettled(context, { memory: unit.memory, metrics: slot.metrics, admission: slot.admission });
-		if (unsettled !== null) throw new Error(`seeding did not settle within ${SETTLE_WAIT_MS} ms (${unsettled})`);
+		if (unsettled !== null) throw new Error(`seeding did not settle (${unsettled})`);
 		await collectCompressor(context, slot);
 		draft.segmentEnd = slot.segments.length;
 		draft.tree = await treeReport(unit.memory);

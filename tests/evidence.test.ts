@@ -17,6 +17,7 @@ import {
 	checkLimits,
 	initialAccounting,
 	MAX_CALLS,
+	MAX_DEADLINE_MS,
 	parseAccountingState,
 	recordCalls,
 	seedBatches,
@@ -448,7 +449,8 @@ describe("prompt-level budget accounting", () => {
 		expect(checkLimits(LIMITS)).toEqual([]);
 		expect(checkLimits({ ...LIMITS, maxCalls: MAX_CALLS + 1 }).length).toBeGreaterThan(0);
 		expect(checkLimits({ ...LIMITS, maxCompressorOutputTokens: 513 }).length).toBeGreaterThan(0);
-		expect(checkLimits({ ...LIMITS, deadlineMs: 600_001 }).length).toBeGreaterThan(0);
+		expect(checkLimits({ ...LIMITS, deadlineMs: MAX_DEADLINE_MS })).toEqual([]);
+		expect(checkLimits({ ...LIMITS, deadlineMs: MAX_DEADLINE_MS + 1 }).length).toBeGreaterThan(0);
 		expect(checkLimits({ ...LIMITS, expiryWaitMs: 310_001 }).length).toBeGreaterThan(0);
 	});
 
