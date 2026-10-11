@@ -32,9 +32,13 @@ import {
 import { dialectKey, sharedToolsAllowed } from "./dialect.js";
 import { readConfig, readEnabled, registerFlags, type OptChatConfig } from "./config.js";
 import { exportHtml, importHistory } from "./history.js";
+import { attachChildView, publishChildSource, registerMemoryTools, UNGUARDED, type ChildView, type PageEnvelope, type WorkEnvelope } from "./handoff.js";
+import { appendMetric, type CompressorUsage } from "./metrics.js";
+import { captureWorkReports, type ArtifactPathSource } from "./reports.js";
+import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } from "./archive.js";
 import { Memory, type CompactionRequest, type Summarize } from "./memory.js";
 import { VIEW_DOC } from "./prompts.js";
-import { Store, type Kind } from "./store.js";
+import { Store, type Kind, type Message } from "./store.js";
 
 type AgentMessage = ContextEvent["messages"][number];
 
@@ -48,7 +52,7 @@ export const SYSTEM_BLOCK = `# OptChat memory\n\n${VIEW_DOC}`;
 export const SETTLE_TIMEOUT_MS = 25_000;
 const HOST_HANDLER_LIMIT_MS = 30_000;
 const IDLE_POLL_MS = 250;
-const TOOL_NAMES: readonly string[] = ["zoom", "date"];
+const TOOL_NAMES: readonly string[] = ["zoom", "date", "work"];
 /** Host tools whose arguments and results are the model's private thoughts: never logged. */
 const PRIVATE_TOOLS: Record<string, true> = { think: true };
 const SKILL_PROMPT_MESSAGE_TYPE = "skill-prompt";
@@ -58,6 +62,30 @@ const BACKGROUND_RESULT_TYPES: Record<string, true> = { "async-result": true, "l
 export interface OptChatOptions {
 	/** Bounded wait for startup and the view's summaries before a fresh turn is refused; below 30 s. */
 	settleTimeoutMs?: number;
+	/** Metric-only, per completed compressor call; receives no message content or credentials. */
+	onCompressorUsage?: (usage: CompressorUsage) => void;
+	/**
+	 * Checked before every compressor provider attempt, including retries. `false`, or a throw, fails that
+	 * call closed: nothing is sent and no summary is published.
+	 */
+	admitCompressorCall?: () => boolean | Promise<boolean>;
+	/** Output cap for compressor requests, an integer from 1 to 512. Unset: the model's own maximum. */
+	compressorMaxTokens?: number;
+}
+
+/**
+ * Reasoning for a compressor call. With an explicit output cap, reasoning is off: a budget-thinking
+ * request makes the SDK raise max_tokens above the cap, and provider usage.output counts reasoning
+ * tokens, so the cap could not bind. Without a cap, the default (medium effort) is unchanged.
+ */
+export function compressorReasoning(model: Model, maxTokens: number | undefined) {
+	return maxTokens === undefined ? clampThinkingLevelForModel(model, Effort.Medium) : undefined;
+}
+
+/** Compressor-call policy: admission before each provider attempt and an optional output cap. */
+interface CompressorPolicy {
+	readonly admit?: () => boolean | Promise<boolean>;
+	readonly maxTokens?: number;
 }
 
 class Refusal extends Error {}
@@ -102,75 +130,195 @@ function keyOf(message: AgentMessage): string {
 	return `${at}:${Bun.hash(JSON.stringify(body) ?? "").toString(36)}`;
 }
 
-function contentText(content: string | readonly (TextContent | ImageContent)[]): string {
-	if (typeof content === "string") return content;
-	return content.map((part) => (part.type === "text" ? part.text : "[image]")).join("\n");
+/** A stored image's text label and, once durable, its attachment. */
+interface ImageLabel {
+	readonly text: string;
+	readonly attachment?: ImageAttachment;
+}
+
+/** Stores one image of a message: the label keeps its place in the text. */
+type ImageSaver = (part: ImageContent, index: number) => ImageLabel;
+
+/** Host-side capture for one message: full tool output (before the cap) and durable images. */
+interface Capture {
+	readonly full: (toolCallId: string) => string | undefined;
+	readonly image: ImageSaver;
+	/** The session's artifact lookup, used to hydrate work reports whose output was saved as an artifact. */
+	readonly artifacts?: ArtifactPathSource;
+}
+
+interface Entry {
+	readonly kind: Kind;
+	readonly text: string;
+	/** Own recorded time, for work reports; otherwise the message's. */
+	readonly at?: number;
+	readonly metadata?: MessageMetadata;
+}
+
+/** Matches the store's per-message image bound. */
+const MAX_IMAGES = 32;
+
+function isImageMime(value: string): value is ImageMimeType {
+	return value === "image/png" || value === "image/jpeg" || value === "image/webp";
+}
+
+/** Text in content order; each image becomes its label and, once durable, its attachment at the source index. */
+function contentOf(
+	content: string | readonly (TextContent | ImageContent)[],
+	image: ImageSaver,
+): { text: string; images: ImageAttachment[] } {
+	if (typeof content === "string") return { text: content, images: [] };
+	const images: ImageAttachment[] = [];
+	const text = content
+		.map((part, index) => {
+			if (part.type === "text") return part.text;
+			const label: ImageLabel =
+				images.length < MAX_IMAGES ? image(part, index) : { text: "[image not stored: more than 32 images]" };
+			if (label.attachment) images.push(label.attachment);
+			return label.text;
+		})
+		.join("\n");
+	return { text, images };
+}
+
+function metadataOf(work: WorkMetadata | undefined, images: readonly ImageAttachment[]): MessageMetadata | undefined {
+	if (work === undefined && images.length === 0) return undefined;
+	return { ...(work === undefined ? {} : { work }), ...(images.length === 0 ? {} : { images }) };
+}
+
+function workOf(
+	source: WorkMetadata["source"],
+	completeness: WorkMetadata["completeness"],
+	id: string | undefined,
+	agentId: string | undefined,
+): WorkMetadata {
+	return {
+		source,
+		completeness,
+		...(id === undefined ? {} : { id }),
+		...(agentId === undefined ? {} : { agentId }),
+	};
+}
+
+/** The newest captured work recorded under this name, among messages before `before`. */
+function findWork(
+	messages: readonly Message[],
+	name: string,
+	before: number,
+): { message: Message; work: WorkMetadata } | undefined {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index]!;
+		const work = message.metadata?.work;
+		if (work && message.i < before && (work.id === name || work.agentId === name || work.name === name)) {
+			return { message, work };
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Captured work entries: one per delivered batch member, each carrying its report's own timestamp.
+ * A report with an incomplete output says why, so the log never presents partial output as whole.
+ */
+async function workEntries(
+	source: WorkMetadata["source"],
+	details: unknown,
+	text: string,
+	images: readonly ImageAttachment[],
+	at: number,
+	capture: Capture,
+): Promise<Entry[]> {
+	const { reports } = await captureWorkReports({
+		source,
+		details,
+		text,
+		timestamp: at,
+		sessionManager: capture.artifacts,
+	});
+	if (reports.length === 0) {
+		return [{ kind: "work", text, metadata: metadataOf(workOf(source, "pointer-only", undefined, undefined), images) }];
+	}
+	return reports.map((report, index) => ({
+		kind: "work",
+		text: report.reason === undefined ? report.body : `[incomplete: ${report.reason}] ${report.body}`,
+		at: report.timestamp,
+		metadata: metadataOf(report.work, index === 0 ? images : []),
+	}));
 }
 
 /** Completed chat entries of one host message, in order; thoughts are never logged. */
-function entriesOf(message: AgentMessage, toolCap: number): Array<{ kind: Kind; text: string }> {
+async function entriesOf(
+	message: AgentMessage,
+	capture: Capture,
+): Promise<Entry[]> {
 	switch (message.role) {
 		case "user": {
 			if (message.synthetic === true || message.attribution === "agent") return [];
-			const text = contentText(message.content);
-			return text.length > 0 ? [{ kind: "user", text }] : [];
+			const { text, images } = contentOf(message.content, capture.image);
+			return text.length > 0 ? [{ kind: "user", text, metadata: metadataOf(undefined, images) }] : [];
 		}
 		case "custom": {
-			const text = contentText(message.content);
+			// Admission precedes extraction: a message nothing admits never reaches capture.image, so it stores no image.
+			const skill = message.customType === SKILL_PROMPT_MESSAGE_TYPE && message.attribution === "user";
+			const background = Object.hasOwn(BACKGROUND_RESULT_TYPES, message.customType);
+			if (!skill && !background) return [];
+			const { text, images } = contentOf(message.content, capture.image);
 			if (text.length === 0) return [];
 			// A skill invoked by the user is the user's own ask.
-			if (message.customType === SKILL_PROMPT_MESSAGE_TYPE && message.attribution === "user") return [{ kind: "user", text }];
+			if (skill) return [{ kind: "user", text, metadata: metadataOf(undefined, images) }];
 			// A background job's report: work delivered to the chat, marked so it never reads as the user's words.
-			if (Object.hasOwn(BACKGROUND_RESULT_TYPES, message.customType)) {
-				const ids = jobIds(message.details);
-				// Preserve the host's existing report-row encoding; prompts label its provenance as work.
-				const label = ids.length > 0 ? `[${ids.join(", ")}]` : "[background]";
-				return [{ kind: "user", text: capText(`${label} ${text}`, toolCap) }];
-			}
-			return [];
+			const source = message.customType === "launch-completion" ? "launch-completion" : "async-result";
+			return workEntries(source, message.details, text, images, stamp(message), capture);
 		}
 		case "assistant":
-			return assistantEntries(message);
+			return assistantEntries(message, capture);
 		case "toolResult": {
 			if (Object.hasOwn(PRIVATE_TOOLS, message.toolName)) return [];
-			const text = contentText(message.content);
-			const echo = message.isError ? `[error] ${text}` : text;
-			// Retrieval output stays whole in the log too: zoom must be lossless.
-			return [{ kind: "echo", text: TOOL_NAMES.includes(message.toolName) ? echo : capText(echo, toolCap) }];
+			const { text, images } = contentOf(message.content, capture.image);
+			// The live result was capped after its full text was captured; the durable log keeps all of it.
+			const full = capture.full(message.toolCallId) ?? text;
+			const echo = message.isError ? `[error] ${full}` : full;
+			if (message.toolName !== "task") return [{ kind: "echo", text: echo, metadata: metadataOf(undefined, images) }];
+			// A subagent's report is work, with the provenance the capture records from its details.
+			return workEntries("task", message.details, echo, images, stamp(message), capture);
 		}
 		default:
 			return [];
 	}
 }
 
-/** Job ids of a background report: `details.jobId`, or each `details.jobs[].jobId`. */
-function jobIds(details: unknown): string[] {
-	if (typeof details !== "object" || details === null) return [];
-	const jobs: unknown[] = "jobs" in details && Array.isArray(details.jobs) ? details.jobs : [details];
-	const ids: string[] = [];
-	for (const job of jobs) {
-		if (typeof job === "object" && job !== null && "jobId" in job && typeof job.jobId === "string") ids.push(job.jobId);
-	}
-	return ids;
-}
-
-function assistantEntries(message: AssistantMessage): Array<{ kind: Kind; text: string }> {
+/**
+ * Talk and tool entries of a finished reply. Public image parts are stored with the talk they sit in;
+ * thinking is never logged, and the store's per-message image bound applies as it does to user content.
+ */
+function assistantEntries(message: AssistantMessage, capture: Capture): Entry[] {
 	// A stopped or failed reply never finished; the messages it never took stay unanswered.
 	if (message.stopReason === "aborted" || message.stopReason === "error") return [];
-	const entries: Array<{ kind: Kind; text: string }> = [];
+	const entries: Entry[] = [];
 	let talk: string[] = [];
+	let images: ImageAttachment[] = [];
+	let stored = 0;
 	const flushTalk = () => {
 		const text = talk.join("\n");
-		if (text.trim().length > 0) entries.push({ kind: "talk", text });
+		if (text.trim().length > 0) entries.push({ kind: "talk", text, metadata: metadataOf(undefined, images) });
 		talk = [];
+		images = [];
 	};
-	for (const part of message.content) {
+	message.content.forEach((part, index) => {
 		if (part.type === "text") talk.push(part.text);
-		else if (part.type === "toolCall" && !Object.hasOwn(PRIVATE_TOOLS, part.name)) {
+		else if (part.type === "image") {
+			const label: ImageLabel =
+				stored < MAX_IMAGES ? capture.image(part, index) : { text: "[image not stored: more than 32 images]" };
+			talk.push(label.text);
+			if (label.attachment) {
+				images.push(label.attachment);
+				stored++;
+			}
+		} else if (part.type === "toolCall" && !Object.hasOwn(PRIVATE_TOOLS, part.name)) {
 			flushTalk();
 			entries.push({ kind: "tool", text: `${part.name} ${JSON.stringify(part.arguments ?? {})}` });
 		}
-	}
+	});
 	flushTalk();
 	return entries;
 }
@@ -313,6 +461,16 @@ class OptChat {
 	/** Messages created before activation or a session switch are prior history, never this chat. */
 	private cutoff = Date.now();
 	private readonly logged = new Set<string>();
+	/** Full ordinary tool output captured before the live cap; consumed by its durable log entry. */
+	private readonly captured = new Map<string, string>();
+	/** Keys queued for logging but not yet appended: each message is appended once, in queue order. */
+	private readonly queued = new Set<string>();
+	private logChain: Promise<void> = Promise.resolve();
+	private unpublish: (() => void) | undefined;
+	private childStatus = "off";
+	private childViewEnabled = false;
+	/** Bumped at each publication: a snapshot of an older session generation never reads the live chat. */
+	private childGeneration = 0;
 	private ctx: ExtensionContext | undefined;
 	private sharedPrefix: SharedPrefix | undefined;
 	private readonly cache = new OptChatCacheCoordinator();
@@ -323,6 +481,8 @@ class OptChat {
 	constructor(
 		private readonly pi: ExtensionAPI,
 		private readonly settleTimeoutMs: number,
+		private readonly observe: (usage: CompressorUsage) => void,
+		private readonly policy: CompressorPolicy = {},
 	) {}
 
 	start(ctx: ExtensionContext): Promise<void> {
@@ -357,10 +517,11 @@ class OptChat {
 			viewBytes: config.viewBytes,
 			jobs: config.jobs,
 			tries: config.tries,
-			retryMs: config.retryMs,
 			report: (message) => this.notify(`OptChat compressor: ${message}`, "warning"),
 		});
 		this.state = { kind: "ready" };
+		this.childViewEnabled = config.childView;
+		if (config.childView) this.publishChildView(ctx);
 		const status = this.memory.status();
 		this.notify(
 			`OptChat active: ${status.messages} messages in ${store.directory}; compressor ${model.provider}/${model.id}.`,
@@ -373,35 +534,91 @@ class OptChat {
 		if (taken.length > 0) {
 			throw new Error(`tool name ${taken.map((tool) => `"${tool.name}"`).join(", ")} is already registered`);
 		}
-		const z = this.pi.zod;
-		const zoomParams = z.object({
-			id: z.number().int().min(0).describe("First message id of the line"),
-			n: z.number().int().min(1).describe("Messages the line covers (a power of 2)"),
+		registerMemoryTools(this.pi, {
+			zoom: (id, n, offset) => this.withImages(this.openMemory().zoom(id, n, offset), id, n, offset),
+			date: (id) => this.openMemory().date(id),
+			work: (name, offset) => this.workEnvelope(name, offset, Number.POSITIVE_INFINITY),
+		}, UNGUARDED);
+	}
+
+	/** Child sessions get a frozen read-only snapshot, revoked when this chat shuts down. */
+	private publishChildView(ctx: ExtensionContext): void {
+		this.unpublish?.();
+		this.unpublish = undefined;
+		const manager = ctx.sessionManager.getArtifactManager();
+		if (!manager) {
+			this.childStatus = "unavailable: this session has no artifact manager";
+			return;
+		}
+		const memory = this.openMemory();
+		const generation = ++this.childGeneration;
+		this.unpublish = publishChildSource(manager, {
+			owner: `parent chat generation ${generation}`,
+			snapshot: () => this.childSnapshot(memory, generation),
 		});
-		this.pi.registerTool<typeof zoomParams>({
-			name: "zoom",
-			label: "OptChat zoom",
-			description:
-				"Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole.",
-			parameters: zoomParams,
-			approval: "read",
-			loadMode: "essential",
-			execute: async (_id, params) => ({
-				content: [{ type: "text", text: this.openMemory().zoom(params.id, params.n) }],
-			}),
-		});
-		const dateParams = z.object({ id: z.number().int().min(0).describe("Message id") });
-		this.pi.registerTool<typeof dateParams>({
-			name: "date",
-			label: "OptChat date",
-			description: "The date and time of message id.",
-			parameters: dateParams,
-			approval: "read",
-			loadMode: "essential",
-			execute: async (_id, params) => ({
-				content: [{ type: "text", text: this.openMemory().date(params.id) }],
-			}),
-		});
+		this.childStatus = "published (read-only snapshot per subagent)";
+	}
+
+	private childSnapshot(memory: Memory, generation: number): ChildView {
+		const live = (): Memory => {
+			if (this.state.kind !== "ready" || this.memory !== memory || this.childGeneration !== generation) {
+				throw new Error("the parent chat is closed");
+			}
+			return memory;
+		};
+		const upperBound = live().status().messages;
+		const within = (id: number, n: number): void => {
+			if (id + n > upperBound) throw new Error(`message ${id} is not in the parent snapshot (${upperBound} messages)`);
+		};
+		return {
+			render: memory.render(),
+			upperBound,
+			zoom: (id, n, offset) => {
+				within(id, n);
+				return this.withImages(live().zoom(id, n, offset), id, n, offset);
+			},
+			date: (id) => {
+				within(id, 1);
+				return live().date(id);
+			},
+			work: (name, offset) => {
+				live();
+				return this.workEnvelope(name, offset, upperBound);
+			},
+		};
+	}
+
+	private openStore(): Store {
+		const store = this.store;
+		if (this.state.kind !== "ready" || !store) throw new Error("OptChat store is not open");
+		return store;
+	}
+
+	/** A durable image attachment, or an explicit label when the image cannot be stored. */
+	private storeImage(part: ImageContent, index: number): ImageLabel {
+		if (!isImageMime(part.mimeType)) return { text: "[image not stored: unsupported format]" };
+		try {
+			const descriptor = this.openStore().saveImage(part.data, part.mimeType);
+			return { text: "[image]", attachment: { ...descriptor, order: index } };
+		} catch (error) {
+			return { text: `[image not stored: ${errorText(error)}]` };
+		}
+	}
+
+	/** One page of a captured report, found by name among messages before `before`. */
+	private workEnvelope(name: string, offset: number, before: number): WorkEnvelope {
+		const store = this.openStore();
+		const found = findWork(store.messages, name, before);
+		if (!found) throw new Error(`no captured work is recorded as "${name}"`);
+		const page = this.withImages(store.readMessagePage(found.message.i, offset), found.message.i, 1, offset);
+		return { page, messageId: found.message.i, source: found.work.source, completeness: found.work.completeness };
+	}
+
+	/** A record's first page carries its stored images in source order; later pages and summaries carry none. */
+	private withImages<Page extends PageEnvelope>(page: Page, id: number, n: number, offset: number): Page {
+		if (n !== 1 || offset !== 0) return page;
+		const images = this.openStore().readMessageImages(id).map(({ attachment, data }) => ({ data, mimeType: attachment.mimeType }));
+		return images.length === 0 ? page : { ...page, images };
 	}
 
 	private openMemory(): Memory {
@@ -422,6 +639,26 @@ class OptChat {
 			.finally(() => signal.removeEventListener("abort", cancel));
 		return promise;
 	};
+
+	/** Metric-only: counts and timing of one completed compressor call; never its content. */
+	private observeUsage(model: Model, reply: AssistantMessage, feedback: number, latencyMs: number): void {
+		const total = reply.usage.cost.total;
+		try {
+			this.observe({
+				model: `${model.provider}/${model.id}`,
+				input: reply.usage.input,
+				output: reply.usage.output,
+				cacheRead: reply.usage.cacheRead,
+				cacheWrite: reply.usage.cacheWrite,
+				attempt: feedback + 1,
+				purpose: feedback > 0 ? "shorten" : "leaf",
+				latencyMs: Math.round(latencyMs),
+				costUsd: Number.isFinite(total) ? total : null,
+			});
+		} catch (error) {
+			this.notify(`OptChat metrics: ${errorText(error)}`, "warning");
+		}
+	}
 
 	private async compress(request: CompactionRequest, signal: AbortSignal): Promise<string> {
 		const model = this.compressor;
@@ -447,6 +684,12 @@ class OptChat {
 			release?.(started);
 			release = undefined;
 		};
+		const started = performance.now();
+		// Admission precedes every send. The first attempt is admitted here, before the request can be
+		// dispatched on any provider path; later payloads (SDK retries) are admitted by onPayload.
+		if (this.policy.admit && !(await this.policy.admit())) throw new Error("compressor call was not admitted");
+		let admitted = true;
+		let sends = 0;
 		const reply = await completeSimple(
 			model,
 			{
@@ -460,12 +703,17 @@ class OptChat {
 				signal,
 				// Full independent context, never the main session's response chain or mutable state.
 				statefulResponses: false,
-				// Medium effort, clamped to what the model offers; none for a model without reasoning.
-				// The output limit stays the host default (the model's own maximum).
-				reasoning: clampThinkingLevelForModel(model, Effort.Medium),
+				maxTokens: this.policy.maxTokens,
+				reasoning: compressorReasoning(model, this.policy.maxTokens),
 				onPayload: async (payload, payloadModel, attemptSignal) => {
 					// Auth/provider retries must release their own previous attempt before waiting.
 					finish();
+					// The first payload is the attempt admitted above; each retry is admitted before its send.
+					sends += 1;
+					if (sends > 1) {
+						admitted = this.policy.admit ? await this.policy.admit() : true;
+						if (!admitted) throw new Error("compressor call was not admitted");
+					}
 					const actualModel = payloadModel ?? model;
 					const encoded = applyOptChatCache(this.alignPrefix(payload, actualModel, ctx), actualModel);
 					// This request's own onResponse/finally release the lease: the only correlated writer.
@@ -477,6 +725,9 @@ class OptChat {
 				onResponse: (response) => finish(response.status >= 200 && response.status < 300),
 			},
 		).finally(() => finish());
+		// A refused attempt was never sent: it is not a completed call and writes no metric line.
+		if (!admitted) throw new Error("compressor call was not admitted");
+		this.observeUsage(model, reply, request.feedback.length, performance.now() - started);
 		if (reply.stopReason === "error" || reply.stopReason === "aborted") {
 			const status = reply.errorStatus === undefined ? "" : ` (HTTP ${reply.errorStatus})`;
 			throw new Error(`${model.provider}/${model.id} request ${reply.stopReason === "error" ? "failed" : "was aborted"}${status}`);
@@ -643,6 +894,8 @@ class OptChat {
 	async context(messages: AgentMessage[], ctx: ExtensionContext): Promise<ContextEventResult | undefined> {
 		const deadline = Date.now() + this.settleTimeoutMs;
 		try {
+			// A side turn is not this chat's turn: it passes through before any turn, pending, log or cutoff use.
+			if (this.state.kind === "ready" && this.isSideTurn(messages, ctx)) return undefined;
 			if (this.state.kind === "starting") await this.waitForStart(deadline);
 			const memory = this.requireReady();
 			const active = new Set(this.pi.getActiveTools());
@@ -684,6 +937,35 @@ class OptChat {
 			if (!(error instanceof Refusal) && this.state.kind === "ready") this.fail(reason);
 			return this.refuse(ctx, reason);
 		}
+	}
+
+	/**
+	 * A side turn (/btw, recap) sends a snapshot of the session plus host-authored agent messages. The
+	 * session never persists those, so an unlogged tail made only of them, absent from the branch, is a
+	 * side turn. A user-attributed message, even one that mimics a recap, is always this chat's input.
+	 */
+	private isSideTurn(messages: AgentMessage[], ctx: ExtensionContext): boolean {
+		const tail = messages.slice(this.unloggedStart(messages));
+		if (tail.length === 0) return false;
+		const agentAuthored = tail.every(
+			(message) => (message.role === "developer" || message.role === "user") && message.attribution === "agent",
+		);
+		if (!agentAuthored) return false;
+		const persisted = new Set(
+			ctx.sessionManager.getBranch().flatMap((entry) => ("message" in entry ? [keyOf(entry.message)] : [])),
+		);
+		return tail.every((message) => !persisted.has(keyOf(message)));
+	}
+
+	/** Index where the unlogged suffix starts: the new prompt batch and the host context queued with it. */
+	private unloggedStart(messages: AgentMessage[]): number {
+		let start = messages.length;
+		while (start > 0) {
+			const message = messages[start - 1]!;
+			if (stamp(message) < this.cutoff || this.logged.has(keyOf(message))) break;
+			start--;
+		}
+		return start;
 	}
 
 	private async waitForStart(deadline: number): Promise<void> {
@@ -740,12 +1022,7 @@ class OptChat {
 		// Context calls are sequential: an unfinished earlier wait was abandoned by the host.
 		if (this.pending) this.supersede(this.pending);
 		// The new prompt batch and the host context queued with it: everything after the last logged message.
-		let start = messages.length;
-		while (start > 0) {
-			const message = messages[start - 1]!;
-			if (stamp(message) < this.cutoff || this.logged.has(keyOf(message))) break;
-			start--;
-		}
+		const start = this.unloggedStart(messages);
 		const tail = messages.slice(start);
 		const job: Pending = { controller: new AbortController(), tail, superseded: false, abandoned: false };
 		this.pending = job;
@@ -801,13 +1078,38 @@ class OptChat {
 		for (const message of this.held.splice(0)) this.logMessage(message);
 	}
 
+	/** Queue one message's durable entries. The cutoff and the full output are fixed now, at queue time. */
 	private logMessage(message: AgentMessage): void {
 		if (stamp(message) < this.cutoff) return;
 		const key = keyOf(message);
-		if (this.logged.has(key)) return;
-		const memory = this.openMemory();
-		for (const entry of entriesOf(message, this.config!.toolCap)) memory.append(entry.kind, entry.text);
-		this.logged.add(key);
+		if (this.logged.has(key) || this.queued.has(key)) return;
+		this.queued.add(key);
+		const at = stamp(message);
+		const full = message.role === "toolResult" ? this.captured.get(message.toolCallId) : undefined;
+		const capture: Capture = {
+			full: () => full,
+			image: (part, index) => this.storeImage(part, index),
+			artifacts: this.ctx?.sessionManager,
+		};
+		this.enqueue(async () => {
+			const memory = this.openMemory();
+			const date = Number.isFinite(at) ? new Date(at) : undefined;
+			for (const entry of await entriesOf(message, capture)) {
+				memory.append(entry.kind, entry.text, entry.at === undefined ? date : new Date(entry.at), entry.metadata);
+			}
+			if (message.role === "toolResult") this.captured.delete(message.toolCallId);
+			this.queued.delete(key);
+			this.logged.add(key);
+		});
+	}
+
+	/** Appends run one at a time, in queue order. A failed append stops logging; later tasks never run. */
+	private enqueue(task: () => Promise<void>): void {
+		this.logChain = this.logChain
+			.then(() => (this.state.kind === "ready" ? task() : undefined))
+			.catch((error: unknown) => {
+				this.fail(`OptChat stopped logging: ${errorText(error)}. Every prompt will be refused until restart.`);
+			});
 	}
 
 	/** A completed message is durable at once, unless a fresh turn still needs its snapshot first. */
@@ -822,7 +1124,13 @@ class OptChat {
 		}
 	}
 
-	agentEnd(messages: AgentMessage[], willContinue: boolean): void {
+	/** The returned promise settles once every queued entry of this run is durable. */
+	agentEnd(messages: AgentMessage[], willContinue: boolean): Promise<void> {
+		this.endTurn(messages, willContinue);
+		return this.logChain;
+	}
+
+	private endTurn(messages: AgentMessage[], willContinue: boolean): void {
 		if (this.state.kind !== "ready") return;
 		try {
 			const turn = this.turn;
@@ -851,21 +1159,33 @@ class OptChat {
 			.map((part) => part.text)
 			.join("\n");
 		if (text.length <= cap) return undefined;
+		// Capture before the cap: the durable log keeps this full text.
+		this.captured.set(event.toolCallId, text);
 		const images = event.content.filter((part): part is ImageContent => part.type === "image");
 		return { content: [{ type: "text", text: capText(text, cap) }, ...images] };
 	}
 
 	/** Prior host history is not this chat's turn; reset turn tracking for the new session. */
-	sessionChanged(): void {
+	sessionChanged(ctx: ExtensionContext): void {
 		this.saveUnanswered();
 		this.turn = undefined;
 		this.cutoff = Date.now();
+		this.captured.clear();
 		this.resetCacheFence();
+		// The child view belongs to the session it was published from: revoke it, then publish the new session's.
+		this.unpublish?.();
+		this.unpublish = undefined;
+		if (this.childViewEnabled && this.state.kind === "ready") this.publishChildView(ctx);
 	}
 
 	async shutdown(): Promise<void> {
 		this.saveUnanswered();
+		// Queued appends settle while the store is still open.
+		await this.logChain;
 		this.state = { kind: "closed" };
+		this.unpublish?.();
+		this.unpublish = undefined;
+		this.captured.clear();
 		this.resetCacheFence();
 		const memory = this.memory;
 		const store = this.store;
@@ -931,6 +1251,14 @@ class OptChat {
 				`view: ${status.parts} lines, ${status.viewBytes} of ${this.config!.viewBytes} bytes`,
 			);
 		}
+		lines.push(
+			`stateless OpenAI: ${process.env.PI_OPENAI_STATEFUL === "0" ? "requested (PI_OPENAI_STATEFUL=0)" : "not set; official OpenAI main requests may chain responses"}`,
+			`settlement deadline: ${this.settleTimeoutMs} ms (host handler limit ${HOST_HANDLER_LIMIT_MS} ms)`,
+			"host maintenance: automatic compaction can bypass the plugin veto; OptChat cannot disable it",
+			"correlation: main provider responses carry no request identity; cache writers are compressor-only",
+			`child view: ${this.childStatus}`,
+			"side turns (/btw, recaps): the host gives no typed purpose; see issue #1",
+		);
 		return lines.join("\n");
 	}
 
@@ -971,10 +1299,20 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 	if (!Number.isFinite(settleTimeoutMs) || settleTimeoutMs <= 0 || settleTimeoutMs >= HOST_HANDLER_LIMIT_MS) {
 		throw new Error(`OptChat settleTimeoutMs must be above 0 and below the host's ${HOST_HANDLER_LIMIT_MS} ms handler limit`);
 	}
+	const maxTokens = options.compressorMaxTokens;
+	if (maxTokens !== undefined && (!Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > 512)) {
+		throw new Error("OptChat compressorMaxTokens must be an integer from 1 to 512");
+	}
+	const policy: CompressorPolicy = { admit: options.admitCompressorCall, maxTokens };
 	return (pi: ExtensionAPI): void => {
 		// Flags are parsed after factories run: register unconditionally, read in session_start.
 		registerFlags(pi);
 		let chat: OptChat | undefined;
+		const metricsFile = process.env.OPTCHAT_METRICS_FILE;
+		const observe = (usage: CompressorUsage): void => {
+			options.onCompressorUsage?.(usage);
+			if (metricsFile) appendMetric(metricsFile, usage);
+		};
 
 		pi.registerCommand("optchat", {
 			description: "OptChat memory: status | view | export PATH | import PATH",
@@ -988,14 +1326,18 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 		});
 
 		pi.on("session_start", async (_event, ctx) => {
-			if (chat || ctx.agent.kind !== "main") return;
+			if (ctx.agent.kind !== "main") {
+				attachChildView(pi, ctx, SYSTEM_BLOCK);
+				return;
+			}
+			if (chat) return;
 			try {
 				if (!readEnabled(pi)) return;
 			} catch {
 				// Invalid activation must enter the same fail-closed startup as any other
 				// malformed config: open() reports it and installed context hooks refuse prompts.
 			}
-			const active = new OptChat(pi, settleTimeoutMs);
+			const active = new OptChat(pi, settleTimeoutMs, observe, policy);
 			chat = active;
 			// Registered only for an activated session: these hooks change host behavior even as no-ops.
 			pi.on("before_agent_start", (event) => active.beforeAgentStart(event.systemPrompt));
@@ -1007,9 +1349,9 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 			pi.on("agent_end", (event) => active.agentEnd(event.messages, event.willContinue === true));
 			// The current turn's tool loop must reach the model verbatim: no host compaction.
 			pi.on("session_before_compact", () => ({ cancel: true }));
-			pi.on("session_switch", () => active.sessionChanged());
-			pi.on("session_branch", () => active.sessionChanged());
-			pi.on("session_tree", () => active.sessionChanged());
+			pi.on("session_switch", (_event, switchCtx) => active.sessionChanged(switchCtx));
+			pi.on("session_branch", (_event, branchCtx) => active.sessionChanged(branchCtx));
+			pi.on("session_tree", (_event, treeCtx) => active.sessionChanged(treeCtx));
 			pi.on("session_shutdown", () => active.shutdown());
 			await active.start(ctx);
 		});

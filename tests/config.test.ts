@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { isAbsolute, resolve } from "node:path";
-import { DEFAULTS, readConfig, readEnabled } from "../src/config.ts";
+import { DEFAULTS, readConfig, readEnabled, registerFlags } from "../src/config.ts";
 
 /** Host OMP 18.6.1 `getFlag` value union; the typed Pick doubles below prove it stays compatible. */
 type FlagValue = boolean | string | undefined;
@@ -15,8 +15,8 @@ type FlagName =
   | "optchat-view-bytes"
   | "optchat-jobs"
   | "optchat-tries"
-  | "optchat-retry-ms"
-  | "optchat-tool-cap";
+  | "optchat-tool-cap"
+  | "optchat-child-view";
 type Flags = Partial<Record<FlagName, FlagValue>>;
 
 const MAX = Number.MAX_SAFE_INTEGER;
@@ -30,7 +30,6 @@ const NUMERIC_FLAGS = [
   { flag: "optchat-view-bytes", key: "viewBytes", minimum: 64, maximum: MAX, sample: "1000", context: { "optchat-node-bytes": "64" } },
   { flag: "optchat-jobs", key: "jobs", minimum: 1, maximum: 64, sample: "7", context: {} },
   { flag: "optchat-tries", key: "tries", minimum: 1, maximum: 100, sample: "7", context: {} },
-  { flag: "optchat-retry-ms", key: "retryMs", minimum: 1, maximum: 2_147_483_647, sample: "7", context: {} },
   { flag: "optchat-tool-cap", key: "toolCap", minimum: 128, maximum: MAX, sample: "1000", context: {} },
 ] satisfies Array<{
   flag: FlagName;
@@ -286,19 +285,22 @@ describe("numeric flags", () => {
     }
   });
 
-  test("retry delay rejects zero", () => {
-    for (const { flags } of ACTIVATIONS) expectRejected({ ...flags, "optchat-retry-ms": "0" }, "optchat-retry-ms");
+  test("the retired retry-delay flag is no longer registered", () => {
+    const registered: string[] = [];
+    registerFlags({ registerFlag: (name: string) => void registered.push(name) } as unknown as Pick<ExtensionAPI, "registerFlag">);
+    expect(registered).toContain("optchat-tool-cap");
+    expect(registered).not.toContain("optchat-retry-ms");
   });
 
-  test("retry delay is limited to the timer maximum", () => {
-    expect(read({ "optchat-retry-ms": "2147483647" }).retryMs).toBe(2_147_483_647);
-    expectRejected({ "optchat-retry-ms": "2147483648" }, "optchat-retry-ms");
-    expectRejected({ "optchat-retry-ms": String(MAX) }, "optchat-retry-ms");
+  test("child view is opt-in and boolean-valued", () => {
+    expect(read({}).childView).toBe(false);
+    expect(read({ "optchat-child-view": "true" }).childView).toBe(true);
+    expectRejected({ "optchat-child-view": "yes" }, "optchat-child-view");
   });
 
   test("accepts leading zeros as decimal digits", () => {
-    const config = read({ "optchat-jobs": "0008", "optchat-retry-ms": "010", "optchat-node-bytes": "000128" });
-    expect(config).toMatchObject({ jobs: 8, retryMs: 10, nodeBytes: 128 });
+    const config = read({ "optchat-jobs": "0008", "optchat-tool-cap": "0128", "optchat-node-bytes": "000128" });
+    expect(config).toMatchObject({ jobs: 8, toolCap: 128, nodeBytes: 128 });
     expectRejected({ "optchat-jobs": "00" }, "optchat-jobs");
   });
 

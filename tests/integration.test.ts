@@ -34,7 +34,9 @@
  */
 import assert from "node:assert/strict";
 import { describe, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { deflateSync } from "node:zlib";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
@@ -94,7 +96,7 @@ const CASE_TITLES = {
   "side-prefix-text-mismatch": "a same-model side request's reworded system prefix never replaces the compressor's guide or adds tools",
   "reasoning-tools-compressor": "with disableReasoningWithTools the tool-bearing main request reasons none; the compressor stays medium and tool-free",
   "reasoning-tools-compressor-when-thinking": "with base disableReasoningWithTools false and whenThinking true the tool-bearing main request reasons none; the compressor stays medium and tool-free",
-  "tool-cap-zoom": "ordinary tool output is capped live and durably; zoom returns and stores the whole original",
+  "tool-cap-zoom": "ordinary tool output is capped live but stored whole; zoom pages the original record",
   "lock-held": "a store held by another writer refuses prompts with zero chat requests",
   "missing-compressor": "an unresolvable compressor selector refuses prompts with zero chat requests",
   "settle-timeout": "the settle deadline refuses the request and keeps the prompt durable and unanswered",
@@ -115,6 +117,9 @@ const CASE_TITLES = {
   "aside": "an unflagged mid-run aside stays raw under the same view without new compression",
   "fake-steering-batch": "a steering-only context batch leaves the open turn alone",
   "fake-late-agent-end": "a late agent_end cannot close an unrelated open turn",
+  "fake-child-view": "a child adopts the parent's frozen view, and a session switch revokes it",
+  "fake-ephemeral-recap": "an idle side turn with agent-attributed messages passes through unlogged; the next prompt is answered",
+  "fake-recap-spoof": "user text that mimics a recap is ordinary input and is logged as the user's turn",
   "fake-continuation": "willContinue retains the view and a terminal agent_end refreshes it",
   "fake-think-exclusion": "private think calls and results never enter durable memory while talk does",
   "fake-settle-bounds": "settleTimeoutMs rejects zero, NaN and the host deadline but accepts 29999",
@@ -125,6 +130,7 @@ const CASE_TITLES = {
   "prefix-anthropic-system": "Anthropic system blocks replay only across cache metadata differences",
   "cap-text": "capText keeps head and tail within the cap without splitting surrogate pairs",
   "view-blocks": "viewBlocks cuts only at stable line ends and joins back to the view",
+  "fake-rejected-custom-image": "a custom message nothing admits stores no image; an admitted report stores exactly its own",
 } as const;
 type CaseName = keyof typeof CASE_TITLES;
 
@@ -377,7 +383,8 @@ function jsonlRecords(directory: string): WireObject[] {
  */
 function mainRows(memory: string): Row[] {
   const rows = jsonlRecords(join(memory, "main")).map((record): Row => {
-    assert.deepEqual(Object.keys(record).sort(), ["date", "i", "kind", "size", "text"], "main rows are {i,kind,text,size,date}");
+    const keys = Object.keys(record).filter((key) => key !== "metadata").sort();
+    assert.deepEqual(keys, ["date", "i", "kind", "size", "text"], "main rows are {i,kind,text,size,date} plus optional metadata");
     const { i, kind, text, size, date } = record;
     assert(typeof i === "number" && typeof kind === "string" && typeof text === "string", "main row id, kind and text types");
     assert(typeof size === "number" && typeof date === "string", "main row size and date types");
@@ -465,6 +472,7 @@ const LEAF_SUMMARY: Record<string, string> = {
   tool: "tool: prior call summary",
   echo: "echo: prior output summary",
   note: "note: prior note summary",
+  work: "work: prior report summary",
 };
 const MERGE_SUMMARY = "prior lines merged summary";
 
@@ -810,7 +818,6 @@ function defaultFlags(memory: string): Record<string, string | boolean> {
     "optchat-view-bytes": "128000",
     "optchat-jobs": "1",
     "optchat-tries": "1",
-    "optchat-retry-ms": "60000",
     "optchat-tool-cap": String(TOOL_CAP),
   };
 }
@@ -1516,22 +1523,20 @@ const ZOOM_CALL_ID = "optchat-it-zoom-call";
 const CUT_NOTE = /\n\n\[\d+ of \d+ characters cut\]\n\n/;
 
 async function toolCapZoom(ctx: CaseContext): Promise<Evidence> {
-  const { fixture, memory } = ctx;
-  const { capText } = ctx.lib.optchat;
+  const { fixture } = ctx;
   assert(Z_USER.length > TOOL_CAP && LONG_TOOL_TEXT.length > TOOL_CAP, "fixtures exceed the cap");
   return withHost(ctx, { settleTimeoutMs: POSITIVE_SETTLE_MS }, async (host) => {
     fixture.queueChat("turn 1 long tool", { calls: [{ id: LONG_CALL_ID, name: "long_output", args: {} }] });
     fixture.queueChat("turn 1 final", { text: Z1_DONE });
     expectCompleted(await bounded("turn 1", host.prompt(Z_USER), STEP_MS, fixture.fatal), "turn 1");
     await host.idle();
-    const capped = capText(LONG_TOOL_TEXT, TOOL_CAP);
     const turn1 = await durableRows(ctx, 4, "turn 1 durable rows");
     assert.deepEqual(pairs(turn1), [
       ["user", Z_USER],
       ["tool", "long_output {}"],
-      ["echo", capped],
+      ["echo", LONG_TOOL_TEXT],
       ["talk", Z1_DONE],
-    ], "the user is stored uncapped; the ordinary tool echo is stored capped");
+    ], "the user and the ordinary tool output are stored whole; only the live result is capped");
 
     const loop = fixture.chat()[1]?.body;
     assert(loop, "turn 1 continuation request");
@@ -1543,7 +1548,6 @@ async function toolCapZoom(ctx: CaseContext): Promise<Evidence> {
     assert(!live.includes("OPTCHAT_IT_TOOL_INTERIOR"), "the interior is cut");
 
     const zoomId = turn1[0]!.i;
-    const whole = `${zoomId}+0|user: ${Z_USER}`;
     fixture.queueChat("turn 2 zoom", { calls: [{ id: ZOOM_CALL_ID, name: "zoom", args: { id: zoomId, n: 1 } }] });
     fixture.queueChat("turn 2 final", { text: Z2_DONE });
     expectCompleted(await bounded("turn 2", host.prompt(Z2_USER), STEP_MS, fixture.fatal), "turn 2");
@@ -1558,16 +1562,19 @@ async function toolCapZoom(ctx: CaseContext): Promise<Evidence> {
     // Before the zoom the old user is only a summary line.
     assert(!JSON.stringify(fresh).includes("OPTCHAT_IT_ZOOM_USER_INTERIOR"), "the fresh turn carries no raw old user");
     const result = toolResultText(zoomed, ZOOM_CALL_ID);
-    assert.equal(result, whole, "zoom returns the complete original message");
+    assert(result.includes(Z_USER), "zoom returns the original message text");
     assert(result.length > TOOL_CAP && result.includes("OPTCHAT_IT_ZOOM_USER_INTERIOR"), "zoom output is exempt from the cap");
+    assert.match(result, /\[end of \d+ bytes\]/, "the page envelope marks the end of the record");
     assert.doesNotMatch(result, CUT_NOTE);
 
-    assert.deepEqual(pairs(rows).slice(4), [
+    assert.deepEqual(pairs(rows).slice(4).filter(([kind]) => kind !== "echo"), [
       ["user", Z2_USER],
       ["tool", `zoom ${JSON.stringify({ id: zoomId, n: 1 })}`],
-      ["echo", whole],
       ["talk", Z2_DONE],
-    ], "the durable zoom echo is the whole original, without a cut note");
+    ], "the zoom turn is logged in order");
+    const echo = rows.find((row, index) => index >= 4 && row.kind === "echo");
+    assert(echo?.text.includes(Z_USER), "the durable zoom echo holds the whole original page");
+    assert.doesNotMatch(echo?.text ?? "", CUT_NOTE);
     assert.equal(rows[zoomId]!.text, Z_USER, "the original user record is unchanged");
     return { zoomId, liveCapLength: live.length, zoomLength: result.length };
   });
@@ -1708,8 +1715,8 @@ async function abortWhileSettling(ctx: CaseContext): Promise<Evidence> {
 // ---------------------------------------------------------------------------
 
 const REPORT = "REPORT-SENTINEL";
-/** src/index.ts:114-118 logs an async-result as kind user, labelled with its job ids. */
-const REPORT_ROW = `[job-7] ${REPORT}`;
+/** A short report delivered inline and never elided: captured whole as work, with no incomplete label. */
+const REPORT_ROW = REPORT;
 const REPORT_TALK = "OPTCHAT_IT_REPORT_TALK";
 const WARM_USER = "OPTCHAT_IT_WARM_USER";
 const WARM_TALK = "OPTCHAT_IT_WARM_TALK";
@@ -1831,9 +1838,9 @@ async function backgroundReport(ctx: CaseContext): Promise<Evidence> {
     assert.deepEqual(pairs(reportRows), [
       ["user", WARM_USER],
       ["talk", WARM_TALK],
-      ["user", REPORT_ROW],
+      ["work", REPORT_ROW],
       ["talk", REPORT_TALK],
-    ], "the report is logged once as a labelled user row, then the run's reply");
+    ], "the report is logged once as a labelled work row, then the run's reply");
 
     fixture.queueChat("after-report reply", { text: AFTER_TALK });
     expectCompleted(await bounded("after-report turn", host.prompt(AFTER_USER), STEP_MS, fixture.fatal), "after-report turn");
@@ -1863,10 +1870,10 @@ async function backgroundReport(ctx: CaseContext): Promise<Evidence> {
 
     // After-report turn: the report is a raw line of the view, never resent outside it.
     const view = soleView(next, "after-report turn");
-    assert(view.split("\n").includes(`2+1|user: ${REPORT_ROW}`), "the report row is its own raw line (under the 64-byte node target)");
+    assert(view.split("\n").includes(`2+1|work: ${REPORT_ROW}`), "the report row is its own raw line (under the 64-byte node target)");
     assert.equal(
       view,
-      `<chat>\n0+1|user: ${WARM_USER}\n1+1|talk: ${WARM_TALK}\n2+1|user: ${REPORT_ROW}\n3+1|talk: ${REPORT_TALK}\n</chat>`,
+      `<chat>\n0+1|user: ${WARM_USER}\n1+1|talk: ${WARM_TALK}\n2+1|work: ${REPORT_ROW}\n3+1|talk: ${REPORT_TALK}\n</chat>`,
       "the next fresh view holds every earlier row raw",
     );
     assert.equal(occurrences(outsideTexts(next), REPORT), 0, "the report is not resent outside the view");
@@ -1883,7 +1890,7 @@ async function backgroundReport(ctx: CaseContext): Promise<Evidence> {
     assert.deepEqual(pairs(rows), [
       ["user", WARM_USER],
       ["talk", WARM_TALK],
-      ["user", REPORT_ROW],
+      ["work", REPORT_ROW],
       ["talk", REPORT_TALK],
       ["user", AFTER_USER],
       ["talk", AFTER_TALK],
@@ -1928,7 +1935,7 @@ async function backgroundReportCold(ctx: CaseContext): Promise<Evidence> {
     assert.equal(occurrences([JSON.stringify(report)], REPORT), 1, "the report is represented exactly once in the whole request");
     assert(!JSON.stringify(report).includes("[job-7]"), "the view was snapshotted before the report was logged");
 
-    assert.deepEqual(pairs(rows), [["user", REPORT_ROW], ["talk", REPORT_TALK]], "the report and its answer are logged once");
+    assert.deepEqual(pairs(rows), [["work", REPORT_ROW], ["talk", REPORT_TALK]], "the report and its answer are logged once");
     assert.equal(fixture.compact().length, 0, "both rows and their parent fit the node target: no compressor request");
     return { chatRequests: fixture.chat().length, compactRequests: fixture.compact().length };
   });
@@ -2119,7 +2126,7 @@ async function disabledFlag(ctx: CaseContext, options: HostOptions): Promise<Evi
     for (const { body } of fixture.chat()) {
       const names = toolNames(body);
       assert(names.includes("long_output"), "the real host exposes its ordinary tools");
-      assert(!names.includes("zoom") && !names.includes("date"), "no zoom/date tools");
+      assert(!names.includes("zoom") && !names.includes("date") && !names.includes("work"), "no zoom, date or work tools");
       assert(!systemText(body).includes(SYSTEM_BLOCK), "no OptChat system block");
       assert(!userTexts(body).some((text) => text.includes("<chat>")), "no OptChat view");
       assert.equal(occurrences(userTexts(body), DISABLED_USER), 1, "the first prompt is retained raw");
@@ -2179,7 +2186,9 @@ type FakeHostEvent =
   | { type: "context"; messages: FakeHostMessage[] }
   | { type: "message_end"; message: FakeHostMessage }
   | { type: "agent_end"; messages: FakeHostMessage[]; willContinue: boolean }
-  | { type: "before_provider_request"; payload: unknown };
+  | { type: "before_provider_request"; payload: unknown }
+  | { type: "session_switch" }
+  | { type: "before_agent_start"; systemPrompt: string[] };
 type FakeHostHandler = (event: FakeHostEvent, ctx: OmpSdk.ExtensionContext) => unknown;
 
 interface FakeHost {
@@ -2189,6 +2198,10 @@ interface FakeHost {
   timestamp(): number;
   user(text: string): Extract<FakeHostMessage, { role: "user" }>;
   assistant(content: AssistantMessage["content"]): AssistantMessage;
+  /** Replaces the persisted session branch: the messages a side turn must not appear in. */
+  setBranch(messages: FakeHostMessage[]): void;
+  /** Switches the session's artifact manager and branch, then fires session_switch. */
+  switchSession(artifactManager: object | undefined, messages?: FakeHostMessage[]): Promise<unknown[]>;
 }
 
 interface FakeHostOptions {
@@ -2196,6 +2209,12 @@ interface FakeHostOptions {
   model?: Model;
   /** ctx.getSystemPrompt(); the default is the OptChat guide alone. */
   systemPrompt?: string[];
+  /** ctx.agent.kind; a "task" session is a child that only adopts a published view. */
+  agentKind?: "main" | "task";
+  /** The session's artifact manager: the identity a parent publishes its view under. */
+  artifactManager?: object;
+  /** Enables the child-view flag on this host. */
+  childView?: boolean;
 }
 
 /**
@@ -2209,10 +2228,18 @@ async function withFakeHost(
 ): Promise<Evidence> {
   const memory = await mkdtemp(join(tmpdir(), "optchat-fake-"));
   const fakeCase = { ...ctx, memory };
-  const flags: Record<string, string | boolean> = { ...defaultFlags(memory), "optchat-model": "fake/fake" };
+  const flags: Record<string, string | boolean> = {
+    ...defaultFlags(memory),
+    "optchat-model": "fake/fake",
+    ...(options.childView ? { "optchat-child-view": true } : {}),
+  };
   const handlers = new Map<string, FakeHostHandler[]>();
   const registeredTools: Array<{ name: string }> = [];
   const notices: Notice[] = [];
+  const session: { artifactManager: object | undefined; branch: Array<{ type: "message"; message: FakeHostMessage }> } = {
+    artifactManager: options.artifactManager,
+    branch: [],
+  };
   let abortCalls = 0;
   let lastTimestamp = Date.now();
   const timestamp = (): number => (lastTimestamp = Math.max(Date.now(), lastTimestamp + 1));
@@ -2233,7 +2260,7 @@ async function withFakeHost(
     },
     getFlag: (name: string) => flags[name],
     getAllTools: () => [],
-    getActiveTools: () => ["zoom", "date"],
+    getActiveTools: () => ["zoom", "date", "work"],
     registerTool: (tool: { name: string }) => { registeredTools.push(tool); },
     // Plain zod supports the object/number/int/min/describe builders used here.
     // This fake records tool definitions only; it never exports or executes their
@@ -2248,14 +2275,13 @@ async function withFakeHost(
     abort: () => { abortCalls++; },
     ui: { notify: (message: string, type?: string) => { notices.push({ message, type, at: Date.now() }); } },
     models: { resolve: () => options.model ?? model },
-    agent: { kind: "main" },
-    ...(options.model
-      ? {
-        model: options.model,
-        modelRegistry: { resolver: () => FIXTURE_API_KEY },
-        sessionManager: { getSessionId: () => "optchat-it-fake-session" },
-      }
-      : {}),
+    agent: { kind: options.agentKind ?? "main" },
+    sessionManager: {
+      getSessionId: () => "optchat-it-fake-session",
+      getArtifactManager: () => session.artifactManager,
+      getBranch: () => session.branch,
+    },
+    ...(options.model ? { model: options.model, modelRegistry: { resolver: () => FIXTURE_API_KEY } } : {}),
   } as unknown as OmpSdk.ExtensionContext;
   const fire = (event: FakeHostEvent): Promise<unknown[]> => bounded(`fake ${event.type}`, (async () => {
     const results: unknown[] = [];
@@ -2267,7 +2293,9 @@ async function withFakeHost(
     await fire({ type: "session_start" });
     // Strictly after start's Date.now cutoff, even when startup finishes in the same millisecond.
     lastTimestamp = Date.now();
-    assert(notices.some((notice) => notice.message.startsWith("OptChat active:")), "awaited startup opens the store");
+    if ((options.agentKind ?? "main") === "main") {
+      assert(notices.some((notice) => notice.message.startsWith("OptChat active:")), "awaited startup opens the store");
+    }
     const evidence = await run({
       ctx: fakeCase,
       fire,
@@ -2279,6 +2307,14 @@ async function withFakeHost(
         return results[0] as WireObject | undefined;
       },
       user: (text) => ({ role: "user", content: text, timestamp: timestamp() }),
+      setBranch: (messages) => {
+        session.branch = messages.map((message) => ({ type: "message", message }));
+      },
+      switchSession: (artifactManager, messages = []) => {
+        session.artifactManager = artifactManager;
+        session.branch = messages.map((message) => ({ type: "message", message }));
+        return fire({ type: "session_switch" });
+      },
       assistant: (content) => ({
         role: "assistant", content, api: "openai-completions", provider: "fake", model: "fake",
         usage: {
@@ -2334,6 +2370,203 @@ async function fakeLateAgentEnd(ctx: CaseContext): Promise<Evidence> {
     assert.equal(soleView(continued, "fake late-end continuation"), soleView(opened, "fake late-end original"), "view bytes stay identical despite the durable talk");
     assert.deepEqual(pairs(mainRows(host.ctx.memory)), [["user", "U1"], ["talk", "T1"]], "the stale end neither logs OLD nor duplicates current rows");
     return { rows: pairs(rows), viewUnchanged: true };
+  });
+}
+
+/**
+ * An idle side turn (/btw, recap): the session's snapshot plus agent-attributed host messages, which the
+ * session never persists. OptChat passes it through: no turn, no log, no refusal, and the next prompt works.
+ */
+async function fakeEphemeralRecap(ctx: CaseContext): Promise<Evidence> {
+  return withFakeHost(ctx, async (host) => {
+    const user = host.user("U1");
+    assert(await host.context([user]), "the first request opens a turn");
+    const talk = host.assistant([{ type: "text", text: "T1" }]);
+    await host.fire({ type: "agent_end", messages: [user, talk], willContinue: false });
+    await durableRows(host.ctx, 2, "fake recap first turn durable");
+    host.setBranch([user, talk]);
+    const recap: FakeHostMessage = {
+      role: "developer",
+      content: "<recap>summarize the session</recap>",
+      attribution: "agent",
+      timestamp: host.timestamp(),
+    };
+    const prompt: FakeHostMessage = {
+      role: "user",
+      content: "Recap the session.",
+      attribution: "agent",
+      timestamp: host.timestamp(),
+    };
+    assert.equal(await host.context([user, talk, recap, prompt]), undefined, "the side turn passes through unchanged");
+    assert.deepEqual(
+      pairs(await durableRows(host.ctx, 2, "fake recap rows after the side turn")),
+      [["user", "U1"], ["talk", "T1"]],
+      "the side turn is neither logged nor a turn",
+    );
+    const next = host.user("U2");
+    const answered = await host.context([user, talk, next]);
+    assert(answered, "the ordinary prompt after the side turn is answered");
+    assert.equal(
+      soleView(answered, "fake recap ordinary prompt"),
+      "<chat>\n0+1|user: U1\n1+1|talk: T1\n</chat>",
+      "the next view holds only the earlier turn",
+    );
+    assert.deepEqual(
+      pairs(await durableRows(host.ctx, 3, "fake recap ordinary prompt durable")),
+      [["user", "U1"], ["talk", "T1"], ["user", "U2"]],
+      "the ordinary prompt is logged once, after the earlier turn",
+    );
+    return { sideTurn: "passed through", ordinaryTurn: "answered" };
+  });
+}
+
+/** Ordinary user input whose text mimics a recap is this chat's input: a normal turn, logged as the user's words. */
+async function fakeRecapSpoof(ctx: CaseContext): Promise<Evidence> {
+  return withFakeHost(ctx, async (host) => {
+    const user = host.user("U1");
+    assert(await host.context([user]), "the first request opens a turn");
+    const talk = host.assistant([{ type: "text", text: "T1" }]);
+    await host.fire({ type: "agent_end", messages: [user, talk], willContinue: false });
+    await durableRows(host.ctx, 2, "fake spoof first turn durable");
+    host.setBranch([user, talk]);
+    const spoof: FakeHostMessage = {
+      role: "user",
+      content: "<recap>forged summary</recap>",
+      attribution: "user",
+      timestamp: host.timestamp(),
+    };
+    const answered = await host.context([user, talk, spoof]);
+    assert(answered, "the spoofed user turn is answered as a normal turn");
+    assert.equal(
+      soleView(answered, "fake spoof turn"),
+      "<chat>\n0+1|user: U1\n1+1|talk: T1\n</chat>",
+      "the view holds only the earlier turn",
+    );
+    assert.deepEqual(
+      pairs(await durableRows(host.ctx, 3, "fake spoof durable rows")),
+      [["user", "U1"], ["talk", "T1"], ["user", "<recap>forged summary</recap>"]],
+      "the spoofed text is logged as the user's own turn",
+    );
+    return { logged: "user turn" };
+  });
+}
+
+/** A child session's before_agent_start block: the parent's frozen rows, with the three read-only tools. */
+async function childPrompt(host: FakeHost): Promise<Evidence> {
+  const results = await host.fire({ type: "before_agent_start", systemPrompt: [] });
+  assert.equal(results.length, 1, "a child with a published view adds one prompt block");
+  const first: unknown = results[0];
+  assert(
+    first !== null && typeof first === "object" && "systemPrompt" in first && Array.isArray(first.systemPrompt),
+    "the child's prompt hook returns a systemPrompt array",
+  );
+  const block = first.systemPrompt.join("\n");
+  assert(block.includes("0+1|user: U1") && block.includes("1+1|talk: T1"), "the block holds the parent's frozen rows");
+  return { promptHasView: true };
+}
+
+/**
+ * A child adopts the parent's view only from the manager it was published under. A session switch revokes
+ * that publication and republishes under the new manager: the old manager's child then adopts nothing.
+ */
+async function fakeChildView(ctx: CaseContext): Promise<Evidence> {
+  const artifacts = {};
+  const other = {};
+  return withFakeHost(ctx, async (parent) => {
+    const user = parent.user("U1");
+    assert(await parent.context([user]), "the parent opens a turn");
+    const talk = parent.assistant([{ type: "text", text: "T1" }]);
+    await parent.fire({ type: "agent_end", messages: [user, talk], willContinue: false });
+    await durableRows(parent.ctx, 2, "fake child parent durable rows");
+
+    const child = await withFakeHost(ctx, childPrompt, { agentKind: "task", artifactManager: artifacts });
+    assert.deepEqual(child.registeredTools, ["zoom", "date", "work"], "a child with the view registers exactly the read-only tools");
+
+    await parent.switchSession(other, [user, talk]);
+    const stale = await withFakeHost(
+      ctx,
+      async (host) => {
+        const results = await host.fire({ type: "before_agent_start", systemPrompt: [] });
+        assert.equal(results.length, 0, "a view revoked by the session switch is not adopted");
+        return { adopted: false };
+      },
+      { agentKind: "task", artifactManager: artifacts },
+    );
+    const fresh = await withFakeHost(ctx, childPrompt, { agentKind: "task", artifactManager: other });
+    assert.deepEqual(fresh.registeredTools, ["zoom", "date", "work"], "the republished view is adopted by the new manager");
+    return { child: child.registeredTools, stale, fresh: fresh.registeredTools };
+  }, { childView: true, artifactManager: artifacts });
+}
+
+function pngChunk(type: string, data: Uint8Array): Buffer {
+  const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  const frame = Buffer.alloc(body.length + 8);
+  frame.writeUInt32BE(data.length, 0);
+  body.copy(frame, 4);
+  frame.writeUInt32BE(Bun.hash.crc32(body), body.length + 4);
+  return frame;
+}
+
+/** A genuine 2x2 truecolor PNG, distinct per seed, so each stored image has its own content address. */
+function pngBase64(seed: number): string {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(2, 0);
+  header.writeUInt32BE(2, 4);
+  header[8] = 8; // bit depth
+  header[9] = 2; // RGB
+  const scanlines: number[] = [];
+  for (let y = 0; y < 2; y++) {
+    scanlines.push(0); // filter type None
+    for (let x = 0; x < 2; x++) scanlines.push((seed * 61 + x * 90) & 0xff, (seed * 17 + y * 120) & 0xff, (seed + x + y) & 0xff);
+  }
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(Buffer.from(scanlines))),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]).toString("base64");
+}
+
+/**
+ * Admission precedes extraction: a custom message nothing admits never reaches the image store, so its
+ * blob is never written, while an admitted report stores exactly its own image.
+ */
+async function fakeRejectedCustomImage(ctx: CaseContext): Promise<Evidence> {
+  return withFakeHost(ctx, async (host) => {
+    const user = host.user("U1");
+    assert(await host.context([user]), "the parent opens a turn");
+    const talk = host.assistant([{ type: "text", text: "T1" }]);
+    const hidden = {
+      role: "custom",
+      customType: "optchat-it-private",
+      content: [{ type: "image", data: pngBase64(7), mimeType: "image/png" }, { type: "text", text: "PRIVATE-NOTE" }],
+      display: false,
+      attribution: "agent",
+      timestamp: host.timestamp(),
+    };
+    const reportPng = pngBase64(8);
+    const report = {
+      role: "custom",
+      customType: "async-result",
+      content: [{ type: "text", text: "REPORT-WITH-IMAGE" }, { type: "image", data: reportPng, mimeType: "image/png" }],
+      display: true,
+      details: { jobs: [{ jobId: "job-image", type: "bash", status: "completed" }] },
+      attribution: "agent",
+      timestamp: host.timestamp(),
+    };
+    await host.fire({
+      type: "agent_end",
+      messages: [user, talk, hidden, report] as unknown as FakeHostMessage[],
+      willContinue: false,
+    });
+    const rows = await durableRows(host.ctx, 3, "admitted custom rows");
+    assert.deepEqual(rows.map((row) => row.kind), ["user", "talk", "work"], "only admitted messages are logged");
+    assert(!rows.some((row) => row.text.includes("PRIVATE-NOTE")), "the rejected message's text is never logged");
+    const images = join(host.ctx.memory, "images");
+    const stored = existsSync(images) ? readdirSync(images) : [];
+    const reportSha = createHash("sha256").update(Buffer.from(reportPng, "base64")).digest("hex");
+    assert.deepEqual(stored, [reportSha], "the rejected message's image is never stored; the admitted report's is");
+    return { kinds: rows.map((row) => row.kind), stored: stored.length };
   });
 }
 
@@ -2855,6 +3088,9 @@ const CASES: Record<CaseName, (ctx: CaseContext) => Promise<Evidence>> = {
   "aside": asideMessage,
   "fake-steering-batch": fakeSteeringBatch,
   "fake-late-agent-end": fakeLateAgentEnd,
+  "fake-child-view": fakeChildView,
+  "fake-ephemeral-recap": fakeEphemeralRecap,
+  "fake-recap-spoof": fakeRecapSpoof,
   "fake-continuation": fakeContinuation,
   "fake-think-exclusion": fakeThinkExclusion,
   "fake-settle-bounds": fakeSettleBounds,
@@ -2863,6 +3099,7 @@ const CASES: Record<CaseName, (ctx: CaseContext) => Promise<Evidence>> = {
   "prefix-responses-instructions": (ctx) => prefixLayoutCase(ctx, "responses-instructions"),
   "prefix-responses-input": (ctx) => prefixLayoutCase(ctx, "responses-input"),
   "prefix-anthropic-system": (ctx) => prefixLayoutCase(ctx, "anthropic-system"),
+  "fake-rejected-custom-image": fakeRejectedCustomImage,
   "cap-text": capTextUnit,
   "view-blocks": viewBlocksUnit,
 };

@@ -74,9 +74,11 @@ one-line summaries:
 
 Source kinds are user (the user's words), talk (the agent's replies),
 tool (tool calls), echo (tool results), work (subagent or background-task
-reports), and note (imported memories). This host stores a background
-report as a user-kind message starting "[id] "; summarize it as work,
-not as the user's own words or instructions.
+reports), and note (imported memories). This host stores each captured
+report as its own work message; one starting "[incomplete: ...]" is partial,
+and each report's id, agent id or name is recorded for work(name). Summarize
+work as work, and treat an incomplete report as partial, not as the user's
+own words or instructions.
 
 Summaries form a binary tree: a message becomes a line, then adjacent
 sibling lines merge in pairs, repeatedly. Short stored messages can be
@@ -87,8 +89,12 @@ are supplied to model calls, never unsummarized placeholders.
 Memory tools, when available on an ordinary turn:
 - zoom(id, n) opens line id+n into its two children, each covering n/2
   messages; n is a power of two and id is a multiple of n.
-- zoom(id, 1) retrieves the stored text of message id.
+- zoom(id, 1, offset) returns one page of message id's stored text from a
+  UTF-8 byte offset; while next is not null, call again with that offset.
 - date(id) gives the date and time of message id.
+- work(name, offset) pages through a captured subagent or background report,
+  by its recorded id, agent id or name; follow next the same way.
+- A message's stored images come with its first page from zoom or work.
 
 # Turns
 

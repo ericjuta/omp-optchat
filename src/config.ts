@@ -8,8 +8,8 @@ export const DEFAULTS = Object.freeze({
   viewBytes: 128_000,
   jobs: 8,
   tries: 5,
-  retryMs: 10_000,
   toolCap: 30_000,
+  childView: false,
 });
 
 export interface OptChatConfig {
@@ -20,8 +20,8 @@ export interface OptChatConfig {
   viewBytes: number;
   jobs: number;
   tries: number;
-  retryMs: number;
   toolCap: number;
+  childView: boolean;
 }
 
 type FlagReader = Pick<ExtensionAPI, "getFlag">;
@@ -68,15 +68,15 @@ export function registerFlags(api: FlagRegistrar): void {
     default: String(DEFAULTS.tries),
     description: "Shortening attempts per summary, from 1 to 100",
   });
-  api.registerFlag("optchat-retry-ms", {
-    type: "string",
-    default: String(DEFAULTS.retryMs),
-    description: "Retry delay in integer milliseconds, from 1 to 2147483647",
-  });
   api.registerFlag("optchat-tool-cap", {
     type: "string",
     default: String(DEFAULTS.toolCap),
     description: "Integer character cap for ordinary tool results (minimum: 128)",
+  });
+  api.registerFlag("optchat-child-view", {
+    type: "boolean",
+    default: DEFAULTS.childView,
+    description: "Give subagents a read-only frozen snapshot of this chat (zoom, date and work only)",
   });
 }
 
@@ -144,7 +144,7 @@ export function readConfig(api: FlagReader, defaultDirectory: string): OptChatCo
     viewBytes,
     jobs: integer(api, "optchat-jobs", DEFAULTS.jobs, 1, 64),
     tries: integer(api, "optchat-tries", DEFAULTS.tries, 1, 100),
-    retryMs: integer(api, "optchat-retry-ms", DEFAULTS.retryMs, 1, 2_147_483_647),
     toolCap: integer(api, "optchat-tool-cap", DEFAULTS.toolCap, 128),
+    childView: boolean(api.getFlag("optchat-child-view"), "optchat-child-view", DEFAULTS.childView),
   };
 }
