@@ -6,8 +6,11 @@ import {
 	completeSimple,
 	type AssistantMessage,
 	type ImageContent,
+	type Judge,
+	type JudgmentResult,
 	type Message as LlmMessage,
 	type Model,
+	type Questions,
 	type TextContent,
 	type Tool,
 	type UserMessage,
@@ -18,6 +21,8 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
+	ToolCallEvent,
+	ToolCallEventResult,
 	ToolResultEvent,
 	ToolResultEventResult,
 } from "@oh-my-pi/pi-coding-agent";
@@ -30,7 +35,14 @@ import {
 	type ViewPartition,
 } from "./cache.js";
 import { dialectKey, sharedToolsAllowed } from "./dialect.js";
-import { defaultStoreDirectory, readConfig, readEnabled, registerFlags, type OptChatConfig } from "./config.js";
+import {
+	defaultStoreDirectory,
+	readConfig,
+	readEnabled,
+	registerFlags,
+	toolGateRequested,
+	type OptChatConfig,
+} from "./config.js";
 import { exportHtml, importHistory } from "./history.js";
 import { writeExportFile } from "./export-file.js";
 import { attachChildView, publishChildSource, registerMemoryTools, UNGUARDED, type ChildView, type PageEnvelope, type WorkEnvelope } from "./handoff.js";
@@ -40,6 +52,12 @@ import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } fr
 import { CompressorRefusedError, Memory, type CompactionRequest, type Summarize } from "./memory.js";
 import { VIEW_DOC } from "./prompts.js";
 import { Store, StoreLeaseConflictError, type Kind, type Message } from "./store.js";
+import { boundedGateError, hostJudge, judgeWithin, type JudgeFactory, type NamedJudge } from "./system1/judge.js";
+import { RuleLedger, renderRules, type Rule } from "./system1/ledger.js";
+import { prefetchBlock, PREFETCH_MS } from "./system1/prefetch.js";
+import { decideTriage, offeredRules, ruleSentences, triageQuestions, triageState } from "./system1/rules.js";
+import { gateToolCall } from "./system1/tool-gate.js";
+import { valueHint } from "./system1/value.js";
 
 type AgentMessage = ContextEvent["messages"][number];
 
@@ -61,6 +79,15 @@ const PRIVATE_TOOLS: Record<string, true> = { think: true };
 const SKILL_PROMPT_MESSAGE_TYPE = "skill-prompt";
 /** Host messages that deliver a background job's output into the chat. */
 const BACKGROUND_RESULT_TYPES: Record<string, true> = { "async-result": true, "launch-completion": true };
+/** Bound for one rules triage judgment. */
+const TRIAGE_MS = 20_000;
+/**
+ * Triage still running at shutdown is waited for at most this long, then abandoned. It stays under the host's
+ * 2 s session_shutdown handler cap, so the wait finishes inside the host's window.
+ */
+const SHUTDOWN_TRIAGE_MS = 1_500;
+/** Prefetch uses the settle deadline's remaining time minus this margin, so it never delays past that deadline. */
+const PREFETCH_MARGIN_MS = 500;
 
 export interface OptChatOptions {
 	/** Bounded wait for startup and the view's summaries before a fresh turn is refused; below 30 s. */
@@ -75,6 +102,11 @@ export interface OptChatOptions {
 	admitCompressorCall?: (model: string) => boolean | Promise<boolean>;
 	/** Output cap for compressor requests, an integer from 1 to 512. Unset: the model's own maximum. */
 	compressorMaxTokens?: number;
+	/**
+	 * The judge for each System One gate, resolved per call with the gate's purpose. Default: the host judge role.
+	 * Undefined means no judge: the gate does not run, and a tool call is blocked (fail closed).
+	 */
+	judge?: JudgeFactory;
 }
 
 /**
@@ -374,6 +406,8 @@ interface Turn {
 	blocks: TextContent[];
 	partition: ViewPartition;
 	timestamp: number;
+	/** System One messages (rules, then prefetch), frozen at the turn's start; empty when every gate is off. */
+	extra: UserMessage[];
 	/** First host message of the turn. */
 	first?: Mark;
 	/** Last host message before the turn, when the turn began with no new message. */
@@ -466,6 +500,14 @@ class OptChat {
 	private mainRetries = 0;
 	private store: Store | undefined;
 	private memory: Memory | undefined;
+	/** Standing rules: present only when the rules gate is on and the session is ready. */
+	private rules: RuleLedger | undefined;
+	/** Triage jobs run one at a time in log order, each after its message is durable. */
+	private triageChain: Promise<void> = Promise.resolve();
+	/** Aborted at shutdown: a triage still waiting on its judge is abandoned and never writes. */
+	private readonly triageAbort = new AbortController();
+	/** The latest System One failure, bounded, for `/optchat status`. */
+	private gateFailure: string | undefined;
 	private ready: Promise<void> = Promise.resolve();
 	private turn: Turn | undefined;
 	private pending: Pending | undefined;
@@ -496,6 +538,7 @@ class OptChat {
 		private readonly settleTimeoutMs: number,
 		private readonly observe: (usage: CompressorUsage) => void,
 		private readonly policy: CompressorPolicy = {},
+		private readonly judges: JudgeFactory = hostJudge,
 	) {}
 
 	/** Inactive sessions pass every host hook through unchanged: no view, no capture, no compaction veto. */
@@ -538,19 +581,24 @@ class OptChat {
 			await store.close();
 			return;
 		}
+		let rules: RuleLedger | undefined;
 		try {
+			rules = config.gates.rules ? RuleLedger.open(store.directory) : undefined;
 			this.registerTools();
 		} catch (error) {
 			await store.close();
 			throw error;
 		}
 		this.store = store;
+		this.rules = rules;
 		this.memory = new Memory(store, this.summarize, {
 			nodeBytes: config.nodeBytes,
 			viewBytes: config.viewBytes,
 			jobs: config.jobs,
 			tries: config.tries,
 			report: (message) => this.notify(`OptChat compressor: ${message}`, "warning"),
+			// Requested only when the value-score gate is on: with it off, the compressor is never asked for a hint.
+			hint: config.gates.valueScore ? (source, signal) => this.valueHintFor(source, signal) : undefined,
 		});
 		this.state = { kind: "ready" };
 		this.childViewEnabled = config.childView;
@@ -1066,7 +1114,7 @@ class OptChat {
 					: [{ type: "text", text: `${SYSTEM_BLOCK}\n\n` }, ...turn.blocks],
 				timestamp: turn.timestamp,
 			};
-			return { messages: [view, ...messages.slice(start)] };
+			return { messages: [view, ...turn.extra, ...messages.slice(start)] };
 		} catch (error) {
 			const reason = error instanceof Refusal ? error.message : `OptChat refused the request: ${errorText(error)}`;
 			if (!(error instanceof Refusal) && this.state.kind === "ready") this.fail(reason);
@@ -1203,9 +1251,11 @@ class OptChat {
 		this.logNew(tail);
 		const partition = viewPartition(ctx.model);
 		const turn: Turn = first
-			? { blocks, partition, timestamp, first: mark(first) }
-			: { blocks, partition, timestamp, after: start > 0 ? mark(messages[start - 1]!) : undefined };
+			? { blocks, partition, timestamp, extra: [], first: mark(first) }
+			: { blocks, partition, timestamp, extra: [], after: start > 0 ? mark(messages[start - 1]!) : undefined };
 		this.turn = turn;
+		// Frozen with the view: every request of this turn carries the same System One messages.
+		turn.extra = await this.extraFor(tail, memory, ctx, deadline, timestamp);
 		return turn;
 	}
 
@@ -1238,12 +1288,17 @@ class OptChat {
 		this.enqueue(async () => {
 			const memory = this.openMemory();
 			const date = Number.isFinite(at) ? new Date(at) : undefined;
+			let typed: { source: number; text: string } | undefined;
 			for (const entry of await entriesOf(message, capture)) {
-				memory.append(entry.kind, entry.text, entry.at === undefined ? date : new Date(entry.at), entry.metadata);
+				const stored = memory.append(entry.kind, entry.text, entry.at === undefined ? date : new Date(entry.at), entry.metadata);
+				// Only a user's own text can state a rule. Skill prompts, reports and agent-authored messages never reach here as role user.
+				if (message.role === "user" && entry.kind === "user") typed = { source: stored.i, text: entry.text };
 			}
 			if (message.role === "toolResult") this.captured.delete(message.toolCallId);
 			this.queued.delete(key);
 			this.logged.add(key);
+			// Triage starts only now: the message is durable, and the chain keeps log order.
+			if (typed && this.rules && this.ctx) this.queueTriage(typed.source, typed.text, this.ctx);
 		});
 	}
 
@@ -1326,6 +1381,11 @@ class OptChat {
 		this.saveUnanswered();
 		// Queued appends settle while the store is still open.
 		await this.logChain;
+		// Triage still judging gets a short wait, then is abandoned: it must never write once the store closes.
+		await this.settleTriage();
+		this.triageAbort.abort();
+		this.rules?.close();
+		this.rules = undefined;
 		this.state = { kind: "closed" };
 		this.unpublish?.();
 		this.unpublish = undefined;
@@ -1373,8 +1433,11 @@ class OptChat {
 					if (!ctx.isIdle()) throw new Error("wait until the agent is idle before importing");
 					ctx.ui.notify(this.importFrom(argument, ctx.cwd), "info");
 					return;
+				case "rules":
+					ctx.ui.notify(this.rulesCommand(argument), "info");
+					return;
 				default:
-					throw new Error(`unknown subcommand "${action}" (use status, view, export PATH or import PATH)`);
+					throw new Error(`unknown subcommand "${action}" (use status, view, export PATH, import PATH or rules [remove ID])`);
 			}
 		} catch (error) {
 			ctx.ui.notify(`/optchat ${action}: ${errorText(error)}`, "error");
@@ -1396,6 +1459,7 @@ class OptChat {
 				`compressor fallbacks: ${this.mainRetries} main-model retries; ${status.extractive} unsummarized stand-ins`,
 			);
 		}
+		lines.push(...this.gateStatus());
 		lines.push(
 			`stateless OpenAI: ${process.env.PI_OPENAI_STATEFUL === "0" ? "requested (PI_OPENAI_STATEFUL=0)" : "not set; official OpenAI main requests may chain responses"}`,
 			`settlement deadline: ${this.settleTimeoutMs} ms (host handler limit ${HOST_HANDLER_LIMIT_MS} ms)`,
@@ -1405,6 +1469,191 @@ class OptChat {
 			"side turns (/btw, recaps): the host gives no typed purpose; see issue #1",
 		);
 		return lines.join("\n");
+	}
+
+	// --- System One (opt-in gates) --------------------------------------------------
+
+	/** The judge for one gate. A factory that throws is recorded as a failure and counts as no judge. */
+	private judgeOf(ctx: ExtensionContext, purpose: string): Judge | undefined {
+		try {
+			return this.judges(ctx, purpose);
+		} catch (error) {
+			this.gateFail(purpose, error);
+			return undefined;
+		}
+	}
+
+	/** Records the latest System One failure for `/optchat status`, bounded and without model output. */
+	private gateFail(gate: string, reason: unknown): void {
+		this.gateFailure = `${gate}: ${boundedGateError(reason)}`;
+	}
+
+	/** A tool call, screened by the judge when the tool gate is on. A failed judgment, or no judge, fails closed. */
+	async toolCall(event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> {
+		const config = this.config;
+		// Without a config, the gate cannot know its threshold: block rather than run unscreened.
+		if (!config) return { block: true, reason: "OptChat tool gate blocked the call: OptChat did not open." };
+		return gateToolCall(
+			{ toolName: event.toolName, input: event.input, cwd: ctx.cwd },
+			{
+				judge: this.judgeOf(ctx, "optchat-tool-gate"),
+				toolAsk: config.gates.toolAsk,
+				ui: { hasUI: ctx.hasUI, confirm: (title, message) => ctx.ui.confirm(title, message) },
+				report: (failure) => this.gateFail("tool gate", failure),
+			},
+		);
+	}
+
+	/** The System One messages of one turn, frozen at its start: the rules block, then the prefetch block. */
+	private async extraFor(
+		tail: AgentMessage[],
+		memory: Memory,
+		ctx: ExtensionContext,
+		deadline: number,
+		timestamp: number,
+	): Promise<UserMessage[]> {
+		const extra: UserMessage[] = [];
+		const rules = this.rules?.active() ?? [];
+		if (rules.length > 0) extra.push({ role: "user", content: [{ type: "text", text: renderRules(rules) }], timestamp });
+		const block = await this.prefetch(tail, memory, ctx, deadline);
+		if (block !== undefined) extra.push({ role: "user", content: [{ type: "text", text: block }], timestamp });
+		return extra;
+	}
+
+	/** The prefetch block for the newest user message of the turn; undefined when it does not apply or fails open. */
+	private async prefetch(tail: AgentMessage[], memory: Memory, ctx: ExtensionContext, deadline: number): Promise<string | undefined> {
+		const config = this.config;
+		if (!config?.gates.prefetch) return undefined;
+		const newest = tail.findLast((message) => message.role === "user");
+		const message = newest?.role === "user"
+			? typeof newest.content === "string"
+				? newest.content
+				: newest.content.filter((part): part is TextContent => part.type === "text").map((part) => part.text).join("\n")
+			: undefined;
+		// No judge is resolved unless there is a merged line to judge and time left within the settle deadline.
+		const remaining = Math.min(PREFETCH_MS, deadline - Date.now() - PREFETCH_MARGIN_MS);
+		if (message === undefined || message.length === 0 || remaining <= 0 || !memory.viewLines().some((line) => line.n >= 2)) {
+			return undefined;
+		}
+		const judge = this.judgeOf(ctx, "optchat-prefetch");
+		if (!judge) {
+			this.gateFail("prefetch", "no judge candidate");
+			return undefined;
+		}
+		try {
+			return await prefetchBlock(memory, {
+				judge,
+				message,
+				k: config.gates.prefetchK,
+				min: config.gates.prefetchMin,
+				timeoutMs: remaining,
+			});
+		} catch (error) {
+			this.gateFail("prefetch", error);
+			return undefined;
+		}
+	}
+
+	/** Queues one durable user message for triage. The chain runs in log order and never rejects. */
+	private queueTriage(source: number, text: string, ctx: ExtensionContext): void {
+		this.triageChain = this.triageChain
+			.then(() => this.triage(source, text, ctx))
+			.catch((error: unknown) => this.gateFail("rules", error));
+	}
+
+	/** One triage: one judge request, then add, replace, or nothing. Fails open: a failure changes no rule. */
+	private async triage(source: number, text: string, ctx: ExtensionContext): Promise<void> {
+		const ledger = this.rules;
+		const config = this.config;
+		const abort = this.triageAbort.signal;
+		if (!ledger || !config || abort.aborted) return;
+		const offered = offeredRules(ledger.active());
+		const judge = this.judgeOf(ctx, "optchat-rules");
+		if (!judge) {
+			this.gateFail("rules", "no judge candidate");
+			return;
+		}
+		const sentences = ruleSentences(text);
+		let result: JudgmentResult<Questions>;
+		try {
+			result = await judgeWithin(
+				judge,
+				{ state: triageState(text, sentences), questions: triageQuestions(offered, sentences) },
+				TRIAGE_MS,
+				abort,
+			);
+		} catch (error) {
+			if (!abort.aborted) this.gateFail("rules", error);
+			return;
+		}
+		// Shutdown began while the judge answered: the ledger is closing, so nothing is written.
+		if (abort.aborted) return;
+		const decision = decideTriage(result.answers, offered, config.gates.ruleAdd, text, sentences);
+		if (decision.kind === "none") return;
+		let rule: Rule;
+		try {
+			rule = decision.kind === "add"
+				? ledger.add(source, decision.text, Date.now())
+				: ledger.replace(decision.replaces, source, decision.text, Date.now());
+		} catch (error) {
+			this.gateFail("rules", error);
+			return;
+		}
+		const change = decision.kind === "add" ? "added" : `replaced ${decision.replaces}`;
+		this.notify(`OptChat rule ${rule.id} ${change} from message ${source}: ${rule.text}\nUndo with /optchat rules remove ${rule.id}.`, "info");
+	}
+
+	/** Waits for queued triage at most SHUTDOWN_TRIAGE_MS. The caller then aborts whatever still runs. */
+	private async settleTriage(): Promise<void> {
+		const { promise: bound, resolve } = Promise.withResolvers<void>();
+		const timer = setTimeout(resolve, SHUTDOWN_TRIAGE_MS);
+		try {
+			await Promise.race([this.triageChain, bound]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	/** The compressor's importance hint for one leaf; undefined when the judge is missing or fails. */
+	private async valueHintFor(source: { kind: Kind; text: string }, signal: AbortSignal): Promise<string | undefined> {
+		const ctx = this.ctx;
+		const judge = ctx ? this.judgeOf(ctx, "optchat-value") : undefined;
+		return judge ? valueHint(judge, source, signal) : undefined;
+	}
+
+	/** `/optchat status` lines for the System One gates. With every gate off there are none: status matches v0.5.0. */
+	private gateStatus(): string[] {
+		const gates = this.config?.gates;
+		if (!gates || !(gates.rules || gates.prefetch || gates.valueScore || gates.toolGate)) return [];
+		const flag = (on: boolean) => (on ? "on" : "off");
+		const lines = [
+			`System One gates: rules ${flag(gates.rules)}, prefetch ${flag(gates.prefetch)}, value-score ${flag(gates.valueScore)}, tool-gate ${flag(gates.toolGate)}`,
+		];
+		const judge = this.ctx ? this.judgeOf(this.ctx, "optchat-status") : undefined;
+		const model = (judge as NamedJudge | undefined)?.primaryModel?.();
+		lines.push(
+			`judge: ${model ? `${model.provider}/${model.id}` : "none (the judge role has no credentialed candidate, or resolving it failed)"}`,
+		);
+		if (gates.rules) lines.push(`standing rules: ${this.rules?.active().length ?? 0} active`);
+		lines.push(`last System One failure: ${this.gateFailure ?? "none"}`);
+		return lines;
+	}
+
+	/** `/optchat rules` lists standing rules; `/optchat rules remove ID` removes one. */
+	private rulesCommand(argument: string): string {
+		const ledger = this.rules;
+		if (!ledger) throw new Error("standing rules are off or unavailable (they are on unless the session started with --no-optchat-rules)");
+		if (argument.length === 0) {
+			const active = ledger.active();
+			if (active.length === 0) return "OptChat has no standing rules.";
+			return ["OptChat standing rules:", ...active.map((rule) => `${rule.id} [${rule.source}] ${rule.text}`)].join("\n");
+		}
+		const [verb, id, ...extra] = argument.split(/\s+/);
+		if (verb !== "remove" || id === undefined || extra.length > 0) {
+			throw new Error("usage: /optchat rules | /optchat rules remove ID");
+		}
+		if (!ledger.remove(id, Date.now())) throw new Error(`no active rule ${id}`);
+		return `OptChat rule ${id} removed.`;
 	}
 
 	private exportTo(argument: string, cwd: string): string {
@@ -1439,6 +1688,7 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 		throw new Error("OptChat compressorMaxTokens must be an integer from 1 to 512");
 	}
 	const policy: CompressorPolicy = { admit: options.admitCompressorCall, maxTokens };
+	const judges: JudgeFactory = options.judge ?? hostJudge;
 	return (pi: ExtensionAPI): void => {
 		// Flags are parsed after factories run: register unconditionally, read in session_start.
 		registerFlags(pi);
@@ -1450,7 +1700,7 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 		};
 
 		pi.registerCommand("optchat", {
-			description: "OptChat memory: status | view | export PATH | import PATH",
+			description: "OptChat memory: status | view | export PATH | import PATH | rules [remove ID]",
 			handler: async (args, ctx) => {
 				if (!chat) {
 					ctx.ui.notify("OptChat is not active in this session (main sessions are active unless opted out with --no-optchat).", "info");
@@ -1472,7 +1722,7 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 				// Invalid activation must enter the same fail-closed startup as any other
 				// malformed config: open() reports it and installed context hooks refuse prompts.
 			}
-			const active = new OptChat(pi, settleTimeoutMs, observe, policy);
+			const active = new OptChat(pi, settleTimeoutMs, observe, policy, judges);
 			chat = active;
 			// Registered for every opted-in main session. An inactive one (startup lease conflict) passes through.
 			pi.on("before_agent_start", (event) => (active.passive ? undefined : active.beforeAgentStart(event.systemPrompt)));
@@ -1480,6 +1730,8 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 			pi.on("before_provider_request", (event, handlerCtx) => (active.passive ? undefined : active.beforeProviderRequest(event.payload, handlerCtx)));
 			pi.on("credential_disabled", () => active.resetCacheFence());
 			pi.on("tool_result", (event) => active.toolResult(event));
+			// Registered only when the gate is requested (a malformed value requests it too, so it fails closed).
+			if (toolGateRequested(pi)) pi.on("tool_call", (event, toolCtx) => active.toolCall(event, toolCtx));
 			pi.on("message_end", (event) => active.messageEnd(event.message));
 			pi.on("agent_end", (event) => active.agentEnd(event.messages, event.willContinue === true));
 			// The current turn's tool loop must reach the model verbatim: no host compaction.

@@ -228,6 +228,60 @@ test("admission stops eight unbuilt leaves ahead, however many jobs are free", a
   expect(memory.status().pending).toBe(8);
 });
 
+test("a leaf's importance hint is added to its compaction instruction, and the hint sees only that leaf", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const seen: string[] = [];
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16,
+    jobs: 4,
+    viewBytes: 1_000_000,
+    hint: async (source) => {
+      seen.push(source.text);
+      return "This record is a decision; keep the choice and its reason. Its importance is high.";
+    },
+  });
+  memory.append("user", "[m0] a long user message");
+  await until(() => model.labels().includes("[m0]"), "leaf m0 with its hint");
+  expect(model.take("[m0]").request.instruction).toContain("Its importance is high.");
+  expect(seen).toEqual(["[m0] a long user message"]);
+});
+
+test("a failing hint leaves the leaf compacted as if no hint existed", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16,
+    jobs: 4,
+    viewBytes: 1_000_000,
+    hint: async () => {
+      throw new Error("hint provider down");
+    },
+  });
+  memory.append("user", "[m0] a long user message");
+  await until(() => model.labels().includes("[m0]"), "leaf m0 without its hint");
+  expect(model.take("[m0]").request.instruction).not.toContain("importance");
+});
+
+// Real timers on purpose: hintTimeoutMs is a wall-clock bound, and observing that the leaf proceeds past it needs real time.
+test("a hint that never answers is abandoned at hintTimeoutMs, and the leaf compacts without it", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16,
+    jobs: 4,
+    viewBytes: 1_000_000,
+    hintTimeoutMs: 20,
+    hint: () => Promise.withResolvers<string>().promise,
+  });
+  memory.append("user", "[m0] a long user message");
+  const { promise: past, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, 60);
+  await past;
+  await until(() => model.labels().includes("[m0]"), "leaf m0 after the hint bound");
+  expect(model.take("[m0]").request.instruction).not.toContain("importance");
+});
+
 test("a failed leaf keeps its admission slot until a retry succeeds", async () => {
   const store = await openStore();
   const model = new Model();

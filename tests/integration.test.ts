@@ -998,6 +998,11 @@ function defaultFlags(memory: string): Record<string, string | boolean> {
     "optchat-jobs": "1",
     "optchat-tries": "1",
     "optchat-tool-cap": String(TOOL_CAP),
+    // Memory cases script every provider request: System One gates (on by default) are covered in system1.test.ts.
+    "no-optchat-rules": true,
+    "no-optchat-prefetch": true,
+    "no-optchat-value-score": true,
+    "no-optchat-tool-gate": true,
   };
 }
 

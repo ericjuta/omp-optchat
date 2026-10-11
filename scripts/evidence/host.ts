@@ -40,6 +40,8 @@ export interface HostLaunch {
 
 /** Common no-ambient-state flags: no tools, skills, rules, or discovered extensions. */
 const ISOLATION_FLAGS = ["--mode", "rpc", "--no-ui", "--no-title", "--no-tools", "--no-skills", "--no-rules", "--no-extensions"];
+const SYSTEM_ONE_OPTOUTS = ["--no-optchat-rules", "--no-optchat-prefetch", "--no-optchat-value-score", "--no-optchat-tool-gate"] as const;
+
 /** Isolation flags for one launch: `--no-tools` unless a tool list names the tools to expose instead. */
 function isolationFlags(tools: readonly string[] | null): string[] {
 	if (tools === null) return [...ISOLATION_FLAGS];
@@ -62,6 +64,8 @@ export function launchArgs(launch: HostLaunch, extension: string): string[] {
 		"--optchat-dir", launch.memory,
 		// Runner-only: a view budget small enough that the saved tree coarsens within the call budget.
 		"--optchat-view-bytes", String(launch.viewBytes),
+		// The benchmark measures memory recall: System One gates (on by default) would add judge calls and block headless tools.
+		...SYSTEM_ONE_OPTOUTS,
 		...(launch.optchat ? [] : ["--no-optchat"]),
 		...launch.extraArgs,
 	];

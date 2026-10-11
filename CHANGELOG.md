@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0 — 2026-10-11
+
+- **System One gates (all on by default; opt out per gate with `--no-optchat-rules`, `--no-optchat-prefetch`, `--no-optchat-value-score`, `--no-optchat-tool-gate`):** Four judge-backed gates use the host's `judge` role: standing rules (`--optchat-rules`, with `/optchat rules` and `/optchat rules remove ID`), view prefetch for each user message (`--optchat-prefetch`), a one-sentence importance hint per compacted leaf (`--optchat-value-score`), and a tool-call gate (`--optchat-tool-gate`). Thresholds: `--optchat-rule-add`, `--optchat-prefetch-k`, `--optchat-prefetch-min`, `--optchat-tool-ask`. A failed judge changes nothing and the session keeps running; the tool gate fails closed.
+- A rule keeps only the sentences of the message that the judge rates as standing instructions; a one-sentence message is kept whole.
+- Standing rules are stored in `ledger.jsonl` beside the chat log. Shutdown waits up to 1.5 s for queued rule triage, then abandons it, so a triage never writes after the store closes.
+- With every gate opted out, context and `/optchat status` match 0.5.0. The evidence runner opts its hosts out, so its benchmark keeps measuring memory alone.
+- Planning kit ported into the repository: `AGENTS.md`, `plans/`, `docs/`, `.scratch/`, `vendor/`, `.agent/`, and project skills in `.omp/skills/`. Documentation only; no runtime change.
+
 ## 0.5.0 — 2026-10-11
 
 Tracks Wayfinder map [#9](https://github.com/ericjuta/omp-optchat/issues/9). SDK packages pinned to 18.9.1 (peers stay `>=18.9.0`).

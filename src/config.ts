@@ -12,6 +12,14 @@ export const DEFAULTS = Object.freeze({
   tries: 5,
   toolCap: 30_000,
   childView: false,
+  rules: true,
+  prefetch: true,
+  valueScore: true,
+  toolGate: true,
+  ruleAdd: 0.8,
+  prefetchK: 8,
+  prefetchMin: 0.5,
+  toolAsk: 0.3,
 });
 
 export interface OptChatConfig {
@@ -24,6 +32,23 @@ export interface OptChatConfig {
   tries: number;
   toolCap: number;
   childView: boolean;
+  gates: GateConfig;
+}
+
+/** System One gates (Jev judgments through the host judge role), on by default. Every gate opted out means no judge is ever resolved. */
+export interface GateConfig {
+  rules: boolean;
+  prefetch: boolean;
+  valueScore: boolean;
+  toolGate: boolean;
+  /** Minimum P(rule) to add or replace a rule, in (0, 1]. */
+  ruleAdd: number;
+  /** Prefetch lines zoomed per turn, from 1 to 32. */
+  prefetchK: number;
+  /** Minimum P(relevant) for a prefetch line, in (0, 1]. */
+  prefetchMin: number;
+  /** Danger at or above which a tool call is confirmed or blocked, in (0, 1]. */
+  toolAsk: number;
 }
 
 type FlagReader = Pick<ExtensionAPI, "getFlag">;
@@ -80,6 +105,51 @@ export function registerFlags(api: FlagRegistrar): void {
     default: DEFAULTS.childView,
     description: "Give subagents a read-only frozen snapshot of this chat (zoom, date and work only)",
   });
+  for (const gate of GATE_FLAGS) {
+    api.registerFlag(gate.flag, {
+      type: "boolean",
+      default: DEFAULTS[gate.key],
+      description: `System One: ${gate.what}, judged by the judge role (default: on; --no-${gate.flag} takes precedence)`,
+    });
+    api.registerFlag(`no-${gate.flag}`, {
+      type: "boolean",
+      default: false,
+      description: `Turn off the System One ${gate.name} for this session, even when --${gate.flag} is present`,
+    });
+  }
+  api.registerFlag("optchat-rule-add", {
+    type: "string",
+    default: String(DEFAULTS.ruleAdd),
+    description: "System One: minimum probability (0, 1] for a rule to be added or replaced (default: 0.8)",
+  });
+  api.registerFlag("optchat-prefetch-k", {
+    type: "string",
+    default: String(DEFAULTS.prefetchK),
+    description: "System One: view lines zoomed per turn, from 1 to 32 (default: 8)",
+  });
+  api.registerFlag("optchat-prefetch-min", {
+    type: "string",
+    default: String(DEFAULTS.prefetchMin),
+    description: "System One: minimum probability (0, 1] for a prefetched line (default: 0.5)",
+  });
+  api.registerFlag("optchat-tool-ask", {
+    type: "string",
+    default: String(DEFAULTS.toolAsk),
+    description: "System One: danger probability (0, 1] at which a tool call is confirmed or blocked (default: 0.3)",
+  });
+}
+
+const GATE_FLAGS = [
+  { key: "rules", flag: "optchat-rules", name: "rules gate", what: "keep standing user rules from messages" },
+  { key: "prefetch", flag: "optchat-prefetch", name: "prefetch gate", what: "zoom view lines relevant to each new user message" },
+  { key: "valueScore", flag: "optchat-value-score", name: "value-score gate", what: "give the compressor a one-sentence importance hint per leaf" },
+  { key: "toolGate", flag: "optchat-tool-gate", name: "tool gate", what: "screen risky tool calls before they run" },
+] as const;
+
+/** One gate: its opt-out wins over its flag; a malformed value of either fails closed. */
+function gate(api: FlagReader, flag: (typeof GATE_FLAGS)[number]["flag"], fallback: boolean): boolean {
+  if (boolean(api.getFlag(`no-${flag}`), `no-${flag}`, false)) return false;
+  return boolean(api.getFlag(flag), flag, fallback);
 }
 
 function invalid(flag: string, requirement: string): never {
@@ -92,6 +162,18 @@ function boolean(value: FlagValue, flag: string, fallback: boolean): boolean {
   if (value === true || value === "true") return true;
   if (value === false || value === "false") return false;
   return invalid(flag, "must be true or false");
+}
+
+/**
+ * Whether the tool_call gate handler is registered at session start. A malformed value also registers it, so the
+ * gate fails closed (every screened call is blocked) instead of silently running without the requested gate.
+ */
+export function toolGateRequested(api: FlagReader): boolean {
+  try {
+    return gate(api, "optchat-tool-gate", DEFAULTS.toolGate);
+  } catch {
+    return true;
+  }
 }
 
 /** Read activation alone so opted-out sessions never initialize memory or model work. */
@@ -130,6 +212,31 @@ function compressor(value: FlagValue): string {
   return value;
 }
 
+/** A probability in (0, 1] written as a plain decimal; anything else fails closed. */
+function probability(api: FlagReader, flag: string, fallback: number): number {
+  const value = api.getFlag(flag);
+  if (value === undefined) return fallback;
+  if (typeof value !== "string" || !/^(?:\d+\.?\d*|\.\d+)$/.test(value)) {
+    return invalid(flag, "must be a decimal probability greater than 0 and at most 1");
+  }
+  const parsed = Number(value);
+  if (!(parsed > 0 && parsed <= 1)) return invalid(flag, "must be a decimal probability greater than 0 and at most 1");
+  return parsed;
+}
+
+function gates(api: FlagReader): GateConfig {
+  return {
+    rules: gate(api, "optchat-rules", DEFAULTS.rules),
+    prefetch: gate(api, "optchat-prefetch", DEFAULTS.prefetch),
+    valueScore: gate(api, "optchat-value-score", DEFAULTS.valueScore),
+    toolGate: gate(api, "optchat-tool-gate", DEFAULTS.toolGate),
+    ruleAdd: probability(api, "optchat-rule-add", DEFAULTS.ruleAdd),
+    prefetchK: integer(api, "optchat-prefetch-k", DEFAULTS.prefetchK, 1, 32),
+    prefetchMin: probability(api, "optchat-prefetch-min", DEFAULTS.prefetchMin),
+    toolAsk: probability(api, "optchat-tool-ask", DEFAULTS.toolAsk),
+  };
+}
+
 /** Only absent flags take defaults; malformed supplied values always fail closed. */
 export function readConfig(api: FlagReader, defaultDirectory: string): OptChatConfig {
   const enabled = readEnabled(api);
@@ -148,6 +255,7 @@ export function readConfig(api: FlagReader, defaultDirectory: string): OptChatCo
     tries: integer(api, "optchat-tries", DEFAULTS.tries, 1, 100),
     toolCap: integer(api, "optchat-tool-cap", DEFAULTS.toolCap, 128),
     childView: boolean(api.getFlag("optchat-child-view"), "optchat-child-view", DEFAULTS.childView),
+    gates: gates(api),
   };
 }
 

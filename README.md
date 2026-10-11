@@ -10,7 +10,7 @@ An OMP extension implementing [Victor Taelin's OptChat specification](https://gi
 Install the tagged release:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.5.0'
+omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.6.0'
 PI_OPENAI_STATEFUL=0 omp
 ```
 
@@ -67,6 +67,7 @@ chat/
   main/YYYY-MM-DD.jsonl   # {i,kind,text,size,date}
   tree/YYYY-MM-DD.jsonl   # {l,i,text,size}
   view.json               # {version:2,length,parts,compacting,compactor:{length,parts,compacting}}
+  ledger.jsonl            # standing rules, appended per event; absent with --no-optchat-rules
   images/                 # content-addressed image blobs referenced by message metadata
 ```
 
@@ -87,6 +88,31 @@ Work sits in dependency-ready queues, as upstream specifies; the tree is never s
 **Refusals.** A compressor refusal is a provider reply with `stopReason: "error"` whose message starts with `Refusal` (how pi-ai reports Anthropic `stop_reason: refusal`). That compaction is retried once with the session's main model, under the same admission, cache, and token rules, and its metric line names the model that answered. The fallback has a 30-second wall deadline covering admission, auth, and the whole provider response; a fallback that exceeds it is cancelled and treated as a refusal. If the main model also refuses, or is the compressor itself, OptChat commits a deterministic excerpt of the node's source, prefixed `[unsummarized: compressor refused]`, within the node's byte budget. A stand-in is navigation, not a model summary: `zoom` returns the originals, and the tree keeps progressing so later prompts are not refused. Other provider errors (transport, HTTP, rate limit, aborts, length) keep the retry-on-next-message behavior. Each fallback is reported once, and `/optchat status` counts main-model retries and stand-ins.
 
 A model turn waits for summaries rather than seeing partial source text. Compression failures are reported. Cancel a wait if the provider is unavailable; history already accepted by the plugin is retained. Reasoning/thinking is not written to the OptChat log. Ordinary tool-result text is head-and-tail capped at 30,000 characters; full `zoom` retrieval is exempt so original messages remain accessible.
+
+## System One gates (Jev)
+
+Four gates send text to the host's `judge` model role. All four are on by default. Turn one off for a session with its opt-out flag (`--no-optchat-rules`, `--no-optchat-prefetch`, `--no-optchat-value-score`, `--no-optchat-tool-gate`); an opt-out takes precedence over the gate's own flag, which is kept for explicit launches. OMP boolean flags are presence flags, so `--optchat-rules=false` does not turn a gate off. With all four opted out, OptChat resolves no judge, registers no tool hook, and its context and `/optchat status` match 0.5.0. Subagents never run the gates.
+
+| Flag | Gate | What it does | Judged per |
+| --- | --- | --- | --- |
+| `--optchat-rules` | Standing rules | Judges each user message for a standing instruction, then adds it to `ledger.jsonl` or replaces the active rule it overrides. Active rules appear in a `<rules>` block after the view. | user message |
+| `--optchat-prefetch` | Prefetch | Judges merged view lines against the new user message and zooms the relevant ones into a `<prefetch>` block. Bounded to 5 s, and to the settle deadline's remaining time. | user message |
+| `--optchat-value-score` | Value hint | Judges each long leaf's label and importance, and adds one fixed sentence to its compaction instruction. The sentence never contains record text or ids. | compacted leaf |
+| `--optchat-tool-gate` | Tool gate | Judges each tool call except read-only and OptChat's own tools (`zoom`, `date`, `work`, `read`, `grep`, `glob`, `find`, `todo`, `ask`, `think`, `web_search`). Danger at or above `--optchat-tool-ask` asks the user, or blocks when no UI is available. Bounded to 8 s. | tool call |
+
+Thresholds: `--optchat-rule-add` (default `0.8`), `--optchat-prefetch-k` (default `8`, integer 1–32), `--optchat-prefetch-min` (default `0.5`), `--optchat-tool-ask` (default `0.3`). Probabilities are plain decimals in (0, 1]. A malformed value fails the session's configuration closed.
+
+Behavior:
+
+- **Judge.** The judge is the host's `judge` role, resolved per call. If the role has no credentialed candidate, or resolving it throws, that gate does not run. `/optchat status` says so. OptChat keeps working.
+- **Failures.** A judge failure, a timeout, or a missing judge changes no rule and adds no prefetch block. The tool gate fails closed: it asks with a UI and blocks without one. `/optchat status` shows the last failure, cut to 200 characters.
+- **Privacy.** An enabled gate sends the text it judges to the judge role's provider: user messages, view lines, tool names and inputs, and record text for the value hint. With every gate opted out, nothing is sent.
+- **Cost.** With the defaults, each user message costs up to two judge requests (rules, then prefetch on a merged view), each long compacted leaf one, and each screened tool call one, before the call runs.
+- **Rules.** A rule's text is the user's own words. When a message has several sentences, the judge rates each one, and the rule keeps only the sentences that reach `--optchat-rule-add`, so "From now on, answer in British English. Also run the tests." stores only the first sentence. Rule IDs (`r1`, `r2`, …) are never reused. `/optchat rules` lists active rules, and `/optchat rules remove ID` removes one. A triage that is still running at shutdown is abandoned and writes nothing.
+- **Shutdown.** A print or JSON run exits right after its reply. On `session_shutdown`, OptChat waits up to 1.5 s for queued rule triage, then abandons whatever is still running. The bound stays under the host's 2 s session-shutdown cap, so the wait is shorter than the 5 s the design allowed.
+- **Frozen per turn.** The rules and prefetch blocks are decided when a turn starts, and every request in that turn carries the same blocks, including tool loops. A rule stated mid-turn applies from the next turn.
+
+Verified in this repository: the unit and integration tests in `tests/system1.test.ts`, `tests/system1-e2e.test.ts` and `tests/memory.test.ts`; a cache test (`tests/cache.test.ts`) showing that the system prompt, tools and view text in an encoded Anthropic request are unchanged when the rules and prefetch messages follow the view; a one-off comparison in which a 12-turn conversation produced byte-identical context and status with every gate opted out, against 0.5.0; and live print-mode runs with the real judge on OMP 18.9.1, where the tool gate blocked `rm -rf build` with no UI and a two-sentence message stored only its rule sentence. Not verified: the judge's accuracy beyond those runs, prefetch on a live merged view, and the confirm dialog in an interactive session.
 
 ## OMP-specific boundaries
 
@@ -197,6 +223,10 @@ The one miss named only part of an ambiguous answer. "Cache-read share" is cache
 The 0.2.0 release was exercised with compiled OMP 18.8.9 against the synthetic provider. A separate real-filesystem run ingested 300 synthetic messages, observed the 128,000-to-64,000-byte main batch and 32,000-to-16,000-byte compactor cycle, and checked byte-identical saved views on restart plus migration from a log without a snapshot.
 
 The initial release was also exercised with the compiled OMP 18.6.1 binary and an authenticated `@smol` model: a long synthetic note was compressed to 185 bytes and its canary name/color were recalled correctly in a new process. Fresh-process discovery after `omp plugin link .` was verified without an explicit extension path. The HTML export was checked in Chromium at desktop and 375-pixel mobile widths, including navigation and escaped script text. These checks do not establish real-provider cache hit rates.
+
+## Planning and specs
+
+The System One plan lives in the repository. Start with `AGENTS.md` for how to work here and the verification commands. The living ExecPlan is `plans/optchat-jev.md`, with progress, decisions and open items. The design is `docs/design/optchat-jev.md`. Project skills (Wayfinder, ExecPlan, grilling and others) load from `.omp/skills/`.
 
 ## Attribution
 

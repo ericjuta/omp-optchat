@@ -32,6 +32,13 @@ export interface MemoryOptions {
   jobs?: number;
   tries?: number;
   report?: (message: string) => void;
+  /**
+   * Optional importance hint for a level-0 leaf whose text is too long to keep verbatim. Its one sentence is
+   * added to that leaf's compaction instruction. It is bounded and fail-open, and it never changes scheduling.
+   */
+  hint?: (source: { kind: Kind; text: string }, signal: AbortSignal) => Promise<string | undefined>;
+  /** Bound for one hint call, in milliseconds; default 2000. */
+  hintTimeoutMs?: number;
 }
 
 export interface ViewPart {
@@ -68,6 +75,12 @@ const EXTRACTIVE_MARK = "[unsummarized: compressor refused] ";
 const EXTRACTIVE_JOIN = " | ";
 
 export const utf8Bytes = (text: string): number => Buffer.byteLength(text, "utf8");
+
+/** A hint as one bounded line, or undefined when nothing remains. */
+function sentence(value: string): string | undefined {
+  const line = utf8Prefix(flatten(value).trim(), 256);
+  return line.length > 0 ? line : undefined;
+}
 
 /** Cut at a byte boundary without manufacturing a replacement character. */
 export function utf8Prefix(text: string, budget: number): string {
@@ -161,6 +174,8 @@ export class Memory {
   private readonly jobs: number;
   private readonly tries: number;
   private readonly report: (message: string) => void;
+  private readonly hint: MemoryOptions["hint"];
+  private readonly hintTimeoutMs: number;
   private view: ViewPart[] = [];
   private bytes = 0;
   private compacting = false;
@@ -203,6 +218,8 @@ export class Memory {
     this.jobs = positive(options.jobs, 8, "jobs");
     this.tries = positive(options.tries, 5, "tries");
     this.report = options.report ?? ((message) => console.error(message));
+    this.hint = options.hint;
+    this.hintTimeoutMs = positive(options.hintTimeoutMs, 2_000, "hintTimeoutMs");
 
     const snapshot = store.viewSnapshot;
     this.view = snapshot?.parts.map(([l, i]) => ({ l, i })) ?? [];
@@ -266,6 +283,19 @@ export class Memory {
 
   render(): string {
     return chat(this.view.map((part) => this.renderPart(part)));
+  }
+
+  /** Merged view lines (n >= 2) with their summary text, flattened to one line. Level-0 lines are excluded. */
+  viewLines(): Array<{ readonly id: number; readonly n: number; readonly text: string }> {
+    const lines: Array<{ readonly id: number; readonly n: number; readonly text: string }> = [];
+    for (const part of this.view) {
+      if (part.l === 0) continue;
+      const node = this.node(part);
+      if (!node) continue;
+      const n = 2 ** part.l;
+      lines.push({ id: part.i * n, n, text: flatten(node.text) });
+    }
+    return lines;
   }
 
   /**
@@ -627,11 +657,14 @@ export class Memory {
     const end = part.l === 0 ? part.i : (part.i + 1) * width;
     const context = this.context(end);
     const half = width / 2;
+    // Only a level-0 leaf that reaches this path is non-free: merges and verbatim nodes never ask for a hint.
+    const hint = part.l === 0 ? await this.hintFor(part.i, signal) : undefined;
+    if (this.stopped || signal.aborted) return undefined;
     const task = part.l === 0
       ? `compress message ${start}`
       : `merge lines ${start}+${half} and ${start + half}+${half}, adjacent,`;
     const details = part.l === 0
-      ? ""
+      ? (hint === undefined ? "" : `${hint}\n`)
       : `<chat> may hold their messages, ${start} to ${end - 1}, in more detail: take details\nof them from there too.\n`;
     const leaf = (body: string): string =>
       `Compaction: ${task} into one line of at most ${this.nodeBytes} bytes\n${this.ruler()}\n${RULER}\n${details}<input>\n${body}\n</input>`;
@@ -684,6 +717,35 @@ export class Memory {
       items = next;
     }
     return items[0];
+  }
+
+  /**
+   * The hint sentence for leaf `i`, or undefined. Bounded by `hintTimeoutMs` and by the job's signal; any
+   * failure, timeout or cancellation yields no hint, and the leaf is compacted exactly as without one.
+   */
+  private async hintFor(i: number, parent: AbortSignal): Promise<string | undefined> {
+    const hint = this.hint;
+    if (!hint || parent.aborted) return undefined;
+    const message = this.store.messages[i]!;
+    const source = { kind: message.kind, text: message.text };
+    const controller = new AbortController();
+    const { promise: bound, resolve } = Promise.withResolvers<undefined>();
+    const giveUp = () => {
+      controller.abort();
+      resolve(undefined);
+    };
+    const timer = setTimeout(giveUp, this.hintTimeoutMs);
+    parent.addEventListener("abort", giveUp, { once: true });
+    try {
+      const value = await Promise.race([
+        Promise.resolve().then(() => hint(source, controller.signal)).catch(() => undefined),
+        bound,
+      ]);
+      return typeof value === "string" ? sentence(value) : undefined;
+    } finally {
+      clearTimeout(timer);
+      parent.removeEventListener("abort", giveUp);
+    }
   }
 
   /**

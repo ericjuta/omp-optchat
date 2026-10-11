@@ -2,6 +2,19 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { getBundledModels } from "@oh-my-pi/pi-catalog";
 import { applyOptChatCache, OptChatCacheCoordinator, viewBlocks, viewPartition } from "../src/cache.ts";
+import {
+  ALL_GATES_OFF,
+  encodeMainRequest,
+  FIRST_MERGED_LINE,
+  hasNotice,
+  Harness,
+  RULE_ADDED,
+  RULE_TEXT,
+  SEED_TEXTS,
+  SMALL_NODES,
+  talk,
+  until,
+} from "./helpers/system1-chat.ts";
 
 type WireObject = Record<string, unknown>;
 type WireMessage = WireObject & { role: string; content: WireObject[] };
@@ -1660,5 +1673,59 @@ describe("cache-prefix writer coordination", () => {
     // A new independent request acquires immediately without waiting for that timer.
     const fresh = await gate.acquire(payload, model);
     fresh();
+  });
+});
+
+describe("System One messages through OptChat", () => {
+  let harness: Harness;
+
+  beforeEach(() => {
+    harness = new Harness();
+  });
+
+  afterEach(async () => {
+    await harness.close();
+  });
+
+  /** A message as the wire carries it, minus the cache marks that OptChat adds as metadata. */
+  function withoutMarks(message: unknown): unknown {
+    return JSON.parse(JSON.stringify(message, (key, value: unknown) => (key === "cache_control" ? undefined : value)));
+  }
+
+  /** One chat with a stated rule and a merged view line, sent with the gates on or all opted out. */
+  async function chatRequest(gates: boolean) {
+    const { host, judge } = await harness.open({
+      flags: gates ? SMALL_NODES : { ...SMALL_NODES, ...ALL_GATES_OFF },
+      routes: { ruleWhen: "French", prefetch: [FIRST_MERGED_LINE] },
+    });
+    let transcript = await talk(host, [], RULE_TEXT);
+    if (gates) await until(() => hasNotice(host, RULE_ADDED), "rule r1");
+    for (const text of SEED_TEXTS) transcript = await talk(host, transcript, text);
+    return { request: await encodeMainRequest(host, transcript, "book the table for two"), judge };
+  }
+
+  test("rules and prefetch follow the view: system, tools and view bytes match a run with every gate opted out", async () => {
+    const on = await chatRequest(true);
+    const off = await chatRequest(false);
+
+    // Preconditions: the gates-on run carried a merged line judged for prefetch, and the gates-off run judged nothing.
+    expect(on.judge.requests.some((r) => Object.keys(r.questions).includes(FIRST_MERGED_LINE))).toBe(true);
+    expect(off.judge.requests).toHaveLength(0);
+
+    expect(on.request.system).toEqual(off.request.system);
+    expect(on.request.tools).toEqual(off.request.tools);
+    // The view's text, block split and order are byte-identical. Cache marks are metadata: a view-end mark may
+    // appear once System One messages follow it, so the marks are bounded separately below.
+    expect(withoutMarks(on.request.messages[0])).toEqual(withoutMarks(off.request.messages[0]));
+    // Anthropic accepts at most four breakpoints per request; the extra messages must not push past it.
+    expect(JSON.stringify(on.request.payload).split('"cache_control"').length - 1).toBeLessThanOrEqual(4);
+
+    const body = JSON.stringify(on.request.messages);
+    const view = body.indexOf("<chat>");
+    expect(body.indexOf("<rules>")).toBeGreaterThan(view);
+    expect(body.indexOf("<prefetch>")).toBeGreaterThan(body.indexOf("<rules>"));
+    expect(JSON.stringify(off.request.messages)).not.toMatch(/<rules>|<prefetch>/);
+    // The user's own message stays last in both requests.
+    expect(on.request.messages.at(-1)).toEqual(off.request.messages.at(-1));
   });
 });
