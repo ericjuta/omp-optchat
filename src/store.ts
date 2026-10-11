@@ -11,20 +11,33 @@ import {
   readFileSync,
   readdirSync,
   readlinkSync,
+  readSync,
   renameSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
+import {
+  DEFAULT_PAGE_BYTES, inspectImage, parseImageDescriptor, parseMetadata, readTextPage, validateImage,
+  type ImageAttachment, type ImageDescriptor, type ImageMimeType, type MessageMetadata, type TextPage,
+} from "./archive.js";
 
-export type Kind = "user" | "talk" | "tool" | "echo" | "note";
+export type Kind = "user" | "talk" | "tool" | "echo" | "note" | "work";
 export interface Message {
   i: number;
   kind: Kind;
   text: string;
   size: number;
   date: string;
+  readonly metadata?: MessageMetadata;
+}
+export interface MessagePage extends TextPage {
+  readonly i: number;
+  readonly kind: Kind;
+  readonly date: string;
+  readonly size: number;
+  readonly metadata?: MessageMetadata;
 }
 export interface TreeNode {
   l: number;
@@ -39,12 +52,21 @@ export const nodeKey = (l: number, i: number): string => `${l}:${i}`;
  * parts may still be unbuilt; higher levels name saved tree nodes. `length` may
  * trail the message log after a crash: the owner appends the durable suffix.
  * `compacting` latches a partially coarsened batch across restarts. No text.
+ * `compactor` (v2) tiles [0, compactor.length) with built nodes only and
+ * `compactor.length <= length`; its latch is independent of the main tiling.
  */
-export interface ViewSnapshot {
-  readonly version: 1;
+export interface ViewState {
   readonly length: number;
   readonly parts: ReadonlyArray<readonly [number, number]>;
   readonly compacting: boolean;
+}
+export interface ViewSnapshot extends ViewState {
+  readonly version: 2;
+  readonly compactor: ViewState;
+}
+/** Disk-only v1 snapshot, admitted once for migration and never written again. */
+export interface LegacyViewSnapshot extends ViewState {
+  readonly version: 1;
 }
 
 type Report = (message: string) => void;
@@ -57,24 +79,30 @@ type Stream = {
 type Lease = { server: Server; failure?: Error };
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const filePattern = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
-const messageFields = ["i", "kind", "text", "size", "date"];
 const nodeFields = ["l", "i", "text", "size"];
-const viewFields = ["version", "length", "parts", "compacting"];
 const viewName = "view.json";
 
 function hasCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
 }
 
-function record(value: unknown, fields: string[], where: string): Record<string, unknown> {
+function record(value: unknown, fields: string[], where: string, optional: string[] = []): Record<string, unknown> {
   if (
     typeof value !== "object" || value === null || Array.isArray(value) ||
-    Object.keys(value).length !== fields.length ||
+    Object.keys(value).some((key) => !fields.includes(key) && !optional.includes(key)) ||
     !fields.every((field) => Object.hasOwn(value, field))
   ) {
     throw new Error(`Invalid record schema at ${where}`);
   }
-  return value as Record<string, unknown>;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const copied: Record<string, unknown> = Object.create(null);
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key !== "string") throw new Error(`Invalid record fields at ${where}`);
+    const descriptor = descriptors[key]!;
+    if (!("value" in descriptor) || !descriptor.enumerable) throw new Error(`Invalid record data property at ${where}`);
+    copied[key] = descriptor.value;
+  }
+  return copied;
 }
 
 function isIndex(value: unknown): value is number {
@@ -83,11 +111,18 @@ function isIndex(value: unknown): value is number {
 
 function isKind(value: unknown): value is Kind {
   return value === "user" || value === "talk" || value === "tool" ||
-    value === "echo" || value === "note";
+    value === "echo" || value === "note" || value === "work";
+}
+
+// Work kind and work metadata must describe each other exactly.
+function checkCoupling(kind: Kind, metadata: MessageMetadata | undefined, where: string): void {
+  if ((kind === "work") !== (metadata?.work !== undefined)) {
+    throw new Error(`Work kind and work metadata must accompany each other at ${where}`);
+  }
 }
 
 function parseMessage(value: unknown, where: string): Message {
-  const row = record(value, messageFields, where);
+  const row = record(value, ["i", "kind", "text", "size", "date"], where, ["metadata"]);
   if (
     !isIndex(row.i) || !isKind(row.kind) || typeof row.text !== "string" ||
     typeof row.size !== "number" || row.size !== row.kind.length + 2 + Buffer.byteLength(row.text, "utf8") ||
@@ -96,9 +131,12 @@ function parseMessage(value: unknown, where: string): Message {
   ) {
     throw new Error(`Invalid message schema, size, date, or index at ${where}`);
   }
+  const metadata = Object.hasOwn(row, "metadata") ? parseMetadata(row.metadata) : undefined;
+  checkCoupling(row.kind, metadata, where);
   return Object.freeze({
     i: row.i, kind: row.kind, text: row.text,
     size: row.size, date: row.date,
+    ...(metadata === undefined ? {} : { metadata }),
   });
 }
 
@@ -117,18 +155,21 @@ function parseNode(value: unknown, where: string): TreeNode {
 }
 
 // Reads every caller-controlled value once, then publishes a deep frozen copy.
-function parseView(
-  value: unknown,
+// `builtOnly` requires every part to name a saved node, including level 0.
+function parseTiling(
+  length: unknown,
+  parts: unknown,
+  compacting: unknown,
   where: string,
-  messages: number,
+  limit: number,
   nodes: ReadonlyMap<string, TreeNode>,
-): ViewSnapshot {
-  const { version, length, parts, compacting } = record(value, viewFields, where);
+  builtOnly: boolean,
+): ViewState {
   if (
-    version !== 1 || !isIndex(length) || length > messages ||
+    !isIndex(length) || length > limit ||
     typeof compacting !== "boolean" || !Array.isArray(parts)
   ) {
-    throw new Error(`Invalid view snapshot schema or length at ${where}`);
+    throw new Error(`Invalid view tiling schema or length at ${where}`);
   }
   const count = parts.length;
   const copied: (readonly [number, number])[] = [];
@@ -147,7 +188,7 @@ function parseView(
     if (!Number.isSafeInteger(next) || i * 2 ** l !== end || next > length) {
       throw new Error(`View part ${nodeKey(l, i)} leaves a gap, overlap, or overrun at ${where}`);
     }
-    if (l > 0 && !nodes.has(nodeKey(l, i))) {
+    if ((builtOnly || l > 0) && !nodes.has(nodeKey(l, i))) {
       throw new Error(`View part ${nodeKey(l, i)} names an unbuilt summary at ${where}`);
     }
     copied.push(Object.freeze([l, i] as const));
@@ -156,7 +197,27 @@ function parseView(
   if (end !== length) {
     throw new Error(`View parts do not cover messages [0, ${length}) at ${where}`);
   }
-  return Object.freeze({ version: 1, length, parts: Object.freeze(copied), compacting });
+  return Object.freeze({ length, parts: Object.freeze(copied), compacting });
+}
+
+function parseViewV2(value: unknown, where: string, messages: number, nodes: ReadonlyMap<string, TreeNode>): ViewSnapshot {
+  const row = record(value, ["version", "length", "parts", "compacting", "compactor"], where);
+  if (row.version !== 2) throw new Error(`Only version 2 view snapshots can be written at ${where}`);
+  const main = parseTiling(row.length, row.parts, row.compacting, where, messages, nodes, false);
+  const compactorWhere = `${where} compactor`;
+  const compactor = record(row.compactor, ["length", "parts", "compacting"], compactorWhere);
+  const built = parseTiling(compactor.length, compactor.parts, compactor.compacting, compactorWhere, main.length, nodes, true);
+  return Object.freeze({ version: 2, ...main, compactor: built });
+}
+
+// Disk replay admits v1 only so the owner can migrate it once; anything else is rejected.
+function parseSnapshot(value: unknown, where: string, messages: number, nodes: ReadonlyMap<string, TreeNode>): ViewSnapshot | LegacyViewSnapshot {
+  if (typeof value === "object" && value !== null && (value as Record<string, unknown>).version === 1) {
+    const row = record(value, ["version", "length", "parts", "compacting"], where);
+    const main = parseTiling(row.length, row.parts, row.compacting, where, messages, nodes, false);
+    return Object.freeze({ version: 1, ...main });
+  }
+  return parseViewV2(value, where, messages, nodes);
 }
 
 // Names daily files by the local wall-clock day a record is written.
@@ -250,10 +311,22 @@ function openRoot(path: string): number {
   }
 }
 
-function openStream(rootFd: number, directory: string, name: "main" | "tree"): Stream {
+function openStream(rootFd: number, directory: string, name: "main" | "tree" | "images"): Stream {
   const path = join(directory, name);
   makeDirectory(rootFd, name);
   return { path, fd: openDirectory(at(rootFd, name), path) };
+}
+
+// An existing images directory is attached before replay so references can be
+// verified; a missing one is created only after replay and snapshot validation.
+function openExistingStream(rootFd: number, directory: string, name: "images"): Stream | undefined {
+  const path = join(directory, name);
+  try {
+    return { path, fd: openDirectory(at(rootFd, name), path) };
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return undefined;
+    throw error;
+  }
 }
 
 function openFile(path: string, display: string, flags: number): number {
@@ -334,7 +407,7 @@ function loadView(
   directory: string,
   messages: number,
   nodes: ReadonlyMap<string, TreeNode>,
-): ViewSnapshot | undefined {
+): ViewSnapshot | LegacyViewSnapshot | undefined {
   const path = join(directory, viewName);
   let fd: number;
   try {
@@ -358,7 +431,7 @@ function loadView(
   } catch (error) {
     throw new Error(`Malformed JSON or UTF-8 view snapshot at ${path}`, { cause: error });
   }
-  return parseView(value, path, messages, nodes);
+  return parseSnapshot(value, path, messages, nodes);
 }
 
 // Commits the view only after its complete private file is durable. Every name
@@ -406,6 +479,76 @@ function replaceView(rootFd: number, directory: string, text: string): void {
   }
 }
 
+// Never let a concurrently enlarged file turn a bounded attachment into an
+// unbounded read. Read one extra byte to reject growth, and recheck the inode.
+function readImageBytes(fd: number, expected: number, display: string): Buffer {
+  if (fstatSync(fd).size !== expected) throw new Error(`Image size mismatch at ${display}`);
+  const bytes = Buffer.allocUnsafe(expected + 1);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
+    if (count === 0) break;
+    offset += count;
+  }
+  checkOwner(fd, display, false);
+  if (offset !== expected || fstatSync(fd).size !== expected) throw new Error(`Image size changed at ${display}`);
+  return bytes.subarray(0, expected);
+}
+
+// Content-addressed images live beside the logs. Identical bytes share one name;
+// an existing entry is reread and must match the digest it was named for.
+function storeImageBytes(imagesFd: number, display: string, descriptor: ImageDescriptor, bytes: Buffer): void {
+  const target = at(imagesFd, descriptor.sha256);
+  const existing = (() => {
+    try {
+      return openFile(target, join(display, descriptor.sha256), constants.O_RDONLY);
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) return undefined;
+      throw error;
+    }
+  })();
+  if (existing !== undefined) {
+    try {
+      if (!readImageBytes(existing, descriptor.bytes, display).equals(bytes)) throw new Error(`Corrupt stored image ${descriptor.sha256}`);
+      // A previous writer could have died after rename but before directory fsync.
+      fsyncSync(existing);
+      fsyncSync(imagesFd);
+    } finally {
+      closeSync(existing);
+    }
+    return;
+  }
+  const name = `.image-${randomUUID()}.tmp`;
+  const temporary = at(imagesFd, name);
+  const fd = openSync(
+    temporary,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    0o600,
+  );
+  let pending = true;
+  try {
+    try {
+      checkOwner(fd, join(display, name), false);
+      if (writeSync(fd, bytes) !== bytes.length) throw new Error(`Short image write for ${descriptor.sha256}`);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, target);
+    pending = false;
+    fsyncSync(imagesFd);
+  } catch (error) {
+    if (pending) {
+      try {
+        unlinkSync(temporary);
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], `Image write and temporary cleanup failed for ${descriptor.sha256}`, { cause: error });
+      }
+    }
+    throw error;
+  }
+}
+
 function reportSafely(report: Report | undefined, message: string): void {
   try { (report ?? console.warn)(message); } catch { /* Diagnostics must not change replay semantics. */ }
 }
@@ -424,7 +567,7 @@ function reportSafely(report: Report | undefined, message: string): void {
 export class Store {
   readonly messages: Message[] = [];
   readonly nodes = new Map<string, TreeNode>();
-  private view?: ViewSnapshot;
+  private view?: ViewSnapshot | LegacyViewSnapshot;
   private closing?: Promise<void>;
   private closed = false;
   private failed = false;
@@ -435,6 +578,7 @@ export class Store {
     private readonly rootFd: number,
     private readonly main: Stream,
     private readonly tree: Stream,
+    private images: Stream | undefined,
     private readonly lease: Lease,
   ) {}
 
@@ -455,9 +599,15 @@ export class Store {
       streams.push(main);
       const tree = openStream(rootFd, canonical, "tree");
       streams.push(tree);
-      const store = new Store(canonical, rootFd, main, tree, lease);
+      const images = openExistingStream(rootFd, canonical, "images");
+      if (images) streams.push(images);
+      const store = new Store(canonical, rootFd, main, tree, images, lease);
       store.replay(report);
       store.view = loadView(rootFd, canonical, store.messages.length, store.nodes);
+      if (store.images === undefined) {
+        store.images = openStream(rootFd, canonical, "images");
+        streams.push(store.images);
+      }
       return store;
     } catch (error) {
       try {
@@ -554,6 +704,9 @@ export class Store {
         if (!previous) this.nodes.set(key, node);
       });
       for (const node of this.nodes.values()) this.validateCoverage(node);
+      for (const message of this.messages) {
+        for (const image of message.metadata?.images ?? []) this.loadImage(image, true);
+      }
       // Validate the complete history before making even append-only repairs.
       for (const { fd, path } of torn) {
         // Reopen the validated inode through its own descriptor link; no name lookup.
@@ -589,7 +742,7 @@ export class Store {
     }
   }
 
-  append(kind: Kind, text: string, date = new Date()): Message {
+  append(kind: Kind, text: string, date = new Date(), metadata?: MessageMetadata): Message {
     this.assertWritable();
     // Snapshot the supplied record date without invoking overridable Date methods.
     // It may be historical; the daily file is still the local day of this write.
@@ -597,12 +750,17 @@ export class Store {
     if (!isKind(kind) || typeof text !== "string" || !Number.isFinite(time)) {
       throw new Error("Invalid message kind, text, or date");
     }
+    const stored = metadata === undefined ? undefined : parseMetadata(metadata);
+    checkCoupling(kind, stored, "new message");
+    // Every referenced image must already be durable and intact before the record exists.
+    for (const attachment of stored?.images ?? []) this.loadImage(attachment, true);
     const message: Message = Object.freeze({
       i: this.messages.length,
       kind,
       text,
       size: kind.length + 2 + Buffer.byteLength(text, "utf8"),
       date: new Date(time).toISOString(),
+      ...(stored === undefined ? {} : { metadata: stored }),
     });
     this.appendRecord(this.main, message);
     this.messages.push(message);
@@ -625,8 +783,93 @@ export class Store {
     this.nodes.set(key, node);
   }
 
-  /** The last committed view, deeply frozen; undefined until one is saved. */
-  get viewSnapshot(): ViewSnapshot | undefined {
+  /** Validates and durably stores one image by SHA-256 content address. */
+  saveImage(data: string, mimeType: ImageMimeType): ImageDescriptor {
+    this.assertWritable();
+    const { descriptor, bytes } = validateImage(data, mimeType);
+    try {
+      this.images ??= openStream(this.rootFd, this.directory, "images");
+      storeImageBytes(this.images.fd, this.images.path, descriptor, bytes);
+    } catch (error) {
+      // The final rename may have happened before a directory fsync failed.
+      this.failed = true;
+      throw error;
+    }
+    return descriptor;
+  }
+
+  /** Reads one stored image, reverifying bytes, digest, format, and dimensions. */
+  readImage(descriptor: ImageDescriptor | ImageAttachment): { readonly descriptor: ImageDescriptor; readonly data: string } {
+    const attachment = descriptor !== null && typeof descriptor === "object" && Object.hasOwn(descriptor, "order")
+      ? parseMetadata({ images: [descriptor] }).images![0]!
+      : undefined;
+    const expected = parseImageDescriptor(attachment === undefined ? descriptor : {
+      sha256: attachment.sha256, mimeType: attachment.mimeType, bytes: attachment.bytes,
+      width: attachment.width, height: attachment.height,
+    });
+    return Object.freeze({ descriptor: expected, data: this.loadImage(expected).toString("base64") });
+  }
+
+  /** Verified images attached to one message, in their recorded order. */
+  readMessageImages(id: number): readonly { readonly attachment: ImageAttachment; readonly data: string }[] {
+    const message = this.messageAt(id);
+    return Object.freeze((message.metadata?.images ?? []).map((attachment) => Object.freeze({
+      attachment,
+      data: this.loadImage(attachment).toString("base64"),
+    })));
+  }
+
+  /** One bounded UTF-8 page of a message's original text, with its record envelope. */
+  readMessagePage(id: number, offset = 0, maxBytes = DEFAULT_PAGE_BYTES): MessagePage {
+    const message = this.messageAt(id);
+    const page = readTextPage(message.text, offset, maxBytes);
+    return Object.freeze({
+      ...page,
+      i: message.i,
+      kind: message.kind,
+      date: message.date,
+      size: message.size,
+      ...(message.metadata === undefined ? {} : { metadata: message.metadata }),
+    });
+  }
+
+  private messageAt(id: number): Message {
+    if (this.closed) throw new Error("Store is closing or closed");
+    if (!isIndex(id) || id >= this.messages.length) throw new Error("Unknown message ID");
+    return this.messages[id]!;
+  }
+
+  // Reopens and verifies the descriptor's content, format, dimensions, and digest.
+  private loadImage(descriptor: ImageDescriptor, durable = false): Buffer {
+    if (this.closed) throw new Error("Store is closing or closed");
+    const images = this.images;
+    if (images === undefined) throw new Error(`Image ${descriptor.sha256} is not stored`);
+    const display = join(images.path, descriptor.sha256);
+    const fd = openFile(at(images.fd, descriptor.sha256), display, constants.O_RDONLY);
+    let bytes: Buffer;
+    try {
+      bytes = readImageBytes(fd, descriptor.bytes, display);
+      if (durable) {
+        fsyncSync(fd);
+        fsyncSync(images.fd);
+      }
+    } finally {
+      closeSync(fd);
+    }
+    const inspected = inspectImage(bytes);
+    if (
+      bytes.length !== descriptor.bytes ||
+      createHash("sha256").update(bytes).digest("hex") !== descriptor.sha256 ||
+      inspected.mimeType !== descriptor.mimeType ||
+      inspected.width !== descriptor.width || inspected.height !== descriptor.height
+    ) {
+      throw new Error(`Image integrity check failed at ${display}`);
+    }
+    return bytes;
+  }
+
+  /** The last committed view; v1 appears only before a one-time migration save. */
+  get viewSnapshot(): ViewSnapshot | LegacyViewSnapshot | undefined {
     return this.view;
   }
 
@@ -637,7 +880,7 @@ export class Store {
    */
   saveView(value: ViewSnapshot): void {
     this.assertWritable();
-    const view = parseView(value, "new view snapshot", this.messages.length, this.nodes);
+    const view = parseViewV2(value, "new view snapshot", this.messages.length, this.nodes);
     try {
       replaceView(this.rootFd, this.directory, `${JSON.stringify(view)}\n`);
     } catch (error) {
@@ -651,6 +894,6 @@ export class Store {
     // No await between marking closed and stopping writes. In-flight writes are
     // synchronous, so they finish/fsync before close can begin on the same thread.
     this.closed = true;
-    return this.closing ??= release(this.rootFd, [this.main, this.tree], this.lease);
+    return this.closing ??= release(this.rootFd, [this.main, this.tree, ...(this.images === undefined ? [] : [this.images])], this.lease);
   }
 }

@@ -4,6 +4,9 @@ import { appendFile, chmod, link, mkdir, mkdtemp, readFile, readdir, realpath, r
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import { deflateSync } from "node:zlib";
+import { DEFAULT_PAGE_BYTES, MAX_PAGE_BYTES, type ImageDescriptor, type ImageMimeType } from "../src/archive.ts";
 import { Store, nodeKey, type Kind, type Message, type TreeNode } from "../src/store.ts";
 
 const storeModule = fileURLToPath(new URL("../src/store.ts", import.meta.url));
@@ -514,11 +517,82 @@ describe("Store record validation", () => {
 
 type ViewSnapshot = Parameters<Store["saveView"]>[0];
 
-function rawView(length: number, compacting = false): ViewSnapshot {
-  return { version: 1, length, parts: Array.from({ length }, (_, i) => [0, i] as const), compacting };
+function snapshotOf(length: number, parts: ReadonlyArray<readonly [number, number]>, compacting: boolean): ViewSnapshot {
+  return { version: 2, length, parts, compacting, compactor: { length: 0, parts: [], compacting: false } };
 }
 
-function expectFrozenView(view: ViewSnapshot): void {
+function rawView(length: number, compacting = false): ViewSnapshot {
+  return snapshotOf(length, Array.from({ length }, (_, i) => [0, i] as const), compacting);
+}
+
+describe("Store v2 snapshot admission", () => {
+  test("a v1 disk snapshot loads once, then migrates to v2 without changing the main tiling", async () => {
+    await withFixture(async (fixture) => {
+      await seed(fixture.directory, "main", "2026-01-01.jsonl", [message(0), message(1), message(2), message(3)]);
+      await seed(fixture.directory, "tree", "2026-01-01.jsonl", [node(0, 0), node(0, 1), node(1, 0)]);
+      const parts: ReadonlyArray<readonly [number, number]> = [[1, 0], [0, 2], [0, 3]];
+      await writeFile(join(fixture.directory, "view.json"), `${JSON.stringify({ version: 1, length: 4, parts, compacting: true })}\n`, { mode: 0o600 });
+      const store = await fixture.open();
+      expect(store.viewSnapshot).toEqual({ version: 1, length: 4, parts, compacting: true });
+      store.saveView(snapshotOf(4, parts, true));
+      expect(store.viewSnapshot).toEqual(snapshotOf(4, parts, true));
+      await store.close();
+      const migrated = await fixture.open();
+      expect(migrated.viewSnapshot).toEqual(snapshotOf(4, parts, true));
+      expect(JSON.parse(await readFile(join(fixture.directory, "view.json"), "utf8")).version).toBe(2);
+      await migrated.close();
+    });
+  });
+
+  test("a v2 compactor restores exactly after restart, frozen and independent of the main latch", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      for (let i = 0; i < 4; i++) store.append("user", `source ${i}`);
+      store.saveNode(node(0, 0));
+      store.saveNode(node(0, 1));
+      store.saveNode(node(1, 0));
+      const snapshot: ViewSnapshot = {
+        version: 2, length: 4, parts: [[1, 0], [0, 2], [0, 3]], compacting: false,
+        compactor: { length: 2, parts: [[1, 0]], compacting: true },
+      };
+      store.saveView(snapshot);
+      await store.close();
+      const restarted = await fixture.open();
+      expect(restarted.viewSnapshot).toEqual(snapshot);
+      expectFrozenView(restarted.viewSnapshot!);
+      expect(Object.isFrozen((restarted.viewSnapshot as ViewSnapshot).compactor)).toBe(true);
+      await restarted.close();
+    });
+  });
+
+  test("a compactor must tile built nodes within the main length; invalid or v1 writes change nothing", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      for (let i = 0; i < 4; i++) store.append("user", `source ${i}`);
+      store.saveNode(node(0, 0));
+      store.saveNode(node(0, 1));
+      store.saveNode(node(1, 0));
+      store.saveView(snapshotOf(0, [], false));
+      const published = store.viewSnapshot;
+      const main: ReadonlyArray<readonly [number, number]> = [[1, 0], [0, 2], [0, 3]];
+      const rejected: unknown[] = [
+        { ...snapshotOf(4, main, false), compactor: { length: 3, parts: [[1, 0], [0, 2]], compacting: false } },
+        { ...snapshotOf(4, main, false), compactor: { length: 5, parts: [[1, 0], [0, 2], [0, 3], [0, 4]], compacting: false } },
+        { ...snapshotOf(4, main, false), compactor: { length: 2, parts: [[0, 1]], compacting: false } },
+        { ...snapshotOf(4, main, false), compactor: { length: 2, parts: [[0, 0]], compacting: false } },
+        { version: 1, length: 0, parts: [], compacting: false },
+      ];
+      for (const bad of rejected) expect(() => store.saveView(bad as ViewSnapshot)).toThrow();
+      expect(store.viewSnapshot).toBe(published);
+      await store.close();
+      expect((await fixture.open()).viewSnapshot).toEqual(snapshotOf(0, [], false));
+    });
+  });
+
+});
+
+function expectFrozenView(view: { readonly parts: readonly (readonly [number, number])[]; readonly compacting: boolean; readonly compactor?: ViewSnapshot["compactor"] }): void {
+  if (view.compactor) expectFrozenView(view.compactor);
   expect(Object.isFrozen(view)).toBe(true);
   expect(Object.isFrozen(view.parts)).toBe(true);
   expect(Reflect.set(view, "compacting", !view.compacting)).toBe(false);
@@ -540,7 +614,7 @@ describe("Store view snapshot persistence", () => {
       expect(store.viewSnapshot).toBeUndefined();
       expect(store.messages).toEqual(history === "legacy history" ? [message(0), message(1)] : []);
       expect(store.nodes.size).toBe(history === "legacy history" ? 3 : 0);
-      expect((await readdir(fixture.directory)).sort()).toEqual(["main", "tree"]);
+      expect((await readdir(fixture.directory)).sort()).toEqual(["images", "main", "tree"]);
       await store.close();
       expect((await fixture.open()).viewSnapshot).toBeUndefined();
     });
@@ -560,8 +634,8 @@ describe("Store view snapshot persistence", () => {
       const treeBytes = await streamContents(fixture.directory, "tree");
       const views: ViewSnapshot[] = [
         rawView(4),
-        { version: 1, length: 4, parts: [[1, 0], [0, 2], [0, 3]], compacting: true },
-        { version: 1, length: 4, parts: [[2, 0]], compacting: false },
+        snapshotOf(4, [[1, 0], [0, 2], [0, 3]], true),
+        snapshotOf(4, [[2, 0]], false),
         rawView(0),
       ];
       for (const view of views) {
@@ -586,7 +660,7 @@ describe("Store view snapshot persistence", () => {
       store.append("user", "first");
       store.append("talk", "second");
       for (const summary of [node(0, 0), node(0, 1), node(1, 0)]) store.saveNode(summary);
-      const prefix: ViewSnapshot = { version: 1, length: 2, parts: [[1, 0]], compacting: true };
+      const prefix: ViewSnapshot = snapshotOf(2, [[1, 0]], true);
       store.saveView(prefix);
       const published = store.viewSnapshot;
       const bytes = await readFile(join(fixture.directory, "view.json"));
@@ -615,10 +689,15 @@ describe("Store view snapshot persistence", () => {
       const store = await fixture.open();
       for (let i = 0; i < 3; i++) store.append("user", `source ${i}`);
       for (const summary of [node(0, 0), node(0, 1), node(1, 0)]) store.saveNode(summary);
-      const input: { version: 1; length: number; parts: [number, number][]; compacting: boolean } = {
-        version: 1, length: 3, parts: [[1, 0], [0, 2]], compacting: true,
+      const input: {
+        version: 2; length: number; parts: [number, number][]; compacting: boolean;
+        compactor: { length: number; parts: [number, number][]; compacting: boolean };
+      } = {
+        version: 2, length: 3, parts: [[1, 0], [0, 2]], compacting: true,
+        compactor: { length: 2, parts: [[1, 0]], compacting: false },
       };
-      const expected: ViewSnapshot = { version: 1, length: 3, parts: [[1, 0], [0, 2]], compacting: true };
+      const expected: ViewSnapshot = { ...snapshotOf(3, [[1, 0], [0, 2]], true),
+        compactor: { length: 2, parts: [[1, 0]], compacting: false } };
       store.saveView(input);
       const saved = store.viewSnapshot!;
       const bytes = await readFile(join(fixture.directory, "view.json"));
@@ -629,6 +708,18 @@ describe("Store view snapshot persistence", () => {
       expect(Object.isFrozen(input)).toBe(false);
       expect(Object.isFrozen(input.parts)).toBe(false);
       expect(Object.isFrozen(input.parts[0])).toBe(false);
+      expect(saved.version).toBe(2);
+      if (saved.version !== 2) throw new Error("Expected v2 snapshot");
+      expect(saved.compactor).not.toBe(input.compactor);
+      expect(saved.compactor.parts).not.toBe(input.compactor.parts);
+      expect(saved.compactor.parts[0]).not.toBe(input.compactor.parts[0]);
+      expect(Object.isFrozen(input.compactor)).toBe(false);
+      expect(Object.isFrozen(input.compactor.parts)).toBe(false);
+      expect(Object.isFrozen(input.compactor.parts[0])).toBe(false);
+      input.compactor.length = 99;
+      input.compactor.compacting = true;
+      input.compactor.parts[0]![1] = 99;
+      input.compactor.parts.push([0, 99]);
       input.length = 99;
       input.compacting = false;
       input.parts[0]![0] = 52;
@@ -682,16 +773,19 @@ describe("Store view snapshot persistence", () => {
 });
 
 describe("Store view snapshot durability faults", () => {
-  for (const initial of ["missing snapshot", "committed snapshot"] as const) {
+  for (const [initial, change] of [["missing snapshot", "main and compactor"], ["committed snapshot", "main and compactor"], ["committed snapshot", "compactor only"]] as const) {
     test.each(["file fsync", "root fsync", "partial write", "rename"] as const)(
-      `${initial}: %s failure withholds publication, poisons writes and recovers the committed disk state`,
+      `${initial}, ${change}: %s failure withholds publication, poisons writes and recovers the committed disk state`,
       async (fault) => {
         await withFixture(async (fixture) => {
           const store = await fixture.open();
           for (let i = 0; i < 3; i++) store.append("user", `source ${i}`);
           for (const summary of [node(0, 0), node(0, 1), node(1, 0)]) store.saveNode(summary);
-          const oldView = rawView(3);
-          const nextView: ViewSnapshot = { version: 1, length: 3, parts: [[1, 0], [0, 2]], compacting: true };
+          const oldView: ViewSnapshot = { ...rawView(3),
+            compactor: { length: 1, parts: [[0, 0]], compacting: true } };
+          const nextView: ViewSnapshot = change === "compactor only"
+            ? { ...oldView, compactor: { length: 2, parts: [[1, 0]], compacting: false } }
+            : { ...snapshotOf(3, [[1, 0], [0, 2]], true), compactor: { length: 2, parts: [[1, 0]], compacting: false } };
           const path = join(fixture.directory, "view.json");
           if (initial === "committed snapshot") store.saveView(oldView);
           const published = store.viewSnapshot;
@@ -935,7 +1029,7 @@ describe("Store view snapshot privacy and lifecycle", () => {
         expect((await stat(join(fixture.directory, "view.json"))).mode & 0o777).toBe(replacementMode);
         expect(await streamContents(moved, "main")).toBe(mainBytes);
         expect(await streamContents(moved, "tree")).toBe(treeBytes);
-        expect((await readdir(moved)).sort()).toEqual(["main", "tree", "view.json"]);
+        expect((await readdir(moved)).sort()).toEqual(["images", "main", "tree", "view.json"]);
         if (other) {
           expect(other.viewSnapshot).toBe(otherPublished);
           expect(await streamContents(otherPath, "main")).toBe(otherMain);
@@ -989,7 +1083,8 @@ describe("Store view snapshot privacy and lifecycle", () => {
           const text = "summary " + l + ":" + i;
           store.saveNode({ l, i, text, size: Buffer.byteLength(text, "utf8") });
         }
-        store.saveView({ version: 1, length: 2, parts: [[1, 0]], compacting: true });
+        store.saveView({ version: 2, length: 2, parts: [[1, 0]], compacting: true,
+          compactor: { length: 2, parts: [[1, 0]], compacting: false } });
         // A referenced socket, not a timer or sleep, holds this real process
         // alive so the parent can exercise OS lease exclusion and SIGKILL.
         const keepAlive = createServer();
@@ -1000,7 +1095,8 @@ describe("Store view snapshot privacy and lifecycle", () => {
         console.log("ready");
       `);
       await waitForReady(holder);
-      const snapshot: ViewSnapshot = { version: 1, length: 2, parts: [[1, 0]], compacting: true };
+      const snapshot: ViewSnapshot = { ...snapshotOf(2, [[1, 0]], true),
+        compactor: { length: 2, parts: [[1, 0]], compacting: false } };
       expect(JSON.parse(await readFile(join(fixture.directory, "view.json"), "utf8"))).toEqual(snapshot);
       const contender = fixture.spawn(`
         let store;
@@ -1019,10 +1115,10 @@ describe("Store view snapshot privacy and lifecycle", () => {
       expectFrozenView(recovered.viewSnapshot!);
       expect(recovered.messages.map((record) => record.text)).toEqual(["snapshot source zero", "snapshot source one"]);
       expect(recovered.nodes.get(nodeKey(1, 0))).toEqual(node(1, 0));
-      expect((await readdir(fixture.directory)).sort()).toEqual(["main", "tree", "view.json"]);
+      expect((await readdir(fixture.directory)).sort()).toEqual(["images", "main", "tree", "view.json"]);
       expect(recovered.append("note", "after killed holder").i).toBe(2);
       recovered.saveNode(node(0, 2));
-      const resumed: ViewSnapshot = { version: 1, length: 3, parts: [[1, 0], [0, 2]], compacting: false };
+      const resumed: ViewSnapshot = snapshotOf(3, [[1, 0], [0, 2]], false);
       recovered.saveView(resumed);
       await recovered.close();
       const restarted = await fixture.open();
@@ -1039,7 +1135,7 @@ describe("Store privacy and lifecycle", () => {
       const date = new Date();
       store.append("user", "private", date);
       store.saveNode(node(0, 0));
-      for (const directory of [fixture.directory, join(fixture.directory, "main"), join(fixture.directory, "tree")]) {
+      for (const directory of [fixture.directory, join(fixture.directory, "main"), join(fixture.directory, "tree"), join(fixture.directory, "images")]) {
         expect((await stat(directory)).mode & 0o777).toBe(0o700);
       }
       for (const stream of ["main", "tree"] as const) {
@@ -1265,7 +1361,7 @@ describe("Store process-lifetime lock", () => {
       // No sleeps, lock-file deletion, PID checks, or acquisition retry policy.
       const recovered = await fixture.open();
       expect(recovered.messages.map((record) => record.text)).toEqual(["durable before SIGKILL"]);
-      expect((await readdir(fixture.directory)).sort()).toEqual(["main", "tree"]);
+      expect((await readdir(fixture.directory)).sort()).toEqual(["images", "main", "tree"]);
       expect(recovered.append("talk", "recovered").i).toBe(1);
       await recovered.close();
       expect((await fixture.open()).messages.map((record) => record.text))
@@ -1278,21 +1374,25 @@ describe("Store view snapshot validation", () => {
   // Four messages with cached leaves 0:0..0:3 and parent 1:0; 1:1 and 2:0 are unbuilt.
   const history = [0, 1, 2, 3].map((i) => message(i));
   const summaries = [node(0, 0), node(0, 1), node(0, 2), node(0, 3), node(1, 0)];
-  const valid: ViewSnapshot = { version: 1, length: 4, parts: [[1, 0], [0, 2], [0, 3]], compacting: false };
+  const valid: ViewSnapshot = { ...snapshotOf(4, [[1, 0], [0, 2], [0, 3]], false),
+    compactor: { length: 2, parts: [[1, 0]], compacting: true } };
   const encoded = JSON.stringify(valid);
   const viewPath = (directory: string) => join(directory, "view.json");
   const withField = (field: string, value: unknown) => ({ ...valid, [field]: value });
   const withoutField = (field: string) => Object.fromEntries(Object.entries(valid).filter(([key]) => key !== field));
   const withParts = (parts: unknown, length = valid.length) => ({ ...valid, length, parts });
+  const withCompactor = (compactor: unknown) => ({ ...valid, compactor });
+  const withCompactorField = (field: string, value: unknown) => withCompactor({ ...valid.compactor, [field]: value });
+  const compactorParts = (parts: unknown, length = valid.compactor.length) => withCompactor({ ...valid.compactor, length, parts });
 
   // JSON-representable, so each case is exercised identically on save and replay.
   const invalidViews: { name: string; value: unknown }[] = [
     { name: "null snapshot", value: null },
     { name: "array snapshot", value: [] },
     { name: "string snapshot", value: "view" },
-    ...["version", "length", "parts", "compacting"].map((field) => ({ name: `missing ${field}`, value: withoutField(field) })),
+    ...["version", "length", "parts", "compacting", "compactor"].map((field) => ({ name: `missing ${field}`, value: withoutField(field) })),
     { name: "unknown text field", value: withField("text", "summary text") },
-    { name: "unsupported version", value: withField("version", 2) },
+    { name: "unsupported version", value: withField("version", 3) },
     { name: "string version", value: withField("version", "1") },
     { name: "string length", value: withField("length", "4") },
     { name: "negative length", value: withField("length", -1) },
@@ -1333,6 +1433,40 @@ describe("Store view snapshot validation", () => {
     { name: "length beyond history", value: withParts([[1, 0], [0, 2], [0, 3], [0, 4]], 5) },
     { name: "missing level-1 summary over cached leaves", value: withParts([[1, 0], [1, 1]]) },
     { name: "missing level-2 summary", value: withParts([[2, 0]]) },
+    { name: "v1 snapshot carrying a compactor", value: { version: 1, length: valid.length, parts: valid.parts, compacting: valid.compacting, compactor: valid.compactor } },
+    { name: "null compactor", value: withCompactor(null) },
+    { name: "array compactor", value: withCompactor([]) },
+    { name: "string compactor", value: withCompactor("compactor") },
+    ...["length", "parts", "compacting"].map((field) => ({ name: `compactor missing ${field}`, value: withCompactor(Object.fromEntries(Object.entries(valid.compactor).filter(([key]) => key !== field))) })),
+    { name: "compactor unknown text field", value: withCompactor({ ...valid.compactor, text: "summary text" }) },
+    { name: "compactor carries version", value: withCompactor({ ...valid.compactor, version: 2 }) },
+    { name: "compactor string length", value: withCompactorField("length", "2") },
+    { name: "compactor negative length", value: withCompactorField("length", -1) },
+    { name: "compactor fractional length", value: withCompactorField("length", 1.5) },
+    { name: "compactor unsafe length", value: withCompactorField("length", Number.MAX_SAFE_INTEGER + 1) },
+    { name: "compactor length beyond main length", value: compactorParts([[1, 0], [0, 2], [0, 3], [0, 4]], 5) },
+    { name: "compactor numeric compacting", value: withCompactorField("compacting", 0) },
+    { name: "compactor string compacting", value: withCompactorField("compacting", "true") },
+    { name: "compactor null compacting", value: withCompactorField("compacting", null) },
+    { name: "compactor null parts", value: withCompactorField("parts", null) },
+    { name: "compactor array-like parts", value: withCompactorField("parts", { 0: [1, 0], length: 1 }) },
+    { name: "compactor scalar part", value: compactorParts([2]) },
+    { name: "compactor one-element part", value: compactorParts([[1]]) },
+    { name: "compactor three-element part", value: compactorParts([[1, 0, 0]]) },
+    { name: "compactor string level", value: compactorParts([["1", 0]]) },
+    { name: "compactor negative index", value: compactorParts([[1, -1]]) },
+    { name: "compactor fractional index", value: compactorParts([[1, 0.5]]) },
+    { name: "compactor unsupported level", value: compactorParts([[53, 0]]) },
+    { name: "compactor unsafe endpoint", value: compactorParts([[1, Number.MAX_SAFE_INTEGER]]) },
+    { name: "compactor gap before first part", value: compactorParts([[0, 1]], 2) },
+    { name: "compactor interior gap", value: compactorParts([[1, 0], [0, 3]], 4) },
+    { name: "compactor overlapping parts", value: compactorParts([[1, 0], [0, 1], [0, 2]], 3) },
+    { name: "compactor parts end before its length", value: compactorParts([[1, 0]], 4) },
+    { name: "compactor part overruns its length", value: compactorParts([[1, 0], [0, 2]], 2) },
+    { name: "compactor no parts for nonzero length", value: compactorParts([], 2) },
+    { name: "compactor parts for zero length", value: compactorParts([[0, 0]], 0) },
+    { name: "compactor names unbuilt level-1 summary", value: compactorParts([[0, 0], [0, 1], [1, 1]], 4) },
+    { name: "compactor names unbuilt level-2 summary", value: compactorParts([[2, 0]], 4) },
   ];
 
   // Values JSON cannot carry, so only a caller can pass them to saveView.
@@ -1343,6 +1477,10 @@ describe("Store view snapshot validation", () => {
     { name: "undefined compacting", value: withField("compacting", undefined) },
     { name: "infinite index", value: withParts([[1, 0], [0, 2], [0, Number.POSITIVE_INFINITY]]) },
     { name: "hole in part", value: withParts([[1, 0], Object.assign(new Array<unknown>(2), { 1: 2 }), [0, 3]]) },
+    { name: "NaN compactor length", value: withCompactorField("length", Number.NaN) },
+    { name: "infinite compactor length", value: withCompactorField("length", Number.POSITIVE_INFINITY) },
+    { name: "undefined compactor compacting", value: withCompactorField("compacting", undefined) },
+    { name: "hole in compactor parts", value: compactorParts(new Array<unknown>(1), 2) },
   ];
 
   const malformedJson = [
@@ -1411,7 +1549,7 @@ describe("Store view snapshot validation", () => {
       const appended = store.append("talk", "after rejected view");
       expect(appended.i).toBe(4);
       store.saveNode(node(1, 1));
-      const next: ViewSnapshot = { version: 1, length: 5, parts: [[1, 0], [1, 1], [0, 4]], compacting: true };
+      const next: ViewSnapshot = snapshotOf(5, [[1, 0], [1, 1], [0, 4]], true);
       store.saveView(next);
       expect(store.viewSnapshot).toEqual(next);
       await store.close();
@@ -1446,6 +1584,15 @@ describe("Store view snapshot validation", () => {
     await expectSaveRejection(value);
   });
 
+  // Version 1 is replay-only; a write of it must never reach disk.
+  const legacyWrites: { name: string; value: unknown }[] = [
+    { name: "legacy version 1 write", value: { version: 1, length: valid.length, parts: valid.parts, compacting: valid.compacting } },
+  ];
+
+  test.each(legacyWrites)("rejects a legacy version 1 write on save without publication, disk change, or poisoning: $name", async ({ value }) => {
+    await expectSaveRejection(value);
+  });
+
   test.each(invalidViews)("rejects on replay, then reopens immediately once repaired: $name", async ({ value }) => {
     await expectReplayRejection(`${JSON.stringify(value)}\n`);
   });
@@ -1458,5 +1605,386 @@ describe("Store view snapshot validation", () => {
     const bytes = shadowed(sequence);
     expect(JSON.parse(new TextDecoder().decode(bytes))).toEqual(valid);
     await expectReplayRejection(bytes);
+  });
+
+  test("a compactor leaf absent from the saved tree is rejected on save and replay, while the same unbuilt main leaves stay legal", async () => {
+    await withFixture(async (fixture) => {
+      await seed(fixture.directory, "main", "2026-01-01.jsonl", history);
+      // Leaves 0:2 and 0:3 are unbuilt: legal for the main tiling, never for the compactor.
+      await seed(fixture.directory, "tree", "2026-01-01.jsonl", [node(0, 0), node(0, 1), node(1, 0)]);
+      const store = await fixture.open();
+      const mainOnly: ViewSnapshot = snapshotOf(4, [[1, 0], [0, 2], [0, 3]], false);
+      const unbuilt: ViewSnapshot = { ...mainOnly, compactor: { length: 4, parts: [[1, 0], [0, 2], [0, 3]], compacting: false } };
+      expect(() => store.saveView(unbuilt)).toThrow();
+      expect(store.viewSnapshot).toBeUndefined();
+      store.saveView(mainOnly);
+      await store.close();
+      const path = join(fixture.directory, "view.json");
+      await writeFile(path, `${JSON.stringify(unbuilt)}\n`);
+      await expect(fixture.open()).rejects.toThrow();
+      await writeFile(path, `${JSON.stringify(mainOnly)}\n`);
+      const reopened = await fixture.open();
+      expect(reopened.viewSnapshot).toEqual(mainOnly);
+      await reopened.close();
+    });
+  });
+});
+
+// CRC-32 (IEEE) over each PNG chunk; the fixtures below are real, decodable images.
+const crcTable = Array.from({ length: 256 }, (_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+
+function crc32(bytes: Uint8Array): number {
+  let c = 0xffffffff;
+  for (const byte of bytes) c = crcTable[(c ^ byte) & 0xff]! ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, data: Uint8Array): Buffer {
+  const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  const frame = Buffer.alloc(body.length + 8);
+  frame.writeUInt32BE(data.length, 0);
+  body.copy(frame, 4);
+  frame.writeUInt32BE(crc32(body), body.length + 4);
+  return frame;
+}
+
+// A genuine 2x2 truecolor PNG: signature, IHDR, zlib-compressed scanlines, IEND.
+function pngFixture(seed: number): { readonly png: Buffer; readonly base64: string; readonly descriptor: ImageDescriptor } {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(2, 0);
+  header.writeUInt32BE(2, 4);
+  header[8] = 8; // bit depth
+  header[9] = 2; // RGB; remaining header bytes are the standard zero values
+  const scanlines: number[] = [];
+  for (let y = 0; y < 2; y++) {
+    scanlines.push(0); // filter type None
+    for (let x = 0; x < 2; x++) scanlines.push((seed * 61 + x * 90) & 0xff, (seed * 17 + y * 120) & 0xff, (seed + x + y) & 0xff);
+  }
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(Buffer.from(scanlines))),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+  return {
+    png,
+    base64: png.toString("base64"),
+    descriptor: { sha256: createHash("sha256").update(png).digest("hex"), mimeType: "image/png", bytes: png.length, width: 2, height: 2 },
+  };
+}
+
+describe("Store image storage and message attachments", () => {
+  const imagesOf = (store: Store) => join(store.directory, "images");
+
+  test("saveImage content-addresses genuine PNG bytes privately, deduplicates them, and reads verified bytes after restart", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const image = pngFixture(1);
+      const descriptor = store.saveImage(image.base64, "image/png");
+      expect(descriptor).toEqual(image.descriptor);
+      expect(store.saveImage(image.base64, "image/png")).toEqual(image.descriptor);
+      const images = imagesOf(store);
+      expect(await readdir(images)).toEqual([image.descriptor.sha256]);
+      expect((await stat(images)).mode & 0o777).toBe(0o700);
+      const path = join(images, image.descriptor.sha256);
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      expect((await readFile(path)).toString("base64")).toBe(image.base64);
+      expect(store.readImage(descriptor)).toEqual({ descriptor, data: image.base64 });
+      await store.close();
+      const restarted = await fixture.open();
+      expect(restarted.readImage(descriptor)).toEqual({ descriptor, data: image.base64 });
+      await restarted.close();
+    });
+  });
+
+  test("fake headers, MIME mismatches, and non-canonical base64 are rejected before any file exists or the writer is poisoned", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const genuine = pngFixture(2);
+      const pngHeaderOnly = genuine.png.subarray(0, 33); // signature and IHDR, no IDAT or IEND
+      const jpegSofOnly = Buffer.from([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x02, 0x00, 0x02, 0x01, 0x01, 0x11, 0x00, 0xff, 0xd9]);
+      const webpHeaderOnly = Buffer.concat([Buffer.from("RIFF"), Buffer.from([12, 0, 0, 0]), Buffer.from("WEBPVP8L"), Buffer.from([0, 0, 0, 0])]);
+      const rejected: [string, ImageMimeType][] = [
+        [pngHeaderOnly.toString("base64"), "image/png"],
+        [jpegSofOnly.toString("base64"), "image/jpeg"],
+        [webpHeaderOnly.toString("base64"), "image/webp"],
+        [genuine.base64, "image/jpeg"],
+        [`${genuine.base64.slice(0, 8)}\n${genuine.base64.slice(8)}`, "image/png"],
+        [`data:image/png;base64,${genuine.base64}`, "image/png"],
+      ];
+      for (const [data, mimeType] of rejected) expect(() => store.saveImage(data, mimeType)).toThrow();
+      expect(await readdir(imagesOf(store))).toEqual([]);
+      expect(store.append("user", "still writable").i).toBe(0);
+      await store.close();
+    });
+  });
+
+  test.each(["temporary fsync", "short write", "rename", "directory fsync after publish"] as const)(
+    "saveImage %s failure is uncertain: it throws, poisons writes, and restarts from exactly the durable entries",
+    async (fault) => {
+      await withFixture(async (fixture) => {
+        const store = await fixture.open();
+        const image = pngFixture(12);
+        const images = imagesOf(store);
+        const isTemporary = (path: string) => path.startsWith(`${images}/.image-`) && path.endsWith(".tmp");
+        const failure = Object.assign(new Error(`injected image ${fault} failure`), { code: "EIO" });
+        const nativeFsync = fs.fsyncSync;
+        const nativeWrite = fs.writeSync;
+        const nativeRename = fs.renameSync;
+        let hits = 0;
+        const fsyncSpy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+          const target = fs.readlinkSync(`/proc/self/fd/${fd}`);
+          if ((fault === "temporary fsync" && isTemporary(target)) || (fault === "directory fsync after publish" && target === images)) {
+            hits++;
+            throw failure;
+          }
+          nativeFsync(fd);
+        });
+        const writeSpy = spyOn(fs, "writeSync").mockImplementation(((fd: number, bytes: Buffer, ...args: unknown[]) => {
+          if (fault === "short write" && isTemporary(fs.readlinkSync(`/proc/self/fd/${fd}`))) {
+            hits++;
+            return nativeWrite(fd, bytes.subarray(0, Math.max(1, Math.floor(bytes.length / 2))));
+          }
+          return Reflect.apply(nativeWrite, fs, [fd, bytes, ...args]);
+        }) as typeof fs.writeSync);
+        const renameSpy = spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+          if (fault === "rename" && isTemporary(fs.realpathSync(source)) && String(destination).endsWith(`/${image.descriptor.sha256}`)) {
+            hits++;
+            throw failure;
+          }
+          nativeRename(source, destination);
+        });
+        try {
+          expect(() => store.saveImage(image.base64, "image/png")).toThrow();
+        } finally {
+          renameSpy.mockRestore();
+          writeSpy.mockRestore();
+          fsyncSpy.mockRestore();
+        }
+        expect(hits).toBe(1);
+        const published = fault === "directory fsync after publish";
+        expect(await readdir(images)).toEqual(published ? [image.descriptor.sha256] : []);
+        expect(() => store.append("user", "must not publish")).toThrow();
+        expect(() => store.saveImage(image.base64, "image/png")).toThrow();
+        await store.close();
+
+        const recovered = await fixture.open();
+        expect(recovered.messages).toEqual([]);
+        if (published) expect(recovered.readImage(image.descriptor).data).toBe(image.base64);
+        else expect(() => recovered.readImage(image.descriptor)).toThrow();
+        expect(recovered.saveImage(image.base64, "image/png")).toEqual(image.descriptor);
+        expect(recovered.readImage(image.descriptor).data).toBe(image.base64);
+        expect(await readdir(images)).toEqual([image.descriptor.sha256]);
+        expect(recovered.append("user", "after recovery", undefined, { images: [{ ...image.descriptor, order: 0 }] }).i).toBe(0);
+        await recovered.close();
+        expect((await fixture.open()).readMessageImages(0)).toEqual([{ attachment: { ...image.descriptor, order: 0 }, data: image.base64 }]);
+      });
+    },
+  );
+
+  test("reads and appends refuse descriptors that claim other bytes, dimensions, paths, or absent entries", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const genuine = pngFixture(3);
+      const descriptor = store.saveImage(genuine.base64, "image/png");
+      const claims: ImageDescriptor[] = [
+        { ...descriptor, bytes: descriptor.bytes + 1 },
+        { ...descriptor, width: descriptor.width + 1 },
+        { ...descriptor, height: descriptor.height + 1 },
+        { ...descriptor, mimeType: "image/webp" },
+        { ...descriptor, sha256: descriptor.sha256.toUpperCase() },
+        { ...descriptor, sha256: `../${descriptor.sha256.slice(3)}` },
+        { ...descriptor, sha256: "0".repeat(64) },
+      ];
+      for (const claim of claims) expect(() => store.readImage(claim)).toThrow();
+      expect(() => store.append("user", "dangling", undefined, { images: [{ ...descriptor, sha256: "0".repeat(64), order: 0 }] })).toThrow();
+      expect(store.messages).toEqual([]);
+      expect(store.append("user", "ok").i).toBe(0);
+      expect(store.readImage(descriptor).data).toBe(genuine.base64);
+      await store.close();
+    });
+  });
+
+  test("work records and work metadata must accompany each other, and legacy records keep exactly five fields", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const work = { source: "task" as const, completeness: "full" as const, id: "task-1" };
+      expect(() => store.append("work", "uncoupled")).toThrow();
+      expect(() => store.append("user", "carries work", undefined, { work })).toThrow();
+      expect(store.messages).toEqual([]);
+      const record = store.append("work", "coupled", undefined, { work });
+      const plain = store.append("user", "legacy");
+      expect([record.i, plain.i]).toEqual([0, 1]);
+      expect(plain.metadata).toBeUndefined();
+      await store.close();
+      const lines = (await streamContents(fixture.directory, "main")).trimEnd().split("\n").map((line) => JSON.parse(line));
+      expect(Object.keys(lines[1]).sort()).toEqual(["date", "i", "kind", "size", "text"]);
+      expect((await fixture.open()).messages).toEqual([record, plain]);
+    });
+  });
+
+  test("attachments keep their recorded order, verified bytes, and frozen work metadata across restart", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const first = pngFixture(5);
+      const second = pngFixture(6);
+      const firstDescriptor = store.saveImage(first.base64, "image/png");
+      const secondDescriptor = store.saveImage(second.base64, "image/png");
+      const record = store.append("work", "task result", new Date("2026-01-10T12:00:00.000Z"), {
+        work: { source: "task", completeness: "full", id: "task-1", name: "Researcher", agentId: "agent-1" },
+        images: [{ ...secondDescriptor, order: 0 }, { ...firstDescriptor, order: 2 }],
+      });
+      expect(Object.isFrozen(record.metadata)).toBe(true);
+      const expected = [
+        { attachment: { ...secondDescriptor, order: 0 }, data: second.base64 },
+        { attachment: { ...firstDescriptor, order: 2 }, data: first.base64 },
+      ];
+      expect(store.readMessageImages(0)).toEqual(expected);
+      expect(store.readMessagePage(0).metadata).toEqual(record.metadata);
+      await store.close();
+      const restarted = await fixture.open();
+      expect(restarted.messages).toEqual([record]);
+      expect(restarted.readMessageImages(0)).toEqual(expected);
+      expect(restarted.readImage(firstDescriptor)).toEqual({ descriptor: firstDescriptor, data: first.base64 });
+      await restarted.close();
+    });
+  });
+
+  test.each(["missing", "truncated", "grown", "same-size corrupt"] as const)(
+    "reopen rejects a %s referenced attachment before repairing a torn log, then accepts once the bytes are restored",
+    async (damage) => {
+      await withFixture(async (fixture) => {
+        const store = await fixture.open();
+        const image = pngFixture(4);
+        const descriptor = store.saveImage(image.base64, "image/png");
+        store.append("user", "with attachment", undefined, { images: [{ ...descriptor, order: 0 }] });
+        await store.close();
+        const logPath = join(fixture.directory, "main", (await readdir(join(fixture.directory, "main")))[0]!);
+        await appendFile(logPath, '{"i":1,"text":');
+        const logBefore = await readFile(logPath);
+        const path = join(fixture.directory, "images", descriptor.sha256);
+        if (damage === "missing") await rm(path);
+        else if (damage === "truncated") await writeFile(path, image.png.subarray(0, image.png.length - 1), { mode: 0o600 });
+        else if (damage === "grown") await appendFile(path, Buffer.from([0]));
+        else {
+          const flipped = Buffer.from(image.png);
+          flipped[45] = flipped[45]! ^ 0xff;
+          await writeFile(path, flipped, { mode: 0o600 });
+        }
+        await expect(fixture.open()).rejects.toThrow();
+        expect(await readFile(logPath)).toEqual(logBefore);
+        await writeFile(path, image.png, { mode: 0o600 });
+        const recovered = await fixture.open();
+        expect(recovered.messages.map((record) => record.text)).toEqual(["with attachment"]);
+        expect(recovered.readMessageImages(0)[0]!.data).toBe(image.base64);
+        await recovered.close();
+        expect((await readFile(logPath, "utf8")).endsWith("\n")).toBe(true);
+      });
+    },
+  );
+
+  test.each(["root", "images directory"] as const)("a renamed %s cannot redirect image writes or reads away from the leased store", async (target) => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const first = pngFixture(8);
+      const second = pngFixture(9);
+      const held = store.saveImage(first.base64, "image/png");
+      if (target === "root") {
+        const moved = join(fixture.root, "moved-chat");
+        await rename(fixture.directory, moved);
+        await mkdir(join(fixture.directory, "images"), { recursive: true, mode: 0o700 });
+        await writeFile(join(fixture.directory, "sentinel"), "fresh", { mode: 0o600 });
+        const added = store.saveImage(second.base64, "image/png");
+        expect((await readdir(join(moved, "images"))).sort()).toEqual([held.sha256, added.sha256].sort());
+        expect(await readdir(join(fixture.directory, "images"))).toEqual([]);
+        expect(await readFile(join(fixture.directory, "sentinel"), "utf8")).toBe("fresh");
+        expect(store.readImage(held).data).toBe(first.base64);
+        await store.close();
+        const recovered = await fixture.open(undefined, moved);
+        expect(recovered.readImage(added).data).toBe(second.base64);
+        await recovered.close();
+      } else {
+        const heldDirectory = join(fixture.directory, "images-held");
+        await rename(join(fixture.directory, "images"), heldDirectory);
+        const outside = join(fixture.root, "outside-images");
+        await mkdir(outside, { mode: 0o700 });
+        await symlink(outside, join(fixture.directory, "images"));
+        const added = store.saveImage(second.base64, "image/png");
+        expect(await readdir(outside)).toEqual([]);
+        expect((await readdir(heldDirectory)).sort()).toEqual([held.sha256, added.sha256].sort());
+        expect(store.readImage(held).data).toBe(first.base64);
+        await store.close();
+        await rm(join(fixture.directory, "images"));
+        await rename(heldDirectory, join(fixture.directory, "images"));
+        const recovered = await fixture.open();
+        expect(recovered.readImage(added).data).toBe(second.base64);
+        await recovered.close();
+      }
+    });
+  });
+
+  for (const linkType of ["symbolic", "hard"] as const) {
+    test(`a ${linkType}-linked image entry is refused on read and write, leaving its target untouched`, async () => {
+      await withFixture(async (fixture) => {
+        const image = pngFixture(11);
+        const store = await fixture.open();
+        const descriptor = store.saveImage(image.base64, "image/png");
+        await store.close();
+        const entry = join(fixture.directory, "images", descriptor.sha256);
+        const outside = join(fixture.root, "outside.png");
+        await writeFile(outside, image.png, { mode: 0o644 });
+        await chmod(outside, 0o644);
+        await rm(entry);
+        if (linkType === "symbolic") await symlink(outside, entry);
+        else await link(outside, entry);
+        const attacked = await fixture.open();
+        expect(() => attacked.readImage(descriptor)).toThrow();
+        expect(() => attacked.saveImage(image.base64, "image/png")).toThrow();
+        expect((await readFile(outside)).toString("base64")).toBe(image.base64);
+        expect((await stat(outside)).mode & 0o777).toBe(0o644);
+        await attacked.close();
+      });
+    });
+  }
+
+  test("image and page reads reject after close, while a restarted writer still verifies the same attachment", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const image = pngFixture(10);
+      const descriptor = store.saveImage(image.base64, "image/png");
+      store.append("user", "closing attachment", undefined, { images: [{ ...descriptor, order: 0 }] });
+      await store.close();
+      expect(() => store.readImage(descriptor)).toThrow();
+      expect(() => store.readMessageImages(0)).toThrow();
+      const restarted = await fixture.open();
+      expect(restarted.readMessageImages(0)).toEqual([{ attachment: { ...descriptor, order: 0 }, data: image.base64 }]);
+      await restarted.close();
+    });
+  });
+
+  test("message page reads are UTF-8 bounded with exact default and hard limits", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const text = "é".repeat(10_000); // 20,000 UTF-8 bytes
+      const record = store.append("user", text);
+      const first = store.readMessagePage(record.i);
+      expect(first).toMatchObject({ i: 0, kind: "user", date: record.date, size: record.size, offset: 0, totalBytes: 20_000, next: DEFAULT_PAGE_BYTES });
+      expect(Buffer.byteLength(first.text, "utf8")).toBe(DEFAULT_PAGE_BYTES);
+      const rest = store.readMessagePage(0, DEFAULT_PAGE_BYTES);
+      expect(rest.text).toBe("é".repeat(1808));
+      expect(rest.next).toBeNull();
+      const whole = store.readMessagePage(0, 0, MAX_PAGE_BYTES);
+      expect(whole.text).toBe(text);
+      expect(whole.next).toBeNull();
+      expect(() => store.readMessagePage(0, 16_383)).toThrow();
+      expect(() => store.readMessagePage(0, 0, MAX_PAGE_BYTES + 1)).toThrow();
+      expect(() => store.readMessagePage(0, 0, 0)).toThrow();
+      expect(() => store.readMessagePage(1)).toThrow();
+      await store.close();
+    });
   });
 });

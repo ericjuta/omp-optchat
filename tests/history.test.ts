@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { deflateSync } from "node:zlib";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { exportHtml, importHistory } from "../src/history.js";
+import { validateImage, type ImageAttachment } from "../src/archive.js";
+import { exportHtml, exportJsonl, importHistory } from "../src/history.js";
 import { Memory } from "../src/memory.js";
 import { Store, type Kind, type Message, type TreeNode } from "../src/store.js";
 
@@ -19,13 +21,22 @@ interface Fixture {
 }
 
 // Exercise the helpers without a host, compressor, filesystem, lock, clock, or session.
-// The cast keeps this fake structurally minimal: only the Memory surface the helpers use.
+// Image-bearing paths use a real Store; the fixture has no image methods and fails loudly if reached.
 function fixture({ messages: initial = [], nodes: initialNodes = [], view = [] }: Fixture = {}) {
   const messages = initial.map((message) => ({ ...message }));
   const nodes = new Map<string, TreeNode>(initialNodes.map((node) => [`${node.l}:${node.i}`, { ...node }] as const));
   const appends: Array<{ kind: Kind; text: string; date?: Date }> = [];
+  const noImages = (): never => {
+    throw new Error("fixture has no image store");
+  };
   const memory = {
-    store: { messages, nodes },
+    store: {
+      messages,
+      nodes,
+      readMessageImages: (): never[] => [],
+      readImage: noImages,
+      saveImage: noImages,
+    },
     append(kind: Kind, text: string, date?: Date): Message {
       appends.push({ kind, text, date });
       const message: Message = {
@@ -369,6 +380,20 @@ describe("exportHtml", () => {
     expect(decode(element(html, "view-1-0"))).toContain(XSS_DATE);
   });
 
+  test("escapes hostile work provenance fields and never emits them as markup", () => {
+    const hostileId = `"><script>alert('id')</script>`;
+    const hostileAgent = `</p><img src=x onerror=alert('agent')>`;
+    const work = message(0, "work", "report body", "2026-01-01T00:00:00.000Z");
+    const state = fixture({
+      messages: [{ ...work, metadata: { work: { source: "task", completeness: "full", id: hostileId, agentId: hostileAgent } } }],
+    });
+    const html = exportHtml(state.memory);
+    expect(html).not.toContain("<script>alert('id')");
+    expect(html).not.toContain("<img src=x onerror=alert('agent')");
+    expect(decode(element(html, "raw-0"))).toContain(`id ${hostileId}`);
+    expect(decode(element(html, "raw-0"))).toContain(`agent ${hostileAgent}`);
+  });
+
   test("includes the current view, ROOT records, and every stored tree level", () => {
     const html = exportHtml(historyFixture(view).memory);
     const ids = new Set(attributeValues(html, "id"));
@@ -459,5 +484,265 @@ describe("exportHtml", () => {
     expect(ids).toContain("root");
     expect(ids.some((id) => /^(raw|node|level|view)-/.test(id))).toBe(false);
     for (const href of hrefs(html)) expect(ids).toContain(href.slice(1));
+  });
+});
+
+// Genuine 8-bit RGB PNGs: zlib-deflated scanlines with correct chunk CRCs, decodable by any PNG reader.
+const crcTable = Array.from({ length: 256 }, (_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+
+function crc32(data: Uint8Array): number {
+  let c = 0xffffffff;
+  for (const byte of data) c = crcTable[(c ^ byte) & 0xff]! ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  const typed = Buffer.concat([Buffer.from(type, "latin1"), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(typed));
+  return Buffer.concat([length, typed, crc]);
+}
+
+function png(width: number, height: number, shade: number): Buffer {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8; // bit depth
+  header[9] = 2; // RGB
+  const row = Buffer.alloc(1 + width * 3, shade);
+  row[0] = 0; // filter: none
+  const scanlines = Buffer.concat(Array.from({ length: height }, () => row));
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(scanlines)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+const PNG_A = png(2, 3, 40).toString("base64");
+const PNG_B = png(1, 4, 200).toString("base64");
+const PNG_A_DESCRIPTOR = validateImage(PNG_A, "image/png").descriptor;
+
+// Metadata refs and inline payloads, built from genuine bytes.
+function refOf(data: string, order: number): ImageAttachment {
+  return { ...validateImage(data, "image/png").descriptor, order };
+}
+
+function inlineOf(data: string, order: number): Record<string, unknown> {
+  return { ...refOf(data, order), data };
+}
+
+// Rejections must leave no message, no main-log byte, and no image file behind.
+async function expectRejectedWithoutWrites(input: string): Promise<void> {
+  await withRealMemory(async (memory) => {
+    const mainBefore = await mainState(memory.store);
+    expect(() => importHistory(memory, input)).toThrow();
+    expect(memory.store.messages).toEqual([]);
+    expect(await mainState(memory.store)).toEqual(mainBefore);
+    expect(await readdir(join(memory.store.directory, "images"))).toEqual([]);
+  });
+}
+
+describe("archive JSONL and provenance with a real Store", () => {
+  test("export then import reproduces metadata, IDs, dates, and image bytes exactly", async () => {
+    let exported = "";
+    let sourceMessages: Message[] = [];
+    await withRealMemory(async (memory) => {
+      memory.append("work", "report <b>body</b>", new Date(DEFAULT_DATE), {
+        work: { source: "task", completeness: "pointer-only", id: "job-1", name: "scout", agentId: "a<1>" },
+        images: [
+          { ...memory.store.saveImage(PNG_A, "image/png"), order: 0 },
+          { ...memory.store.saveImage(PNG_B, "image/png"), order: 3 },
+        ],
+      });
+      memory.append("user", "plain");
+      exported = exportJsonl(memory);
+      sourceMessages = memory.store.messages.map((entry) => ({ ...entry }));
+    });
+    await withRealMemory(async (memory) => {
+      expect(importHistory(memory, exported)).toBe(2);
+      expect(memory.store.messages).toEqual(sourceMessages);
+      expect(memory.store.messages[1]!.metadata).toBeUndefined();
+      expect(memory.store.readMessageImages(0).map(({ attachment, data }) => ({ sha256: attachment.sha256, order: attachment.order, data })))
+        .toEqual([
+          { sha256: validateImage(PNG_A, "image/png").descriptor.sha256, order: 0, data: PNG_A },
+          { sha256: validateImage(PNG_B, "image/png").descriptor.sha256, order: 3, data: PNG_B },
+        ]);
+      expect(exportJsonl(memory)).toBe(exported);
+    });
+  });
+
+  test("exports one strict record shape: metadata refs plus one inline payload per ref", async () => {
+    await withRealMemory(async (memory) => {
+      memory.append("work", "text", new Date(DEFAULT_DATE), {
+        work: { source: "task", completeness: "full" },
+        images: [{ ...memory.store.saveImage(PNG_A, "image/png"), order: 1 }],
+      });
+      const [record] = exportJsonl(memory).trimEnd().split("\n").map((line) => JSON.parse(line));
+      expect(Object.keys(record)).toEqual(["i", "kind", "text", "date", "size", "metadata", "images"]);
+      expect(Object.keys(record.metadata)).toEqual(["work", "images"]);
+      expect(record.metadata.images).toEqual([{ ...PNG_A_DESCRIPTOR, order: 1 }]);
+      expect(record.images).toEqual([{ ...PNG_A_DESCRIPTOR, order: 1, data: PNG_A }]);
+    });
+  });
+
+  test("a legacy payload-only record without metadata refs imports with its payloads as refs", async () => {
+    await withRealMemory(async (memory) => {
+      const input = jsonl([{
+        kind: "work", text: "legacy", date: DEFAULT_DATE,
+        metadata: { work: { source: "task", completeness: "full" } },
+        images: [inlineOf(PNG_A, 2)],
+      }]);
+      expect(importHistory(memory, input)).toBe(1);
+      expect(memory.store.messages[0]!.metadata).toEqual({
+        work: { source: "task", completeness: "full" },
+        images: [{ ...PNG_A_DESCRIPTOR, order: 2 }],
+      });
+      expect(memory.store.readMessageImages(0)[0]!.data).toBe(PNG_A);
+    });
+  });
+
+  test("raw persisted metadata-only refs import when the image is already durable", async () => {
+    await withRealMemory(async (memory) => {
+      memory.store.saveImage(PNG_A, "image/png");
+      const raw = jsonl([{
+        i: 0, kind: "work", text: "raw", date: DEFAULT_DATE, size: messageSize("work", "raw"),
+        metadata: { work: { source: "task", completeness: "full" }, images: [{ ...PNG_A_DESCRIPTOR, order: 0 }] },
+      }]);
+      expect(importHistory(memory, raw)).toBe(1);
+      expect(memory.store.readMessageImages(0)[0]!.data).toBe(PNG_A);
+    });
+  });
+
+  test("raw metadata-only refs are rejected without writes when the image is absent", async () => {
+    await expectRejectedWithoutWrites(jsonl([{
+      kind: "note", text: "raw", metadata: { images: [{ ...PNG_A_DESCRIPTOR, order: 0 }] },
+    }]));
+  });
+
+  test("a metadata-only ref is satisfied by identical bytes supplied in the same import", async () => {
+    await withRealMemory(async (memory) => {
+      const input = jsonl([
+        { kind: "note", text: "refers", metadata: { images: [refOf(PNG_A, 0)] } },
+        { kind: "note", text: "supplies", metadata: { images: [refOf(PNG_A, 1)] }, images: [inlineOf(PNG_A, 1)] },
+      ]);
+      expect(importHistory(memory, input)).toBe(2);
+      expect(memory.store.readMessageImages(0)[0]!.data).toBe(PNG_A);
+      expect(memory.store.readMessageImages(1)[0]!.data).toBe(PNG_A);
+    });
+  });
+
+  test("a metadata-only ref whose descriptor disagrees with the supplied bytes is rejected", async () => {
+    await expectRejectedWithoutWrites(jsonl([
+      { kind: "note", text: "refers", metadata: { images: [{ ...refOf(PNG_A, 0), width: 9 }] } },
+      { kind: "note", text: "supplies", metadata: { images: [refOf(PNG_A, 1)] }, images: [inlineOf(PNG_A, 1)] },
+    ]));
+  });
+
+  test.each([
+    ["fewer payloads than refs", [refOf(PNG_A, 0), refOf(PNG_B, 3)], [inlineOf(PNG_A, 0)]],
+    ["payloads out of order", [refOf(PNG_A, 0), refOf(PNG_B, 3)], [inlineOf(PNG_B, 3), inlineOf(PNG_A, 0)]],
+    ["payload bytes differ from ref", [refOf(PNG_A, 0)], [inlineOf(PNG_B, 0)]],
+    ["payload order differs from ref", [refOf(PNG_A, 0)], [inlineOf(PNG_A, 1)]],
+    ["extra payload beyond refs", [refOf(PNG_A, 0)], [inlineOf(PNG_A, 0), inlineOf(PNG_B, 1)]],
+  ] as const)("inline images must match metadata refs one-to-one: %s", async (_name, refs, payloads) => {
+    await expectRejectedWithoutWrites(jsonl([{
+      kind: "work", text: "mismatch",
+      metadata: { work: { source: "task", completeness: "full" }, images: refs },
+      images: payloads,
+    }]));
+  });
+
+  test("an inline payload whose claimed digest or size lies is rejected before any write", async () => {
+    const lying = { ...inlineOf(PNG_A, 0), bytes: PNG_A_DESCRIPTOR.bytes + 1 };
+    await expectRejectedWithoutWrites(jsonl([{ kind: "note", text: "lying", images: [lying] }]));
+  });
+
+  test("zero-length image arrays are invalid whether top-level or in metadata", () => {
+    expectRejectedWithoutAppend(jsonl([{ kind: "note", text: "empty inline", images: [] }]));
+    expectRejectedWithoutAppend(jsonl([{ kind: "note", text: "empty refs", metadata: { images: [] } }]));
+  });
+
+  test("an oversized inline image array is rejected before any entry is inspected", () => {
+    const thirtyThree = Array.from({ length: 33 }, () => ({}));
+    expectRejectedWithoutAppend(jsonl([{ kind: "note", text: "too many", images: thirtyThree }]));
+  });
+
+  test("unknown fields are rejected in records, metadata, and inline payloads", () => {
+    expectRejectedWithoutAppend(jsonl([{
+      kind: "note", text: "record field", images: [{ ...inlineOf(PNG_A, 0), role: "user" }],
+    }]));
+    expectRejectedWithoutAppend(jsonl([{
+      kind: "work", text: "metadata field", metadata: { work: { source: "task", completeness: "full", extra: 1 } },
+    }]));
+    expectRejectedWithoutAppend(jsonl([{
+      kind: "note", text: "metadata ref field", metadata: { images: [{ ...refOf(PNG_A, 0), extra: true }] },
+    }]));
+  });
+
+  test("work kind must carry work metadata even when images are present", () => {
+    expectRejectedWithoutAppend(jsonl([{
+      kind: "work", text: "no provenance", images: [inlineOf(PNG_A, 0)],
+    }]));
+  });
+
+  test("a bad image in any record stops the whole import before any append or image write", async () => {
+    const lying = { ...PNG_A_DESCRIPTOR, width: PNG_A_DESCRIPTOR.width + 1 };
+    const input = jsonl([
+      { kind: "note", text: "valid first", images: [inlineOf(PNG_A, 0)] },
+      { kind: "note", text: "lying dimensions", images: [{ ...lying, order: 0, data: PNG_A }] },
+    ]);
+    await expectRejectedWithoutWrites(input);
+  });
+
+  test("a valid genuine image followed by an invalid raw tail writes neither image nor record", async () => {
+    await expectRejectedWithoutWrites(jsonl([
+      { kind: "note", text: "valid first", images: [inlineOf(PNG_B, 0)] },
+      { kind: "note", text: "tail", metadata: { images: [{ ...PNG_A_DESCRIPTOR, order: 0 }] } },
+    ]));
+  });
+
+  test("a corrupt durable image fails export and metadata-only import without repair", async () => {
+    await withRealMemory(async (memory) => {
+      const descriptor = memory.store.saveImage(PNG_A, "image/png");
+      memory.append("work", "report", new Date(DEFAULT_DATE), {
+        work: { source: "task", completeness: "full" },
+        images: [{ ...descriptor, order: 0 }],
+      });
+      const path = join(memory.store.directory, "images", descriptor.sha256);
+      const corrupted = Buffer.from(await readFile(path));
+      corrupted[corrupted.length - 1]! ^= 0xff;
+      await rm(path);
+      await writeFile(path, corrupted);
+
+      expect(() => exportJsonl(memory)).toThrow();
+      const before = memory.store.messages.length;
+      expect(() => importHistory(memory, jsonl([{
+        kind: "note", text: "raw", metadata: { images: [{ ...descriptor, order: 0 }] },
+      }]))).toThrow();
+      expect(memory.store.messages).toHaveLength(before);
+    });
+  });
+
+  test("HTML export escapes provenance and shows images only as validated data URIs", async () => {
+    let html = "";
+    await withRealMemory(async (memory) => {
+      memory.append("work", "text", new Date(DEFAULT_DATE), {
+        work: { source: "task", completeness: "full", name: `<img src=x onerror="alert(1)">` },
+        images: [{ ...memory.store.saveImage(PNG_A, "image/png"), order: 0 }],
+      });
+      html = exportHtml(memory);
+    });
+    expect(html).not.toContain("<img src=x");
+    expect(html).not.toContain('onerror="alert');
+    expect(html).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
+    expect(html).toContain(`src="data:image/png;base64,${PNG_A}"`);
   });
 });
