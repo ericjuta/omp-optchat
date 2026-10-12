@@ -20,3 +20,12 @@ Write the result as an `## Answer` section, then update the map's Decisions so f
 ## Comments
 
 Ticket 01's measurements depend on this ticket.
+
+## Answer
+
+2026-10-12, OMP eval kernel on this host, `judge` role = `openrouter/~typesafe/jev-latest`.
+
+- One `bool` + one `choice` judgment answered natively in 0.33 s: danger P(yes)=0.97, choice `file_op` p=1.
+- Candidate: native Jev, model `openrouter/typesafe/jev-1.13-20260917` (from `judge_batch` status); cost $1.14e-05 per one-question state. No error class, no account-limit errors.
+- Route: OpenRouter credential already in OMP's credential store; no new variable names. Jev is not on an OAuth subscription; only proposer and runner roles (`default`, `task`, `smol`, all `anthropic/*`) bill to OAuth.
+- Without a native judge the decided fallback applies: tool gate on the session model, other gates inactive.

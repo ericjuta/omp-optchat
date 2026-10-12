@@ -8,15 +8,23 @@ export type JudgeFactory = (ctx: ExtensionContext, purpose: string) => Judge | u
 /** A judge that can name its first candidate, as the host ChainJudge does. */
 export interface NamedJudge extends Judge {
   primaryModel?(): { provider: string; id: string } | undefined;
+  /** True when the judge role has no candidate and the session model answers alone (see `hostJudge`). */
+  readonly sessionFallback?: boolean;
+}
+
+/** Whether a judge is the session-model fallback rather than a judge-role model. */
+export function sessionFallbackOf(judge: Judge): boolean {
+  return (judge as NamedJudge).sessionFallback === true;
 }
 
 /**
  * The host judge role, resolved per call with usage journaled to this session and the shared answer cache.
- * A synchronous resolution failure or an empty candidate chain yields `undefined`; it never throws.
+ * With no judge-role candidate, the session model is the judge and the result is marked `sessionFallback`: only
+ * the tool gate runs on it. A synchronous resolution failure or an empty candidate chain yields `undefined`; it never throws.
  */
 export function hostJudge(ctx: ExtensionContext, purpose: string): Judge | undefined {
   try {
-    const judge = resolveJudge({
+    const deps = {
       settings,
       registry: ctx.modelRegistry,
       sessionModel: ctx.model,
@@ -24,8 +32,12 @@ export function hostJudge(ctx: ExtensionContext, purpose: string): Judge | undef
       purpose,
       onUsage: journalJudgmentUsage(ctx.sessionManager),
       cache: sharedJudgmentCache(),
-    });
-    return judge.primaryModel() === undefined ? undefined : judge;
+    };
+    const judge = resolveJudge(deps);
+    if (judge.primaryModel() === undefined) return undefined;
+    // The session model is appended only when the role has no candidate of its own: the fallback case.
+    const roleCandidate = resolveJudge({ ...deps, sessionModel: undefined }).primaryModel() !== undefined;
+    return roleCandidate ? judge : Object.assign(judge, { sessionFallback: true });
   } catch {
     return undefined;
   }

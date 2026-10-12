@@ -37,6 +37,9 @@ export interface GateCall {
   readonly cwd: string;
 }
 
+/** `allowed`: the call ran. `asked`: a confirm dialog was shown. `blocked`: the call did not run. */
+export type GateOutcome = "allowed" | "asked" | "blocked";
+
 export interface GateOptions {
   readonly judge: Judge | undefined;
   readonly toolAsk: number;
@@ -44,6 +47,8 @@ export interface GateOptions {
   readonly timeoutMs?: number;
   /** Receives a bounded reason whenever the judge could not screen a call. */
   readonly report?: (failure: string) => void;
+  /** Receives the outcome of each screened call, once it is decided. */
+  readonly outcome?: (outcome: GateOutcome) => void;
 }
 
 const QUESTIONS: Questions = {
@@ -99,14 +104,19 @@ function summaryOf(input: unknown): string {
 export async function gateToolCall(call: GateCall, options: GateOptions): Promise<ToolCallEventResult | undefined> {
   if (Object.hasOwn(EXEMPT_TOOLS, call.toolName)) return undefined;
   const failure = await screen(call, options);
-  if (failure.kind === "judged" && failure.danger < options.toolAsk) return undefined;
+  if (failure.kind === "judged" && failure.danger < options.toolAsk) {
+    options.outcome?.("allowed");
+    return undefined;
+  }
   if (failure.kind === "failed") options.report?.(failure.error);
   const reason = failure.kind === "judged"
     ? `danger ${failure.danger.toFixed(2)} is at or above ${options.toolAsk.toFixed(2)}`
     : `the judge failed (${failure.error})`;
   if (!options.ui.hasUI) {
+    options.outcome?.("blocked");
     return { block: true, reason: `OptChat tool gate blocked ${call.toolName}: ${reason}; no UI to confirm.` };
   }
+  options.outcome?.("asked");
   let approved: boolean;
   try {
     approved = await options.ui.confirm(
@@ -114,8 +124,10 @@ export async function gateToolCall(call: GateCall, options: GateOptions): Promis
       `${reason}.\nInput: ${summaryOf(call.input)}\nAllow this call?`,
     );
   } catch (error) {
+    options.outcome?.("blocked");
     return { block: true, reason: `OptChat tool gate blocked ${call.toolName}: confirmation failed (${boundedGateError(error)}).` };
   }
+  options.outcome?.(approved ? "allowed" : "blocked");
   return approved ? undefined : { block: true, reason: `OptChat tool gate: ${call.toolName} was declined (${reason}).` };
 }
 

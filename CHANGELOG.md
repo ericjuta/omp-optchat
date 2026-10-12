@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Session-model fallback:** when the `judge` role has no candidate, OptChat's judge is the session model, marked as a fallback. Only the tool gate runs on it. Rules, prefetch, value-score and recall are inactive, `/optchat status` says why, and `chat_recall` stays registered and answers that it is inactive, so tool definitions do not change. Before, with no role candidate, all five gates ran on the session model.
+- **Gate counters in `/optchat status`:** per gate, judge calls, failures and outcomes (tool gate allowed/asked/blocked; rules added/replaced; prefetch blocks and bytes; value-score hints; recall answered/none/failed), in memory for the session. Printed only while a gate is on; with every gate off, status is unchanged.
+- A judge factory that throws is now recorded under the gate's label (for example `rules: ...`), not its purpose string.
+
 ## 0.7.0 — 2026-10-11
 
 - **`chat_search(text, kind, limit, before)`:** finds stored messages containing every word of `text`, case-insensitively, newest first, with ~240-byte snippets and `before` paging. It reads the original log, so it reaches names, paths, numbers and errors that summaries dropped. Memory tool calls and search/recall results are never hits. Child views search only their snapshot. Always on with memory, like `zoom`.

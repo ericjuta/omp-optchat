@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { HostMessage } from "./helpers/fake-host.ts";
-import { choice, fakeJudge, noul, type FakeJudge } from "./helpers/fake-judge.ts";
+import { choice, fakeJudge, noul, sessionFallbackJudge, type FakeJudge } from "./helpers/fake-judge.ts";
 import {
   Harness,
   FIRST_MERGED_LINE,
@@ -58,6 +58,10 @@ describe("prefetch through OptChat", () => {
     expect(block).toContain("0+1|user: From now on always reply in French.");
     expect(block).toContain("1+1|talk: noted");
     expect(block).not.toContain("morning coffee for two");
+
+    // Blocks are counted where they are built: one per request that carries one, with their bytes.
+    const status = (await host.command("status")).map((notice) => notice.message).join("\n");
+    expect(status).toMatch(/prefetch counts: [1-9]\d* judge calls, 0 failures, [1-9]\d* blocks, [1-9]\d* bytes/);
   });
 
   test("with no merged view line the judge is never asked for prefetch and no block is sent", async () => {
@@ -167,6 +171,20 @@ describe("chat_recall through OptChat", () => {
     const off = await harness.open({ flags: { ...SMALL_NODES, "no-optchat-recall": true } });
     expect(off.host.tools.has("chat_recall")).toBe(false);
     expect(off.host.tools.has("chat_search")).toBe(true);
+  });
+
+  test("on the session-model fallback, chat_recall says it is inactive and the judge sees no recall request", async () => {
+    harness = new Harness();
+    const judge = sessionFallbackJudge(() => ({}));
+    const { host } = await harness.open({ flags: SMALL_NODES, judge });
+    let transcript: HostMessage[] = [];
+    for (const text of TEXTS) transcript = await talk(host, transcript, text);
+
+    const answer = await host.callTool("chat_recall", { question: QUESTION });
+    expect(answer).toContain("inactive: no native judge model");
+    expect(answer).not.toContain(PLANTED);
+    expect(judge.requests.some((r) => "first" in (r.state as object) || "lines" in (r.state as object))).toBe(false);
+    expect(host.tools.has("chat_recall")).toBe(true);
   });
 
   test("a judge failure during chat_recall yields the recall-failed text and is the last System One failure in status", async () => {

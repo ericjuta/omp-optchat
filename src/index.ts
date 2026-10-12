@@ -52,7 +52,8 @@ import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } fr
 import { CompressorRefusedError, Memory, type CompactionRequest, type Summarize } from "./memory.js";
 import { VIEW_DOC } from "./prompts.js";
 import { Store, StoreLeaseConflictError, type Kind, type Message } from "./store.js";
-import { boundedGateError, hostJudge, judgeWithin, type JudgeFactory, type NamedJudge } from "./system1/judge.js";
+import { boundedGateError, hostJudge, judgeWithin, sessionFallbackOf, utf8Length, type JudgeFactory, type NamedJudge } from "./system1/judge.js";
+import { counted, GATE_KEYS, GATE_LABEL, GATE_PURPOSE, GateCounts, INACTIVE_REASON, type GateKey, type Judging } from "./system1/gates.js";
 import { RuleLedger, renderRules, type Rule } from "./system1/ledger.js";
 import { prefetchBlock, PREFETCH_MS } from "./system1/prefetch.js";
 import { recall, registerRecallTool, renderRecall } from "./system1/recall.js";
@@ -509,6 +510,8 @@ class OptChat {
 	private readonly triageAbort = new AbortController();
 	/** The latest System One failure, bounded, for `/optchat status`. */
 	private gateFailure: string | undefined;
+	/** Per-gate judge calls, failures and outcomes, in memory, for `/optchat status` only. */
+	private readonly counts = new GateCounts();
 	private ready: Promise<void> = Promise.resolve();
 	private turn: Turn | undefined;
 	private pending: Pending | undefined;
@@ -637,8 +640,10 @@ class OptChat {
 		const memory = this.openMemory();
 		const config = this.config!;
 		const ctx = current ?? this.ctx;
-		const judge = ctx ? this.judgeOf(ctx, "optchat-recall") : undefined;
-		if (!judge) {
+		const judging = ctx ? this.judgingFor(ctx, "recall") : undefined;
+		// The tool stays registered, so tool definitions do not change with the judge; the call says why it did nothing.
+		if (judging?.kind === "inactive") return `[optchat recall] inactive: ${INACTIVE_REASON}; use chat_search or zoom`;
+		if (judging?.kind !== "judge") {
 			this.gateFail("recall", "no judge candidate");
 			throw new Error("chat_recall needs the judge role, which has no usable candidate; use chat_search or zoom");
 		}
@@ -648,8 +653,9 @@ class OptChat {
 				lineAt: (id, n) => memory.lineAt(id, n),
 				page: (id) => memory.zoom(id, 1, 0),
 			},
-			{ judge, question, min: config.gates.recallMin, signal },
+			{ judge: judging.judge, question, min: config.gates.recallMin, signal },
 		);
+		this.counts.add("recall", outcome.kind === "found" ? "answered" : outcome.kind);
 		if (outcome.kind === "failed") this.gateFail("recall", outcome.reason);
 		return renderRecall(outcome);
 	}
@@ -1509,19 +1515,31 @@ class OptChat {
 
 	// --- System One (opt-in gates) --------------------------------------------------
 
-	/** The judge for one gate. A factory that throws is recorded as a failure and counts as no judge. */
-	private judgeOf(ctx: ExtensionContext, purpose: string): Judge | undefined {
+	/** The judge factory's answer for one gate. A factory that throws is recorded as a failure and counts as no judge. */
+	private factoryJudge(ctx: ExtensionContext, gate: GateKey): Judge | undefined {
 		try {
-			return this.judges(ctx, purpose);
+			return this.judges(ctx, GATE_PURPOSE[gate]);
 		} catch (error) {
-			this.gateFail(purpose, error);
+			this.gateFail(gate, error);
 			return undefined;
 		}
 	}
 
+	/**
+	 * How one gate may judge. The session-model fallback serves only the tool gate; every other gate is inactive on it,
+	 * which is not a failure and records nothing. Each judgment of a returned judge is counted for `/optchat status`.
+	 */
+	private judgingFor(ctx: ExtensionContext, gate: GateKey): Judging {
+		const judge = this.factoryJudge(ctx, gate);
+		if (!judge) return { kind: "none" };
+		if (gate !== "toolGate" && sessionFallbackOf(judge)) return { kind: "inactive" };
+		return { kind: "judge", judge: counted(judge, () => this.counts.add(gate, "calls")) };
+	}
+
 	/** Records the latest System One failure for `/optchat status`, bounded and without model output. */
-	private gateFail(gate: string, reason: unknown): void {
-		this.gateFailure = `${gate}: ${boundedGateError(reason)}`;
+	private gateFail(gate: GateKey, reason: unknown): void {
+		this.gateFailure = `${GATE_LABEL[gate]}: ${boundedGateError(reason)}`;
+		this.counts.add(gate, "failures");
 	}
 
 	/** A tool call, screened by the judge when the tool gate is on. A failed judgment, or no judge, fails closed. */
@@ -1529,13 +1547,15 @@ class OptChat {
 		const config = this.config;
 		// Without a config, the gate cannot know its threshold: block rather than run unscreened.
 		if (!config) return { block: true, reason: "OptChat tool gate blocked the call: OptChat did not open." };
+		const judging = this.judgingFor(ctx, "toolGate");
 		return gateToolCall(
 			{ toolName: event.toolName, input: event.input, cwd: ctx.cwd },
 			{
-				judge: this.judgeOf(ctx, "optchat-tool-gate"),
+				judge: judging.kind === "judge" ? judging.judge : undefined,
 				toolAsk: config.gates.toolAsk,
 				ui: { hasUI: ctx.hasUI, confirm: (title, message) => ctx.ui.confirm(title, message) },
-				report: (failure) => this.gateFail("tool gate", failure),
+				report: (failure) => this.gateFail("toolGate", failure),
+				outcome: (result) => this.counts.add("toolGate", result),
 			},
 		);
 	}
@@ -1571,14 +1591,16 @@ class OptChat {
 		if (message === undefined || message.length === 0 || remaining <= 0 || !memory.viewLines().some((line) => line.n >= 2)) {
 			return undefined;
 		}
-		const judge = this.judgeOf(ctx, "optchat-prefetch");
-		if (!judge) {
+		const judging = this.judgingFor(ctx, "prefetch");
+		if (judging.kind === "inactive") return undefined;
+		if (judging.kind === "none") {
 			this.gateFail("prefetch", "no judge candidate");
 			return undefined;
 		}
+		let block: string | undefined;
 		try {
-			return await prefetchBlock(memory, {
-				judge,
+			block = await prefetchBlock(memory, {
+				judge: judging.judge,
 				message,
 				k: config.gates.prefetchK,
 				min: config.gates.prefetchMin,
@@ -1588,6 +1610,11 @@ class OptChat {
 			this.gateFail("prefetch", error);
 			return undefined;
 		}
+		if (block !== undefined) {
+			this.counts.add("prefetch", "blocks");
+			this.counts.add("prefetch", "bytes", utf8Length(block));
+		}
+		return block;
 	}
 
 	/** Queues one durable user message for triage. The chain runs in log order and never rejects. */
@@ -1604,8 +1631,9 @@ class OptChat {
 		const abort = this.triageAbort.signal;
 		if (!ledger || !config || abort.aborted) return;
 		const offered = offeredRules(ledger.active());
-		const judge = this.judgeOf(ctx, "optchat-rules");
-		if (!judge) {
+		const judging = this.judgingFor(ctx, "rules");
+		if (judging.kind === "inactive") return;
+		if (judging.kind === "none") {
 			this.gateFail("rules", "no judge candidate");
 			return;
 		}
@@ -1613,7 +1641,7 @@ class OptChat {
 		let result: JudgmentResult<Questions>;
 		try {
 			result = await judgeWithin(
-				judge,
+				judging.judge,
 				{ state: triageState(text, sentences), questions: triageQuestions(offered, sentences) },
 				TRIAGE_MS,
 				abort,
@@ -1635,6 +1663,7 @@ class OptChat {
 			this.gateFail("rules", error);
 			return;
 		}
+		this.counts.add("rules", decision.kind === "add" ? "added" : "replaced");
 		const change = decision.kind === "add" ? "added" : `replaced ${decision.replaces}`;
 		this.notify(`OptChat rule ${rule.id} ${change} from message ${source}: ${rule.text}\nUndo with /optchat rules remove ${rule.id}.`, "info");
 	}
@@ -1653,8 +1682,11 @@ class OptChat {
 	/** The compressor's importance hint for one leaf; undefined when the judge is missing or fails. */
 	private async valueHintFor(source: { kind: Kind; text: string }, signal: AbortSignal): Promise<string | undefined> {
 		const ctx = this.ctx;
-		const judge = ctx ? this.judgeOf(ctx, "optchat-value") : undefined;
-		return judge ? valueHint(judge, source, signal) : undefined;
+		const judging = ctx ? this.judgingFor(ctx, "valueScore") : undefined;
+		if (judging?.kind !== "judge") return undefined;
+		const hint = await valueHint(judging.judge, source, signal);
+		if (hint !== undefined) this.counts.add("valueScore", "hints");
+		return hint;
 	}
 
 	/** `/optchat status` lines for the System One gates. With every gate off there are none: status matches v0.5.0. */
@@ -1665,13 +1697,20 @@ class OptChat {
 		const lines = [
 			`System One gates: rules ${flag(gates.rules)}, prefetch ${flag(gates.prefetch)}, value-score ${flag(gates.valueScore)}, tool-gate ${flag(gates.toolGate)}, recall ${flag(gates.recall)}`,
 		];
-		const judge = this.ctx ? this.judgeOf(this.ctx, "optchat-status") : undefined;
+		const judge = this.ctx ? this.factoryJudge(this.ctx, "toolGate") : undefined;
 		const model = (judge as NamedJudge | undefined)?.primaryModel?.();
+		const fallback = judge !== undefined && sessionFallbackOf(judge);
 		lines.push(
-			`judge: ${model ? `${model.provider}/${model.id}` : "none (the judge role has no credentialed candidate, or resolving it failed)"}`,
+			`judge: ${model ? `${model.provider}/${model.id}` : "none (the judge role has no credentialed candidate, or resolving it failed)"}${fallback ? " (session model fallback: the judge role has no native candidate; only the tool gate runs)" : ""}`,
 		);
+		if (fallback) {
+			for (const gate of GATE_KEYS) {
+				if (gates[gate] && gate !== "toolGate") lines.push(`${GATE_LABEL[gate]} inactive: ${INACTIVE_REASON}`);
+			}
+		}
 		if (gates.rules) lines.push(`standing rules: ${this.rules?.active().length ?? 0} active`);
 		lines.push(`last System One failure: ${this.gateFailure ?? "none"}`);
+		lines.push(...this.counts.lines(gates));
 		return lines;
 	}
 

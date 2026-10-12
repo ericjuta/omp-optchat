@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { utf8Prefix } from "../memory.js";
 import { boundedGateError, judgeWithin, utf8Length } from "./judge.js";
 import { scoreViewLines, type ViewLine } from "./prefetch.js";
+import { RECALL_DESCENT, RECALL_SCORE_NEED } from "./recall-prompt.js";
 
 /** The question as judged and shown: 1 to this many characters. */
 export const RECALL_QUESTION_CHARS = 1_000;
@@ -82,7 +83,7 @@ export async function recall(memory: RecallMemory, options: RecallOptions): Prom
 async function search(memory: RecallMemory, judge: Judge, question: string, min: number, signal: AbortSignal): Promise<RecallOutcome> {
   const lines: ViewLine[] = memory.viewLines().map((line) => ({ id: line.id, n: line.n, text: utf8Prefix(line.text, RECALL_TEXT_BYTES) }));
   if (lines.length === 0) return { kind: "none", min };
-  const scores = await scoreViewLines(judge, { question }, lines, "the question", signal, RECALL_STEP_MS);
+  const scores = await scoreViewLines(judge, { question }, lines, RECALL_SCORE_NEED, signal, RECALL_STEP_MS);
   if (scores.scored.length === 0 && scores.failures.length > 0) return { kind: "failed", reason: scores.failures[0]! };
   let best: { line: ViewLine; p: number } | undefined;
   for (const entry of scores.scored) {
@@ -131,8 +132,8 @@ async function descend(
   const questions: Questions = {
     side: {
       type: "choice",
-      instructions: "Which line more likely holds the information that answers the question?",
-      criteria: { first: "the first line holds the answer", second: "the second line holds the answer" },
+      instructions: RECALL_DESCENT.instructions,
+      criteria: { ...RECALL_DESCENT.criteria },
     },
   };
   const state = { question, first: utf8Prefix(first, RECALL_TEXT_BYTES), second: utf8Prefix(second, RECALL_TEXT_BYTES) };

@@ -46,6 +46,17 @@ export function fakeJudge(reply: Reply): FakeJudge {
   };
 }
 
+/**
+ * A fake that stands in for the session-model fallback: the judge role has no candidate, so the host marks the
+ * session model's judge `sessionFallback` and names its model.
+ */
+export function sessionFallbackJudge(reply: Reply): FakeJudge & { readonly sessionFallback: true } {
+  return Object.assign(fakeJudge(reply), {
+    sessionFallback: true as const,
+    primaryModel: () => ({ provider: "fake", id: "session" }),
+  });
+}
+
 export const noul = (p: number): NoulAnswer => ({ type: "noul", noul: p });
 
 export const choice = (picked: string, probabilities: Record<string, number>): ChoiceAnswer<string> => ({

@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Answer } from "@oh-my-pi/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { Settings, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULTS, readConfig, toolGateRequested } from "../src/config.ts";
 import { createOptChat } from "../src/index.ts";
-import { hostJudge } from "../src/system1/judge.ts";
+import { hostJudge, sessionFallbackOf } from "../src/system1/judge.ts";
 import { LEDGER_FILE, RULE_TEXT_BYTES, RuleLedger, clipRule, renderRules } from "../src/system1/ledger.ts";
 import { PREFETCH_HEADER, PREFETCH_QUESTIONS, PREFETCH_STATE_BYTES, prefetchBlock, type PrefetchMemory } from "../src/system1/prefetch.ts";
 import {
@@ -20,7 +20,7 @@ import {
 } from "../src/system1/rules.ts";
 import { EXEMPT_TOOLS, dangerOf, gateToolCall } from "../src/system1/tool-gate.ts";
 import { valueHint } from "../src/system1/value.ts";
-import { choice, fakeJudge, noul, score, type FakeJudge } from "./helpers/fake-judge.ts";
+import { choice, fakeJudge, noul, score, sessionFallbackJudge, type FakeJudge } from "./helpers/fake-judge.ts";
 import { openFakeHost, type FakeHost, type FakeHostOptions, type HostMessage } from "./helpers/fake-host.ts";
 
 const dirs: string[] = [];
@@ -607,5 +607,97 @@ describe("System One through OptChat", () => {
     const host = await start({ "no-optchat-prefetch": true, "no-optchat-value-score": true }, fakeJudge(() => ({})));
     const status = await host.command("status");
     expect(status.some((notice) => notice.message.includes("System One gates: rules on, prefetch off, value-score off, tool-gate on, recall on"))).toBe(true);
+  });
+
+  test("the host marks the session model as the judge only when the judge role has no candidate", async () => {
+    // The host resolves the judge role through its settings singleton: in memory, so no user config is read or written.
+    await Settings.init({ inMemory: true });
+    const sessionModel = { provider: "fake", id: "session", api: "openai-completions" };
+    const ctx = (model: unknown) =>
+      ({ modelRegistry: { getAvailable: () => [] }, sessionManager: { getSessionId: () => "s" }, model }) as unknown as ExtensionContext;
+    expect(hostJudge(ctx(undefined), "optchat-tool-gate")).toBeUndefined();
+    const fallback = hostJudge(ctx(sessionModel), "optchat-tool-gate");
+    expect(fallback).toBeDefined();
+    expect(sessionFallbackOf(fallback!)).toBe(true);
+  });
+
+  test("session-model fallback: the tool gate still runs on it; rules, prefetch, value-score and recall are inactive, and status says why", async () => {
+    const judge = sessionFallbackJudge(() => destructiveAnswers());
+    const host = await start({ "optchat-rules": true, "optchat-prefetch": true, "optchat-tool-gate": true }, judge, { hasUI: false });
+    // A rule-stating message would be judged by the rules gate on a native judge; on the fallback it is not.
+    await contextTexts(host, [host.user(RULE_TEXT)]);
+    const blocked = (await host.fire("tool_call", { toolName: "bash", input: { command: "rm -rf build" } }))[0] as
+      | { block?: boolean }
+      | undefined;
+    expect(blocked?.block).toBe(true);
+    expect(judge.requests).toHaveLength(1);
+    expect(Object.keys(judge.requests[0]!.questions)).toContain("risk");
+    expect(await ledgerText(host.directory)).not.toContain(RULE_TEXT);
+
+    const status = (await host.command("status")).map((notice) => notice.message).join("\n");
+    expect(status).toContain("judge: fake/session (session model fallback");
+    expect(status).toContain("rules inactive: no native judge model (judge role resolves to session model)");
+    expect(status).toContain("prefetch inactive: no native judge model (judge role resolves to session model)");
+    expect(status).toContain("value-score inactive: no native judge model");
+    expect(status).toContain("recall inactive: no native judge model");
+    expect(status).not.toContain("tool gate inactive");
+  });
+
+  test("session-model fallback: chat_recall stays registered and answers with the inactive text; tool definitions match a native judge", async () => {
+    const native = await start({}, fakeJudge(() => ({})));
+    const fallback = await start({}, sessionFallbackJudge(() => ({})));
+    // The fake host keeps each tool whole; the definition members are read here, the execute function is not compared.
+    const definition = (name: string) => {
+      const tool = native.tools.get(name) as unknown as Record<string, unknown>;
+      return { label: tool.label, description: tool.description, approval: tool.approval, loadMode: tool.loadMode };
+    };
+    const fallbackTool = fallback.tools.get("chat_recall") as unknown as Record<string, unknown>;
+    expect({ label: fallbackTool.label, description: fallbackTool.description, approval: fallbackTool.approval, loadMode: fallbackTool.loadMode }).toEqual(definition("chat_recall"));
+    const answer = await fallback.callTool("chat_recall", { question: "anything" });
+    expect(answer).toBe("[optchat recall] inactive: no native judge model (judge role resolves to session model); use chat_search or zoom");
+  });
+
+  test("gate counters: judge calls and outcomes per gate, in status, when a gate is on", async () => {
+    const judge = fakeJudge(() => ({ ...destructiveAnswers(), rule: noul(0.95) }));
+    const host = await start({ "optchat-rules": true, "optchat-tool-gate": true }, judge, { hasUI: false });
+    await contextTexts(host, [host.user(RULE_TEXT)]);
+    await waitFor(() => host.notices.some((notice) => notice.message.startsWith(RULE_ADDED)), "rule r1");
+    await host.fire("tool_call", { toolName: "bash", input: { command: "rm -rf build" } });
+
+    const status = (await host.command("status")).map((notice) => notice.message).join("\n");
+    expect(status).toContain("rules counts: 1 judge calls, 0 failures, 1 added, 0 replaced");
+    expect(status).toContain("tool gate counts: 1 judge calls, 0 failures, 0 allowed, 0 asked, 1 blocked");
+    expect(status).toContain("prefetch counts:");
+  });
+
+  test("gate counters: a failed judgment counts as a failure, and the tool gate counts a dialog it shows", async () => {
+    const judge = fakeJudge(() => {
+      throw new Error("provider down");
+    });
+    const host = await start({ "optchat-tool-gate": true }, judge, { hasUI: true, confirm: () => true });
+    const approved = (await host.fire("tool_call", { toolName: "bash", input: { command: "ls" } }))[0];
+    expect(approved).toBeUndefined();
+    expect(host.confirms).toHaveLength(1);
+
+    const status = (await host.command("status")).map((notice) => notice.message).join("\n");
+    expect(status).toContain("tool gate counts: 1 judge calls, 1 failures, 1 allowed, 1 asked, 0 blocked");
+  });
+
+  test("all gates off: status has no gate, counter or fallback lines", async () => {
+    const host = await openFakeHost(createOptChat({ judge: () => sessionFallbackJudge(() => ({})) }), {
+      flags: {
+        "no-optchat-rules": true,
+        "no-optchat-prefetch": true,
+        "no-optchat-value-score": true,
+        "no-optchat-tool-gate": true,
+        "no-optchat-recall": true,
+      },
+    });
+    hosts.push(host);
+    const status = (await host.command("status")).map((notice) => notice.message).join("\n");
+    expect(status).not.toContain("System One");
+    expect(status).not.toContain("counts:");
+    expect(status).not.toContain("inactive");
+    expect(status).not.toContain("judge:");
   });
 });

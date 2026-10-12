@@ -2,3 +2,5 @@ node_modules/
 coverage/
 *.tgz
 .optchat/
+evals/recall/cases/real.jsonl
+evals/recall/real-spec.json

@@ -128,6 +128,8 @@ modelRoles:
 
 Jev (TypeSafe's typed decision model, directly or through OpenRouter) answers natively. The role also accepts tiny and ordinary chat models, which answer through OMP's prompted judge. Credentials stay in OMP's credential store; the plugin has no API-key variable or provider client of its own. If no candidate is credentialed, the gates simply do not run and `/optchat status` says so.
 
+When the `judge` role has no candidate at all but the session has a model, OMP answers with the session model. OptChat then runs only the tool gate, on that model. Rules, prefetch, value-score and recall are inactive, and `/optchat status` says why. `chat_recall` stays registered, so tool definitions do not change; it answers that it is inactive. The tool gate's judged text goes to the session model's provider.
+
 ### Turning gates off
 
 ```sh
@@ -147,7 +149,24 @@ System One gates: rules on, prefetch on, value-score on, tool-gate on, recall on
 judge: openrouter/~typesafe/jev-latest
 standing rules: 1 active
 last System One failure: none
+rules counts: 3 judge calls, 0 failures, 1 added, 0 replaced
+prefetch counts: 3 judge calls, 0 failures, 2 blocks, 1480 bytes
+value-score counts: 0 judge calls, 0 failures, 0 hints
+tool gate counts: 2 judge calls, 0 failures, 2 allowed, 0 asked, 0 blocked
+recall counts: 0 judge calls, 0 failures, 0 answered, 0 none, 0 failed
 ```
+
+On the session-model fallback, the gate section reads instead:
+
+```text
+judge: openrouter/anthropic/claude-sonnet (session model fallback: the judge role has no native candidate; only the tool gate runs)
+rules inactive: no native judge model (judge role resolves to session model)
+prefetch inactive: no native judge model (judge role resolves to session model)
+value-score inactive: no native judge model (judge role resolves to session model)
+recall inactive: no native judge model (judge role resolves to session model)
+```
+
+The counts above are an illustrative sample, not a measurement. They are in memory for this session only. Judge calls count every judgment a gate makes; failures count the failures recorded in the last-failure line. Outcomes: rules `added` and `replaced`; prefetch `blocks` built and their `bytes`; value-score `hints` added to a compaction instruction; tool gate `allowed` (ran), `asked` (a confirm dialog was shown) and `blocked` (did not run); recall `answered`, `none` and `failed`. A block is counted for each request that carries one. The counts never enter the system prompt, the view or a provider request. With every gate off, status has no gate lines.
 
 Active standing rules follow the view as their own message, with the id, the source message id and the user's words, for example:
 
@@ -186,9 +205,9 @@ Thresholds: `--optchat-rule-add` (default `0.8`), `--optchat-prefetch-k` (defaul
 
 Behavior:
 
-- **Judge.** The judge is the host's `judge` role, resolved per call. If the role has no credentialed candidate, or resolving it throws, that gate does not run. `/optchat status` says so. OptChat keeps working.
+- **Judge.** The judge is the host's `judge` role, resolved per call. If the role has no credentialed candidate, or resolving it throws, that gate does not run. `/optchat status` says so. OptChat keeps working. With no role candidate and a session model, the session model is the fallback judge: only the tool gate runs on it (see above).
 - **Failures.** A judge failure, a timeout, or a missing judge changes no rule and adds no prefetch block. The tool gate fails closed: it asks with a UI and blocks without one. `/optchat status` shows the last failure, cut to 200 characters.
-- **Privacy.** An enabled gate sends the text it judges to the judge role's provider: user messages, view lines, tool names and inputs, and record text for the value hint. With every gate opted out, nothing is sent.
+- **Privacy.** An enabled gate sends the text it judges to the judge role's provider: user messages, view lines, tool names and inputs, and record text for the value hint. On the session-model fallback, only the tool gate sends, and it sends to the session model's provider. With every gate opted out, nothing is sent.
 - **Cost.** With the defaults, each user message costs up to two judge requests (rules, then prefetch on a merged view), each long compacted leaf one, and each screened tool call one, before the call runs. A `chat_recall` call costs one scoring request per 64 view lines plus one choice per tree level, and only when the model calls it.
 - **Rules.** A rule's text is the user's own words. When a message has several sentences, the judge rates each one, and the rule keeps only the sentences that reach `--optchat-rule-add`, so "From now on, answer in British English. Also run the tests." stores only the first sentence. Rule IDs (`r1`, `r2`, …) are never reused. `/optchat rules` lists active rules, and `/optchat rules remove ID` removes one. A triage that is still running at shutdown is abandoned and writes nothing.
 - **Shutdown.** A print or JSON run exits right after its reply. On `session_shutdown`, OptChat waits up to 1.5 s for queued rule triage, then abandons whatever is still running. The bound stays under the host's 2 s session-shutdown cap, so the wait is shorter than the 5 s the design allowed.
