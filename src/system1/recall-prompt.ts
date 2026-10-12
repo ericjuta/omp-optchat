@@ -1,11 +1,11 @@
 /**
  * The judge wording of chat_recall: the relevance question asked per view line and the sibling choice asked per
  * descent level. recall.ts reads these; the recall eval (evals/recall) tunes this file. A string here changes what the
- * judge is asked, never the control flow, bounds or thresholds.
+ * judge is asked, never the control flow, bounds, state shape or thresholds.
  */
 
-/** The relevance question per line reads "Line <id>+<n> holds information needed to answer <this>". */
-export const RECALL_SCORE_NEED = "the question";
+/** The relevance question asked of each view line; `{line}` becomes the line's `id+n` key, which is also its state key. */
+export const RECALL_SCORE_INSTRUCTION = "Line {line} holds information needed to answer the question";
 
 export interface RecallDescentPrompt {
   readonly instructions: string;
