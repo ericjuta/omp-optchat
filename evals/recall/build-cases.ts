@@ -135,6 +135,8 @@ interface RealSpec {
   readonly fact: string;
   readonly question: string;
   readonly difficulty: "easy" | "hard";
+  /** The leaf summary paraphrases the fact, so only a semantic match can reach it (see the coverage diagnostic). */
+  readonly paraphrase?: boolean;
   readonly note: string;
 }
 
@@ -154,7 +156,7 @@ export async function realCases(specs: readonly RealSpec[]): Promise<CaseRecord[
     if (spec.question.toLowerCase().includes(spec.fact.toLowerCase())) throw new Error(`${spec.id}: question contains the fact`);
     cases.push({
       id: spec.id,
-      tags: ["real", spec.difficulty],
+      tags: ["real", spec.difficulty, ...(spec.paraphrase === true ? ["paraphrase"] : [])],
       question: spec.question,
       gold: spec.gold,
       store: { kind: "snapshot", name: spec.store },

@@ -1,9 +1,9 @@
-import type { ChoiceAnswer, Judge, Questions } from "@oh-my-pi/pi-ai";
+import type { ChoiceAnswer, Judge, NoulAnswer, Questions } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { utf8Prefix } from "../memory.js";
-import { boundedGateError, judgeWithin, utf8Length } from "./judge.js";
-import { scoreViewLines, type ViewLine } from "./prefetch.js";
-import { RECALL_DESCENT, RECALL_SCORE_NEED } from "./recall-prompt.js";
+import { boundedGateError, judgeWithin, packByBytes, utf8Length } from "./judge.js";
+import { PREFETCH_IN_FLIGHT, PREFETCH_QUESTIONS, PREFETCH_STATE_BYTES, type ViewLine } from "./prefetch.js";
+import { RECALL_DESCENT, RECALL_SCORE_INSTRUCTION } from "./recall-prompt.js";
 
 /** The question as judged and shown: 1 to this many characters. */
 export const RECALL_QUESTION_CHARS = 1_000;
@@ -83,7 +83,7 @@ export async function recall(memory: RecallMemory, options: RecallOptions): Prom
 async function search(memory: RecallMemory, judge: Judge, question: string, min: number, signal: AbortSignal): Promise<RecallOutcome> {
   const lines: ViewLine[] = memory.viewLines().map((line) => ({ id: line.id, n: line.n, text: utf8Prefix(line.text, RECALL_TEXT_BYTES) }));
   if (lines.length === 0) return { kind: "none", min };
-  const scores = await scoreViewLines(judge, { question }, lines, RECALL_SCORE_NEED, signal, RECALL_STEP_MS);
+  const scores = await scoreLines(judge, question, lines, signal);
   if (scores.scored.length === 0 && scores.failures.length > 0) return { kind: "failed", reason: scores.failures[0]! };
   let best: { line: ViewLine; p: number } | undefined;
   for (const entry of scores.scored) {
@@ -119,6 +119,57 @@ async function search(memory: RecallMemory, judge: Judge, question: string, min:
     path,
     message: { id: current.id, text, shownBytes: utf8Length(text), totalBytes: page.totalBytes },
   };
+}
+
+/**
+ * The relevance gate: one noul question per line (RECALL_SCORE_INSTRUCTION with the line's `id+n` key), in requests
+ * whose state is `{ question, lines }`, packed within the prefetch gate's state and question limits, PREFETCH_IN_FLIGHT
+ * at once, each within RECALL_STEP_MS. At the shipped wording the requests are byte-identical to the prefetch scorer's.
+ * Never throws: a failed or skipped request contributes no lines and one bounded error; a non-number answer is dropped.
+ */
+async function scoreLines(
+  judge: Judge,
+  question: string,
+  lines: readonly ViewLine[],
+  signal: AbortSignal,
+): Promise<{ scored: Array<{ line: ViewLine; p: number }>; failures: string[] }> {
+  const keyed = lines.map((line) => ({ line, key: `${line.id}+${line.n}` }));
+  const chunks = packByBytes(
+    keyed,
+    utf8Length(JSON.stringify({ question, lines: {} })),
+    (entry) => utf8Length(JSON.stringify(entry.key)) + utf8Length(JSON.stringify(entry.line.text)) + 2,
+    PREFETCH_STATE_BYTES,
+    PREFETCH_QUESTIONS,
+  );
+  const scored: Array<{ line: ViewLine; p: number }>[] = [];
+  const failures: string[] = [];
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < chunks.length) {
+      const index = next++;
+      const chunk = chunks[index]!;
+      if (signal.aborted) {
+        failures.push("not sent: the bound passed");
+        continue;
+      }
+      const map: Record<string, string> = {};
+      const questions: Questions = {};
+      for (const { line, key } of chunk) {
+        map[key] = line.text;
+        questions[key] = { type: "noul", instructions: RECALL_SCORE_INSTRUCTION.replaceAll("{line}", key) };
+      }
+      try {
+        const result = await judgeWithin(judge, { state: { question, lines: map }, questions }, RECALL_STEP_MS, signal);
+        scored[index] = chunk
+          .map(({ line, key }) => ({ line, p: (result.answers[key] as NoulAnswer).noul }))
+          .filter((entry) => typeof entry.p === "number" && !Number.isNaN(entry.p));
+      } catch (error) {
+        failures.push(boundedGateError(error));
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PREFETCH_IN_FLIGHT, chunks.length) }, worker));
+  return { scored: scored.flat(), failures };
 }
 
 /** One choice between two sibling lines. A tie goes to the second, the newer line. */
