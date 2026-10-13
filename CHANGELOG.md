@@ -5,6 +5,7 @@
 - **Session-model fallback:** when the `judge` role has no candidate, OptChat's judge is the session model, marked as a fallback. Only the tool gate runs on it. Rules, prefetch, value-score and recall are inactive, `/optchat status` says why, and `chat_recall` stays registered and answers that it is inactive, so tool definitions do not change. Before, with no role candidate, all five gates ran on the session model.
 - **Gate counters in `/optchat status`:** per gate, judge calls, failures and outcomes (tool gate allowed/asked/blocked; rules added/replaced; prefetch blocks and bytes; value-score hints; recall answered/none/failed), in memory for the session. Printed only while a gate is on; with every gate off, status is unchanged.
 - A judge factory that throws is now recorded under the gate's label (for example `rules: ...`), not its purpose string.
+- **Requires OMP 18.10.3 or newer.** OMP 18.10.3 moved `isOfficialCodexApiUrl` from `@oh-my-pi/pi-ai` to `@oh-my-pi/pi-catalog/wire/codex`, so OptChat failed to load ("Export named 'isOfficialCodexApiUrl' not found"). OptChat now imports it from the catalog. 18.10.3 also made `task.structured` default to off, which takes `yield` away from children; the smoke and the evidence runner's child overlay now set `task.structured: true`, because their scripted children answer through `yield`.
 
 ## 0.7.0 — 2026-10-11
 

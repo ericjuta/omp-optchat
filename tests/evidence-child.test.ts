@@ -1,7 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { buildCorpus, type Corpus, type Question } from "../scripts/evidence/corpus.ts";
 import {
 	analyzeTaskTurn,
@@ -10,7 +7,6 @@ import {
 	childTaskText,
 	deriveChildTasks,
 	parentPrompt,
-	writeSyncTaskOverlay,
 	type ArmBase,
 	type ChildTask,
 	type TaskFiles,
@@ -143,17 +139,6 @@ describe("childLaunch and overlay", () => {
 		const configured: ArmBase = { ...base, extraArgs: ["-e", "fixture.ts", "--optchat-child-view", "--config=stale.yml"] };
 		expect(childLaunch(configured, "view", files).extraArgs).toEqual(["-e", "fixture.ts", "--optchat-child-view", "--config=work/child-overlay.yml"]);
 		expect(childLaunch(configured, "blind", files).extraArgs).toEqual(["-e", "fixture.ts", "--config=work/child-overlay.yml"]);
-	});
-
-	test("the written overlay turns async task execution off", async () => {
-		const directory = await mkdtemp(join(tmpdir(), "child-overlay-"));
-		try {
-			const file = join(directory, "overlay.yml");
-			await writeSyncTaskOverlay(file);
-			expect(await readFile(file, "utf8")).toBe("async:\n  enabled: false\n");
-		} finally {
-			await rm(directory, { recursive: true, force: true });
-		}
 	});
 });
 

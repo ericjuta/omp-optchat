@@ -224,9 +224,12 @@ export function parentPrompt(task: ChildTask): string {
 	].join("\n");
 }
 
-/** Config overlay that keeps `task` synchronous, so the child result arrives in the tool result. */
+/**
+ * Config overlay that keeps `task` synchronous, so the child result arrives in the tool result, and
+ * structured, so children answer through `yield` (OMP 18.10.3 made unstructured the default).
+ */
 export async function writeSyncTaskOverlay(file: string): Promise<void> {
-	await writeFile(file, "async:\n  enabled: false\n", { mode: 0o600 });
+	await writeFile(file, "task:\n  structured: true\nasync:\n  enabled: false\n", { mode: 0o600 });
 }
 
 /**

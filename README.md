@@ -27,7 +27,7 @@ What it costs: a compressor call per stored message and per merge, plus up to tw
 
 ## Requirements and start
 
-- OMP **18.9.0 or newer**, Bun, and Linux. CI checks every push and runs a weekly check against the latest published OMP SDK.
+- OMP **18.10.3 or newer**, Bun, and Linux. CI checks every push and runs a weekly check against the latest published OMP SDK.
 - An authenticated model for the main chat and an authenticated compressor model. Compression uses OMP's `@smol` role by default; choose a competent inexpensive model explicitly if that role is unsuitable.
 
 Install the tagged release:

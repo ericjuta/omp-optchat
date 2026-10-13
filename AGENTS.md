@@ -43,7 +43,7 @@ When writing complex features or significant refactors, use an ExecPlan (as desc
 - Unknown provenance or unknown cost is unresolved. Record it as `unknown`, never as zero, and never as a guess.
 - Never claim savings, quality gains or cache wins without paired evidence: the same chat, the same probes, repeated runs, and a stated budget.
 - Skills live in `.omp/skills/`. Do not add paths or instructions for any other agent harness to this repo.
-- Read host source from this repo's `node_modules/@oh-my-pi/pi-coding-agent/src` (18.9.1), not the stale copy under `~/.omp/plugins/node_modules`.
+- Read host source from this repo's `node_modules/@oh-my-pi/pi-coding-agent/src` (18.10.3), not the stale copy under `~/.omp/plugins/node_modules`.
 
 ## Verification
 

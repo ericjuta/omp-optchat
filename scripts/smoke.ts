@@ -540,7 +540,7 @@ async function main(): Promise<void> {
   try {
     await Promise.all([mkdir(memory), mkdir(workspace), mkdir(home), mkdir(agentDirectory)]);
     const fixtureConfig = join(temporary, "fixture.yml");
-    await writeFile(fixtureConfig, "task:\n  batch: true\nasync:\n  enabled: true\ntools:\n  intentTracing: false\nautolearn:\n  enabled: false\n");
+    await writeFile(fixtureConfig, "task:\n  batch: true\n  structured: true\nasync:\n  enabled: true\ntools:\n  intentTracing: false\nautolearn:\n  enabled: false\n");
     const agents = join(workspace, ".omp", "agents");
     await mkdir(agents, { recursive: true });
     await writeFile(join(agents, "optchat-smoke-reader.md"), [

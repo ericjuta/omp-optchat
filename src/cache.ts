@@ -1,5 +1,6 @@
 import { createHash, type Hash } from "node:crypto";
-import { isOfficialCodexApiUrl, resolveCacheRetention, type Model, type TextContent } from "@oh-my-pi/pi-ai";
+import { resolveCacheRetention, type Model, type TextContent } from "@oh-my-pi/pi-ai";
+import { isOfficialCodexApiUrl } from "@oh-my-pi/pi-catalog/wire/codex";
 
 /**
  * Provider prompt-cache metadata for the OptChat view.
