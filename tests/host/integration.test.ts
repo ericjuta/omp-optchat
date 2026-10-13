@@ -1,5 +1,6 @@
 /**
- * Real-host integration suite for OptChat.
+ * Real-host integration suite for OptChat. Lives under tests/host/ and runs through
+ * `bun run test:host`, which CI also runs, not the default `bun test tests`.
  *
  * Isolation. The bun:test parent imports only bun/node modules and types. Each
  * case re-runs this file as `bun test ./tests/integration.test.ts` in a fresh
@@ -57,16 +58,16 @@ import type { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import type { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import type { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type * as Zod from "zod";
-import type { viewBlocks } from "../src/cache.ts";
-import type * as OptChatModule from "../src/index.ts";
-import type { Kind, Store } from "../src/store.ts";
+import type { viewBlocks } from "../../src/cache.ts";
+import type * as OptChatModule from "../../src/index.ts";
+import type { Kind, Store } from "../../src/store.ts";
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type WireObject = { [key: string]: Json };
 type Evidence = { [key: string]: Json };
 
 const THIS_FILE = fileURLToPath(import.meta.url);
-const REPO_ROOT = resolve(dirname(THIS_FILE), "..");
+const REPO_ROOT = resolve(dirname(THIS_FILE), "../..");
 /** Child marker: a child never re-spawns; it runs exactly the named case. */
 const CHILD_ENV = "OPTCHAT_IT_CHILD";
 const ROOT_ENV = "OPTCHAT_IT_ROOT";
@@ -252,10 +253,10 @@ async function loadLibraries(): Promise<Libraries> {
   const { EventBus } = await import("@oh-my-pi/pi-coding-agent/utils/event-bus");
   const { initializeExtensions } = await import("@oh-my-pi/pi-coding-agent/modes/runtime-init");
   const { parseArgs } = await import("@oh-my-pi/pi-coding-agent/cli/args");
-  const optchat = await import("../src/index.ts");
-  const { viewBlocks } = await import("../src/cache.ts");
+  const optchat = await import("../../src/index.ts");
+  const { viewBlocks } = await import("../../src/cache.ts");
   const { getBundledModels } = await import("@oh-my-pi/pi-catalog/models");
-  const { Store } = await import("../src/store.ts");
+  const { Store } = await import("../../src/store.ts");
   const { completeSimple } = await import("@oh-my-pi/pi-ai");
   const { clampThinkingLevelForModel } = await import("@oh-my-pi/pi-catalog");
   // Keep the fake-host schema dependency behind the same child-only loading boundary.

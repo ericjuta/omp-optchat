@@ -9,7 +9,7 @@
  *   run.json        the run's settings and totals
  *
  *   bun evals/recall/run.ts --variant baseline --out <dir> [--state <flow>/_state.json]
- *     [--reps 2] [--concurrency 4] [--max-judge-calls 3000] [--only id,id] [--cases <file.jsonl>]...
+ *     [--reps 2] [--concurrency 4] [--max-judge-calls 3000] [--k 1..8] [--only id,id] [--cases <file.jsonl>]...
  *     [--mode live|oracle|null] [--induce-error <case id>]
  *
  * Real cases copy their snapshot into a fresh temp dir for every attempt (read-only originals). Synthetic cases share one
@@ -22,7 +22,7 @@ import { join, resolve } from "node:path";
 import { DEFAULTS } from "../../src/config.ts";
 import { Memory, type Summarize } from "../../src/memory.ts";
 import { Store } from "../../src/store.ts";
-import { recall, renderRecall, type RecallMemory, type RecallOutcome } from "../../src/system1/recall.ts";
+import { RECALL_K_MAX, recall, renderRecall, type RecallMemory, type RecallOutcome } from "../../src/system1/recall.ts";
 import { buildTree, type SyntheticTree } from "../../scripts/retrieval/synthetic.ts";
 import { CASES_DIR, type CaseRecord, SNAPSHOT_ROOT } from "./build-cases.ts";
 import { grade } from "./grade.ts";
@@ -38,6 +38,8 @@ interface Options {
   reps: number;
   concurrency: number;
   maxJudgeCalls: number;
+  /** View lines each recall descends from, 1 to RECALL_K_MAX. */
+  k: number;
   only?: ReadonlySet<string>;
   cases: string[];
   mode: Mode;
@@ -80,8 +82,9 @@ function errorText(error: unknown): string {
 }
 
 function parse(argv: readonly string[]): Options {
-  const opts: Options = { variant: "", out: "", reps: 2, concurrency: 4, maxJudgeCalls: 1000, cases: [], mode: "live" };
+  const opts: Options = { variant: "", out: "", reps: 2, concurrency: 4, maxJudgeCalls: 1000, k: 1, cases: [], mode: "live" };
   const cases: string[] = [];
+  let flagK: number | undefined;
   for (let i = 0; i < argv.length; i += 2) {
     const flag = argv[i];
     const value = argv[i + 1];
@@ -95,10 +98,20 @@ function parse(argv: readonly string[]): Options {
     else if (flag === "--only") opts.only = new Set(value.split(",").filter((id) => id.length > 0));
     else if (flag === "--cases") cases.push(value);
     else if (flag === "--mode" && (value === "live" || value === "oracle" || value === "null" || value === "coverage")) opts.mode = value;
+    else if (flag === "--k") flagK = Number(value);
     else if (flag === "--induce-error") opts.induce = value;
     else throw new Error(`unknown or invalid argument ${flag}`);
   }
-  if (!/^(baseline|v[1-9][0-9]*)$/.test(opts.variant)) throw new Error('--variant must be "baseline" or v<N>');
+  // A topk-k<N> variant names its k; --k may repeat it but never disagree. Other variants default to the single descent.
+  const variantK = /^topk-k([1-8])$/.exec(opts.variant);
+  if (!variantK && !/^(baseline|v[1-9][0-9]*)$/.test(opts.variant)) {
+    throw new Error('--variant must be "baseline", v<N> or topk-k<1..8>');
+  }
+  if (variantK && flagK !== undefined && flagK !== Number(variantK[1])) throw new Error("--k disagrees with the k in --variant");
+  opts.k = variantK ? Number(variantK[1]) : (flagK ?? 1);
+  if (!Number.isSafeInteger(opts.k) || opts.k < 1 || opts.k > RECALL_K_MAX) {
+    throw new Error(`--k must be an integer from 1 to ${RECALL_K_MAX}`);
+  }
   if (opts.out.length === 0) throw new Error("--out is required");
   for (const [flag, n] of [["--reps", opts.reps], ["--concurrency", opts.concurrency], ["--max-judge-calls", opts.maxJudgeCalls]] as const) {
     if (!Number.isSafeInteger(n) || n < 1) throw new Error(`${flag} must be a positive integer`);
@@ -267,7 +280,13 @@ async function attempt(c: CaseRecord, ctx: Context, induced: boolean): Promise<A
     }, CEILING_MS);
     let outcome: RecallOutcome;
     try {
-      outcome = await recall(recallView(handle.memory), { judge, question: c.question, min: RECALL_MIN, signal: ceiling.signal });
+      outcome = await recall(recallView(handle.memory), {
+        judge,
+        question: c.question,
+        min: RECALL_MIN,
+        k: ctx.options.k,
+        signal: ceiling.signal,
+      });
     } finally {
       clearTimeout(timer);
     }
@@ -284,7 +303,7 @@ async function attempt(c: CaseRecord, ctx: Context, induced: boolean): Promise<A
 /** Oracle and null references exercise the grader without a model: the oracle answers gold, the null answers nothing. */
 function referenceOutcome(c: CaseRecord, mode: Mode): RecallOutcome {
   if (mode === "oracle") {
-    return { kind: "found", question: c.question, path: [], message: { id: c.gold, text: "", shownBytes: 0, totalBytes: 0 } };
+    return { kind: "found", question: c.question, path: [], others: [], message: { id: c.gold, text: "", shownBytes: 0, totalBytes: 0 } };
   }
   return { kind: "none", min: RECALL_MIN };
 }
@@ -483,6 +502,7 @@ async function main(argv: readonly string[]): Promise<void> {
   }
   const summary = {
     variant: options.variant,
+    k: options.k,
     mode: options.mode,
     cases: cases.length,
     reps: options.reps,

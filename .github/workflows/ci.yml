@@ -34,7 +34,8 @@ jobs:
         run: >-
           node -p "JSON.parse(require('fs').readFileSync('node_modules/@oh-my-pi/pi-coding-agent/package.json','utf8')).version"
       - run: bun run typecheck
-      - run: bun test
+      - run: bun run test
+      - run: bun run test:host
       - run: bun run smoke
         env:
           OPTCHAT_SMOKE_OMP: ./node_modules/.bin/omp

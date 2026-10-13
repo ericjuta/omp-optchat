@@ -50,10 +50,11 @@ When writing complex features or significant refactors, use an ExecPlan (as desc
 Run from the repository root. There are no git hooks; these commands are the gates.
 
     bun run typecheck
-    bun test tests
+    bun run test
+    bun run test:host
     OPTCHAT_SMOKE_OMP=/home/ericjuta/.bun/bin/omp bun run smoke
 
-The smoke uses a loopback model and makes no provider calls. CI (`.github/workflows/ci.yml`) runs the same three checks: typecheck, `bun test` (the `test` script covers `tests`), and smoke.
+The smoke uses a loopback model and makes no provider calls. `bun run test:host` launches real OMP hosts from `tests/host/` (the real-host integration suite and the paired evidence run). CI (`.github/workflows/ci.yml`) runs the same checks: typecheck, `bun run test`, `bun run test:host`, and smoke.
 
 ## Agent skills
 

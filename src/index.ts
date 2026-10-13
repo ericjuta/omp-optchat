@@ -649,7 +649,7 @@ class OptChat {
 				lineAt: (id, n) => memory.lineAt(id, n),
 				page: (id) => memory.zoom(id, 1, 0),
 			},
-			{ judge: judging.judge, question, min: config.gates.recallMin, signal },
+			{ judge: judging.judge, question, min: config.gates.recallMin, k: config.gates.recallK, signal },
 		);
 		this.counts.add("recall", outcome.kind === "found" ? "answered" : outcome.kind);
 		if (outcome.kind === "failed") this.gateFail("recall", outcome.reason);

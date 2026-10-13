@@ -18,7 +18,8 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "test": "bun test tests",
+    "test": "bun test tests --path-ignore-patterns 'tests/host/**'",
+    "test:host": "bun test tests/host",
     "typecheck": "tsc --noEmit",
     "smoke": "bun run scripts/smoke.ts",
     "evidence:recall": "bun run scripts/evidence-recall.ts",

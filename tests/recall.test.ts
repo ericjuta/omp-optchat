@@ -5,6 +5,8 @@ import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "@oh-my
 import { utf8Length } from "../src/system1/judge.ts";
 import { PREFETCH_QUESTIONS } from "../src/system1/prefetch.ts";
 import {
+  RECALL_DESCENT_IN_FLIGHT,
+  RECALL_K_MAX,
   RECALL_PAGE_BYTES,
   RECALL_QUESTION_CHARS,
   recall,
@@ -13,6 +15,7 @@ import {
   type RecallMemory,
   type RecallOutcome,
 } from "../src/system1/recall.ts";
+import { readConfig } from "../src/config.ts";
 import { choice, fakeJudge, noul } from "./helpers/fake-judge.ts";
 
 interface Span {
@@ -313,5 +316,169 @@ describe("renderRecall", () => {
     expect(text.startsWith("[optchat recall] ")).toBe(true);
     expect(text).toContain("recall failed (provider down)");
     expect(text).not.toContain("message ");
+  });
+});
+
+/**
+ * Scores lines by key. A choice favours its first side when that text starts with "a" (0.6 against 0.4), and the
+ * second side otherwise (0.95). `refusal` makes the descents fail: on "a" sides only, or on every side.
+ */
+function halvesJudge(
+  scores: Readonly<Record<string, number>>,
+  refusal: "none" | "a-side" | "every-side" = "none",
+): (request: JudgmentRequest<Questions>) => Answers {
+  return (request) => {
+    const probed = request.state as Probed;
+    const answers: Answers = {};
+    for (const [key, question] of Object.entries(request.questions)) {
+      if (question.type === "noul") {
+        answers[key] = noul(scores[key] ?? 0);
+        continue;
+      }
+      const onA = probed.first?.startsWith("a") ?? false;
+      if (refusal === "every-side" || (refusal === "a-side" && onA)) throw new Error("step failed");
+      answers[key] = onA ? choice("first", { first: 0.6, second: 0.4 }) : choice("second", { first: 0.05, second: 0.95 });
+    }
+    return answers;
+  };
+}
+
+/** Eight messages in two halves: "a" messages 0 to 3, "b" messages 4 to 7. The view holds one line per half. */
+const AB = ["a0", "a1", "a2", "a3", "b4", "b5", "b6", "b7"];
+const HALVES = [
+  { id: 0, n: 4 },
+  { id: 4, n: 4 },
+];
+
+describe("recall: top-k descents", () => {
+  test("k=1 is the single argmax descent: the same outcome and judge requests as leaving k out", async () => {
+    const omitted = fakeJudge(answerFor("invoice"));
+    const explicit = fakeJudge(answerFor("invoice"));
+    const left = await recall(treeMemory(SEVEN), { judge: omitted, question: "invoice", min: 0.5 });
+    const one = await recall(treeMemory(SEVEN), { judge: explicit, question: "invoice", min: 0.5, k: 1 });
+    expect(one).toEqual(left);
+    expect(explicit.requests).toEqual(omitted.requests);
+    expect(judged(one).others).toEqual([]);
+  });
+
+  test("with k above 1, a lower-scored line wins when its descent is more probable", async () => {
+    const scores = { "0+4": 0.9, "4+4": 0.8 };
+    const single = judged(await recall(treeMemory(AB, { view: HALVES }), { judge: fakeJudge(halvesJudge(scores)), question: "q", min: 0.5 }));
+    expect(single.message.id).toBe(0);
+
+    const top = judged(
+      await recall(treeMemory(AB, { view: HALVES }), { judge: fakeJudge(halvesJudge(scores)), question: "q", min: 0.5, k: 3 }),
+    );
+    // 0.8 x 0.95 x 0.95 = 0.722 beats 0.9 x 0.6 x 0.6 = 0.324.
+    expect(top.message.id).toBe(7);
+    expect(top.path.map((step) => `${step.id}+${step.n}`)).toEqual(["4+4", "6+2", "7+1"]);
+    expect(top.others).toHaveLength(1);
+    const other = top.others[0];
+    expect(other?.kind === "answer" && other.id === 0 && Math.abs(other.p - 0.324) < 1e-9).toBe(true);
+    expect(renderRecall(top)).toContain("chosen message 7 (path p=0.722)");
+    expect(renderRecall(top)).toContain("other message 0 (path p=0.324)");
+  });
+
+  test("a message reached by several descents counts once, with its likeliest chain", async () => {
+    // Every line of the default view holds "invoice 5" or covers it, so the three top starts all descend to message 5.
+    const judge = fakeJudge(answerFor("invoice"));
+    const outcome = judged(await recall(treeMemory(SEVEN), { judge, question: "invoice", min: 0.5, k: 3 }));
+    expect(outcome.message.id).toBe(5);
+    expect(outcome.path[0]).toMatchObject({ id: 4, n: 2 });
+    expect(outcome.others).toEqual([]);
+  });
+
+  test("lines below min are never descended from or listed", async () => {
+    const memory = treeMemory(["m0", "m1", "m2"], { view: [{ id: 0, n: 1 }, { id: 1, n: 1 }, { id: 2, n: 1 }] });
+    const judge = fakeJudge(halvesJudge({ "0+1": 0.9, "1+1": 0.3, "2+1": 0.6 }));
+    const outcome = judged(await recall(memory, { judge, question: "q", min: 0.5, k: 3 }));
+    expect(outcome.message.id).toBe(0);
+    expect(outcome.others).toEqual([{ kind: "answer", id: 2, p: 0.6 }]);
+  });
+
+  test("descents run concurrently, never more than RECALL_DESCENT_IN_FLIGHT at once", async () => {
+    const texts = Array.from({ length: 16 }, (_, index) => `m${index}`);
+    const view = Array.from({ length: 8 }, (_, index) => ({ id: index * 2, n: 2 }));
+    // Every choice parks until the test releases it, so the cap is observed exactly, not raced.
+    const full = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let inFlight = 0;
+    let peak = 0;
+    const judge = fakeJudge(async (request) => {
+      const answers: Answers = {};
+      for (const [key, question] of Object.entries(request.questions)) {
+        if (question.type === "noul") {
+          answers[key] = noul(0.9);
+          continue;
+        }
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        if (inFlight === RECALL_DESCENT_IN_FLIGHT) full.resolve();
+        await release.promise;
+        inFlight--;
+        answers[key] = choice("first", { first: 0.9, second: 0.1 });
+      }
+      return answers;
+    });
+    const running = recall(treeMemory(texts, { view }), { judge, question: "q", min: 0.5, k: RECALL_K_MAX });
+    await full.promise;
+    expect(peak).toBe(RECALL_DESCENT_IN_FLIGHT);
+    release.resolve();
+    const outcome = judged(await running);
+    expect(peak).toBe(RECALL_DESCENT_IN_FLIGHT);
+    // Equal chains tie on probability; the higher-ranked (newer) start wins, and every other start is listed.
+    expect(outcome.message.id).toBe(14);
+    expect(outcome.others).toHaveLength(7);
+  });
+
+  test("a failed descent is listed among the others, and the best of the rest answers", async () => {
+    const judge = fakeJudge(halvesJudge({ "0+4": 0.9, "4+4": 0.8 }, "a-side"));
+    const outcome = judged(await recall(treeMemory(AB, { view: HALVES }), { judge, question: "q", min: 0.5, k: 3 }));
+    expect(outcome.message.id).toBe(7);
+    expect(outcome.others).toEqual([{ kind: "failed", id: 0, n: 4, reason: "step failed" }]);
+    expect(renderRecall(outcome)).toContain("other 0+4 failed: step failed");
+  });
+
+  test("when every descent fails, the recall fails with the first descent's reason and reads no page", async () => {
+    const memory = treeMemory(AB, { view: HALVES });
+    const judge = fakeJudge(halvesJudge({ "0+4": 0.9, "4+4": 0.8 }, "every-side"));
+    expect(await recall(memory, { judge, question: "q", min: 0.5, k: 3 })).toEqual({ kind: "failed", reason: "step failed" });
+    expect(memory.pages).toHaveLength(0);
+  });
+
+  test("the recall bound also cuts every descent, with no page read", async () => {
+    const scoring = answerFor("invoice");
+    const judge = fakeJudge((request, signal) => ("side" in request.questions ? hung(request, signal) : scoring(request)));
+    const memory = treeMemory(SEVEN);
+    expect(await recall(memory, { judge, question: "invoice", min: 0.5, k: 3, timeoutMs: 50 })).toEqual({
+      kind: "failed",
+      reason: "the recall bound passed",
+    });
+    expect(memory.pages).toHaveLength(0);
+  });
+
+  test("k outside 1 to RECALL_K_MAX, or not an integer, fails before any judge call", async () => {
+    for (const k of [0, RECALL_K_MAX + 1, 1.5, Number.NaN]) {
+      const judge = fakeJudge(answerFor("invoice"));
+      expect(await recall(treeMemory(SEVEN), { judge, question: "invoice", min: 0.5, k })).toEqual({
+        kind: "failed",
+        reason: `k must be an integer from 1 to ${RECALL_K_MAX}`,
+      });
+      expect(judge.requests).toHaveLength(0);
+    }
+  });
+});
+
+describe("recall-k flag", () => {
+  const flagsOf = (values: Record<string, string>): ExtensionAPI =>
+    ({ getFlag: (name: string) => values[name] }) as unknown as ExtensionAPI;
+
+  test("defaults to 1, takes integers from 1 to 8, and fails closed otherwise", () => {
+    expect(readConfig(flagsOf({}), "/tmp/unused").gates.recallK).toBe(1);
+    expect(readConfig(flagsOf({ "optchat-recall-k": "1" }), "/tmp/unused").gates.recallK).toBe(1);
+    expect(readConfig(flagsOf({ "optchat-recall-k": "8" }), "/tmp/unused").gates.recallK).toBe(8);
+    for (const value of ["0", "9", "2.5", "x", "", "-1"]) {
+      expect(() => readConfig(flagsOf({ "optchat-recall-k": value }), "/tmp/unused")).toThrow("--optchat-recall-k");
+    }
   });
 });

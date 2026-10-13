@@ -15,6 +15,10 @@ export const RECALL_PAGE_BYTES = 8_000;
 export const RECALL_MS = 20_000;
 /** Wall bound for one judge call: a scoring request or one descent step. */
 export const RECALL_STEP_MS = 5_000;
+/** The most view lines one recall descends from. */
+export const RECALL_K_MAX = 8;
+/** Descents running at once; the rest of the k wait for a slot. */
+export const RECALL_DESCENT_IN_FLIGHT = 4;
 
 /** The memory as recall sees it. Memory satisfies this structurally through an adapter over its zoom. */
 export interface RecallMemory {
@@ -27,8 +31,10 @@ export interface RecallOptions {
   readonly judge: Judge;
   /** Trimmed, whitespace runs collapsed, and 1 to RECALL_QUESTION_CHARS characters. */
   readonly question: string;
-  /** Minimum P(answer) for the first line, in (0, 1]. */
+  /** Minimum P(answer) for a descent's first line, in (0, 1]. */
   readonly min: number;
+  /** How many of the top lines at or above `min` to descend from, 1 to RECALL_K_MAX. Absent means 1: the single argmax descent. */
+  readonly k?: number;
   /** Overall bound; overrides RECALL_MS. */
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
@@ -42,25 +48,39 @@ export interface RecallStep {
   readonly p?: number;
 }
 
+/** A candidate the winning descent beat: a message with its path probability, or a descent that failed. */
+export type RecallOther =
+  | { readonly kind: "answer"; readonly id: number; readonly p: number }
+  | { readonly kind: "failed"; readonly id: number; readonly n: number; readonly reason: string };
+
 export type RecallOutcome =
   | {
       readonly kind: "found";
       readonly question: string;
+      /** The winning descent, from its view line down to the message. */
       readonly path: readonly RecallStep[];
+      /** The other candidates in rank order; always empty for k=1. */
+      readonly others: readonly RecallOther[];
       readonly message: { readonly id: number; readonly text: string; readonly shownBytes: number; readonly totalBytes: number };
     }
   | { readonly kind: "none"; readonly min: number; readonly best?: number }
   | { readonly kind: "failed"; readonly reason: string };
 
 /**
- * The message most likely to answer `question`: a relevance gate scores the merged view lines, then one choice per level
- * descends into the likelier half until a single message remains. Never throws: any failure, timeout or cancellation
- * is a `failed` outcome, and no answer is ever guessed.
+ * The message most likely to answer `question`. A relevance gate scores the merged view lines; the top `k` at or above
+ * `min` each descend, one choice per level into the likelier half, to a single message. A message's probability is its
+ * start line's score times each choice's probability on its descent, and the most probable message answers. A descent
+ * that fails is one failed candidate, not a failed recall, unless every descent failed. Never throws: any failure,
+ * timeout or cancellation is a `failed` outcome, and no answer is ever guessed.
  */
 export async function recall(memory: RecallMemory, options: RecallOptions): Promise<RecallOutcome> {
   const question = options.question.trim().replace(/\s+/g, " ");
   if (question.length === 0 || [...question].length > RECALL_QUESTION_CHARS) {
     return { kind: "failed", reason: `the question must be 1 to ${RECALL_QUESTION_CHARS} characters` };
+  }
+  const k = options.k ?? 1;
+  if (!Number.isSafeInteger(k) || k < 1 || k > RECALL_K_MAX) {
+    return { kind: "failed", reason: `k must be an integer from 1 to ${RECALL_K_MAX}` };
   }
   const bound = new AbortController();
   const onParent = () => bound.abort(options.signal?.reason);
@@ -68,7 +88,7 @@ export async function recall(memory: RecallMemory, options: RecallOptions): Prom
   options.signal?.addEventListener("abort", onParent, { once: true });
   const timer = setTimeout(() => bound.abort(new Error("recall exceeded its bound")), options.timeoutMs ?? RECALL_MS);
   try {
-    const outcome = await search(memory, options.judge, question, options.min, bound.signal);
+    const outcome = await search(memory, options.judge, question, options.min, k, bound.signal);
     if (!bound.signal.aborted) return outcome;
     return { kind: "failed", reason: options.signal?.aborted ? "cancelled" : "the recall bound passed" };
   } catch (error) {
@@ -80,45 +100,35 @@ export async function recall(memory: RecallMemory, options: RecallOptions): Prom
   }
 }
 
-async function search(memory: RecallMemory, judge: Judge, question: string, min: number, signal: AbortSignal): Promise<RecallOutcome> {
+/** A view line with its probability that it holds the answer. */
+interface Scored {
+  readonly line: ViewLine;
+  readonly p: number;
+}
+
+/** How one descent ended: the chain it walked, or the start it failed from and why. */
+type Descent =
+  | { readonly kind: "chain"; readonly path: readonly RecallStep[]; readonly leaf: RecallStep; readonly p: number }
+  | { readonly kind: "failed"; readonly id: number; readonly n: number; readonly reason: string };
+
+async function search(
+  memory: RecallMemory,
+  judge: Judge,
+  question: string,
+  min: number,
+  k: number,
+  signal: AbortSignal,
+): Promise<RecallOutcome> {
   const lines: ViewLine[] = memory.viewLines().map((line) => ({ id: line.id, n: line.n, text: utf8Prefix(line.text, RECALL_TEXT_BYTES) }));
   if (lines.length === 0) return { kind: "none", min };
   const scores = await scoreLines(judge, question, lines, signal);
   if (scores.scored.length === 0 && scores.failures.length > 0) return { kind: "failed", reason: scores.failures[0]! };
-  let best: { line: ViewLine; p: number } | undefined;
-  for (const entry of scores.scored) {
-    if (!best || entry.p > best.p || (entry.p === best.p && entry.line.id > best.line.id)) best = entry;
-  }
+  // Higher probability first; a tie goes to the newer line, as the single argmax always chose.
+  const ranked = [...scores.scored].sort((a, b) => b.p - a.p || b.line.id - a.line.id);
+  const best = ranked[0];
   if (!best || best.p < min) return { kind: "none", min, best: best?.p };
-
-  const path: RecallStep[] = [{ id: best.line.id, n: best.line.n, text: best.line.text, p: best.p }];
-  let current = path[0]!;
-  while (current.n > 1) {
-    const half = current.n / 2;
-    const first = memory.lineAt(current.id, half);
-    const second = memory.lineAt(current.id + half, half);
-    if (!first && !second) return { kind: "failed", reason: `no built children under line ${current.id}+${current.n}` };
-    let step: RecallStep;
-    if (first && second) {
-      const pick = await descend(judge, question, first.text, second.text, signal);
-      const side = pick.picked === "first" ? first : second;
-      step = { id: side.id, n: side.n, text: utf8Prefix(side.text, RECALL_TEXT_BYTES), p: pick.p };
-    } else {
-      const only = (first ?? second)!;
-      step = { id: only.id, n: only.n, text: utf8Prefix(only.text, RECALL_TEXT_BYTES) };
-    }
-    path.push(step);
-    current = step;
-  }
-
-  const page = memory.page(current.id);
-  const text = utf8Prefix(page.text, RECALL_PAGE_BYTES);
-  return {
-    kind: "found",
-    question,
-    path,
-    message: { id: current.id, text, shownBytes: utf8Length(text), totalBytes: page.totalBytes },
-  };
+  const starts = ranked.filter((entry) => entry.p >= min).slice(0, k);
+  return choose(memory, question, await descendAll(memory, judge, question, starts, signal));
 }
 
 /**
@@ -172,6 +182,111 @@ async function scoreLines(
   return { scored: scored.flat(), failures };
 }
 
+/** Every start's descent, at most RECALL_DESCENT_IN_FLIGHT at once. Results keep the starts' rank order. */
+async function descendAll(
+  memory: RecallMemory,
+  judge: Judge,
+  question: string,
+  starts: readonly Scored[],
+  signal: AbortSignal,
+): Promise<Descent[]> {
+  const results: Descent[] = [];
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < starts.length) {
+      const rank = next++;
+      results[rank] = await descendFrom(memory, judge, question, starts[rank]!, signal);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(RECALL_DESCENT_IN_FLIGHT, starts.length) }, worker));
+  return results;
+}
+
+/** One descent from a scored line: one choice per level into the likelier half, until a single message remains. Never throws. */
+async function descendFrom(
+  memory: RecallMemory,
+  judge: Judge,
+  question: string,
+  start: Scored,
+  signal: AbortSignal,
+): Promise<Descent> {
+  const top: RecallStep = { id: start.line.id, n: start.line.n, text: start.line.text, p: start.p };
+  const failed = (reason: string): Descent => ({ kind: "failed", id: top.id, n: top.n, reason });
+  if (signal.aborted) return failed("not started: the bound passed");
+  const path: RecallStep[] = [top];
+  let current = top;
+  try {
+    while (current.n > 1) {
+      const half = current.n / 2;
+      const low = memory.lineAt(current.id, half);
+      const high = memory.lineAt(current.id + half, half);
+      if (!low && !high) return failed(`no built children under line ${current.id}+${current.n}`);
+      let step: RecallStep;
+      if (low && high) {
+        const pick = await descend(judge, question, low.text, high.text, signal);
+        const side = pick.picked === "first" ? low : high;
+        step = { id: side.id, n: side.n, text: utf8Prefix(side.text, RECALL_TEXT_BYTES), p: pick.p };
+      } else {
+        const only = (low ?? high)!;
+        step = { id: only.id, n: only.n, text: utf8Prefix(only.text, RECALL_TEXT_BYTES) };
+      }
+      path.push(step);
+      current = step;
+    }
+  } catch (error) {
+    return failed(boundedGateError(error));
+  }
+  return { kind: "chain", path, leaf: current, p: chainProbability(path) };
+}
+
+/**
+ * The winning chain. A message reached by several descents (overlapping view lines) competes once, with its likeliest
+ * chain; the earlier-ranked chain wins a tie. The most probable chain answers, and a tie goes to the higher-ranked start.
+ * Only the winner's message is read. With no chain at all, every descent failed and the first failure is the reason.
+ */
+function choose(memory: RecallMemory, question: string, descents: readonly Descent[]): RecallOutcome {
+  const likeliest = new Map<number, { readonly rank: number; readonly p: number }>();
+  descents.forEach((descent, rank) => {
+    if (descent.kind !== "chain") return;
+    const seen = likeliest.get(descent.leaf.id);
+    if (seen === undefined || descent.p > seen.p) likeliest.set(descent.leaf.id, { rank, p: descent.p });
+  });
+  const candidates = descents.filter(
+    (descent, rank) => descent.kind === "failed" || likeliest.get(descent.leaf.id)!.rank === rank,
+  );
+  let winner: Extract<Descent, { kind: "chain" }> | undefined;
+  for (const candidate of candidates) {
+    if (candidate.kind === "chain" && (winner === undefined || candidate.p > winner.p)) winner = candidate;
+  }
+  if (winner === undefined) {
+    const failure = candidates.find((candidate) => candidate.kind === "failed");
+    return { kind: "failed", reason: failure?.kind === "failed" ? failure.reason : "no descent ran" };
+  }
+  const page = memory.page(winner.leaf.id);
+  const text = utf8Prefix(page.text, RECALL_PAGE_BYTES);
+  const others: RecallOther[] = [];
+  for (const candidate of candidates) {
+    if (candidate === winner) continue;
+    others.push(
+      candidate.kind === "chain"
+        ? { kind: "answer", id: candidate.leaf.id, p: candidate.p }
+        : { kind: "failed", id: candidate.id, n: candidate.n, reason: candidate.reason },
+    );
+  }
+  return {
+    kind: "found",
+    question,
+    path: winner.path,
+    others,
+    message: { id: winner.leaf.id, text, shownBytes: utf8Length(text), totalBytes: page.totalBytes },
+  };
+}
+
+/** A path's probability under the chain model: the start's score times each choice's probability. Forced steps add none. */
+function chainProbability(path: readonly RecallStep[]): number {
+  return path.reduce((product, step) => (step.p === undefined ? product : product * step.p), 1);
+}
+
 /** One choice between two sibling lines. A tie goes to the second, the newer line. */
 async function descend(
   judge: Judge,
@@ -195,7 +310,10 @@ async function descend(
   return pFirst > pSecond ? { picked: "first", p: pFirst } : { picked: "second", p: pSecond };
 }
 
-/** The outcome as the tool shows it. `found` lists the descent path, then the message's first page and where the rest is. */
+/**
+ * The outcome as the tool shows it. `found` lists the winning descent path, then, when there are other candidates, the
+ * chosen probability and one line per other, then the message's first page and where the rest is.
+ */
 export function renderRecall(outcome: RecallOutcome): string {
   if (outcome.kind === "none") {
     const best = outcome.best === undefined ? "none" : outcome.best.toFixed(2);
@@ -208,6 +326,16 @@ export function renderRecall(outcome: RecallOutcome): string {
   const lines = [`[optchat recall] ${outcome.question}`];
   for (const step of outcome.path) {
     lines.push(`${step.id}+${step.n}|${step.text}${step.p === undefined ? "" : ` (p=${step.p.toFixed(2)})`}`);
+  }
+  if (outcome.others.length > 0) {
+    lines.push(`chosen message ${message.id} (path p=${chainProbability(outcome.path).toFixed(3)})`);
+    for (const other of outcome.others) {
+      lines.push(
+        other.kind === "answer"
+          ? `other message ${other.id} (path p=${other.p.toFixed(3)})`
+          : `other ${other.id}+${other.n} failed: ${other.reason}`,
+      );
+    }
   }
   lines.push(`message ${message.id}:`, message.text);
   lines.push(

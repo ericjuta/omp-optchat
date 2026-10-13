@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Recall descends from the top k lines (`--optchat-recall-k`, default 1, integer 1–8):** opt-in; on the recall eval k=3 scored 15/96 vs 14/96 for k=1 (within noise) for 37% more judge calls, so the default stays 1. The top k view lines at or above `--optchat-recall-min` each descend (at most 4 descents in flight, one 20 s bound), and the message with the highest path probability answers: its line's score times each choice's probability. Other candidates are listed one line each; a failed descent is listed and fails only the candidate, unless every descent failed. `--optchat-recall-k 1` is the previous single argmax descent. Judge calls: at most ⌈lines/64⌉ + k·log₂ n.
+- **`evals/recall/`:** `--k` (or a `topk-k<N>` variant) sets k; `run.json` records it.
+- **Test layout:** the real-host suites (`tests/host/integration.test.ts`, the paired evidence run and no-call plan in `tests/host/evidence-benchmark.test.ts`) run through `bun run test:host`, which CI also runs. `bun run test` covers the rest. The retrieval comparison builds its report and tree once per file.
+
 ## 0.8.0 — 2026-10-13
 
 - **Removed: tool gate.** `--optchat-tool-gate`, `--no-optchat-tool-gate` and `--optchat-tool-ask` are gone, with `src/system1/tool-gate.ts` and the `tool_call` hook. Risky-call confirmation is OMP's own tool approval (`tools.approval`). Scripts that pass the removed flags should drop them. The four remaining gates are rules, prefetch, value-score and recall.
