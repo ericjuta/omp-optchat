@@ -4,3 +4,4 @@ coverage/
 .optchat/
 evals/recall/cases/real.jsonl
 evals/recall/real-spec.json
+.omp/ratchet/
