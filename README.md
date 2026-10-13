@@ -115,7 +115,9 @@ A model turn waits for summaries rather than seeing partial source text. Compres
 
 ## System One gates (Jev)
 
-Five gates send text to the host's `judge` model role. All five are on by default. Turn one off for a session with its opt-out flag (`--no-optchat-rules`, `--no-optchat-prefetch`, `--no-optchat-value-score`, `--no-optchat-tool-gate`, `--no-optchat-recall`); an opt-out takes precedence over the gate's own flag, which is kept for explicit launches. OMP boolean flags are presence flags, so `--optchat-rules=false` does not turn a gate off. With all five opted out, OptChat resolves no judge, registers no tool hook and no `chat_recall` tool, and sends no gate messages: its context and `/optchat status` are the memory-only ones (0.5.0's, plus `chat_search` and `zoom` depth since 0.7.0). Subagents never run the gates.
+Four gates send text to the host's `judge` model role. All four are on by default. Turn one off for a session with its opt-out flag (`--no-optchat-rules`, `--no-optchat-prefetch`, `--no-optchat-value-score`, `--no-optchat-recall`); an opt-out takes precedence over the gate's own flag, which is kept for explicit launches. OMP boolean flags are presence flags, so `--optchat-rules=false` does not turn a gate off. With all four opted out, OptChat resolves no judge, registers no `chat_recall` tool, and sends no gate messages: its context and `/optchat status` are the memory-only ones (0.5.0's, plus `chat_search` and `zoom` depth since 0.7.0). Subagents never run the gates.
+
+The tool gate, which screened tool calls before they ran, was removed in 0.8.0. Risky-call confirmation is OMP's own tool approval (`tools.approval` in OMP's settings).
 
 ### Choosing the judge
 
@@ -128,15 +130,14 @@ modelRoles:
 
 Jev (TypeSafe's typed decision model, directly or through OpenRouter) answers natively. The role also accepts tiny and ordinary chat models, which answer through OMP's prompted judge. Credentials stay in OMP's credential store; the plugin has no API-key variable or provider client of its own. If no candidate is credentialed, the gates simply do not run and `/optchat status` says so.
 
-When the `judge` role has no candidate at all but the session has a model, OMP answers with the session model. OptChat then runs only the tool gate, on that model. Rules, prefetch, value-score and recall are inactive, and `/optchat status` says why. `chat_recall` stays registered, so tool definitions do not change; it answers that it is inactive. The tool gate's judged text goes to the session model's provider.
+When the `judge` role has no candidate at all but the session has a model, OMP answers with the session model. OptChat then runs no gate on that model: rules, prefetch, value-score and recall are inactive, and `/optchat status` says why. `chat_recall` stays registered, so tool definitions do not change; it answers that it is inactive. No judged text is sent to the session model's provider.
 
 ### Turning gates off
 
 ```sh
-omp --no-optchat-tool-gate                       # keep memory and the other gates, skip tool screening
 omp --no-optchat-prefetch --no-optchat-value-score
 omp --no-optchat-recall                          # no chat_recall tool; chat_search and zoom stay
-omp --no-optchat-rules --no-optchat-prefetch --no-optchat-value-score --no-optchat-tool-gate --no-optchat-recall   # memory only
+omp --no-optchat-rules --no-optchat-prefetch --no-optchat-value-score --no-optchat-recall   # memory only
 omp --no-optchat                                 # plain OMP: no memory, no gates
 ```
 
@@ -145,28 +146,27 @@ omp --no-optchat                                 # plain OMP: no memory, no gate
 `/optchat status` gains a gate section while any gate is on:
 
 ```text
-System One gates: rules on, prefetch on, value-score on, tool-gate on, recall on
+System One gates: rules on, prefetch on, value-score on, recall on
 judge: openrouter/~typesafe/jev-latest
 standing rules: 1 active
 last System One failure: none
 rules counts: 3 judge calls, 0 failures, 1 added, 0 replaced
 prefetch counts: 3 judge calls, 0 failures, 2 blocks, 1480 bytes
 value-score counts: 0 judge calls, 0 failures, 0 hints
-tool gate counts: 2 judge calls, 0 failures, 2 allowed, 0 asked, 0 blocked
 recall counts: 0 judge calls, 0 failures, 0 answered, 0 none, 0 failed
 ```
 
 On the session-model fallback, the gate section reads instead:
 
 ```text
-judge: openrouter/anthropic/claude-sonnet (session model fallback: the judge role has no native candidate; only the tool gate runs)
+judge: openrouter/anthropic/claude-sonnet (session model fallback: the judge role has no native candidate; no gate runs)
 rules inactive: no native judge model (judge role resolves to session model)
 prefetch inactive: no native judge model (judge role resolves to session model)
 value-score inactive: no native judge model (judge role resolves to session model)
 recall inactive: no native judge model (judge role resolves to session model)
 ```
 
-The counts above are an illustrative sample, not a measurement. They are in memory for this session only. Judge calls count every judgment a gate makes; failures count the failures recorded in the last-failure line. Outcomes: rules `added` and `replaced`; prefetch `blocks` built and their `bytes`; value-score `hints` added to a compaction instruction; tool gate `allowed` (ran), `asked` (a confirm dialog was shown) and `blocked` (did not run); recall `answered`, `none` and `failed`. A block is counted for each request that carries one. The counts never enter the system prompt, the view or a provider request. With every gate off, status has no gate lines.
+The counts above are an illustrative sample, not a measurement. They are in memory for this session only. Judge calls count every judgment a gate makes; failures count the failures recorded in the last-failure line. Outcomes: rules `added` and `replaced`; prefetch `blocks` built and their `bytes`; value-score `hints` added to a compaction instruction; recall `answered`, `none` and `failed`. A block is counted for each request that carries one. The counts never enter the system prompt, the view or a provider request. With every gate off, status has no gate lines.
 
 Active standing rules follow the view as their own message, with the id, the source message id and the user's words, for example:
 
@@ -198,22 +198,21 @@ Error: DATABASE_URL is not set in environment "staging" …
 | `--optchat-rules` | Standing rules | Judges each user message for a standing instruction, then adds it to `ledger.jsonl` or replaces the active rule it overrides. Active rules appear in a `<rules>` block after the view. | user message |
 | `--optchat-prefetch` | Prefetch | Judges merged view lines against the new user message and zooms the relevant ones into a `<prefetch>` block. Bounded to 5 s, and to the settle deadline's remaining time. | user message |
 | `--optchat-value-score` | Value hint | Judges each long leaf's label and importance, and adds one fixed sentence to its compaction instruction. The sentence never contains record text or ids. | compacted leaf |
-| `--optchat-tool-gate` | Tool gate | Judges each tool call except read-only and OptChat's own tools (`zoom`, `date`, `work`, `chat_search`, `chat_recall`, `read`, `grep`, `glob`, `find`, `todo`, `ask`, `think`, `web_search`). Danger at or above `--optchat-tool-ask` asks the user, or blocks when no UI is available. Bounded to 8 s. | tool call |
 | `--optchat-recall` | Recall | Registers the `chat_recall(question)` tool. Scores the view lines against the question (single-message lines are returned directly), takes the best one at or above `--optchat-recall-min`, then asks one two-way choice per level (which half more likely holds the answer) down to a single message, and returns the path with that message's first 8 KB. At most ⌈lines/64⌉ + log₂ n judge calls; bounded to 20 s, 5 s per call. A failure or timeout returns an explicit "recall failed" result, never a guessed answer. | tool call |
 
-Thresholds: `--optchat-rule-add` (default `0.8`), `--optchat-prefetch-k` (default `8`, integer 1–32), `--optchat-prefetch-min` (default `0.5`), `--optchat-tool-ask` (default `0.3`), `--optchat-recall-min` (default `0.5`). Probabilities are plain decimals in (0, 1]. A malformed value fails the session's configuration closed.
+Thresholds: `--optchat-rule-add` (default `0.8`), `--optchat-prefetch-k` (default `8`, integer 1–32), `--optchat-prefetch-min` (default `0.5`), `--optchat-recall-min` (default `0.5`). Probabilities are plain decimals in (0, 1]. A malformed value fails the session's configuration closed.
 
 Behavior:
 
-- **Judge.** The judge is the host's `judge` role, resolved per call. If the role has no credentialed candidate, or resolving it throws, that gate does not run. `/optchat status` says so. OptChat keeps working. With no role candidate and a session model, the session model is the fallback judge: only the tool gate runs on it (see above).
-- **Failures.** A judge failure, a timeout, or a missing judge changes no rule and adds no prefetch block. The tool gate fails closed: it asks with a UI and blocks without one. `/optchat status` shows the last failure, cut to 200 characters.
-- **Privacy.** An enabled gate sends the text it judges to the judge role's provider: user messages, view lines, tool names and inputs, and record text for the value hint. On the session-model fallback, only the tool gate sends, and it sends to the session model's provider. With every gate opted out, nothing is sent.
-- **Cost.** With the defaults, each user message costs up to two judge requests (rules, then prefetch on a merged view), each long compacted leaf one, and each screened tool call one, before the call runs. A `chat_recall` call costs one scoring request per 64 view lines plus one choice per tree level, and only when the model calls it.
+- **Judge.** The judge is the host's `judge` role, resolved per call. If the role has no credentialed candidate, or resolving it throws, that gate does not run. `/optchat status` says so. OptChat keeps working. With no role candidate and a session model, the session model is the fallback judge, and every gate is inactive on it (see above).
+- **Failures.** A judge failure, a timeout, or a missing judge changes no rule and adds no prefetch block. `/optchat status` shows the last failure, cut to 200 characters.
+- **Privacy.** An enabled gate sends the text it judges to the judge role's provider: user messages, view lines, tool names and inputs, and record text for the value hint. On the session-model fallback no gate runs, so nothing is sent. With every gate opted out, nothing is sent.
+- **Cost.** With the defaults, each user message costs up to two judge requests (rules, then prefetch on a merged view) and each long compacted leaf one. A `chat_recall` call costs one scoring request per 64 view lines plus one choice per tree level, and only when the model calls it.
 - **Rules.** A rule's text is the user's own words. When a message has several sentences, the judge rates each one, and the rule keeps only the sentences that reach `--optchat-rule-add`, so "From now on, answer in British English. Also run the tests." stores only the first sentence. Rule IDs (`r1`, `r2`, …) are never reused. `/optchat rules` lists active rules, and `/optchat rules remove ID` removes one. A triage that is still running at shutdown is abandoned and writes nothing.
 - **Shutdown.** A print or JSON run exits right after its reply. On `session_shutdown`, OptChat waits up to 1.5 s for queued rule triage, then abandons whatever is still running. The bound stays under the host's 2 s session-shutdown cap, so the wait is shorter than the 5 s the design allowed.
 - **Frozen per turn.** The rules and prefetch blocks are decided when a turn starts, and every request in that turn carries the same blocks, including tool loops. A rule stated mid-turn applies from the next turn.
 
-Verified in this repository: the unit and integration tests in `tests/system1.test.ts`, `tests/system1-e2e.test.ts` and `tests/memory.test.ts`; a cache test (`tests/cache.test.ts`) showing that the system prompt, tools and view text in an encoded Anthropic request are unchanged when the rules and prefetch messages follow the view; a one-off comparison in which a 12-turn conversation produced byte-identical context and status with every gate opted out, against 0.5.0; and live print-mode runs with the real judge on OMP 18.9.1, where the tool gate blocked `rm -rf build` with no UI and a two-sentence message stored only its rule sentence. Not verified: the judge's accuracy beyond those runs, prefetch on a live merged view, and the confirm dialog in an interactive session.
+Verified in this repository: the unit and integration tests in `tests/system1.test.ts`, `tests/system1-e2e.test.ts` and `tests/memory.test.ts`; a cache test (`tests/cache.test.ts`) showing that the system prompt, tools and view text in an encoded Anthropic request are unchanged when the rules and prefetch messages follow the view; a one-off comparison in which a 12-turn conversation produced byte-identical context and status with every gate opted out, against 0.5.0; and live print-mode runs with the real judge on OMP 18.9.1, where the tool gate (removed in 0.8.0) blocked `rm -rf build` with no UI and a two-sentence message stored only its rule sentence. Not verified: the judge's accuracy beyond those runs, prefetch on a live merged view, and the confirm dialog in an interactive session.
 
 ## OMP-specific boundaries
 

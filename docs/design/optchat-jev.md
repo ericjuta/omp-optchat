@@ -114,9 +114,9 @@ How the plugin reaches it. The host's `judge` role maps to Jev on this user's ho
 4. **Slowest-changing first.** Anything Jev produces per turn goes after the view in the prompt.
 5. **Behind a seam, behind a flag.** Gates ask Jev through one injected judge (`OptChatOptions.judge`, defaulting to the host judge role). Tests inject a fake judge that implements the same interface. Each gate has its own flag, so every gate can be ablated.
 6. **Off means plain OptChat.** With every gate off, requests must be byte-identical to omp-optchat v0.5.0. The plan's golden test checks this for a fixed chat.
-7. **Fail open for context, fail closed for actions.** A failed rule triage, prefetch or hint means no rule, no block and no hint, and the turn proceeds. A failed tool-gate judgment never runs an unscreened call: it asks with a UI and blocks without one.
+7. **Fail open for context, fail closed for actions.** A failed rule triage, prefetch or hint means no rule, no block and no hint, and the turn proceeds.
 
-### 3.3 The four gates
+### 3.3 The four gates (the tool gate was removed in 0.8.0)
 
 **Rules ledger** (per user message, in the background, after the message is durable). Only human-typed user messages are triaged: work reports, skill prompts and side turns are skipped. One Jev request asks two things: is this a standing instruction or correction (`noul`), and if rules exist, which current rule does it replace, if any (`choice` over the 64 most recent rule ids plus `none`). A rule is added when P(rule) is at least 0.8 (`--optchat-rule-add`). It replaces a rule only when P(rule) clears that threshold and the supersede pick has probability at least 0.5. There is no ask band: every add and replace is announced, appears in `/optchat rules`, and can be removed with `/optchat rules remove <id>`. A wrong rule is cheap to see and cheap to remove, so a visible announcement replaces the blocking question the first design had. The ledger is a durable file in omp-optchat's store directory. It is rendered as a message after the view, so changing it never changes the view's cache marks. The original messages stay in the log and remain the source of truth.
 
@@ -124,7 +124,7 @@ How the plugin reaches it. The host's `judge` role maps to Jev on this user's ho
 
 **Value score** (per logged message, in the background). This gate applies only to level-0 leaves that need a summary call. Short messages that are their own nodes get no hint. Jev returns a label (decision, preference, finding, or noise) and an importance (low, medium, high). The hint is a sentence built from a closed template for that label and importance, so no model text reaches the compactor. The compactor waits at most 2 s for the hint. A late or missing hint means no hint, and the node still builds. A hint never changes which nodes are built or in what order.
 
-**Tool gate** (per proposed tool call from the main agent). Exempt tools are read-only or internal: `zoom`, `date`, `work`, `read`, `grep`, `glob`, `find`, `todo`, `ask`, `think`, `web_search`. Every other call gets one request: a `choice` risk over safe, risky and destructive, and `noul` questions for deletes, remote code or data, and production or shared effects. Danger is the largest of those probabilities. At or above 0.3 (`--optchat-tool-ask`), the gate asks through `ctx.ui.confirm` when a UI exists, and blocks with a reason when none exists. A judge failure or a timeout after 8 s is an unanswered risk: it asks with a UI and blocks without one. The `task` tool is screened on its arguments, because subagent calls run with approval set to yolo (`src/task/executor.ts:1144-1146` in the host). Both the proposal and the verdict are logged, as a blocked call's reason or an allowed call's result.
+**Tool gate** (removed in 0.8.0; historical). It screened each proposed tool call from the main agent with one judge request, and asked through `ctx.ui.confirm` or blocked risky calls. It is removed: OMP's `tools.approval` owns risky-call approval.
 
 ### 3.4 State machines
 
@@ -143,12 +143,6 @@ stateDiagram-v2
     Triage --> Agent: not a rule
     Ledger --> Announce
     Announce --> Agent
-    Agent --> ToolGate: tool call proposed (gate on)
-    ToolGate --> Agent: allow, result logged
-    ToolGate --> UserAsk: danger at or above ask threshold, UI present
-    ToolGate --> Agent: block, reason logged (no UI or judge failure)
-    UserAsk --> Agent: approved, call runs
-    UserAsk --> Agent: declined, call blocked
     Agent --> Reply: final answer
     Reply --> Idle
 ```
@@ -209,7 +203,7 @@ That costs about B × depth judge calls, where depth is at most log2 of the chat
 Rules:
 
 - **Read-only.** A retrieval script may call `zoom`, `date` and `work`. The kernel's `tool.<name>` can reach any enabled tool, so the script's allowed set must be checked, not assumed. Only the turn loop and the compactor write.
-- **The script is a tool call.** The tool gate screens it like any other call. Its output is a tool result, capped and logged, so later turns know what was looked up.
+- **The script is a tool call.** OMP's tool approval applies to it like any other call. Its output is a tool result, capped and logged, so later turns know what was looked up.
 - **Bounded.** Each script gets a time limit, and a cap on judge calls and zooms.
 - **Same exposure as zoom.** Memory content returned to the script is data, not instructions; it reaches the agent as a tool result, exactly as `zoom` output does.
 - **Optional extra.** `omp-cljs-codemode` is installed on this host but disabled (research §4). It is not needed for this design.
@@ -222,7 +216,7 @@ Why writes stay fixed: the compactor must run on every message, in order, before
 
 - **Spawn.** The `task` tool runs subagents in parallel; results come back as messages. Ids return at once.
 - **Starting context.** A subagent does not automatically inherit the parent's view. With `--optchat-child-view` on (default off), it gets a frozen render of the parent's view plus read-only `zoom`, `date` and `work`, bounded to the spawn point (`src/config.ts:14,78-82`; `src/index.ts:578-622`; `src/handoff.ts:77-233`).
-- **Tool approval.** Subagents run with approval set to yolo (`src/task/executor.ts:1144-1146`). The tool gate therefore screens the `task` call, not each subagent call.
+- **Tool approval.** Subagents run with approval set to yolo (`src/task/executor.ts:1144-1146`), so OMP's approval of the parent's `task` call is the only approval point for the subagent's work.
 - **Written back.** A subagent's report is logged as a `work` message with its source (task, async result, or launch completion) and completeness (full or pointer only) (`src/index.ts:232-256`; `src/reports.ts`).
 
 So a subagent's report is the only part of its work that enters the parent's chat, and the subagent's own steps stay in its own session.
@@ -232,7 +226,7 @@ So a subagent's report is the only part of its work that enters the parent's cha
 1. **Freeze the fork at spawn.** Implemented as an option: child views are bounded to the spawn point. Off by default.
 2. **The report is the only thing that survives.** Implemented: reports are logged as `work`. Requiring a report that states what changed, what failed and what was learned is a prompt change, not yet made.
 3. **Reports are not the user's words.** Planned in plan Milestone 2: triage runs only on human-typed user messages (kind `user`, attribution `user`), so a report can never create or replace a rule.
-4. **The tool gate still applies.** Partly: the `task` call is screened on its arguments. Individual subagent calls run in yolo and are not screened. Whether to screen them is open (map, "Not yet specified").
+4. **Tool approval applies to the `task` call only.** Individual subagent calls run in yolo and are not approved again. The tool gate that would have screened them was removed in 0.8.0; whether subagent calls need any approval is open (map, "Not yet specified").
 5. **Keep subagent tasks short.** A subagent's own session gets none of omp-optchat's view protection, so a long one can still degrade as its context grows.
 
 Whether the demo needs subagents at all is still open (map, "Not yet specified").

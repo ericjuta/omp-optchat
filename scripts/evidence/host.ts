@@ -40,7 +40,7 @@ export interface HostLaunch {
 
 /** Common no-ambient-state flags: no tools, skills, rules, or discovered extensions. */
 const ISOLATION_FLAGS = ["--mode", "rpc", "--no-ui", "--no-title", "--no-tools", "--no-skills", "--no-rules", "--no-extensions"];
-const SYSTEM_ONE_OPTOUTS = ["--no-optchat-rules", "--no-optchat-prefetch", "--no-optchat-value-score", "--no-optchat-tool-gate", "--no-optchat-recall"] as const;
+const SYSTEM_ONE_OPTOUTS = ["--no-optchat-rules", "--no-optchat-prefetch", "--no-optchat-value-score", "--no-optchat-recall"] as const;
 
 /** Isolation flags for one launch: `--no-tools` unless a tool list names the tools to expose instead. */
 function isolationFlags(tools: readonly string[] | null): string[] {

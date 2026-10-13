@@ -19,14 +19,14 @@ Configs name omp-optchat flags and OMP model roles. They never hold a model id r
     {"name": "baseline",
      "constants": {"NODE": 512, "VIEW_UPPER_BYTES": 128000, "VIEW_TARGET_BYTES": 64000,
                    "JOBS": 8, "TRIES": 5, "CAP": 30000, "RETRY": "on next append (no timer)"},
-     "flags": {"rules": false, "prefetch": false, "valueScore": false, "toolGate": false, "codemode": false},
-     "thresholds": {"ruleAdd": 0.8, "toolAsk": 0.3, "prefetchK": 8, "prefetchMin": 0.5, "prefetchDepth": 1},
+     "flags": {"rules": false, "prefetch": false, "valueScore": false, "codemode": false},
+     "thresholds": {"ruleAdd": 0.8, "prefetchK": 8, "prefetchMin": 0.5, "prefetchDepth": 1},
      "models": {"agent": "session model", "compactor": "--optchat-model (default @smol)",
                 "system_one": "judge role (Jev) | fake",
                 "eval_judge": "a model role other than judge, from a different family than agent and compactor"},
      "repeats": 3, "budget_usd": 20}
 
-Flag names match the plugin's command-line flags: `--optchat-rules`, `--optchat-prefetch`, `--optchat-value-score`, `--optchat-tool-gate`. Thresholds match `--optchat-rule-add`, `--optchat-tool-ask`, `--optchat-prefetch-k` and `--optchat-prefetch-min`.
+Flag names match the plugin's command-line flags: `--optchat-rules`, `--optchat-prefetch`, `--optchat-value-score`. Thresholds match `--optchat-rule-add`, `--optchat-prefetch-k` and `--optchat-prefetch-min`.
 
 ## chat.jsonl
 
@@ -63,7 +63,7 @@ One line per scored run:
 
     {"run": "2026-10-12T14:03Z-baseline-dev-s1", "experiment": "000-baseline", "config": {...},
      "split": "dev", "dataset": "seed1", "commit": "abc1234",
-     "gates": {"G1": "pass", "G2": "pass", "G3": 0.004, "G4": "pass", "G5": "pass"},
+     "gates": {"G1": "pass", "G3": 0.004, "G4": "pass", "G5": "pass"},
      "metrics": {"M1": 0.71, "M1_curve": [0.98, 0.91, 0.74, 0.55, 0.38], "M2": 0.66,
                  "M2_zooms_median": 3, "M3_latest": 0.82, "M3_stale": 0.07, "M4_support": 0.93,
                  "M5a": {"is_rule": 0.11}, "M5b": 0.58, "M6a": 0.84, "M6b": 0.031,

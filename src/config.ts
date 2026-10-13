@@ -15,12 +15,10 @@ export const DEFAULTS = Object.freeze({
   rules: true,
   prefetch: true,
   valueScore: true,
-  toolGate: true,
   recall: true,
   ruleAdd: 0.8,
   prefetchK: 8,
   prefetchMin: 0.5,
-  toolAsk: 0.3,
   recallMin: 0.5,
 });
 
@@ -42,7 +40,6 @@ export interface GateConfig {
   rules: boolean;
   prefetch: boolean;
   valueScore: boolean;
-  toolGate: boolean;
   /** Whether the recall tool may judge the view; off means the tool is not registered. */
   recall: boolean;
   /** Minimum P(rule) to add or replace a rule, in (0, 1]. */
@@ -51,8 +48,6 @@ export interface GateConfig {
   prefetchK: number;
   /** Minimum P(relevant) for a prefetch line, in (0, 1]. */
   prefetchMin: number;
-  /** Danger at or above which a tool call is confirmed or blocked, in (0, 1]. */
-  toolAsk: number;
   /** Minimum P(answer) for the recall tool's first line, in (0, 1]. */
   recallMin: number;
 }
@@ -138,11 +133,6 @@ export function registerFlags(api: FlagRegistrar): void {
     default: String(DEFAULTS.prefetchMin),
     description: "System One: minimum probability (0, 1] for a prefetched line (default: 0.5)",
   });
-  api.registerFlag("optchat-tool-ask", {
-    type: "string",
-    default: String(DEFAULTS.toolAsk),
-    description: "System One: danger probability (0, 1] at which a tool call is confirmed or blocked (default: 0.3)",
-  });
   api.registerFlag("optchat-recall-min", {
     type: "string",
     default: String(DEFAULTS.recallMin),
@@ -154,7 +144,6 @@ const GATE_FLAGS = [
   { key: "rules", flag: "optchat-rules", name: "rules gate", what: "keep standing user rules from messages" },
   { key: "prefetch", flag: "optchat-prefetch", name: "prefetch gate", what: "zoom view lines relevant to each new user message" },
   { key: "valueScore", flag: "optchat-value-score", name: "value-score gate", what: "give the compressor a one-sentence importance hint per leaf" },
-  { key: "toolGate", flag: "optchat-tool-gate", name: "tool gate", what: "screen risky tool calls before they run" },
   { key: "recall", flag: "optchat-recall", name: "recall gate", what: "answer questions from stored history by descending the view (chat_recall tool)" },
 ] as const;
 
@@ -174,18 +163,6 @@ function boolean(value: FlagValue, flag: string, fallback: boolean): boolean {
   if (value === true || value === "true") return true;
   if (value === false || value === "false") return false;
   return invalid(flag, "must be true or false");
-}
-
-/**
- * Whether the tool_call gate handler is registered at session start. A malformed value also registers it, so the
- * gate fails closed (every screened call is blocked) instead of silently running without the requested gate.
- */
-export function toolGateRequested(api: FlagReader): boolean {
-  try {
-    return gate(api, "optchat-tool-gate", DEFAULTS.toolGate);
-  } catch {
-    return true;
-  }
 }
 
 /** Read activation alone so opted-out sessions never initialize memory or model work. */
@@ -241,12 +218,10 @@ function gates(api: FlagReader): GateConfig {
     rules: gate(api, "optchat-rules", DEFAULTS.rules),
     prefetch: gate(api, "optchat-prefetch", DEFAULTS.prefetch),
     valueScore: gate(api, "optchat-value-score", DEFAULTS.valueScore),
-    toolGate: gate(api, "optchat-tool-gate", DEFAULTS.toolGate),
     recall: gate(api, "optchat-recall", DEFAULTS.recall),
     ruleAdd: probability(api, "optchat-rule-add", DEFAULTS.ruleAdd),
     prefetchK: integer(api, "optchat-prefetch-k", DEFAULTS.prefetchK, 1, 32),
     prefetchMin: probability(api, "optchat-prefetch-min", DEFAULTS.prefetchMin),
-    toolAsk: probability(api, "optchat-tool-ask", DEFAULTS.toolAsk),
     recallMin: probability(api, "optchat-recall-min", DEFAULTS.recallMin),
   };
 }

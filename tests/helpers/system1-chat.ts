@@ -23,26 +23,11 @@ export interface Routes {
   prefetch?: string[];
   /** Rule triage: a user message whose text contains this states a rule. */
   ruleWhen?: string;
-  /** Tool gate: the danger of a judged call. */
-  danger?: "safe" | "destructive";
   /** Value hint: the label and importance of a leaf. */
   value?: { label: "decision" | "preference" | "finding" | "noise"; importance: number };
 }
 
 const PREFETCH_KEY = /^\d+\+\d+$/;
-
-const harmless = {
-  risk: choice("safe", { safe: 1, risky: 0, destructive: 0 }),
-  deletes: noul(0.1),
-  remote: noul(0),
-  shared: noul(0),
-};
-const destructive = {
-  risk: choice("destructive", { safe: 0, risky: 0, destructive: 1 }),
-  deletes: noul(0.9),
-  remote: noul(0),
-  shared: noul(0),
-};
 
 /** A judge that answers each question set by its keys, and throws on any set it does not know. */
 export function routedJudge(routes: Routes = {}): FakeJudge {
@@ -58,7 +43,6 @@ export function routedJudge(routes: Routes = {}): FakeJudge {
       if (keys.includes("supersedes")) answers.supersedes = choice("none", { none: 1 });
       return answers;
     }
-    if (keys.includes("risk")) return routes.danger === "destructive" ? destructive : harmless;
     if (keys.includes("label")) {
       const value = routes.value ?? { label: "noise", importance: 0 };
       const probabilities = { decision: 0, preference: 0, finding: 0, noise: 0, [value.label]: 1 };
@@ -73,8 +57,6 @@ export interface OpenOptions {
   routes?: Routes;
   /** A custom judge; default is `routedJudge(routes)`. */
   judge?: FakeJudge;
-  hasUI?: boolean;
-  confirm?: (title: string, message: string) => boolean;
   /** Use this compressor server; the default starts one for this harness. */
   compressor?: CompressorServer;
 }
@@ -90,8 +72,6 @@ export class Harness {
     if (!options.compressor) this.servers.push(compressor);
     const host = await openFakeHost(createOptChat({ judge: () => judge }), {
       flags: options.flags ?? {},
-      hasUI: options.hasUI,
-      confirm: options.confirm,
       model: compressor.model,
       mainModel: anthropicModel(),
       apiKey: "fixture-key",
@@ -141,7 +121,6 @@ export const ALL_GATES_OFF = {
   "no-optchat-rules": true,
   "no-optchat-prefetch": true,
   "no-optchat-value-score": true,
-  "no-optchat-tool-gate": true,
   "no-optchat-recall": true,
 } as const;
 

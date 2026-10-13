@@ -202,26 +202,3 @@ describe("chat_recall through OptChat", () => {
     expect(status).toContain("last System One failure: recall: recall judge offline");
   });
 });
-
-describe("tool gate with a UI", () => {
-  test("a risky call the user declines is blocked, and the user was asked once by title", async () => {
-    harness = new Harness();
-    const { host } = await harness.open({ hasUI: true, confirm: () => false, routes: { danger: "destructive" } });
-    const result = (await host.fire("tool_call", { toolName: "bash", input: { command: "rm -rf build" } }))[0];
-    expect(result).toMatchObject({ block: true, reason: expect.stringContaining("declined") });
-    expect(host.confirms.map((confirm) => confirm.title)).toEqual(["OptChat tool gate: bash"]);
-  });
-
-  test("a safe call runs without asking the user, and an exempt tool is never screened even with a UI", async () => {
-    harness = new Harness();
-    const { host, judge } = await harness.open({ hasUI: true, confirm: () => false, routes: { danger: "safe" } });
-    expect((await host.fire("tool_call", { toolName: "bash", input: { command: "ls" } }))[0]).toBeUndefined();
-    expect(host.confirms).toHaveLength(0);
-    expect(judge.requests).toHaveLength(1);
-
-    const exempt = (await host.fire("tool_call", { toolName: "read", input: { path: "notes.txt" } }))[0];
-    expect(exempt).toBeUndefined();
-    expect(judge.requests).toHaveLength(1);
-    expect(host.confirms).toHaveLength(0);
-  });
-});

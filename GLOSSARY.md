@@ -85,9 +85,6 @@ _Avoid_: self-managed memory (writes stay fixed)
 **Value score**:
 A System One label and importance for a message, passed to the compactor as a closed-template hint.
 
-**Tool gate**:
-The gate that screens each proposed tool call and allows it, asks the user, or blocks it.
-
 ## Subagents
 
 **Subagent**:

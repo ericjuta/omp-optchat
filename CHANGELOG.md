@@ -1,11 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — 2026-10-13
 
-- **Session-model fallback:** when the `judge` role has no candidate, OptChat's judge is the session model, marked as a fallback. Only the tool gate runs on it. Rules, prefetch, value-score and recall are inactive, `/optchat status` says why, and `chat_recall` stays registered and answers that it is inactive, so tool definitions do not change. Before, with no role candidate, all five gates ran on the session model.
-- **Gate counters in `/optchat status`:** per gate, judge calls, failures and outcomes (tool gate allowed/asked/blocked; rules added/replaced; prefetch blocks and bytes; value-score hints; recall answered/none/failed), in memory for the session. Printed only while a gate is on; with every gate off, status is unchanged.
+- **Removed: tool gate.** `--optchat-tool-gate`, `--no-optchat-tool-gate` and `--optchat-tool-ask` are gone, with `src/system1/tool-gate.ts` and the `tool_call` hook. Risky-call confirmation is OMP's own tool approval (`tools.approval`). Scripts that pass the removed flags should drop them. The four remaining gates are rules, prefetch, value-score and recall.
+- **Session-model fallback:** when the `judge` role has no candidate, OptChat's judge is the session model, marked as a fallback. No gate runs on it: rules, prefetch, value-score and recall are inactive, `/optchat status` says why, and `chat_recall` stays registered and answers that it is inactive, so tool definitions do not change. Before, with no role candidate, all gates ran on the session model.
+- **Gate counters in `/optchat status`:** per gate, judge calls, failures and outcomes (rules added/replaced; prefetch blocks and bytes; value-score hints; recall answered/none/failed), in memory for the session. Printed only while a gate is on; with every gate off, status is unchanged.
 - A judge factory that throws is now recorded under the gate's label (for example `rules: ...`), not its purpose string.
 - **Requires OMP 18.10.3 or newer.** OMP 18.10.3 moved `isOfficialCodexApiUrl` from `@oh-my-pi/pi-ai` to `@oh-my-pi/pi-catalog/wire/codex`, so OptChat failed to load ("Export named 'isOfficialCodexApiUrl' not found"). OptChat now imports it from the catalog. 18.10.3 also made `task.structured` default to off, which takes `yield` away from children; the smoke and the evidence runner's child overlay now set `task.structured: true`, because their scripted children answer through `yield`.
+- **Gates-off golden:** `tests/system1-off.test.ts` pins the exact request bytes (system prompt, tool definitions, context messages) and `/optchat status` with every gate opted out, and checks that no judge is resolved and no `tool_call` hook is registered.
+- **`chat_recall` eval:** `evals/recall/` (`bun run evals:recall`) runs the real recall over synthetic and real-store cases with a deterministic gold-id grader. Recall's judge wording moved to `src/system1/recall-prompt.ts` (recall now owns its scoring frame; requests are unchanged).
 
 ## 0.7.0 — 2026-10-11
 

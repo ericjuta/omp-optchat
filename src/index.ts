@@ -21,8 +21,6 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
-	ToolCallEvent,
-	ToolCallEventResult,
 	ToolResultEvent,
 	ToolResultEventResult,
 } from "@oh-my-pi/pi-coding-agent";
@@ -40,7 +38,6 @@ import {
 	readConfig,
 	readEnabled,
 	registerFlags,
-	toolGateRequested,
 	type OptChatConfig,
 } from "./config.js";
 import { exportHtml, importHistory } from "./history.js";
@@ -58,7 +55,6 @@ import { RuleLedger, renderRules, type Rule } from "./system1/ledger.js";
 import { prefetchBlock, PREFETCH_MS } from "./system1/prefetch.js";
 import { recall, registerRecallTool, renderRecall } from "./system1/recall.js";
 import { decideTriage, offeredRules, ruleSentences, triageQuestions, triageState } from "./system1/rules.js";
-import { gateToolCall } from "./system1/tool-gate.js";
 import { valueHint } from "./system1/value.js";
 
 type AgentMessage = ContextEvent["messages"][number];
@@ -1526,13 +1522,13 @@ class OptChat {
 	}
 
 	/**
-	 * How one gate may judge. The session-model fallback serves only the tool gate; every other gate is inactive on it,
-	 * which is not a failure and records nothing. Each judgment of a returned judge is counted for `/optchat status`.
+	 * How one gate may judge. The session-model fallback runs no gate: each is inactive on it, which is not a failure
+	 * and records nothing. Each judgment of a returned judge is counted for `/optchat status`.
 	 */
 	private judgingFor(ctx: ExtensionContext, gate: GateKey): Judging {
 		const judge = this.factoryJudge(ctx, gate);
 		if (!judge) return { kind: "none" };
-		if (gate !== "toolGate" && sessionFallbackOf(judge)) return { kind: "inactive" };
+		if (sessionFallbackOf(judge)) return { kind: "inactive" };
 		return { kind: "judge", judge: counted(judge, () => this.counts.add(gate, "calls")) };
 	}
 
@@ -1540,24 +1536,6 @@ class OptChat {
 	private gateFail(gate: GateKey, reason: unknown): void {
 		this.gateFailure = `${GATE_LABEL[gate]}: ${boundedGateError(reason)}`;
 		this.counts.add(gate, "failures");
-	}
-
-	/** A tool call, screened by the judge when the tool gate is on. A failed judgment, or no judge, fails closed. */
-	async toolCall(event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> {
-		const config = this.config;
-		// Without a config, the gate cannot know its threshold: block rather than run unscreened.
-		if (!config) return { block: true, reason: "OptChat tool gate blocked the call: OptChat did not open." };
-		const judging = this.judgingFor(ctx, "toolGate");
-		return gateToolCall(
-			{ toolName: event.toolName, input: event.input, cwd: ctx.cwd },
-			{
-				judge: judging.kind === "judge" ? judging.judge : undefined,
-				toolAsk: config.gates.toolAsk,
-				ui: { hasUI: ctx.hasUI, confirm: (title, message) => ctx.ui.confirm(title, message) },
-				report: (failure) => this.gateFail("toolGate", failure),
-				outcome: (result) => this.counts.add("toolGate", result),
-			},
-		);
 	}
 
 	/** The System One messages of one turn, frozen at its start: the rules block, then the prefetch block. */
@@ -1692,20 +1670,20 @@ class OptChat {
 	/** `/optchat status` lines for the System One gates. With every gate off there are none: status matches v0.5.0. */
 	private gateStatus(): string[] {
 		const gates = this.config?.gates;
-		if (!gates || !(gates.rules || gates.prefetch || gates.valueScore || gates.toolGate || gates.recall)) return [];
+		if (!gates || !(gates.rules || gates.prefetch || gates.valueScore || gates.recall)) return [];
 		const flag = (on: boolean) => (on ? "on" : "off");
 		const lines = [
-			`System One gates: rules ${flag(gates.rules)}, prefetch ${flag(gates.prefetch)}, value-score ${flag(gates.valueScore)}, tool-gate ${flag(gates.toolGate)}, recall ${flag(gates.recall)}`,
+			`System One gates: rules ${flag(gates.rules)}, prefetch ${flag(gates.prefetch)}, value-score ${flag(gates.valueScore)}, recall ${flag(gates.recall)}`,
 		];
-		const judge = this.ctx ? this.factoryJudge(this.ctx, "toolGate") : undefined;
+		const judge = this.ctx ? this.factoryJudge(this.ctx, "rules") : undefined;
 		const model = (judge as NamedJudge | undefined)?.primaryModel?.();
 		const fallback = judge !== undefined && sessionFallbackOf(judge);
 		lines.push(
-			`judge: ${model ? `${model.provider}/${model.id}` : "none (the judge role has no credentialed candidate, or resolving it failed)"}${fallback ? " (session model fallback: the judge role has no native candidate; only the tool gate runs)" : ""}`,
+			`judge: ${model ? `${model.provider}/${model.id}` : "none (the judge role has no credentialed candidate, or resolving it failed)"}${fallback ? " (session model fallback: the judge role has no native candidate; no gate runs)" : ""}`,
 		);
 		if (fallback) {
 			for (const gate of GATE_KEYS) {
-				if (gates[gate] && gate !== "toolGate") lines.push(`${GATE_LABEL[gate]} inactive: ${INACTIVE_REASON}`);
+				if (gates[gate]) lines.push(`${GATE_LABEL[gate]} inactive: ${INACTIVE_REASON}`);
 			}
 		}
 		if (gates.rules) lines.push(`standing rules: ${this.rules?.active().length ?? 0} active`);
@@ -1805,8 +1783,6 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 			pi.on("before_provider_request", (event, handlerCtx) => (active.passive ? undefined : active.beforeProviderRequest(event.payload, handlerCtx)));
 			pi.on("credential_disabled", () => active.resetCacheFence());
 			pi.on("tool_result", (event) => active.toolResult(event));
-			// Registered only when the gate is requested (a malformed value requests it too, so it fails closed).
-			if (toolGateRequested(pi)) pi.on("tool_call", (event, toolCtx) => active.toolCall(event, toolCtx));
 			pi.on("message_end", (event) => active.messageEnd(event.message));
 			pi.on("agent_end", (event) => active.agentEnd(event.messages, event.willContinue === true));
 			// The current turn's tool loop must reach the model verbatim: no host compaction.

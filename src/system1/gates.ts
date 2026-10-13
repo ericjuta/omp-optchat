@@ -1,8 +1,8 @@
 import type { Judge, JudgeOptions, JudgmentRequest, JudgmentResult, Questions } from "@oh-my-pi/pi-ai";
 import type { GateConfig } from "../config.js";
 
-/** The five System One gates, keyed as in GateConfig, in status order. */
-export const GATE_KEYS = ["rules", "prefetch", "valueScore", "toolGate", "recall"] as const;
+/** The four System One gates, keyed as in GateConfig, in status order. */
+export const GATE_KEYS = ["rules", "prefetch", "valueScore", "recall"] as const;
 export type GateKey = (typeof GATE_KEYS)[number];
 
 /** Each gate's name in status lines and recorded failures. */
@@ -10,7 +10,6 @@ export const GATE_LABEL: Readonly<Record<GateKey, string>> = {
   rules: "rules",
   prefetch: "prefetch",
   valueScore: "value-score",
-  toolGate: "tool gate",
   recall: "recall",
 };
 
@@ -19,11 +18,10 @@ export const GATE_PURPOSE: Readonly<Record<GateKey, string>> = {
   rules: "optchat-rules",
   prefetch: "optchat-prefetch",
   valueScore: "optchat-value",
-  toolGate: "optchat-tool-gate",
   recall: "optchat-recall",
 };
 
-/** Why a gate other than the tool gate does not run when the judge is the session-model fallback. */
+/** Why no gate runs when the judge is the session-model fallback. */
 export const INACTIVE_REASON = "no native judge model (judge role resolves to session model)";
 
 /** Outcome counts per gate, besides judge calls and failures. Each is a count of what the gate did. */
@@ -31,8 +29,6 @@ export const OUTCOMES: Readonly<Record<GateKey, readonly string[]>> = {
   rules: ["added", "replaced"],
   prefetch: ["blocks", "bytes"],
   valueScore: ["hints"],
-  // allowed: the call ran (judged safe, or approved). asked: a confirm dialog was shown. blocked: the call did not run.
-  toolGate: ["allowed", "asked", "blocked"],
   recall: ["answered", "none", "failed"],
 };
 

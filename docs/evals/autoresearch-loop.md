@@ -12,8 +12,8 @@ How an agent can improve OptChat + Jev unattended, one experiment at a time, sco
 ## Flows (one ratchet flow each)
 
 1. **Compressor prompt.** The summary instructions in omp-optchat's `src/prompts.ts`. Scored by M4 (claim support) and M1 (recall by age).
-2. **Jev question wording.** The question texts of the rules, prefetch, value and tool gates, once they exist. Scored by M5a calibration against labels.
-3. **Thresholds.** `--optchat-rule-add`, `--optchat-tool-ask`, `--optchat-prefetch-k` and `--optchat-prefetch-min`. Scored by M3, M5b, G2 and M6b.
+2. **Jev question wording.** The question texts of the rules, prefetch and value gates, once they exist. Scored by M5a calibration against labels.
+3. **Thresholds.** `--optchat-rule-add`, `--optchat-prefetch-k` and `--optchat-prefetch-min`. Scored by M3, M5b and M6b.
 
 Structural changes (new gates, the write path, the view rules) are not a ratchet flow. They need a human-approved experiment file first.
 
@@ -46,7 +46,7 @@ The omp-optchat repository has `bun run evidence:recall` (`package.json`, script
 
 Start where changes are cheap and deterministic; move outward only when the inner layer stops paying.
 
-1. **Constants and thresholds**: the view upper and target budgets (128k/64k, 256k/128k bytes), `NODE` (256, 384, 512, 768), `TRIES`, prefetch `k` (0, 4, 8, 16) and depth (1, 2), rule add threshold, tool-gate ask threshold, the compactor model (`--optchat-model`) and its effort.
+1. **Constants and thresholds**: the view upper and target budgets (128k/64k, 256k/128k bytes), `NODE` (256, 384, 512, 768), `TRIES`, prefetch `k` (0, 4, 8, 16) and depth (1, 2), rule add threshold, the compactor model (`--optchat-model`) and its effort.
 2. **Prompts**: the compactor prompt (`src/prompts.ts`), the agent's system prompt, Jev question wording and question sets.
 3. **Structure**: new gates, search over the raw log, codemode retrieval strategies, topic indexes, changes to the turn loop. These need a human-approved experiment file before they start.
 

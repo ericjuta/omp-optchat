@@ -19,8 +19,9 @@ export function sessionFallbackOf(judge: Judge): boolean {
 
 /**
  * The host judge role, resolved per call with usage journaled to this session and the shared answer cache.
- * With no judge-role candidate, the session model is the judge and the result is marked `sessionFallback`: only
- * the tool gate runs on it. A synchronous resolution failure or an empty candidate chain yields `undefined`; it never throws.
+ * With no judge-role candidate, the session model is the judge and the result is marked `sessionFallback`; every gate
+ * is inactive on it, and `chat_recall` says so. A synchronous resolution failure or an empty candidate chain yields
+ * `undefined`; it never throws.
  */
 export function hostJudge(ctx: ExtensionContext, purpose: string): Judge | undefined {
   try {
