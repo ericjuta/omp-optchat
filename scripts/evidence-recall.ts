@@ -1545,7 +1545,11 @@ async function prerequisites(options: Options, selectors: readonly string[], dir
 	const blockers = [...overrideBlockers];
 	const catalog: Record<string, CatalogEntry> = {};
 	for (const selector of selectors) catalog[selector] = await readCatalogEntry(options.omp, selector, env, dirs.workspace, discovery);
-	const models = await queryAvailableModels(options.omp, env, dirs.sessions, dirs.workspace, 60_000, discovery);
+	// A host with no usable model at all refuses to start RPC mode; that is a prerequisite blocker, not a crash.
+	const models = await queryAvailableModels(options.omp, env, dirs.sessions, dirs.workspace, 60_000, discovery).catch((error: unknown) => {
+		blockers.push(`host model listing failed: ${error instanceof Error ? error.message : String(error)}`);
+		return [];
+	});
 	const available: Record<string, boolean> = {};
 	for (const selector of selectors) {
 		available[selector] = isAvailable(models, selector);
