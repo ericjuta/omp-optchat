@@ -1,6 +1,7 @@
 import type { Answer, Questions } from "@oh-my-pi/pi-ai";
 import { utf8Prefix } from "../memory.js";
 import type { Rule } from "./ledger.js";
+import { RULE_PROMPT, SENTENCE_PROMPT, SUPERSEDES_PROMPT } from "./rules-prompt.js";
 
 /** The user message as judged: bounded so one request stays within the judge's state limit. */
 export const TRIAGE_MESSAGE_BYTES = 4_000;
@@ -57,21 +58,14 @@ export function triageState(message: string, sentences: readonly string[]): { me
  */
 export function triageQuestions(offered: readonly Rule[], sentences: readonly string[] = []): Questions {
   const questions: Questions = {
-    rule: {
-      type: "noul",
-      instructions: "The message states a standing instruction or preference meant to hold for future replies, not a one-off request.",
-      criteria: {
-        true: "a rule or preference that should keep applying in later turns",
-        false: "a one-off request, a question, or ordinary task content",
-      },
-    },
+    rule: { type: "noul", instructions: RULE_PROMPT.instructions, criteria: { ...RULE_PROMPT.criteria } },
   };
   if (offered.length > 0) {
-    const criteria: Record<string, string | null> = { none: "the message does not replace any listed rule" };
+    const criteria: Record<string, string | null> = { none: SUPERSEDES_PROMPT.none };
     for (const rule of offered) criteria[rule.id] = rule.text;
     questions.supersedes = {
       type: "choice",
-      instructions: "The message replaces or overrides exactly one of the listed rules, or none.",
+      instructions: SUPERSEDES_PROMPT.instructions,
       criteria,
     };
   }
@@ -79,11 +73,8 @@ export function triageQuestions(offered: readonly Rule[], sentences: readonly st
     for (let index = 0; index < sentences.length; index++) {
       questions[`s${index}`] = {
         type: "noul",
-        instructions: `State field sentences[${index}] itself states a standing instruction or preference meant to hold for future replies.`,
-        criteria: {
-          true: "this sentence states a rule or preference that should keep applying in later turns",
-          false: "this sentence is a one-off request, a question, context, or ordinary task content",
-        },
+        instructions: SENTENCE_PROMPT.instructions.replaceAll("{index}", String(index)),
+        criteria: { ...SENTENCE_PROMPT.criteria },
       };
     }
   }

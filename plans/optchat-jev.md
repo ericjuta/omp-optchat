@@ -236,6 +236,8 @@ After this plan is complete, an OMP user can start `omp` with no gate flags and 
 
 - Decision (2026-10-13, Eric): `/optchat new` starts a fresh chat. It archives the store directory as `<dir>.<UTC timestamp>` and reopens an empty store; nothing is deleted. Date/Author: 2026-10-13 / Eric.
 
+- Decision (2026-10-14, Eric): next measurement work is the rules-triage flow (`evals/rules/`, wording moved byte-identically to `src/system1/rules-prompt.ts`) and small fixed G1/G3 sets (`evals/gates/`, 20 cases each); budget $5; the design doc's gates-off wording follows the 0.9.0 golden. Baseline (Jev 1.13, threshold 0.8, 2 reps): rules score 0.979, precision 1.000, recall 0.936, F1 0.967; but null scores 0.768 on `score`, so a rules ratchet should target F1, not `score` (open). Real held-out has only 2 standing rules in 122 messages. G1 flagged 2/20, G3 5/20 on the smol compressor; on reading, all appear to be false positives, but they are unconfirmed pending human review. Spend ≈ $0.019. Date/Author: 2026-10-14 / Eric.
+
 ## Outcomes & Retrospective
 
 2026-10-11, retrieval (0.7.0): in a synthetic tree with a rule-based summariser and a lexical fake judge, every summary-navigating strategy found only the facts whose topic survived in the view (3/12 and 5/12 over two seeds), and `chat_search` found 12/12 in 24 calls and about 8.5 KB. `chat_recall` reached the surviving facts in one agent step instead of about 200 zoom calls. This measures navigation mechanics, not Jev or real summaries; no quality or cost claim follows from it.

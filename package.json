@@ -24,7 +24,8 @@
     "smoke": "bun run scripts/smoke.ts",
     "evidence:recall": "bun run scripts/evidence-recall.ts",
     "evidence:retrieval": "bun run scripts/retrieval-compare.ts",
-    "evals:recall": "bun run evals/recall/run.ts"
+    "evals:recall": "bun run evals/recall/run.ts",
+    "evals:rules": "bun run evals/rules/run.ts"
   },
   "peerDependencies": {
     "@oh-my-pi/pi-ai": ">=18.10.3",

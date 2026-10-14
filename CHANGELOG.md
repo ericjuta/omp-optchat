@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **`evals/rules/` (`bun run evals:rules`):** an eval for the rules-triage gate. It runs the production triage (`triageState`, `triageQuestions`, `decideTriage` at `--optchat-rule-add`) over synthetic and real user messages, and scores each decision against its label: precision, recall and F1 over rule adds, and a per-case pass rate (`score`). Triage wording moved to `src/system1/rules-prompt.ts` (requests are byte-identical, pinned by `tests/rules-prompt.test.ts`). Real messages stay in gitignored files.
+- **`evals/gates/`:** fixed hand-written sets for rubric hard gates G1 (injection obedience, 20 cases) and G3 (status inflation, 20 cases), run through the real compressor step with deterministic checks; flagged lines go to a human-review list, never auto-confirmed.
+- **Docs:** the design doc's status and gates-off wording now refer to the 0.9.0 memory-only golden, not v0.5.0.
+
 ## 0.9.1 — 2026-10-14
 
 - **Fixed: the evidence runner's no-call plan crashed on a host with no usable model.** OMP refuses RPC mode when no model is configured, so the catalog probe waited out its 60 s deadline and the runner printed an error instead of its JSON plan. The probe now fails as soon as the host exits, with the host's stderr, and the plan reports it as a blocker (`host model listing failed: …`) with status `blocked`. This was the CI failure on 0.8.x–0.9.0 once `bun run test:host` put the pinned `omp` on `PATH`. Plugin code is unchanged.

@@ -1,6 +1,6 @@
 # OptChat + Jev: design reference
 
-Status: **proposal, being built.** OptChat is implemented by the OMP plugin omp-optchat (v0.5.0, HEAD `bc633ac`). The System One gates are being added to it as flags, as described in `plans/optchat-jev.md`. Every default below is a starting position; the plan's Decision Log and `.scratch/optchat-jev/map.md` record what is settled.
+Status: **built (v0.9.1); measurement in progress.** OptChat is implemented by the OMP plugin omp-optchat. The System One gates ship in it, on by default with per-gate opt-outs, as described in `plans/optchat-jev.md`. Sections citing v0.5.0 (`bc633ac`) describe the base this design started from. Every default below is a starting position; the plan's Decision Log and `.scratch/optchat-jev/map.md` record what is settled.
 
 This document explains the design in plain words. The build steps live in the ExecPlan (`plans/optchat-jev.md`). What the OMP host, omp-optchat and omp-jevify actually provide is audited, with file and line citations, in `docs/research/omp-capabilities.md`. The way we measure it lives in `docs/evals/`.
 
@@ -151,7 +151,7 @@ stateDiagram-v2
     Reply --> Idle
 ```
 
-The turn's blocks are computed once, when the turn opens, so every request of the turn is byte-stable. A rule added during the turn applies from the next turn. With the rules and prefetch gates off, `OpenTurn` and `FreezeBlocks` add nothing, and the view and message reach the agent exactly as they do in v0.5.0.
+The turn's blocks are computed once, when the turn opens, so every request of the turn is byte-stable. A rule added during the turn applies from the next turn. With the rules and prefetch gates off, `OpenTurn` and `FreezeBlocks` add nothing, and the view and message reach the agent byte-identical to the omp-optchat 0.9.0 memory-only golden (`tests/system1-off.test.ts`).
 
 Background lane:
 
