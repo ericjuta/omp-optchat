@@ -151,11 +151,31 @@ const HEAD = new RegExp(
 const HEAD_FEEDBACK =
   "Your line began with a head or preamble. Write only the summary line for the same <input>, with no id+n| head, label, tag or commentary.";
 
+/*
+ * A colon-less opening that names the task's own message ids ("1197 Live …",
+ * "1191 ← store check", "Message 1185 records", "Echo 1211:"). A bare leading
+ * number is only a head when it falls inside the task's own range, so a line
+ * opening with a count ("1394 rows …") is not flagged.
+ */
+const OWN_HEAD = /^(?:(?:message|msg|echo|line|node)s?\s+)?(\d+)(?:[+\-–]\d*)?(?![\d.,%])\s*(?:←|->|→|—|–|-|:|\|)?\s*/iu;
+
 /** Length of the forbidden heads that open `reply`, 0 when it opens with the summary itself. */
-function replyHead(reply: string): number {
+function replyHead(reply: string, own: { lo: number; hi: number }): number {
   let length = 0;
-  for (let match; (match = HEAD.exec(reply.slice(length))) && match[0];) length += match[0].length;
-  return length;
+  for (;;) {
+    const rest = reply.slice(length);
+    const match = HEAD.exec(rest);
+    if (match?.[0]) {
+      length += match[0].length;
+      continue;
+    }
+    const id = OWN_HEAD.exec(rest);
+    if (id?.[0] && Number(id[1]) >= own.lo && Number(id[1]) <= own.hi) {
+      length += id[0].length;
+      continue;
+    }
+    return length;
+  }
 }
 
 export const utf8Bytes = (text: string): number => Buffer.byteLength(text, "utf8");
@@ -312,6 +332,10 @@ export class Memory {
   private readonly reported = new Set<string>();
   /** Nodes committed as source-derived stand-ins after a terminal compressor refusal, this process. */
   private extractiveNodes = 0;
+  /** Compressor calls this process, and the retries spent on heads and on length. */
+  private compressorCalls = 0;
+  private headRetries = 0;
+  private lengthRetries = 0;
   private readonly ready: ViewPart[] = [];
   private readyHead = 0;
   private readonly queued = new Set<string>();
@@ -578,7 +602,17 @@ export class Memory {
     return this.closing;
   }
 
-  status(): { messages: number; nodes: number; pending: number; viewBytes: number; parts: number; extractive: number } {
+  status(): {
+    messages: number;
+    nodes: number;
+    pending: number;
+    viewBytes: number;
+    parts: number;
+    extractive: number;
+    compressorCalls: number;
+    headRetries: number;
+    lengthRetries: number;
+  } {
     return {
       messages: this.store.messages.length,
       nodes: this.store.nodes.size,
@@ -586,6 +620,9 @@ export class Memory {
       viewBytes: this.bytes,
       parts: this.view.length,
       extractive: this.extractiveNodes,
+      compressorCalls: this.compressorCalls,
+      headRetries: this.headRetries,
+      lengthRetries: this.lengthRetries,
     };
   }
 
@@ -889,6 +926,7 @@ export class Memory {
     const end = part.l === 0 ? part.i : (part.i + 1) * width;
     const context = this.context(end);
     const half = width / 2;
+    const own = { lo: start, hi: end - (part.l === 0 ? 0 : 1) };
     // Only a level-0 leaf that reaches this path is non-free: merges and verbatim nodes never ask for a hint.
     const hint = part.l === 0 ? await this.hintFor(part.i, signal) : undefined;
     if (this.stopped || signal.aborted) return undefined;
@@ -901,7 +939,7 @@ export class Memory {
     const leaf = (body: string): string =>
       `Compaction: ${task} into one line of at most ${this.nodeBytes} bytes\n${this.ruler()}\n${RULER}\n${details}<input>\n${body}\n</input>`;
 
-    if (utf8Bytes(input) <= this.pageBytes) return this.compact(context, leaf(input), signal);
+    if (utf8Bytes(input) <= this.pageBytes) return this.compact(context, leaf(input), own, signal);
 
     // Pages are exact UTF-8 slices of the input; only bounded partial summaries
     // are retained, never the page strings themselves.
@@ -914,6 +952,7 @@ export class Memory {
       const reply = await this.compact(
         context,
         `Compaction: ${task}, part ${++pageNumber}, source bytes ${page.offset} to ${page.next ?? page.totalBytes} of ${page.totalBytes}, into one line of at most ${this.nodeBytes} bytes. Other parts are summarized separately: keep only what this part states.\n${this.ruler()}\n${RULER}\n${details}<input>\n${page.text}\n</input>`,
+        own,
         signal,
       );
       if (reply === undefined) return undefined;
@@ -928,6 +967,7 @@ export class Memory {
         return this.compact(
           context,
           leaf(`Ordered partial summaries of the complete input:\n${items.join("\n")}`),
+          own,
           signal,
         );
       }
@@ -940,6 +980,7 @@ export class Memory {
         const merged = await this.compact(
           context,
           `Compaction: ${task}; merge these ${group.length} ordered partial summaries of the complete input into one line of at most ${this.nodeBytes} bytes\n${this.ruler()}\n${RULER}\n<input>\n${group.join("\n")}\n</input>`,
+          own,
           signal,
         );
         if (merged === undefined) return undefined;
@@ -1016,28 +1057,37 @@ export class Memory {
 
   /**
    * At most `tries` calls (five by default). A reply that is over-long or opens
-   * with a forbidden head is retried with one bounded feedback turn. The first
+   * with a forbidden head (including one naming the task's own ids, `own`) is
+   * retried with one bounded feedback turn. The first
    * clean fitting reply wins; otherwise the first fitting headed reply, else the
    * shortest whole reply. Replies beyond the safety ceiling are never stored or
    * replayed in full. If no whole candidate fits that ceiling, fail rather than
    * truncate content. Stored text is never rewritten.
    */
-  private async compact(context: string, instruction: string, signal: AbortSignal): Promise<string | undefined> {
+  private async compact(
+    context: string,
+    instruction: string,
+    own: { lo: number; hi: number },
+    signal: AbortSignal,
+  ): Promise<string | undefined> {
     let feedback: CompactionRequest["feedback"] = [];
     let headed: string | undefined;
     let shortest: { text: string; size: number } | undefined;
     for (let attempt = 0; attempt < this.tries; attempt++) {
       if (this.stopped || signal.aborted) return undefined;
+      this.compressorCalls++;
       const reply = (await this.summarize({ context, instruction, feedback }, signal)).trim();
       if (this.stopped || signal.aborted) return undefined;
       if (!reply) throw new Error("Compactor returned an empty summary");
       const size = utf8Bytes(reply);
-      const head = replyHead(reply);
+      const head = replyHead(reply, own);
       const fits = size <= this.nodeBytes;
       if (fits && head === 0) return reply;
       if (fits) headed ??= reply;
       else if (size <= this.summaryLimit && (!shortest || size < shortest.size)) shortest = { text: reply, size };
       if (attempt + 1 === this.tries) break;
+      if (head > 0) this.headRetries++;
+      if (!fits) this.lengthRetries++;
       // The head is cut from the echoed reply so no ids go back into compressor input.
       const body = reply.slice(head);
       const excerpt = utf8Prefix(body, this.summaryLimit);

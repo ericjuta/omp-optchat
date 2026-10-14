@@ -1601,6 +1601,12 @@ class OptChat {
 				`view: ${status.parts} lines, ${status.viewBytes} of ${this.config!.viewBytes} bytes`,
 				`compressor fallbacks: ${this.mainRetries} main-model retries; ${status.extractive} unsummarized stand-ins`,
 			);
+			// Shown once the compressor has run, so an idle status stays unchanged.
+			if (status.compressorCalls > 0) {
+				lines.push(
+					`compressor calls: ${status.compressorCalls}; ${status.headRetries} head retries, ${status.lengthRetries} length retries`,
+				);
+			}
 		}
 		lines.push(...this.gateStatus());
 		lines.push(

@@ -627,6 +627,25 @@ test("a reply that is both headed and over-long gets one feedback turn covering 
   expect(model.calls).toHaveLength(2);
 });
 
+test("a colon-less opening naming the leaf's own id is retried and counted; other numbers are not", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const memory = memoryFor(store, model, { nodeBytes: 40, tries: 3, jobs: 1 });
+  memory.append("user", "[m0] a message that needs a summary, long enough");
+
+  await until(() => model.calls.length === 1, "first try");
+  model.calls[0]!.resolve("Message 0 records a finding");
+  await until(() => model.calls.length === 2, "second try");
+  const turn = model.calls[1]!.request.feedback[0]!;
+  expect(turn.reply).toBe("records a finding");
+  expect(turn.instruction).toContain("Your line began with a head or preamble.");
+  model.calls[1]!.resolve("7 rows found in the store");
+
+  await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("7 rows found in the store");
+  expect(memory.status()).toMatchObject({ compressorCalls: 2, headRetries: 1, lengthRetries: 0 });
+});
+
 test("an ordinary opening such as 'user: ...' is never retried", async () => {
   const store = await openStore();
   const model = new Model();

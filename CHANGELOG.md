@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.3 — 2026-10-14
+
+- **Compressor replies that open with their own message id are retried.** After 0.9.2 the head guard caught none of the live heads it knows (63.9% → 0%), but colon-less openings that name the task's own ids ("1197 Live …", "Message 1185 records …", "1191 ← store check") still reached 9.9% of new lines here and 29.1% in another store. `compact()` now also treats a leading number inside the task's own message range, with an optional "Message"/"Echo"/"Line" word and arrow or dash, as a head. A number outside that range ("7 rows found") is not. On this repository's live tree the check flags 195 of 2,576 stored lines.
+- **`/optchat status` counts compressor attempts:** once the compressor has run, a `compressor calls: N; H head retries, L length retries` line shows this process's calls and the retries spent on heads and on length. An idle status is unchanged, so the gates-off golden still pins 0.9.0 bytes.
+
 ## 0.9.2 — 2026-10-14
 
 - **`evals/rules/` (`bun run evals:rules`):** an eval for the rules-triage gate. It runs the production triage (`triageState`, `triageQuestions`, `decideTriage` at `--optchat-rule-add`) over synthetic and real user messages, and scores each decision against its label: precision, recall and F1 over rule adds, and a per-case pass rate (`score`). Triage wording moved to `src/system1/rules-prompt.ts` (requests are byte-identical, pinned by `tests/rules-prompt.test.ts`). Real messages stay in gitignored files.
