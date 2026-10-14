@@ -560,6 +560,87 @@ test("feedback cuts on UTF-8 boundaries and the shortest try is measured in byte
   expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("abcdefgh");
 });
 
+test("a reply that opens with a head is retried once; the echo drops the head and the clean reply is stored", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const memory = memoryFor(store, model, { nodeBytes: 20, tries: 3, jobs: 1 });
+  memory.append("user", "[m0] a message that needs a summary");
+
+  await until(() => model.calls.length === 1, "first try");
+  model.calls[0]!.resolve("476+4|user: a line");
+
+  await until(() => model.calls.length === 2, "second try");
+  const second = model.calls[1]!;
+  expect(second.request.instruction).toBe(model.calls[0]!.request.instruction);
+  expect(second.request.feedback).toHaveLength(1);
+  const turn = second.request.feedback[0]!;
+  expect(turn.reply).toBe("user: a line");
+  expect(turn.instruction).toContain("Your line began with a head or preamble.");
+  expect(turn.instruction).not.toContain("Too long");
+  expect(JSON.stringify(second.request.feedback)).not.toContain("476");
+  second.resolve("user: a clean line");
+
+  await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("user: a clean line");
+  expect(model.calls).toHaveLength(2);
+});
+
+test("when every try opens with a head, the first fitting headed reply is stored and the leaf completes", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const memory = memoryFor(store, model, { nodeBytes: 20, tries: 3, jobs: 1 });
+  memory.append("user", "[m0] a message that needs a summary");
+
+  await until(() => model.calls.length === 1, "first try");
+  model.calls[0]!.resolve("1+1|head one");
+  await until(() => model.calls.length === 2, "second try");
+  model.calls[1]!.resolve("2+1|head two");
+  await until(() => model.calls.length === 3, "third try");
+  model.calls[2]!.resolve("3+1|head three");
+
+  await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("1+1|head one");
+  expect(model.calls).toHaveLength(3);
+});
+
+test("a reply that is both headed and over-long gets one feedback turn covering both", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const memory = memoryFor(store, model, { nodeBytes: 20, tries: 3, jobs: 1 });
+  memory.append("user", "[m0] a message that needs a summary");
+
+  await until(() => model.calls.length === 1, "first try");
+  model.calls[0]!.resolve(`476+4|${"x".repeat(30)}`);
+
+  await until(() => model.calls.length === 2, "second try");
+  const second = model.calls[1]!;
+  expect(second.request.feedback).toHaveLength(1);
+  const turn = second.request.feedback[0]!;
+  expect(turn.reply).toBe("x".repeat(30));
+  expect(turn.instruction).toContain("Your line began with a head or preamble.");
+  expect(turn.instruction).toContain("your line is 36 bytes, over the 20-byte limit");
+  expect(JSON.stringify(second.request.feedback)).not.toContain("476");
+  second.resolve("y".repeat(15));
+
+  await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("y".repeat(15));
+  expect(model.calls).toHaveLength(2);
+});
+
+test("an ordinary opening such as 'user: ...' is never retried", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const memory = memoryFor(store, model, { nodeBytes: 20, tries: 3, jobs: 1 });
+  memory.append("user", "[m0] a message that needs a summary");
+
+  await until(() => model.calls.length === 1, "first try");
+  model.calls[0]!.resolve("user: asks about it");
+
+  await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("user: asks about it");
+  expect(model.calls).toHaveLength(1);
+});
+
 test("an unresolved early leaf stalls only its ancestors; the right subtree still completes", async () => {
   const store = await openStore();
   const model = new Model();

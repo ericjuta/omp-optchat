@@ -4,7 +4,7 @@
  *
  *   bun evals/rules/build-cases.ts synthetic   # cases/synthetic.jsonl (committed: generated text only)
  *   bun evals/rules/build-cases.ts real        # cases/real.jsonl (gitignored): labels from real-spec.json, text read
- *                                              # read-only from the local stores under ~/.omp/agent
+ *                                              # read-only from the local stores and session logs under ~/.omp/agent
  *
  * ## What the eval measures
  * One user message through the production triage, as the rules gate runs it: triageState, triageQuestions, then
@@ -22,7 +22,9 @@
  *         the message alone; secret-like text (the recall eval's SECRET_LIKE screen, so no credential-shaped text is sent
  *         to the judge); or an exact duplicate of an earlier message.
  * A real message keeps its stored text verbatim. The spec records its store path, index and SHA-256 so a changed store
- * fails the build instead of silently re-labelling.
+ * fails the build instead of silently re-labelling. A `store` under `sessions/` names an OMP session log instead of an
+ * OptChat store: `i` is the 0-based line of a user message entry, and the text is its text parts joined by newlines.
+ * Session logs hold the user's messages from every project, so standing rules said outside OptChat stores count too.
  *
  * ## Splits
  * Each stratum is source x label (synthetic-rule, synthetic-none, real-rule, real-none). Within a stratum, a SHA-256 of
@@ -314,6 +316,25 @@ export async function loadStore(rel: string): Promise<StoredMessage[]> {
   return messages;
 }
 
+/** One user message from an OMP session log, read-only: line `i` of `rel` under STORE_ROOT. */
+export async function loadSessionMessage(rel: string, i: number): Promise<StoredMessage | undefined> {
+  const line = (await readFile(join(STORE_ROOT, rel), "utf8")).split("\n")[i];
+  if (line === undefined || line.length === 0) return undefined;
+  const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };
+  if (entry.type !== "message" || entry.message?.role !== "user") return undefined;
+  const content = entry.message.content;
+  const text =
+    typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? content
+            .filter((part): part is { type: "text"; text: string } => part?.type === "text" && typeof part.text === "string")
+            .map((part) => part.text)
+            .join("\n")
+        : undefined;
+  return text === undefined ? undefined : { i, kind: "user", text };
+}
+
 /** The real drafts from labelled specs. Every labelled entry is checked against its store message. */
 export async function realDrafts(specs: readonly RealSpec[]): Promise<Draft[]> {
   const stores = new Map<string, StoredMessage[]>();
@@ -321,9 +342,14 @@ export async function realDrafts(specs: readonly RealSpec[]): Promise<Draft[]> {
   for (const spec of specs) {
     if (spec.label === "excluded") continue;
     if (spec.sha256 === undefined) throw new Error(`${spec.id}: labelled entry has no sha256`);
-    const messages = stores.get(spec.store) ?? (await loadStore(spec.store));
-    stores.set(spec.store, messages);
-    const at = messages[spec.i];
+    let at: StoredMessage | undefined;
+    if (spec.store.startsWith("sessions/")) {
+      at = await loadSessionMessage(spec.store, spec.i);
+    } else {
+      const messages = stores.get(spec.store) ?? (await loadStore(spec.store));
+      stores.set(spec.store, messages);
+      at = messages[spec.i];
+    }
     if (at === undefined || at.kind !== "user") throw new Error(`${spec.id}: message ${spec.i} in ${spec.store} is not a user message`);
     if (SECRET_LIKE.test(at.text)) throw new Error(`${spec.id}: secret-like text; label it excluded`);
     if (createHash("sha256").update(at.text).digest("hex") !== spec.sha256) throw new Error(`${spec.id}: text changed since labelling`);

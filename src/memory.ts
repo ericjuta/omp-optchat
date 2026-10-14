@@ -120,6 +120,44 @@ const MIN_PAGE_BYTES = 4;
 const EXTRACTIVE_MARK = "[unsummarized: compressor refused] ";
 const EXTRACTIVE_JOIN = " | ";
 
+/*
+ * One forbidden head at the start of a compressor reply: the id+n| heads,
+ * labels, tags and commentary the system block forbids ("476+4|",
+ * "Compacted line (≤512 bytes):", "<merged-line id=…>", "The merged line
+ * below covers …"). Anchored and case-insensitive; ordinary openings such as
+ * "user: …", "Eric's …" or "Finding: …" do not match. Heads can stack, so
+ * replyHead strips them repeatedly.
+ */
+const HEAD_ID = String.raw`\d+(?:[+\-–]\d+)?`;
+const HEAD_IDS = String.raw`${HEAD_ID}(?:(?:\s*,\s*|\s+and\s+|\s+)${HEAD_ID})*`;
+const HEAD_WORDS = String.raw`(?:\s*[,;]|\s+(?:\([^)\n]*\)|\d+-byte|${HEAD_ID}|of|for|messages?|msgs?|and|with|merged|covers|within|under|or|less|at|most|max|limit|ruler|respected|bytes|lines?|chat))*`;
+const HEAD_LABEL = String.raw`(?:compact(?:ed|ion)|compress(?:ed|ion)|merged?|lines?|summary)` +
+  String.raw`(?:${HEAD_WORDS}\s*:(?!\d)|(?:\s+lines?)?\s*(?:${HEAD_IDS}\s*)?\([^)\n]*\)[^:\n]{0,60}:(?!\d))`;
+const HEAD = new RegExp(
+  String.raw`^(?:\p{Extended_Pictographic}\uFE0F?\s*)?(?:` + [
+    String.raw`<\/?[a-z][\w-]*(?:\s[^>\n]*)?>`, // <summary>, <merged-line id="…">, <chat>
+    String.raw`\[\/?merged-line\b[^\]\n]*\]`, // [merged-line id="…"]
+    "```[\\w-]*", // code fence
+    String.raw`the\s+(?:merged|compressed|compacted|summary)\s+line\s+(?:is|covers|below|above)\b[^\n.]*\.?(?:\s+It\s+is\s+\d+\s+bytes\b[^\n.]*\.?)?`,
+    HEAD_LABEL, // Compaction 725 (medium): / Merged line (476+2, 478+2):
+    String.raw`${HEAD_IDS}\s*\|`, // 476+4| / 908 |
+    String.raw`${HEAD_IDS}\s*:(?!\d)`, // 921: / 936-939:
+    String.raw`${HEAD_IDS}\s+merged?(?:\s*\([^)\n]*\))?\s*:(?!\d)`, // 634+1 and 635+1 merged (≤512 bytes):
+    String.raw`${HEAD_IDS}\s*(?:\([^)\n]*\)|\[[^\]\n]*\])\s*:(?!\d)`, // 626 [finding, high]:
+    String.raw`${HEAD_IDS}\s+(?=${HEAD_LABEL})`, // 715+1 Compaction 716 (medium):
+  ].join("|") + String.raw`)\s*`,
+  "iu",
+);
+const HEAD_FEEDBACK =
+  "Your line began with a head or preamble. Write only the summary line for the same <input>, with no id+n| head, label, tag or commentary.";
+
+/** Length of the forbidden heads that open `reply`, 0 when it opens with the summary itself. */
+function replyHead(reply: string): number {
+  let length = 0;
+  for (let match; (match = HEAD.exec(reply.slice(length))) && match[0];) length += match[0].length;
+  return length;
+}
+
 export const utf8Bytes = (text: string): number => Buffer.byteLength(text, "utf8");
 
 /** A hint as one bounded line, or undefined when nothing remains. */
@@ -977,12 +1015,16 @@ export class Memory {
   }
 
   /**
-   * At most `tries` calls (five by default), keeping the shortest whole reply.
-   * Replies beyond the safety ceiling are never stored or replayed in full.
-   * If no whole candidate fits that ceiling, fail rather than truncate content.
+   * At most `tries` calls (five by default). A reply that is over-long or opens
+   * with a forbidden head is retried with one bounded feedback turn. The first
+   * clean fitting reply wins; otherwise the first fitting headed reply, else the
+   * shortest whole reply. Replies beyond the safety ceiling are never stored or
+   * replayed in full. If no whole candidate fits that ceiling, fail rather than
+   * truncate content. Stored text is never rewritten.
    */
   private async compact(context: string, instruction: string, signal: AbortSignal): Promise<string | undefined> {
     let feedback: CompactionRequest["feedback"] = [];
+    let headed: string | undefined;
     let shortest: { text: string; size: number } | undefined;
     for (let attempt = 0; attempt < this.tries; attempt++) {
       if (this.stopped || signal.aborted) return undefined;
@@ -990,17 +1032,25 @@ export class Memory {
       if (this.stopped || signal.aborted) return undefined;
       if (!reply) throw new Error("Compactor returned an empty summary");
       const size = utf8Bytes(reply);
-      if (size <= this.nodeBytes) return reply;
-      if (size <= this.summaryLimit && (!shortest || size < shortest.size)) shortest = { text: reply, size };
+      const head = replyHead(reply);
+      const fits = size <= this.nodeBytes;
+      if (fits && head === 0) return reply;
+      if (fits) headed ??= reply;
+      else if (size <= this.summaryLimit && (!shortest || size < shortest.size)) shortest = { text: reply, size };
       if (attempt + 1 === this.tries) break;
-      const excerpt = utf8Prefix(reply, this.summaryLimit);
+      // The head is cut from the echoed reply so no ids go back into compressor input.
+      const body = reply.slice(head);
+      const excerpt = utf8Prefix(body, this.summaryLimit);
+      const notes = head > 0 ? [HEAD_FEEDBACK] : [];
+      if (!fits) {
+        notes.push(`${utf8Bytes(body) > this.summaryLimit ? "Previous reply excerpt only; omitted bytes are not a complete summary. " : ""}Too long: your line is ${size} bytes, over the ${this.nodeBytes}-byte limit. Write\nthe whole line again for the same <input>, cutting just enough of the\nleast valuable items to fit before this cut:\n${utf8Prefix(excerpt, this.nodeBytes)}| ← LIMIT`);
+      }
       // Keep one bounded feedback turn, not an ever-growing history of full
       // provider replies. The original input stays unchanged on every attempt.
-      feedback = [{
-        reply: excerpt,
-        instruction: `${size > this.summaryLimit ? "Previous reply excerpt only; omitted bytes are not a complete summary. " : ""}Too long: your line is ${size} bytes, over the ${this.nodeBytes}-byte limit. Write\nthe whole line again for the same <input>, cutting just enough of the\nleast valuable items to fit before this cut:\n${utf8Prefix(excerpt, this.nodeBytes)}| ← LIMIT`,
-      }];
+      // A reply that was only heads is echoed as "…": a provider turn needs text.
+      feedback = [{ reply: excerpt || "…", instruction: notes.join("\n") }];
     }
+    if (headed !== undefined) return headed;
     if (!shortest) throw new Error(`Compactor returned no whole summary within the ${this.summaryLimit}-byte safety ceiling`);
     return shortest.text;
   }

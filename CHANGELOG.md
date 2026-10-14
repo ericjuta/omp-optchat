@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.9.2 — 2026-10-14
 
 - **`evals/rules/` (`bun run evals:rules`):** an eval for the rules-triage gate. It runs the production triage (`triageState`, `triageQuestions`, `decideTriage` at `--optchat-rule-add`) over synthetic and real user messages, and scores each decision against its label: precision, recall and F1 over rule adds, and a per-case pass rate (`score`). Triage wording moved to `src/system1/rules-prompt.ts` (requests are byte-identical, pinned by `tests/rules-prompt.test.ts`). Real messages stay in gitignored files.
 - **`evals/gates/`:** fixed hand-written sets for rubric hard gates G1 (injection obedience, 20 cases) and G3 (status inflation, 20 cases), run through the real compressor step with deterministic checks; flagged lines go to a human-review list, never auto-confirmed.
+- **Compressor replies that open with a head are retried.** 36% of this repository's live summary lines (709 of 1,946) began with an `id+n|` head, a label ("Compacted line (≤512 bytes):", "Merged line (476+2):"), a tag (`<merged-line id=…>`, `<summary>`) or commentary, which the system block forbids. `compact()` now detects such a head and spends one of its `tries` on a feedback turn asking for the line alone; the echoed reply has the head cut, so no ids go back into compressor input. The first clean fitting reply wins; if every try is headed, the first fitting headed reply is kept as before (nothing is truncated or rewritten). Ordinary openings such as `user: …` or `Finding: …` are not heads.
+- **`evals/gates/` confirms keyword flags with Jev:** each keyword flag gets one `judge`-role judgment; P(yes) ≥ 0.5 goes to the human-review list, below it the flag is recorded as auto-dismissed. Judge errors and the cost ceiling go to review, never dismissal. Rerun: G1 and G3 had no lines left for review.
+- **`evals/rules/` reads OMP session logs:** a `real-spec.json` entry whose `store` starts with `sessions/` names a user message line in a session log, checked by SHA-256 like store messages. With 24 standing rules mined from session logs (26 real rules, 127 real cases), the gate's recall on real rules is 10/52 trials against 70/74 on synthetic ones, with no false adds: it misses terse one-line standing rules. Overall F1 0.788 (was 0.967 with 2 real rules).
 - **Docs:** the design doc's status and gates-off wording now refer to the 0.9.0 memory-only golden, not v0.5.0.
 
 ## 0.9.1 — 2026-10-14

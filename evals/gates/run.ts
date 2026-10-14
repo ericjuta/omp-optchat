@@ -6,15 +6,20 @@
  *
  *   bun evals/gates/run.ts --preflight
  *       Scorers only, no model. Each hand-written oracle line must pass; each failing line must fail or be flagged.
- *   bun evals/gates/run.ts --run <label> [--model @smol] [--max-calls 120] [--budget-usd 2]
+ *   bun evals/gates/run.ts --run <label> [--model @smol] [--max-calls 120] [--max-judge-calls 120] [--budget-usd 2]
  *       One live run. Writes under ~/.cache/omp-optchat-evals/gates/<label>/:
- *         outputs.jsonl        every replayed case, with each summary line and its verdict
- *         human-review.jsonl   flagged lines (G3 flags, G1 failures and G1 review items) for a person to confirm
- *         summary.json         totals against the rubric
+ *         outputs.jsonl        every replayed case, with each summary line, its keyword verdict and its Jev confirmation
+ *         human-review.jsonl   lines that still need a person: Jev-confirmed flags and judge errors (never auto-dismissed)
+ *         summary.json         totals against the rubric, with keyword hits, Jev-confirmed and auto-dismissed counts
+ *
+ * Keyword + Jev confirm (approved by the user 2026-10-14): each keyword flag gets one Jev judgment through the host
+ * `judge` role (score.ts `confirmFlag`). P(yes) >= JEV_CONFIRM_MIN goes to human review; below it the flag is
+ * auto-dismissed and stays visible in outputs.jsonl and summary.json. A judge error goes to human review.
  *
  * Deliberate differences from production, recorded in summary.json: the host system prompt is omitted (SYSTEM_BLOCK
  * only), and the value-score hint is not requested (the Jev gate is not run). Cost is the provider's reported
- * usage.cost.total per call; a non-finite cost is counted as unknown, never as zero.
+ * usage.cost.total per call, for the compressor and for each confirm judgment; a non-finite or missing cost is counted
+ * as unknown, never as zero. --budget-usd caps the compressor and confirm costs together.
  */
 import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -29,7 +34,8 @@ import { compressorReasoning, SYSTEM_BLOCK } from "../../src/index.ts";
 import { CompressorRefusedError, Memory, type Summarize } from "../../src/memory.ts";
 import { Store } from "../../src/store.ts";
 import type { MessageMetadata } from "../../src/archive.ts";
-import { type GateCase, scoreG1, scoreG3 } from "./score.ts";
+import { type Confirmation, confirmFlag, type GateCase, JEV_CONFIRM_MIN, needsReview, scoreG1, scoreG3, tallyConfirmations } from "./score.ts";
+import { type HostJudge, JudgeBudget, type Meter, metered, newMeter, openHostJudge } from "../recall/judge.ts";
 
 const CASES_DIR = join(import.meta.dir, "cases");
 const CACHE_ROOT = join(homedir(), ".cache", "omp-optchat-evals", "gates");
@@ -58,6 +64,7 @@ interface Options {
   readonly run: string;
   readonly model: string;
   readonly maxCalls: number;
+  readonly maxJudgeCalls: number;
   readonly budgetUsd: number;
 }
 
@@ -67,6 +74,7 @@ function parse(argv: readonly string[]): Options {
     run: new Date().toISOString().replace(/[:.]/g, "-"),
     model: "@smol",
     maxCalls: 120,
+    maxJudgeCalls: 120,
     budgetUsd: 2,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -84,6 +92,9 @@ function parse(argv: readonly string[]): Options {
     } else if (flag === "--max-calls") {
       if (!Number.isSafeInteger(Number(value)) || Number(value) < 1) throw new Error("--max-calls must be a positive integer");
       opts.maxCalls = Number(value);
+    } else if (flag === "--max-judge-calls") {
+      if (!Number.isSafeInteger(Number(value)) || Number(value) < 1) throw new Error("--max-judge-calls must be a positive integer");
+      opts.maxJudgeCalls = Number(value);
     } else if (flag === "--budget-usd") {
       if (!Number.isFinite(Number(value)) || Number(value) <= 0) throw new Error("--budget-usd must be a positive number");
       opts.budgetUsd = Number(value);
@@ -132,13 +143,37 @@ async function preflight(cases: readonly GateCase[], out: string): Promise<boole
   return passed === rows.length;
 }
 
+/** A keyword flag's Jev confirmation with the cost of its judgment: 0 when no call ran, `unknown` when a call lacks usage. */
+type Judged = Confirmation & { readonly cost_usd: number | "unknown" };
+
+/** The judgment's cost from the host's usage. A judgment that sent no call costs 0; a missing or non-finite cost is unknown. */
+function judgeCostOf(meter: Meter): number | "unknown" {
+  if (meter.calls.length === 0 || meter.budgetExhausted) return 0;
+  const total = meter.usage?.cost.total;
+  return total !== undefined && Number.isFinite(total) ? total : "unknown";
+}
+
 class Ledger {
   calls = 0;
   costUsd = 0;
   unknownCostCalls = 0;
+  judgeCalls = 0;
+  judgeCostUsd = 0;
+  judgeUnknownCostCalls = 0;
+  /** Compressor and confirm costs together: what --budget-usd caps. */
+  get totalUsd(): number {
+    return this.costUsd + this.judgeCostUsd;
+  }
   record(total: number): void {
     if (Number.isFinite(total)) this.costUsd += total;
     else this.unknownCostCalls++;
+  }
+  recordJudge(meter: Meter): void {
+    if (meter.calls.length === 0 || meter.budgetExhausted) return;
+    this.judgeCalls += meter.calls.length;
+    const cost = judgeCostOf(meter);
+    if (cost === "unknown") this.judgeUnknownCostCalls += meter.calls.length;
+    else this.judgeCostUsd += cost;
   }
 }
 
@@ -246,12 +281,32 @@ async function replay(c: GateCase, summarize: Summarize): Promise<Replayed> {
   }
 }
 
+/** One Jev confirmation for a keyword flag. Judge failures and the cost ceiling fail toward human review, never dismissal. */
+async function confirmKeyword(judge: HostJudge, budget: JudgeBudget, ledger: Ledger, opts: Options, c: GateCase, text: string): Promise<Judged> {
+  if (ledger.totalUsd >= opts.budgetUsd) return { outcome: "judge_error", error: "cost ceiling reached", cost_usd: 0 };
+  const meter = newMeter();
+  const confirmation = await confirmFlag(metered(judge.judge, meter, budget), c, text);
+  ledger.recordJudge(meter);
+  return { ...confirmation, cost_usd: judgeCostOf(meter) };
+}
+
+interface ScoredLine {
+  readonly l: number;
+  readonly i: number;
+  readonly text: string;
+  readonly failed: boolean;
+  readonly flagged: boolean;
+  readonly detail: unknown;
+  /** Present on every keyword hit (failed or flagged). */
+  readonly confirmation?: Judged;
+}
+
 interface Result {
   readonly id: string;
   readonly gate: "g1" | "g3";
   readonly settled: boolean;
   readonly refused: number;
-  readonly lines: ReadonlyArray<{ l: number; i: number; text: string; failed: boolean; flagged: boolean; detail: unknown }>;
+  readonly lines: readonly ScoredLine[];
 }
 
 async function live(opts: Options, cases: readonly GateCase[]): Promise<void> {
@@ -265,6 +320,8 @@ async function live(opts: Options, cases: readonly GateCase[]): Promise<void> {
   const settings = await Settings.init({ cwd: process.cwd() });
   const auth = await discoverAuthStorage(undefined, { settings });
   const ledger = new Ledger();
+  const judge = await openHostJudge(process.cwd(), "gates-eval");
+  const judgeBudget = new JudgeBudget(opts.maxJudgeCalls);
   const results: Result[] = [];
   const skipped: string[] = [];
   const errors: Array<{ id: string; error: string }> = [];
@@ -278,7 +335,7 @@ async function live(opts: Options, cases: readonly GateCase[]): Promise<void> {
     if (model === undefined) throw new Error(`${opts.model} does not resolve to an available model`);
     const summarize = summarizerFor(model, registry, ledger);
     for (const c of cases) {
-      if (ledger.calls >= opts.maxCalls || ledger.costUsd >= opts.budgetUsd) {
+      if (ledger.calls >= opts.maxCalls || ledger.totalUsd >= opts.budgetUsd) {
         skipped.push(c.id);
         continue;
       }
@@ -289,24 +346,31 @@ async function live(opts: Options, cases: readonly GateCase[]): Promise<void> {
         errors.push({ id: c.id, error: String(error instanceof Error ? error.message : error).slice(0, 300) });
         continue;
       }
-      const lines = replayed.lines.map((line) => ({ ...line, ...scoreLine(c, line.text) }));
+      const lines: ScoredLine[] = [];
+      for (const line of replayed.lines) {
+        const verdict = scoreLine(c, line.text);
+        const keyword = verdict.failed || verdict.flagged;
+        const confirmation = keyword ? await confirmKeyword(judge, judgeBudget, ledger, opts, c, line.text) : undefined;
+        lines.push({ ...line, ...verdict, ...(confirmation === undefined ? {} : { confirmation }) });
+      }
       const result: Result = { id: c.id, gate: c.gate, settled: replayed.settled, refused: replayed.refused, lines };
       results.push(result);
       await appendFile(outputs, `${JSON.stringify({ ...result, shape: c.shape, reports: replayed.reports })}\n`);
       for (const line of lines) {
-        if (line.failed) await appendFile(review, `${JSON.stringify({ id: c.id, gate: c.gate, kind: "g1_fail", line: line.text, detail: line.detail })}\n`);
-        else if (line.flagged) {
-          const kind = c.gate === "g1" ? "g1_review" : "g3_flag";
-          await appendFile(review, `${JSON.stringify({ id: c.id, gate: c.gate, kind, line: line.text, detail: line.detail })}\n`);
-        }
+        if (line.confirmation === undefined || !needsReview(line.confirmation)) continue;
+        const kind = line.failed ? "g1_fail" : c.gate === "g1" ? "g1_review" : "g3_flag";
+        await appendFile(review, `${JSON.stringify({ id: c.id, gate: c.gate, kind, line: line.text, detail: line.detail, jev: line.confirmation })}\n`);
       }
     }
     const g1 = results.filter((r) => r.gate === "g1");
     const g3 = results.filter((r) => r.gate === "g3");
-    const g1Failing = g1.filter((r) => r.lines.some((line) => line.failed)).length;
+    const g1Judged = tallyConfirmations(g1.flatMap((r) => r.lines.flatMap((line) => (line.confirmation === undefined ? [] : [line.confirmation]))));
+    const g3Judged = tallyConfirmations(g3.flatMap((r) => r.lines.flatMap((line) => (line.confirmation === undefined ? [] : [line.confirmation]))));
+    const g1Failing = g1.filter((r) => r.lines.some((line) => line.failed && line.confirmation !== undefined && needsReview(line.confirmation))).length;
     const g3Lines = g3.reduce((n, r) => n + r.lines.length, 0);
-    const g3Flagged = g3.reduce((n, r) => n + r.lines.filter((line) => line.flagged).length, 0);
-    const g3Share = g3Lines === 0 ? 0 : g3Flagged / g3Lines;
+    const g3KeywordShare = g3Lines === 0 ? 0 : g3Judged.keyword_hits / g3Lines;
+    const g3ReviewShare = g3Lines === 0 ? 0 : g3Judged.human_review / g3Lines;
+    const autoDismissed = results.flatMap((r) => r.lines.filter((line) => line.confirmation?.outcome === "dismissed").map((line) => ({ id: r.id, gate: r.gate, p: line.confirmation?.p })));
     const summary = {
       run: opts.run,
       model: `${model.provider}/${model.id}`,
@@ -317,34 +381,53 @@ async function live(opts: Options, cases: readonly GateCase[]): Promise<void> {
       started,
       finished: new Date().toISOString(),
       calls: ledger.calls,
-      cost_usd: ledger.costUsd,
+      judge: judge.primary,
+      judge_label: judge.judge.label,
+      judge_calls: ledger.judgeCalls,
+      max_judge_calls: opts.maxJudgeCalls,
+      compressor_cost_usd: ledger.costUsd,
+      judge_cost_usd: ledger.judgeCostUsd,
+      cost_usd: ledger.totalUsd,
       unknown_cost_calls: ledger.unknownCostCalls,
+      judge_unknown_cost_calls: ledger.judgeUnknownCostCalls,
       budget_usd: opts.budgetUsd,
       max_calls: opts.maxCalls,
+      jev_confirm_min: JEV_CONFIRM_MIN,
       skipped_cases: skipped,
       errors,
       refused_nodes: results.reduce((n, r) => n + r.refused, 0),
       g1: {
         injection_cases: g1.length,
+        keyword_hits: g1Judged.keyword_hits,
+        jev_confirmed: g1Judged.jev_confirmed,
+        auto_dismissed: g1Judged.auto_dismissed,
+        judge_errors: g1Judged.judge_errors,
+        human_review_items: g1Judged.human_review,
         cases_with_failing_line: g1Failing,
-        review_lines: g1.reduce((n, r) => n + r.lines.filter((line) => line.flagged).length, 0),
-        threshold: `${G1_MAX_FAILING_CASES} failing cases (rubric G1)`,
-        verdict: g1Failing <= G1_MAX_FAILING_CASES ? "pass" : "fail",
+        threshold: `${G1_MAX_FAILING_CASES} failing cases (rubric G1), confirmed by a person`,
+        verdict: g1Failing > G1_MAX_FAILING_CASES ? "fail: a failing line was not auto-dismissed; a person must confirm" : g1Judged.human_review > 0 ? "pass pending human confirmation of human_review_items" : "pass",
       },
       g3: {
         cases: g3.length,
         scored_lines: g3Lines,
-        flagged_lines: g3Flagged,
-        flagged_share: g3Share,
+        keyword_hits: g3Judged.keyword_hits,
+        keyword_share: g3KeywordShare,
+        jev_confirmed: g3Judged.jev_confirmed,
+        auto_dismissed: g3Judged.auto_dismissed,
+        judge_errors: g3Judged.judge_errors,
+        human_review_lines: g3Judged.human_review,
+        human_review_share: g3ReviewShare,
         threshold: `<= ${G3_MAX_SHARE} of summary lines, confirmed by a person (rubric G3)`,
-        verdict: g3Share <= G3_MAX_SHARE ? "flags within threshold before human review" : "flags exceed threshold before human review",
+        verdict: g3ReviewShare <= G3_MAX_SHARE ? "human-review lines within threshold before person confirmation" : "human-review lines exceed threshold before person confirmation",
         confirmed: "pending human review of human-review.jsonl",
       },
+      auto_dismissed_lines: autoDismissed,
       files: { outputs, human_review: review },
     };
     await writeFile(join(out, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`);
     console.log(JSON.stringify(summary, null, 2));
   } finally {
+    judge.close();
     auth.close();
   }
 }
