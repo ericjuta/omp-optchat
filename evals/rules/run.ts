@@ -54,6 +54,8 @@ interface Options {
   cases: string[];
   mode: Mode;
   induce?: string;
+  /** A ratchet flow's `_state.json`: when given, its `train_ids` (not the case file's split) decide which cases get traces. */
+  state?: string;
 }
 
 interface Attempt {
@@ -75,6 +77,16 @@ interface Context {
   readonly results: string;
   readonly errors: string;
   readonly traces: string;
+  /** Train ids from `--state`; undefined means the case file's split decides. */
+  readonly trainIds?: ReadonlySet<string>;
+}
+
+/** The `train_ids` of a ratchet flow's `_state.json`. */
+async function loadTrainIds(file: string): Promise<ReadonlySet<string>> {
+  const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
+  const ids = parsed !== null && typeof parsed === "object" && "train_ids" in parsed ? parsed.train_ids : undefined;
+  if (!Array.isArray(ids) || !ids.every((id) => typeof id === "string")) throw new Error(`${file} has no train_ids string array`);
+  return new Set(ids);
 }
 
 /** The production bound on one rules triage judgment (src/index.ts TRIAGE_MS). */
@@ -117,6 +129,7 @@ function parse(argv: readonly string[]): Options {
     else if (flag === "--cases") cases.push(value);
     else if (flag === "--mode" && (value === "live" || value === "oracle" || value === "null")) opts.mode = value;
     else if (flag === "--induce-error") opts.induce = value;
+    else if (flag === "--state") opts.state = value;
     else throw new Error(`unknown or invalid argument ${flag}`);
   }
   if (!/^(baseline|v[1-9][0-9]*)$/.test(opts.variant)) throw new Error('--variant must be "baseline" or v<N>');
@@ -210,7 +223,7 @@ function costOf(meter: Meter): number | "unknown" {
 }
 
 async function writeTrace(c: RuleCase, rep: number, ctx: Context, meter: Meter, decision?: TriageDecision, cls?: string): Promise<void> {
-  if (c.split !== "train") return;
+  if (!(ctx.trainIds?.has(c.id) ?? c.split === "train")) return;
   const transcript: Array<{ role: string; content: string; name?: string }> = [{ role: "user", content: c.message }];
   for (const call of meter.calls) {
     transcript.push({ role: "tool_call", name: "judge", content: JSON.stringify({ state: call.state, questions: call.questions }) });
@@ -384,7 +397,8 @@ async function main(argv: readonly string[]): Promise<void> {
 
   const budget = new JudgeBudget(options.maxJudgeCalls);
   const judge = options.mode === "live" ? await openHostJudge(process.cwd(), "rules-eval") : undefined;
-  const ctx: Context = { options, judge, budget, spend: { usd: 0 }, results, errors, traces: join(out, "traces") };
+  const trainIds = options.state === undefined ? undefined : await loadTrainIds(options.state);
+  const ctx: Context = { options, judge, budget, spend: { usd: 0 }, results, errors, traces: join(out, "traces"), trainIds };
   const started = new Date().toISOString();
   const trials: Array<{ c: RuleCase; rep: number }> = [];
   for (const c of cases) {
