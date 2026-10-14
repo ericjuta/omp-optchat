@@ -1,5 +1,5 @@
 Type: research
-Status: open
+Status: resolved
 Blocked by: 02
 
 # Jev through the OMP host

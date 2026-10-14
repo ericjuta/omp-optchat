@@ -23,16 +23,18 @@
 - [Retrieval primitives](issues/10-codemode-retrieval.md): raw-log text search ships as `chat_search`, judge-guided descent as the recall gate's `chat_recall`, plus `zoom` depth; codemode beam stays in the eval kernel, not the plugin. Synthetic comparison recorded in ticket 10; real-summary and Jev evidence still open. Answers ticket 10 (synthetic).
 - Skills live under `.omp/skills/` (wayfinder, grilling, domain-modeling, research, prototype, execplan). Set by the user's direction; no ticket.
 - The eval harness and the automated research loop are out of scope for the current build. Set by the user's direction; narrows ticket 07 to the current build, and their reference documents remain in `docs/evals/`.
+- [Jev access](issues/02-jev-access.md) and [Jev limits](issues/01-jev-api-and-limits.md): native Jev answers through OpenRouter only (the direct TypeSafe credential was removed); limits and latency are in `docs/research/jev-api.md`, and the chunker constants hold. Closes tickets 01 and 02.
+- Tool gate removed in 0.8.0 (Eric, 2026-10-13): OMP's own tool approval owns risky-call approval. This settles the tool gate against `tools.approval` and the question of screening subagent calls.
+- Standing instructions are split by scope (Eric, 2026-10-13): the rules ledger holds what the user says in this chat (per store), OMP TTSR rule files hold enforced guardrails across sessions, and Sharpshooter holds cross-session project decisions. Documentation only.
+- First ratchet flow `chat-recall-descent` plateaued after three wording rounds (test 1/19); the misses are structural. Top-k descent is opt-in (no measurable gain); raw-log seeds are being evaluated.
 
 ## Not yet specified
 
 - Embedding search over the raw log, beside the shipped text search (`chat_search`).
 - Where replayed real sessions come from for cost and cache metrics, and how private content is kept out of shared datasets.
-- Subagents: omp-optchat already logs `work` reports and offers opt-in child views (design §4). Still open: whether the demo needs subagents, and whether the tool gate should screen subagent calls, which run in yolo mode.
+- Subagents: omp-optchat already logs `work` reports and offers opt-in child views (design §4). Still open: whether the demo needs subagents.
 - Whether Jev can pre-filter tool noise before the compactor, beyond giving it a hint.
 - Rules ledger edge cases: rules with a scope ("for this project only"), and rules that expire.
-- Rules ledger against other rule mechanisms on this host: OMP's judged TTSR rules (a rule file with `question:` frontmatter) and Sharpshooter memory. Which one owns standing instructions?
-- Tool gate against the host's own approval settings (`tools.approval`): does the gate sit beside them, replace them, or defer to them?
 
 ## Out of scope
 

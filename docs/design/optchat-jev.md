@@ -113,12 +113,16 @@ How the plugin reaches it. The host's `judge` role maps to Jev on this user's ho
 3. **Stay out of the view merge.** Merges stay purely deterministic (the age rule). Importance-weighted merging would change lines in the middle of the view and break the cache.
 4. **Slowest-changing first.** Anything Jev produces per turn goes after the view in the prompt.
 5. **Behind a seam, behind a flag.** Gates ask Jev through one injected judge (`OptChatOptions.judge`, defaulting to the host judge role). Tests inject a fake judge that implements the same interface. Each gate has its own flag, so every gate can be ablated.
-6. **Off means plain OptChat.** With every gate off, requests must be byte-identical to omp-optchat v0.5.0. The plan's golden test checks this for a fixed chat.
+6. **Off means plain OptChat.** With every gate off, requests must be byte-identical to the omp-optchat 0.9.0 memory-only golden. `tests/system1-off.test.ts` checks this for a fixed chat.
 7. **Fail open for context, fail closed for actions.** A failed rule triage, prefetch or hint means no rule, no block and no hint, and the turn proceeds.
 
 ### 3.3 The four gates (the tool gate was removed in 0.8.0)
 
 **Rules ledger** (per user message, in the background, after the message is durable). Only human-typed user messages are triaged: work reports, skill prompts and side turns are skipped. One Jev request asks two things: is this a standing instruction or correction (`noul`), and if rules exist, which current rule does it replace, if any (`choice` over the 64 most recent rule ids plus `none`). A rule is added when P(rule) is at least 0.8 (`--optchat-rule-add`). It replaces a rule only when P(rule) clears that threshold and the supersede pick has probability at least 0.5. There is no ask band: every add and replace is announced, appears in `/optchat rules`, and can be removed with `/optchat rules remove <id>`. A wrong rule is cheap to see and cheap to remove, so a visible announcement replaces the blocking question the first design had. The ledger is a durable file in omp-optchat's store directory. It is rendered as a message after the view, so changing it never changes the view's cache marks. The original messages stay in the log and remain the source of truth.
+
+**Standing instructions have three scopes.** The rules ledger holds instructions you state in this chat, per store (per worktree by default). OMP TTSR rule files hold enforced guardrails that apply to every session. Sharpshooter holds cross-session project decisions learned from friction. An item in one scope is not copied into another.
+
+**Recall** (on demand, the `chat_recall` tool). Candidates are the view lines and up to `--optchat-recall-seeds` (default 8) raw-log matches of the question: stored messages ranked by the inverse document frequency of the question's words, with no model call (`Memory.rankMessages`). Every candidate is scored in the same relevance requests, in chunks of at most 64 lines. The top `--optchat-recall-k` candidates (default 1) at or above `--optchat-recall-min` each descend, one two-way choice per level, to one message, and the most probable message answers. A seed is a single-message candidate, so it answers directly; a raw-log winner is labelled as such. Judge calls are at most ⌈(lines+seeds)/64⌉ + k·log₂ n. The seed default comes from the recall eval: summaries kept the fact for 11 of 48 gold messages that a view line covered, and seeds 8 answered 65 of 96 trials against 21 of 96 with seeds 0, with the same counts on a replicate run (`CHANGELOG.md`, Unreleased).
 
 **Prefetch** (per turn, after settle). Candidates are view lines that cover two or more messages, so prefetch only works once the view has merged. The candidate lines are asked in chunks that fit Jev's limits: each request holds at most 24,000 bytes and 64 questions, with at most four requests in flight. Each line gets one `noul` question: does it hold what the new message needs? The top 8 lines with probability at least 0.5 are zoomed one level. The block is ordered by message id, capped at 16,384 bytes, and shown after the rules block. It runs under a time bound (the smaller of 5 s and the remaining settle budget). A wrong score costs some context, never lost memory, because the agent can still zoom manually.
 
@@ -235,7 +239,7 @@ Whether the demo needs subagents at all is still open (map, "Not yet specified")
 
 Each has a ticket in `.scratch/optchat-jev/issues/` or sits under "Not yet specified" in the map.
 
-- Jev's real limits from this host: max questions per request, latency, and the context ceiling (ticket 01, now narrowed by `docs/research/omp-capabilities.md`).
+- Jev's limits from this host (questions per request, latency, context ceiling, cost) are measured in `docs/research/jev-api.md`; its "Still unverified" section lists what remains (ticket 01).
 - Whether Jev access works on this account and which route answers (ticket 02).
 - How the rules and prefetch blocks after the view interact with `src/cache.ts` marks on each provider (ticket 05; plan Milestone 2 test).
 - Which gates default on, and their thresholds (ticket 06).

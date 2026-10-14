@@ -48,7 +48,7 @@ import { captureWorkReports, type ArtifactPathSource } from "./reports.js";
 import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } from "./archive.js";
 import { CompressorRefusedError, Memory, type CompactionRequest, type Summarize } from "./memory.js";
 import { VIEW_DOC } from "./prompts.js";
-import { Store, StoreLeaseConflictError, type Kind, type Message } from "./store.js";
+import { archiveStoreDirectory, nextArchivePath, Store, StoreLeaseConflictError, type Kind, type Message } from "./store.js";
 import { boundedGateError, hostJudge, judgeWithin, sessionFallbackOf, utf8Length, type JudgeFactory, type NamedJudge } from "./system1/judge.js";
 import { counted, GATE_KEYS, GATE_LABEL, GATE_PURPOSE, GateCounts, INACTIVE_REASON, type GateKey, type Judging } from "./system1/gates.js";
 import { RuleLedger, renderRules, type Rule } from "./system1/ledger.js";
@@ -498,16 +498,18 @@ class OptChat {
 	private mainRetries = 0;
 	private store: Store | undefined;
 	private memory: Memory | undefined;
+	/** Set once the tools are registered: the host rejects a second registration, so a reopened chat keeps them. */
+	private toolsRegistered = false;
 	/** Standing rules: present only when the rules gate is on and the session is ready. */
 	private rules: RuleLedger | undefined;
 	/** Triage jobs run one at a time in log order, each after its message is durable. */
 	private triageChain: Promise<void> = Promise.resolve();
-	/** Aborted at shutdown: a triage still waiting on its judge is abandoned and never writes. */
-	private readonly triageAbort = new AbortController();
+	/** Aborted when the memory closes: a triage still waiting on its judge is abandoned and never writes. */
+	private triageAbort = new AbortController();
 	/** The latest System One failure, bounded, for `/optchat status`. */
 	private gateFailure: string | undefined;
 	/** Per-gate judge calls, failures and outcomes, in memory, for `/optchat status` only. */
-	private readonly counts = new GateCounts();
+	private counts = new GateCounts();
 	private ready: Promise<void> = Promise.resolve();
 	private turn: Turn | undefined;
 	private pending: Pending | undefined;
@@ -584,8 +586,11 @@ class OptChat {
 		let rules: RuleLedger | undefined;
 		try {
 			rules = config.gates.rules ? RuleLedger.open(store.directory) : undefined;
-			this.registerTools();
-			if (config.gates.recall) this.registerRecall();
+			if (!this.toolsRegistered) {
+				this.registerTools();
+				if (config.gates.recall) this.registerRecall();
+				this.toolsRegistered = true;
+			}
 		} catch (error) {
 			await store.close();
 			throw error;
@@ -648,8 +653,16 @@ class OptChat {
 				viewLines: () => memory.viewLines(true),
 				lineAt: (id, n) => memory.lineAt(id, n),
 				page: (id) => memory.zoom(id, 1, 0),
+				rank: (text, limit) => memory.rankMessages(text, { limit }),
 			},
-			{ judge: judging.judge, question, min: config.gates.recallMin, k: config.gates.recallK, signal },
+			{
+				judge: judging.judge,
+				question,
+				min: config.gates.recallMin,
+				k: config.gates.recallK,
+				seeds: config.gates.recallSeeds,
+				signal,
+			},
 		);
 		this.counts.add("recall", outcome.kind === "found" ? "answered" : outcome.kind);
 		if (outcome.kind === "failed") this.gateFail("recall", outcome.reason);
@@ -1323,8 +1336,7 @@ class OptChat {
 			image: (part, index) => this.storeImage(part, index),
 			artifacts: this.ctx?.sessionManager,
 		};
-		this.enqueue(async () => {
-			const memory = this.openMemory();
+		this.enqueue(async (memory) => {
 			const date = Number.isFinite(at) ? new Date(at) : undefined;
 			let typed: { source: number; text: string } | undefined;
 			for (const entry of await entriesOf(message, capture)) {
@@ -1340,10 +1352,14 @@ class OptChat {
 		});
 	}
 
-	/** Appends run one at a time, in queue order. A failed append stops logging; later tasks never run. */
-	private enqueue(task: () => Promise<void>): void {
+	/**
+	 * Appends run one at a time, in queue order. A task belongs to the memory open when it was queued: after a reset it
+	 * never writes to the next one. A failed append stops logging; later tasks never run.
+	 */
+	private enqueue(task: (memory: Memory) => Promise<void>): void {
+		const memory = this.memory;
 		this.logChain = this.logChain
-			.then(() => (this.state.kind === "ready" ? task() : undefined))
+			.then(() => (memory !== undefined && this.memory === memory && this.state.kind === "ready" ? task(memory) : undefined))
 			.catch((error: unknown) => {
 				this.fail(`OptChat stopped logging: ${errorText(error)}. Every prompt will be refused until restart.`);
 			});
@@ -1415,8 +1431,13 @@ class OptChat {
 		if (this.childViewEnabled && this.state.kind === "ready") this.publishChildView(ctx);
 	}
 
+	/**
+	 * Ends this chat's memory, as session_shutdown does and as `/optchat new` does before it archives the store: appends
+	 * and triage settle, compressor jobs stop, and the store closes with its lease released. Nothing reaches it afterwards.
+	 */
 	async shutdown(): Promise<void> {
 		this.saveUnanswered();
+		this.turn = undefined;
 		// Queued appends settle while the store is still open.
 		await this.logChain;
 		// Triage still judging gets a short wait, then is abandoned: it must never write once the store closes.
@@ -1435,6 +1456,87 @@ class OptChat {
 		this.store = undefined;
 		await memory?.close();
 		await store?.close();
+	}
+
+	/**
+	 * `/optchat new`: archives this chat's store and opens an empty one at the same path. The archive is a sibling
+	 * rename, so its files keep their bytes, and `--optchat-dir <archive>` reopens the old chat.
+	 */
+	private async startNewChat(ctx: ExtensionCommandContext): Promise<string> {
+		let directory = this.newChatDirectory(ctx);
+		const now = new Date();
+		const planned = nextArchivePath(directory, now);
+		if (ctx.hasUI) {
+			const proceed = await ctx.ui.confirm(
+				"Start a new OptChat chat?",
+				`The current chat moves to ${planned}; nothing in it is deleted. A new, empty chat opens at ${directory}.`,
+			);
+			if (!proceed) return "OptChat new chat cancelled: nothing changed.";
+			// The dialog may have been open while the agent started a turn.
+			directory = this.newChatDirectory(ctx);
+		}
+		let archive: string;
+		try {
+			await this.shutdown();
+			archive = archiveStoreDirectory(directory, now, (message) => this.notify(message, "warning"));
+		} catch (error) {
+			const failure = await this.reopen(ctx);
+			const state = failure === undefined ? `the chat is open again at ${directory}` : `reopening ${directory} failed (${failure})`;
+			throw new Error(`could not archive the chat (${errorText(error)}); ${state}`);
+		}
+		// A fresh chat starts as a new session does: earlier host messages are prior history, and the counters start at zero.
+		this.cutoff = Date.now();
+		this.counts = new GateCounts();
+		this.gateFailure = undefined;
+		this.mainRetries = 0;
+		const failure = await this.reopen(ctx);
+		if (failure !== undefined) {
+			throw new Error(
+				`the previous chat is archived at ${archive}, but no fresh chat opened at ${directory} (${failure}); ` +
+					`reopen the previous chat with --optchat-dir ${archive}`,
+			);
+		}
+		return `OptChat started a new chat. The previous chat is archived at ${archive}; reopen it with --optchat-dir ${archive}.`;
+	}
+
+	/** The directory a new chat replaces. Needs this session's memory open and the agent idle, as `import` does. */
+	private newChatDirectory(ctx: ExtensionContext): string {
+		const store = this.store;
+		const reason = this.closedReason();
+		if (reason !== undefined || store === undefined) throw new Error(`this session holds no open memory (${reason ?? "memory is closed"})`);
+		if (!ctx.isIdle()) throw new Error("wait until the agent is idle before starting a new chat");
+		return store.directory;
+	}
+
+	/**
+	 * Opens the store at its configured path again with a new triage signal: the one piece the closed memory left aborted.
+	 * Returns undefined once memory is open, otherwise the reason.
+	 */
+	private async reopen(ctx: ExtensionContext): Promise<string | undefined> {
+		this.triageAbort = new AbortController();
+		this.state = { kind: "starting" };
+		try {
+			await this.open(ctx);
+		} catch (error) {
+			if (this.state.kind === "starting") this.state = { kind: "failed", reason: errorText(error) };
+		}
+		return this.closedReason();
+	}
+
+	/** Why this session has no open memory, or undefined when it has one: a failure, a lease conflict, or the state's name. */
+	private closedReason(): string | undefined {
+		const state = this.state;
+		switch (state.kind) {
+			case "ready":
+				return this.memory === undefined ? "memory is missing" : undefined;
+			case "failed":
+			case "inactive":
+				return state.reason;
+			case "starting":
+				return "memory is still opening";
+			case "closed":
+				return "memory is closed";
+		}
 	}
 
 	/** Log a waiting prompt and messages held for a snapshot that will not come. */
@@ -1474,8 +1576,11 @@ class OptChat {
 				case "rules":
 					ctx.ui.notify(this.rulesCommand(argument), "info");
 					return;
+				case "new":
+					ctx.ui.notify(await this.startNewChat(ctx), "info");
+					return;
 				default:
-					throw new Error(`unknown subcommand "${action}" (use status, view, export PATH, import PATH or rules [remove ID])`);
+					throw new Error(`unknown subcommand "${action}" (use status, view, export PATH, import PATH, rules [remove ID] or new)`);
 			}
 		} catch (error) {
 			ctx.ui.notify(`/optchat ${action}: ${errorText(error)}`, "error");
@@ -1597,16 +1702,17 @@ class OptChat {
 
 	/** Queues one durable user message for triage. The chain runs in log order and never rejects. */
 	private queueTriage(source: number, text: string, ctx: ExtensionContext): void {
+		// Bound to the memory that queued it: once that memory closes its signal is aborted, so the job writes nothing.
+		const abort = this.triageAbort.signal;
 		this.triageChain = this.triageChain
-			.then(() => this.triage(source, text, ctx))
+			.then(() => this.triage(source, text, ctx, abort))
 			.catch((error: unknown) => this.gateFail("rules", error));
 	}
 
 	/** One triage: one judge request, then add, replace, or nothing. Fails open: a failure changes no rule. */
-	private async triage(source: number, text: string, ctx: ExtensionContext): Promise<void> {
+	private async triage(source: number, text: string, ctx: ExtensionContext, abort: AbortSignal): Promise<void> {
 		const ledger = this.rules;
 		const config = this.config;
-		const abort = this.triageAbort.signal;
 		if (!ledger || !config || abort.aborted) return;
 		const offered = offeredRules(ledger.active());
 		const judging = this.judgingFor(ctx, "rules");
@@ -1753,7 +1859,7 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 		};
 
 		pi.registerCommand("optchat", {
-			description: "OptChat memory: status | view | export PATH | import PATH | rules [remove ID]",
+			description: "OptChat memory: status | view | export PATH | import PATH | rules [remove ID] | new",
 			handler: async (args, ctx) => {
 				if (!chat) {
 					ctx.ui.notify("OptChat is not active in this session (main sessions are active unless opted out with --no-optchat).", "info");

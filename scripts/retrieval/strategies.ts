@@ -268,6 +268,7 @@ const viaRecall: Run = async (tree, probe) => {
       counts.zooms++;
       return memory.zoom(id, 1, 0);
     },
+    rank: (question, limit) => memory.rankMessages(question, { limit }),
   };
   const outcome = await recall(adapter, {
     judge: metered(overlapJudge(probe.words), counts),

@@ -9,7 +9,7 @@
  *   run.json        the run's settings and totals
  *
  *   bun evals/recall/run.ts --variant baseline --out <dir> [--state <flow>/_state.json]
- *     [--reps 2] [--concurrency 4] [--max-judge-calls 3000] [--k 1..8] [--only id,id] [--cases <file.jsonl>]...
+ *     [--reps 2] [--concurrency 4] [--max-judge-calls 3000] [--k 1..8] [--seeds 0..32] [--only id,id] [--cases <file.jsonl>]...
  *     [--mode live|oracle|null] [--induce-error <case id>]
  *
  * Real cases copy their snapshot into a fresh temp dir for every attempt (read-only originals). Synthetic cases share one
@@ -22,7 +22,7 @@ import { join, resolve } from "node:path";
 import { DEFAULTS } from "../../src/config.ts";
 import { Memory, type Summarize } from "../../src/memory.ts";
 import { Store } from "../../src/store.ts";
-import { RECALL_K_MAX, recall, renderRecall, type RecallMemory, type RecallOutcome } from "../../src/system1/recall.ts";
+import { RECALL_K_MAX, RECALL_SEEDS_MAX, recall, renderRecall, type RecallMemory, type RecallOutcome } from "../../src/system1/recall.ts";
 import { buildTree, type SyntheticTree } from "../../scripts/retrieval/synthetic.ts";
 import { CASES_DIR, type CaseRecord, SNAPSHOT_ROOT } from "./build-cases.ts";
 import { grade } from "./grade.ts";
@@ -40,6 +40,8 @@ interface Options {
   maxJudgeCalls: number;
   /** View lines each recall descends from, 1 to RECALL_K_MAX. */
   k: number;
+  /** Raw-log matches recall adds as single-message candidates, 0 to RECALL_SEEDS_MAX. */
+  seeds: number;
   only?: ReadonlySet<string>;
   cases: string[];
   mode: Mode;
@@ -82,7 +84,7 @@ function errorText(error: unknown): string {
 }
 
 function parse(argv: readonly string[]): Options {
-  const opts: Options = { variant: "", out: "", reps: 2, concurrency: 4, maxJudgeCalls: 1000, k: 1, cases: [], mode: "live" };
+  const opts: Options = { variant: "", out: "", reps: 2, concurrency: 4, maxJudgeCalls: 1000, k: 1, seeds: DEFAULTS.recallSeeds, cases: [], mode: "live" };
   const cases: string[] = [];
   let flagK: number | undefined;
   for (let i = 0; i < argv.length; i += 2) {
@@ -99,6 +101,7 @@ function parse(argv: readonly string[]): Options {
     else if (flag === "--cases") cases.push(value);
     else if (flag === "--mode" && (value === "live" || value === "oracle" || value === "null" || value === "coverage")) opts.mode = value;
     else if (flag === "--k") flagK = Number(value);
+    else if (flag === "--seeds") opts.seeds = Number(value);
     else if (flag === "--induce-error") opts.induce = value;
     else throw new Error(`unknown or invalid argument ${flag}`);
   }
@@ -111,6 +114,9 @@ function parse(argv: readonly string[]): Options {
   opts.k = variantK ? Number(variantK[1]) : (flagK ?? 1);
   if (!Number.isSafeInteger(opts.k) || opts.k < 1 || opts.k > RECALL_K_MAX) {
     throw new Error(`--k must be an integer from 1 to ${RECALL_K_MAX}`);
+  }
+  if (!Number.isSafeInteger(opts.seeds) || opts.seeds < 0 || opts.seeds > RECALL_SEEDS_MAX) {
+    throw new Error(`--seeds must be an integer from 0 to ${RECALL_SEEDS_MAX}`);
   }
   if (opts.out.length === 0) throw new Error("--out is required");
   for (const [flag, n] of [["--reps", opts.reps], ["--concurrency", opts.concurrency], ["--max-judge-calls", opts.maxJudgeCalls]] as const) {
@@ -185,6 +191,7 @@ function recallView(memory: Memory): RecallMemory {
     viewLines: () => memory.viewLines(true),
     lineAt: (id, n) => memory.lineAt(id, n),
     page: (id) => memory.zoom(id, 1, 0),
+    rank: (question, limit) => memory.rankMessages(question, { limit }),
   };
 }
 
@@ -245,15 +252,17 @@ async function openStore(c: CaseRecord, trees: Map<string, Promise<SyntheticTree
   return handle;
 }
 
-/** Failure class of one recall outcome, or undefined when it is scorable. */
+/**
+ * Failure class of one recall attempt, or undefined when it is scorable. A found or none outcome is scored as recall
+ * returned it, even when judge calls inside it failed (the row counts them); only an attempt with no outcome is an error.
+ */
 function classify(outcome: RecallOutcome, meter: Meter, induced: boolean): string | undefined {
-  if (meter.budgetExhausted) return "budget";
   if (outcome.kind === "failed") {
+    if (meter.budgetExhausted) return "budget";
     if (/bound passed/.test(outcome.reason)) return "timeout";
     if (/cancel/.test(outcome.reason)) return "cancelled";
     return induced ? "induced" : "judge_error";
   }
-  if (meter.errors > 0) return induced ? "induced" : "judge_error";
   if (meter.calls.length === 0) return "no_judge_call";
   return undefined;
 }
@@ -285,12 +294,13 @@ async function attempt(c: CaseRecord, ctx: Context, induced: boolean): Promise<A
         question: c.question,
         min: RECALL_MIN,
         k: ctx.options.k,
+        seeds: ctx.options.seeds,
         signal: ceiling.signal,
       });
     } finally {
       clearTimeout(timer);
     }
-    const cls = ceilingFired ? "timeout" : classify(outcome, meter, induced);
+    const cls = outcome.kind === "failed" && ceilingFired ? "timeout" : classify(outcome, meter, induced);
     const message = outcome.kind === "failed" ? outcome.reason : undefined;
     return { outcome, cls, message, meter, latency: latency() };
   } catch (error) {
@@ -352,10 +362,9 @@ async function writeResult(c: CaseRecord, rep: number, ctx: Context, attemptResu
     await writeError(c, rep, ctx, { ...attemptResult, cls: "grader_crash", message: errorText(error) }, retries);
     return;
   }
-  // Strict scoring: a pass that needed a retry counts as a fail.
-  const pass = verdict.pass && retries === 0;
-  const explanation =
-    verdict.pass && retries > 0 ? `pass-on-retry scored as fail (strict; ${retries} retries)` : verdict.explanation;
+  // Scored as recall returned it: retries happen only for attempts without an outcome, so no retry is penalised here.
+  const pass = verdict.pass;
+  const explanation = verdict.explanation;
   const models = [...meter.models].filter((model) => model.length > 0);
   const row: Record<string, unknown> = {
     prompt_id: c.id,
@@ -368,10 +377,12 @@ async function writeResult(c: CaseRecord, rep: number, ctx: Context, attemptResu
     latency_s: attemptResult.latency,
     judge_calls: meter.calls.length,
     judge_bytes: meter.bytes,
+    internal_judge_errors: meter.errors,
     retries,
     store: c.store.kind,
     found: verdict.found,
     depth: verdict.depth,
+    raw: outcome.kind === "found" && outcome.raw === true,
   };
   if (models.length > 0) row.model = models[0];
   if (meter.usage) row.usage = meter.usage;
@@ -503,6 +514,7 @@ async function main(argv: readonly string[]): Promise<void> {
   const summary = {
     variant: options.variant,
     k: options.k,
+    seeds: options.seeds,
     mode: options.mode,
     cases: cases.length,
     reps: options.reps,

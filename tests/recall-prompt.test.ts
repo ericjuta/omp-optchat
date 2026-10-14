@@ -15,6 +15,7 @@ const wide: RecallMemory = {
   page: () => {
     throw new Error("nothing is found, so no page is read");
   },
+  rank: () => [],
 };
 
 const zeroes = (request: JudgmentRequest<Questions>) =>
@@ -41,6 +42,7 @@ describe("chat_recall judge wording", () => {
       viewLines: () => [{ id: 0, n: 2, text: "alpha beta" }],
       lineAt: (id, n) => (n === 1 && id < 2 ? { id, n, text: ["alpha", "beta"][id]! } : undefined),
       page: (id) => ({ text: ["alpha", "beta"][id]!, next: null, totalBytes: 5 }),
+      rank: () => [],
     };
     const judge = fakeJudge((request) =>
       "side" in request.questions

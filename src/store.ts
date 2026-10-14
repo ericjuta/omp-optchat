@@ -6,6 +6,7 @@ import {
   fchmodSync,
   fstatSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -13,6 +14,7 @@ import {
   readlinkSync,
   readSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -555,6 +557,69 @@ function storeImageBytes(imagesFd: number, display: string, descriptor: ImageDes
       }
     }
     throw error;
+  }
+}
+
+// Sibling archive names of a closed store, tried in order: `<dir>.<UTC stamp>`, then `-2`, `-3`, ...
+function archiveName(directory: string, now: Date, attempt: number): string {
+  const stamp = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+  return attempt === 1 ? `${directory}.${stamp}` : `${directory}.${stamp}-${attempt}`;
+}
+
+function fsyncDirectory(path: string): void {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY);
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** The first archive name for `directory` that is free now. Advisory: archiveStoreDirectory claims the name itself. */
+export function nextArchivePath(directory: string, now: Date): string {
+  for (let attempt = 1; ; attempt++) {
+    const candidate = archiveName(directory, now, attempt);
+    try {
+      lstatSync(candidate);
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) return candidate;
+      throw error;
+    }
+  }
+}
+
+/**
+ * Moves a closed store's directory to a sibling archive and returns its path. The name is claimed with mkdir first:
+ * rename(2) would silently replace an empty directory, and a taken name must never be replaced. Only the directory
+ * entry moves, so every file keeps its bytes. The caller closes the Store first.
+ */
+export function archiveStoreDirectory(directory: string, now: Date, report?: Report): string {
+  for (let attempt = 1; ; attempt++) {
+    const archive = archiveName(directory, now, attempt);
+    try {
+      mkdirSync(archive, { mode: 0o700 });
+    } catch (error) {
+      if (hasCode(error, "EEXIST")) continue;
+      throw error;
+    }
+    try {
+      renameSync(directory, archive);
+    } catch (error) {
+      // The claim is still our own empty directory: remove it, so a failed archive leaves nothing behind.
+      try {
+        rmdirSync(archive);
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], `Store archive and claim cleanup failed at ${archive}`, { cause: error });
+      }
+      throw error;
+    }
+    try {
+      fsyncDirectory(dirname(directory));
+    } catch (error) {
+      // The rename is done and no file moved out of reach: only its durability is unconfirmed, so this is a warning.
+      reportSafely(report, `Store archived to ${archive}, but syncing its parent directory failed: ${String(error)}`);
+    }
+    return archive;
   }
 }
 

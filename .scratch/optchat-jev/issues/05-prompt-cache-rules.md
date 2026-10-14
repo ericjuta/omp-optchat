@@ -13,6 +13,10 @@ Two parts.
 
 Write the findings to `docs/research/prompt-cache.md`, with a citation for each claim. Vendor claims stay labelled as vendor claims.
 
+## Measured prefetch bytes per turn (2026-10-13, Milestone 6)
+
+Per user turn on a merged 229-line view, the `<prefetch>` block bytes from the `prefetch counts ... bytes` deltas in `/optchat status`: 0, 0, 0, 7155, 6915, 0 over six turns (two blocks). This is the uncached per-turn input the prefetch block adds after the view. Not measured: the rules block bytes and the main model's token counts for those turns.
+
 ## Comments
 
 Ticket 03 is resolved (provider route: `judge` role for Jev, OMP roles for the agent and compactor). The provider for the agent is the session's own model, so part 1 covers the session provider that the user's host actually runs.

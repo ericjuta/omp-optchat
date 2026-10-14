@@ -189,6 +189,84 @@ describe("Memory.search", () => {
   });
 });
 
+describe("Memory.rankMessages", () => {
+  test("ranks by inverse document frequency: a rare word outranks a common one, and a word in most messages weighs nothing", async () => {
+    const store = await openStore();
+    store.append("talk", "deploy finished");
+    store.append("talk", "Deploy, the BILLING service!");
+    store.append("talk", "deploy again");
+    store.append("talk", "deploy notes");
+    const memory = memoryOver(store);
+    // "deploy" is in every message, so it weighs 0; only message 1 holds "billing".
+    expect(memory.rankMessages("billing deploy", { limit: 5 })).toEqual([1]);
+  });
+
+  test("a message matching a rarer term outranks one matching only a commoner term", async () => {
+    const store = await openStore();
+    store.append("talk", "alpha beta");
+    store.append("talk", "alpha only");
+    for (let i = 0; i < 8; i++) store.append("talk", `filler ${i}`);
+    const memory = memoryOver(store);
+    // alpha is in 2 of 10 messages, beta in 1: message 0 holds both terms and so scores highest.
+    expect(memory.rankMessages("alpha beta", { limit: 5 })).toEqual([0, 1]);
+  });
+
+  test("terms are lowercased, split on non-letters and digits, deduplicated, and drop words under 3 characters", async () => {
+    const store = await openStore();
+    store.append("talk", "invoice 42 is due");
+    store.append("talk", "nothing here");
+    for (let i = 0; i < 8; i++) store.append("talk", `filler ${i}`);
+    const memory = memoryOver(store);
+    expect(memory.rankMessages("INVOICE, invoice; 42!", { limit: 5 })).toEqual([0]);
+    // "is", "it", "a" and "42" are under 3 characters: no term is left to rank by.
+    expect(memory.rankMessages("is it a 42?", { limit: 5 })).toEqual([]);
+    expect(memory.rankMessages("a of to", { limit: 5 })).toEqual([]);
+    expect(memory.rankMessages("   ", { limit: 5 })).toEqual([]);
+  });
+
+  test("memory tool call records and search or recall results are never ranked", async () => {
+    const store = await openStore();
+    store.append("tool", 'zoom {"id":1,"n":1}');
+    store.append("echo", "[optchat search] alpha");
+    store.append("echo", "[optchat recall] alpha");
+    store.append("talk", "alpha");
+    for (let i = 0; i < 8; i++) store.append("talk", `filler ${i}`);
+    const memory = memoryOver(store);
+    expect(memory.rankMessages("alpha", { limit: 5 })).toEqual([3]);
+  });
+
+  test("before bounds the scan as in search, and the term weights come from the messages scanned", async () => {
+    const store = await openStore();
+    store.append("talk", "alpha");
+    for (let i = 0; i < 5; i++) store.append("talk", `filler ${i}`);
+    store.append("talk", "alpha");
+    const memory = memoryOver(store);
+    expect(memory.rankMessages("alpha", { limit: 5 })).toEqual([6, 0]);
+    expect(memory.rankMessages("alpha", { limit: 5, before: 6 })).toEqual([0]);
+  });
+
+  test("ties go to the newer message, and the limit caps the result", async () => {
+    const store = await openStore();
+    store.append("talk", "alpha");
+    store.append("talk", "alpha");
+    store.append("talk", "alpha");
+    for (let i = 0; i < 8; i++) store.append("talk", `filler ${i}`);
+    const memory = memoryOver(store);
+    expect(memory.rankMessages("alpha", { limit: 5 })).toEqual([2, 1, 0]);
+    expect(memory.rankMessages("alpha", { limit: 2 })).toEqual([2, 1]);
+  });
+
+  test("invalid limit or before throws RangeError", async () => {
+    const store = await openStore();
+    store.append("talk", "alpha");
+    const memory = memoryOver(store);
+    for (const limit of [0, 51, 1.5, Number.NaN]) {
+      expect(() => memory.rankMessages("alpha", { limit })).toThrow(RangeError);
+    }
+    expect(() => memory.rankMessages("alpha", { limit: 1, before: -1 })).toThrow(RangeError);
+  });
+});
+
 describe("Memory.zoom depth", () => {
   test("depth 1 is the two children, exactly as before", async () => {
     const store = await openStore();

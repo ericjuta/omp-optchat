@@ -97,9 +97,10 @@ Memory tools, when available on an ordinary turn:
   all the words, newest first, with snippets; open a hit with zoom(id, 1).
   Use it when a summary dropped a name, path, number or error.
 - chat_recall(question), when the recall gate is on, asks a relevance
-  judge to pick a view line and open one half per level down to the
-  message that best answers the question; it returns the path and that
-  message's first page. Check its answer like any summary.
+  judge to score view lines and messages whose words match the question,
+  then opens one half per level down to the message that best answers
+  it; it returns the path and that message's first page. Check its
+  answer like any summary.
 - date(id) gives the date and time of message id.
 - work(name, offset) pages through a captured subagent or background report,
   by its recorded id, agent id or name; follow next the same way.

@@ -19,12 +19,16 @@ export const RECALL_STEP_MS = 5_000;
 export const RECALL_K_MAX = 8;
 /** Descents running at once; the rest of the k wait for a slot. */
 export const RECALL_DESCENT_IN_FLIGHT = 4;
+/** The most raw-log matches one recall adds as candidate lines. */
+export const RECALL_SEEDS_MAX = 32;
 
 /** The memory as recall sees it. Memory satisfies this structurally through an adapter over its zoom. */
 export interface RecallMemory {
   viewLines(): ReadonlyArray<{ id: number; n: number; text: string }>;
   lineAt(id: number, n: number): { id: number; n: number; text: string } | undefined;
   page(id: number): { text: string; next: number | null; totalBytes: number };
+  /** The stored messages whose words best match `question` in the raw log, best first, at most `limit`. No model call. */
+  rank(question: string, limit: number): number[];
 }
 
 export interface RecallOptions {
@@ -35,6 +39,8 @@ export interface RecallOptions {
   readonly min: number;
   /** How many of the top lines at or above `min` to descend from, 1 to RECALL_K_MAX. Absent means 1: the single argmax descent. */
   readonly k?: number;
+  /** Raw-log matches added as single-message candidates, 0 to RECALL_SEEDS_MAX. Absent means 0. */
+  readonly seeds?: number;
   /** Overall bound; overrides RECALL_MS. */
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
@@ -62,6 +68,8 @@ export type RecallOutcome =
       /** The other candidates in rank order; always empty for k=1. */
       readonly others: readonly RecallOther[];
       readonly message: { readonly id: number; readonly text: string; readonly shownBytes: number; readonly totalBytes: number };
+      /** Set when the winner is a raw-log match: one message whose words matched the question, not a view line. */
+      readonly raw?: true;
     }
   | { readonly kind: "none"; readonly min: number; readonly best?: number }
   | { readonly kind: "failed"; readonly reason: string };
@@ -72,6 +80,7 @@ export type RecallOutcome =
  * start line's score times each choice's probability on its descent, and the most probable message answers. A descent
  * that fails is one failed candidate, not a failed recall, unless every descent failed. Never throws: any failure,
  * timeout or cancellation is a `failed` outcome, and no answer is ever guessed.
+ * Raw-log matches (seeds) are single-message candidates: scored in the same requests as the view lines, then ranked with them.
  */
 export async function recall(memory: RecallMemory, options: RecallOptions): Promise<RecallOutcome> {
   const question = options.question.trim().replace(/\s+/g, " ");
@@ -82,13 +91,17 @@ export async function recall(memory: RecallMemory, options: RecallOptions): Prom
   if (!Number.isSafeInteger(k) || k < 1 || k > RECALL_K_MAX) {
     return { kind: "failed", reason: `k must be an integer from 1 to ${RECALL_K_MAX}` };
   }
+  const seeds = options.seeds ?? 0;
+  if (!Number.isSafeInteger(seeds) || seeds < 0 || seeds > RECALL_SEEDS_MAX) {
+    return { kind: "failed", reason: `seeds must be an integer from 0 to ${RECALL_SEEDS_MAX}` };
+  }
   const bound = new AbortController();
   const onParent = () => bound.abort(options.signal?.reason);
   if (options.signal?.aborted) onParent();
   options.signal?.addEventListener("abort", onParent, { once: true });
   const timer = setTimeout(() => bound.abort(new Error("recall exceeded its bound")), options.timeoutMs ?? RECALL_MS);
   try {
-    const outcome = await search(memory, options.judge, question, options.min, k, bound.signal);
+    const outcome = await search(memory, options.judge, question, options.min, k, seeds, bound.signal);
     if (!bound.signal.aborted) return outcome;
     return { kind: "failed", reason: options.signal?.aborted ? "cancelled" : "the recall bound passed" };
   } catch (error) {
@@ -100,15 +113,20 @@ export async function recall(memory: RecallMemory, options: RecallOptions): Prom
   }
 }
 
+/** A candidate line: a view line, or a raw-log match (`raw`), one message whose words matched the question. */
+interface Candidate extends ViewLine {
+  readonly raw: boolean;
+}
+
 /** A view line with its probability that it holds the answer. */
 interface Scored {
-  readonly line: ViewLine;
+  readonly line: Candidate;
   readonly p: number;
 }
 
 /** How one descent ended: the chain it walked, or the start it failed from and why. */
 type Descent =
-  | { readonly kind: "chain"; readonly path: readonly RecallStep[]; readonly leaf: RecallStep; readonly p: number }
+  | { readonly kind: "chain"; readonly path: readonly RecallStep[]; readonly leaf: RecallStep; readonly p: number; readonly raw: boolean }
   | { readonly kind: "failed"; readonly id: number; readonly n: number; readonly reason: string };
 
 async function search(
@@ -117,9 +135,21 @@ async function search(
   question: string,
   min: number,
   k: number,
+  seeds: number,
   signal: AbortSignal,
 ): Promise<RecallOutcome> {
-  const lines: ViewLine[] = memory.viewLines().map((line) => ({ id: line.id, n: line.n, text: utf8Prefix(line.text, RECALL_TEXT_BYTES) }));
+  const lines: Candidate[] = memory
+    .viewLines()
+    .map((line) => ({ id: line.id, n: line.n, text: utf8Prefix(line.text, RECALL_TEXT_BYTES), raw: false }));
+  if (seeds > 0) {
+    // A message a view line already is (n = 1) stays one candidate: the view line.
+    const covered = new Set(lines.filter((line) => line.n === 1).map((line) => line.id));
+    for (const id of memory.rank(question, seeds)) {
+      if (covered.has(id)) continue;
+      covered.add(id);
+      lines.push({ id, n: 1, text: utf8Prefix(memory.page(id).text, RECALL_TEXT_BYTES), raw: true });
+    }
+  }
   if (lines.length === 0) return { kind: "none", min };
   const scores = await scoreLines(judge, question, lines, signal);
   if (scores.scored.length === 0 && scores.failures.length > 0) return { kind: "failed", reason: scores.failures[0]! };
@@ -140,9 +170,9 @@ async function search(
 async function scoreLines(
   judge: Judge,
   question: string,
-  lines: readonly ViewLine[],
+  lines: readonly Candidate[],
   signal: AbortSignal,
-): Promise<{ scored: Array<{ line: ViewLine; p: number }>; failures: string[] }> {
+): Promise<{ scored: Array<{ line: Candidate; p: number }>; failures: string[] }> {
   const keyed = lines.map((line) => ({ line, key: `${line.id}+${line.n}` }));
   const chunks = packByBytes(
     keyed,
@@ -151,7 +181,7 @@ async function scoreLines(
     PREFETCH_STATE_BYTES,
     PREFETCH_QUESTIONS,
   );
-  const scored: Array<{ line: ViewLine; p: number }>[] = [];
+  const scored: Array<{ line: Candidate; p: number }>[] = [];
   const failures: string[] = [];
   let next = 0;
   const worker = async (): Promise<void> => {
@@ -236,7 +266,7 @@ async function descendFrom(
   } catch (error) {
     return failed(boundedGateError(error));
   }
-  return { kind: "chain", path, leaf: current, p: chainProbability(path) };
+  return { kind: "chain", path, leaf: current, p: chainProbability(path), raw: start.line.raw };
 }
 
 /**
@@ -279,6 +309,7 @@ function choose(memory: RecallMemory, question: string, descents: readonly Desce
     path: winner.path,
     others,
     message: { id: winner.leaf.id, text, shownBytes: utf8Length(text), totalBytes: page.totalBytes },
+    ...(winner.raw ? { raw: true as const } : {}),
   };
 }
 
@@ -336,6 +367,9 @@ export function renderRecall(outcome: RecallOutcome): string {
           : `other ${other.id}+${other.n} failed: ${other.reason}`,
       );
     }
+  }
+  if (outcome.raw) {
+    lines.push(`raw-log match: message ${message.id} matched the question's words in the raw log, not a view line's summary`);
   }
   lines.push(`message ${message.id}:`, message.text);
   lines.push(

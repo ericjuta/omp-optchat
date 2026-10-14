@@ -21,6 +21,7 @@ export const DEFAULTS = Object.freeze({
   prefetchMin: 0.5,
   recallMin: 0.5,
   recallK: 1,
+  recallSeeds: 8,
 });
 
 export interface OptChatConfig {
@@ -53,6 +54,8 @@ export interface GateConfig {
   recallMin: number;
   /** How many of the top lines at or above recallMin the recall tool descends from, from 1 to 8. */
   recallK: number;
+  /** How many raw-log matches for the question are added as single-message recall candidates, from 0 to 32. */
+  recallSeeds: number;
 }
 
 type FlagReader = Pick<ExtensionAPI, "getFlag">;
@@ -146,6 +149,11 @@ export function registerFlags(api: FlagRegistrar): void {
     default: String(DEFAULTS.recallK),
     description: "System One: view lines at or above recall-min that recall descends from, from 1 to 8 (default: 1)",
   });
+  api.registerFlag("optchat-recall-seeds", {
+    type: "string",
+    default: String(DEFAULTS.recallSeeds),
+    description: "System One: raw-log matches for the question added as recall candidates, from 0 to 32 (default: 8)",
+  });
 }
 
 const GATE_FLAGS = [
@@ -232,6 +240,7 @@ function gates(api: FlagReader): GateConfig {
     prefetchMin: probability(api, "optchat-prefetch-min", DEFAULTS.prefetchMin),
     recallMin: probability(api, "optchat-recall-min", DEFAULTS.recallMin),
     recallK: integer(api, "optchat-recall-k", DEFAULTS.recallK, 1, 8),
+    recallSeeds: integer(api, "optchat-recall-seeds", DEFAULTS.recallSeeds, 0, 32),
   };
 }
 

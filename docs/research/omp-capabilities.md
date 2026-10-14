@@ -175,7 +175,7 @@ omp-jevify is a skill-only plugin: `files: [skills, …]`, `omp: {}`, no TypeScr
 ## 5. Still unverified
 
 - Whether `journalJudgmentUsage(ctx.sessionManager)` journals from an extension at runtime (type gap in 1.2). Checked by ExecPlan M1 (unit) and M6 (real host).
-- Maximum questions per Jev request, and judge latency from this host (map ticket 01).
+- Maximum questions per Jev request and judge latency from this host are measured in `docs/research/jev-api.md` (sections 1 and 2; map ticket 01).
 - Whether Jev access works on this account through the configured route (map ticket 02).
 - How extra user messages after the view interact with `src/cache.ts` marks on each provider (map ticket 05; ExecPlan M1 test).
 - Vendor claims about Jev not observed here: price ($0.042 per million input tokens, output free), latency 70-500 ms, a 255-option cap on choices, a 64,000-token context on some routes. These come from launch coverage (`docs/design/optchat-jev.md`, Sources) and stay labelled as vendor-reported.

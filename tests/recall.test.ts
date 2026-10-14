@@ -8,6 +8,8 @@ import {
   RECALL_DESCENT_IN_FLIGHT,
   RECALL_K_MAX,
   RECALL_PAGE_BYTES,
+  RECALL_SEEDS_MAX,
+  RECALL_TEXT_BYTES,
   RECALL_QUESTION_CHARS,
   recall,
   registerRecallTool,
@@ -15,7 +17,7 @@ import {
   type RecallMemory,
   type RecallOutcome,
 } from "../src/system1/recall.ts";
-import { readConfig } from "../src/config.ts";
+import { DEFAULTS, readConfig } from "../src/config.ts";
 import { choice, fakeJudge, noul } from "./helpers/fake-judge.ts";
 
 interface Span {
@@ -28,6 +30,8 @@ interface TreeOptions {
   readonly view?: readonly Span[];
   /** Lines that are not built: the view omits them and lineAt reports them missing. */
   readonly missing?: readonly string[];
+  /** What `rank` returns, best first; recall takes the first `seeds` of it. */
+  readonly ranked?: readonly number[];
 }
 
 /** A complete binary tree over `texts` (one message each). A node's summary is its messages' texts, joined. */
@@ -40,6 +44,7 @@ function treeMemory(texts: readonly string[], options: TreeOptions = {}): Recall
   const pages: number[] = [];
   return {
     pages,
+    rank: (_question, limit) => (options.ranked ?? []).slice(0, limit),
     viewLines: () =>
       view.filter((line) => !missing.has(`${line.id}+${line.n}`)).map((line) => ({ ...line, text: summary(line.id, line.n) })),
     lineAt: (id, n) => {
@@ -465,6 +470,102 @@ describe("recall: top-k descents", () => {
         reason: `k must be an integer from 1 to ${RECALL_K_MAX}`,
       });
       expect(judge.requests).toHaveLength(0);
+    }
+  });
+});
+
+describe("recall: raw-log seeds", () => {
+  test("seeds 0 is the same recall as leaving seeds out: judge requests, outcome, rendering, and no rank call", async () => {
+    const memory = treeMemory(SEVEN, { ranked: [5] });
+    let ranks = 0;
+    const counted: RecallMemory = {
+      ...memory,
+      rank: (question, limit) => {
+        ranks++;
+        return memory.rank(question, limit);
+      },
+    };
+    const omitted = fakeJudge(answerFor("invoice"));
+    const zero = fakeJudge(answerFor("invoice"));
+    const left = await recall(counted, { judge: omitted, question: "invoice", min: 0.5, k: 3 });
+    const none = await recall(counted, { judge: zero, question: "invoice", min: 0.5, k: 3, seeds: 0 });
+    expect(none).toEqual(left);
+    expect(zero.requests).toEqual(omitted.requests);
+    expect(renderRecall(none)).toBe(renderRecall(left));
+    expect(ranks).toBe(0);
+  });
+
+  test("a raw-log match is a single-message candidate in the same relevance request, and answers directly", async () => {
+    const memory = treeMemory(SEVEN, { view: [{ id: 0, n: 4 }], ranked: [5] });
+    const judge = fakeJudge(answerFor("invoice"));
+    const outcome = judged(await recall(memory, { judge, question: "invoice", min: 0.5, seeds: 1 }));
+    expect(outcome.message.id).toBe(5);
+    expect(outcome.raw).toBe(true);
+    expect(outcome.path).toEqual([{ id: 5, n: 1, text: "invoice 5", p: 0.9 }]);
+    expect(judge.requests).toHaveLength(1);
+    expect(Object.keys((judge.requests[0]!.state as Probed).lines!).sort()).toEqual(["0+4", "5+1"]);
+    expect(renderRecall(outcome)).toContain("raw-log match: message 5 matched the question's words in the raw log");
+  });
+
+  test("a raw-log match that a view leaf already is stays one candidate: the view line", async () => {
+    const memory = treeMemory(SEVEN, { view: [{ id: 5, n: 1 }, { id: 0, n: 4 }], ranked: [5, 6] });
+    const judge = fakeJudge(answerFor("invoice"));
+    const outcome = judged(await recall(memory, { judge, question: "invoice", min: 0.5, seeds: 2 }));
+    expect(Object.keys((judge.requests[0]!.state as Probed).lines!).sort()).toEqual(["0+4", "5+1", "6+1"]);
+    expect(outcome.message.id).toBe(5);
+    expect(outcome.raw).toBeUndefined();
+    expect(renderRecall(outcome)).not.toContain("raw-log match");
+  });
+
+  test("a seed's text is its message's first RECALL_TEXT_BYTES bytes", async () => {
+    const texts = ["m0", "m1", "m2", "m3", "m4", `invoice${"é".repeat(5_000)}`, "m6", "m7"];
+    const memory = treeMemory(texts, { view: [{ id: 0, n: 4 }], ranked: [5] });
+    const judge = fakeJudge(answerFor("invoice"));
+    const outcome = judged(await recall(memory, { judge, question: "invoice", min: 0.5, seeds: 1 }));
+    const text = (judge.requests[0]!.state as Probed).lines!["5+1"]!;
+    expect(utf8Length(text)).toBeLessThanOrEqual(RECALL_TEXT_BYTES);
+    expect(text.startsWith("invoice")).toBe(true);
+    expect(outcome.message.id).toBe(5);
+  });
+
+  test("seeds takes the first `seeds` ids the raw log ranks; a bad count fails before any judge call", async () => {
+    const texts = Array.from({ length: 16 }, (_, index) => `m${index}`);
+    const memory = treeMemory(texts, { view: [{ id: 0, n: 4 }], ranked: [10, 11, 12, 13, 14] });
+    const judge = fakeJudge(answerFor("zzz"));
+    await recall(memory, { judge, question: "q", min: 0.5, seeds: 2 });
+    expect(Object.keys((judge.requests[0]!.state as Probed).lines!).sort()).toEqual(["0+4", "10+1", "11+1"]);
+    for (const seeds of [-1, RECALL_SEEDS_MAX + 1, 1.5, Number.NaN]) {
+      const refused = fakeJudge(answerFor("zzz"));
+      expect(await recall(memory, { judge: refused, question: "q", min: 0.5, seeds })).toEqual({
+        kind: "failed",
+        reason: `seeds must be an integer from 0 to ${RECALL_SEEDS_MAX}`,
+      });
+      expect(refused.requests).toHaveLength(0);
+    }
+  });
+
+  test("a seed competes in the descent ranking with view lines: with k=2 both descend and the seed answers", async () => {
+    const memory = treeMemory(SEVEN, { view: [{ id: 0, n: 4 }], ranked: [5] });
+    const judge = fakeJudge(answerFor("invoice"));
+    const outcome = judged(await recall(memory, { judge, question: "invoice", min: 0.05, k: 2, seeds: 1 }));
+    expect(outcome.message.id).toBe(5);
+    expect(outcome.raw).toBe(true);
+    expect(outcome.others).toHaveLength(1);
+    expect(outcome.others[0]?.kind).toBe("answer");
+  });
+});
+
+describe("recall-seeds flag", () => {
+  const flagsOf = (values: Record<string, string>): ExtensionAPI =>
+    ({ getFlag: (name: string) => values[name] }) as unknown as ExtensionAPI;
+
+  test("takes integers from 0 to 32, defaults to the shipped value, and fails closed otherwise", () => {
+    expect(readConfig(flagsOf({}), "/tmp/unused").gates.recallSeeds).toBe(DEFAULTS.recallSeeds);
+    expect(readConfig(flagsOf({ "optchat-recall-seeds": "0" }), "/tmp/unused").gates.recallSeeds).toBe(0);
+    expect(readConfig(flagsOf({ "optchat-recall-seeds": "8" }), "/tmp/unused").gates.recallSeeds).toBe(8);
+    expect(readConfig(flagsOf({ "optchat-recall-seeds": "32" }), "/tmp/unused").gates.recallSeeds).toBe(32);
+    for (const value of ["-1", "33", "2.5", "x", "", "1e1"]) {
+      expect(() => readConfig(flagsOf({ "optchat-recall-seeds": value }), "/tmp/unused")).toThrow("--optchat-recall-seeds");
     }
   });
 });

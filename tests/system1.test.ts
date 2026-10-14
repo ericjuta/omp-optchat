@@ -97,6 +97,7 @@ describe("System One config", () => {
       prefetchMin: 0.5,
       recallMin: 0.5,
       recallK: 1,
+      recallSeeds: 8,
     });
     expect(DEFAULTS.ruleAdd).toBe(0.8);
   });

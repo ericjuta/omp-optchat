@@ -58,6 +58,8 @@ export const SEARCH_QUERY_CHARS = 200;
 export const SEARCH_TERMS = 8;
 export const SEARCH_LIMIT = 10;
 export const SEARCH_MAX_LIMIT = 50;
+/** A question word shorter than this many characters is not a ranking term. */
+export const RANK_TERM_CHARS = 3;
 /** Bytes of a search snippet before its whitespace is flattened and its cut marks added. */
 const SNIPPET_BYTES = 240;
 /** Bytes of a snippet kept before the first match. */
@@ -67,6 +69,13 @@ export interface SearchOptions {
   readonly kind?: Kind;
   readonly limit?: number;
   /** Only messages with id below this; a previous result's `next`. */
+  readonly before?: number;
+}
+
+export interface RankOptions {
+  /** How many ids to return at most, 1 to SEARCH_MAX_LIMIT. */
+  readonly limit: number;
+  /** Only messages with id below this, as in `search`. */
   readonly before?: number;
 }
 
@@ -428,6 +437,53 @@ export class Memory {
       hits.push({ id, kind: message.kind, date: message.date, snippet: snippet(message.text, at) });
     }
     return { hits, next: null };
+  }
+
+  /**
+   * Stored message ids ranked against a natural-language question, best first, without a model. Terms are the
+   * question's lowercased words (split on anything but letters and digits), deduplicated, of at least RANK_TERM_CHARS
+   * characters. A message matches a term when its lowercased text contains it, as `search` matches. Over the scanned
+   * messages (search's skips and `before` bound), each term weighs its BM25 inverse document frequency,
+   * ln((N - df + 0.5) / (df + 0.5)), floored at 0, so a term in half the messages or more weighs nothing. A message
+   * scores the sum of its matched terms' weights; only scores above 0 are ranked, and a tie goes to the newer message.
+   * Invalid options throw RangeError.
+   */
+  rankMessages(question: string, options: RankOptions): number[] {
+    const { limit, before } = options;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > SEARCH_MAX_LIMIT) {
+      throw new RangeError(`limit must be an integer from 1 to ${SEARCH_MAX_LIMIT}`);
+    }
+    if (before !== undefined && (!Number.isSafeInteger(before) || before < 0)) {
+      throw new RangeError("before must be a nonnegative safe integer");
+    }
+    const terms = [...new Set(question.toLowerCase().split(/[^\p{L}\p{N}]+/u))].filter(
+      (term) => [...term].length >= RANK_TERM_CHARS,
+    );
+    if (terms.length === 0) return [];
+    const messages = this.store.messages;
+    const df = new Array<number>(terms.length).fill(0);
+    const matched: Array<{ readonly id: number; readonly terms: number[] }> = [];
+    let scanned = 0;
+    for (let id = 0; id < Math.min(before ?? messages.length, messages.length); id++) {
+      const message = messages[id]!;
+      if (memoryRecord(message)) continue;
+      scanned++;
+      const lower = message.text.toLowerCase();
+      let found: number[] | undefined;
+      for (let term = 0; term < terms.length; term++) {
+        if (!lower.includes(terms[term]!)) continue;
+        df[term]!++;
+        (found ??= []).push(term);
+      }
+      if (found) matched.push({ id, terms: found });
+    }
+    const weight = df.map((count) => Math.max(0, Math.log((scanned - count + 0.5) / (count + 0.5))));
+    return matched
+      .map(({ id, terms: found }) => ({ id, score: found.reduce((sum, term) => sum + weight[term]!, 0) }))
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score || b.id - a.id)
+      .slice(0, limit)
+      .map((entry) => entry.id);
   }
 
   /**

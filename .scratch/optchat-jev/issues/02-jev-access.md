@@ -1,5 +1,5 @@
 Type: task
-Status: open
+Status: resolved
 Blocked by:
 
 # Confirm Jev access on this OMP account
@@ -28,4 +28,5 @@ Ticket 01's measurements depend on this ticket.
 - One `bool` + one `choice` judgment answered natively in 0.33 s: danger P(yes)=0.97, choice `file_op` p=1.
 - Candidate: native Jev, model `openrouter/typesafe/jev-1.13-20260917` (from `judge_batch` status); cost $1.14e-05 per one-question state. No error class, no account-limit errors.
 - Route: OpenRouter credential already in OMP's credential store; no new variable names. Jev is not on an OAuth subscription; only proposer and runner roles (`default`, `task`, `smol`, all `anthropic/*`) bill to OAuth.
-- Without a native judge the decided fallback applies: tool gate on the session model, other gates inactive.
+- Without a native judge the decided fallback applies: every gate is inactive (the tool gate was removed in 0.8.0).
+- 2026-10-13: the direct TypeSafe credential answered HTTP 402 (no billing) and was removed through the host's RPC `logout` (marked "deleted by user"), by Eric's decision. Jev is reached through OpenRouter only; a check judgment afterwards answered in 0.43 s from `openrouter/typesafe/jev-1.13-20260917`.
