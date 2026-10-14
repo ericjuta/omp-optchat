@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.1 — 2026-10-14
+
+- **Fixed: the evidence runner's no-call plan crashed on a host with no usable model.** OMP refuses RPC mode when no model is configured, so the catalog probe waited out its 60 s deadline and the runner printed an error instead of its JSON plan. The probe now fails as soon as the host exits, with the host's stderr, and the plan reports it as a blocker (`host model listing failed: …`) with status `blocked`. This was the CI failure on 0.8.x–0.9.0 once `bun run test:host` put the pinned `omp` on `PATH`. Plugin code is unchanged.
+
 ## 0.9.0 — 2026-10-13
 
 - **Changed default: `chat_recall` now seeds candidates from the raw log.** `--optchat-recall-seeds` defaults to 8, so every `chat_recall` call also scores up to 8 stored messages whose words match the question, next to the view lines. On the recall eval it answered 65/96 against 21/96 without seeds, replicated on a second run (real-only cases 11 vs 5, same direction, not significant). Cost: at most ⌈(lines+seeds)/64⌉ scoring requests per call, usually the same count as before. Pass `--optchat-recall-seeds 0` for the 0.8.0 recall requests.
