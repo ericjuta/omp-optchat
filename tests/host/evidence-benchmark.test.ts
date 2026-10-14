@@ -22,6 +22,7 @@ describe.skipIf(OMP === null)("evidence recall no-call plan", () => {
 				const args = ["--main", "unconfigured/main", "--compressor", "unconfigured/compressor", "--agent-dir", dir, "--omp", OMP ?? "omp", "--out", out];
 				if (mainContextWindow !== null) args.push("--main-context-window", String(mainContextWindow), "--max-calls", "2000");
 				const { output } = await runRecall(args);
+				expect(output.trimStart().startsWith("{"), output).toBe(true);
 				const report = JSON.parse(output);
 				expect(report.status).toBe("blocked");
 				expect(report.plan.mainContextWindow).toBe(mainContextWindow);
