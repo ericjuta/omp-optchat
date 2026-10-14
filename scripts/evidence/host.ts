@@ -254,8 +254,11 @@ export async function queryAvailableModels(
 	child.once("exit", (code) => exit.resolve(code));
 	const exited = exit.promise;
 	child.stdin.on("error", () => {});
-	child.stderr.on("data", () => {});
+	let stderrTail = "";
+	child.stderr.on("data", (chunk: Buffer) => { stderrTail = (stderrTail + chunk.toString("utf8")).slice(-2000); });
 	const response = Promise.withResolvers<Frame>();
+	// A host that exits before answering fails now, with its stderr, instead of after the deadline.
+	void exited.then((code) => response.reject(new Error(`omp exited (${code}) before get_available_models answered: ${stderrTail.trim()}`)));
 	createInterface({ input: child.stdout }).on("line", (line) => {
 		try {
 			const frame = asFrame(JSON.parse(line));
@@ -266,7 +269,9 @@ export async function queryAvailableModels(
 	});
 	try {
 		child.stdin.write(`${JSON.stringify({ id: "models", type: "get_available_models" })}\n`);
-		const frame = await withDeadline("RPC get_available_models", response.promise, timeoutMs);
+		const frame = await withDeadline("RPC get_available_models", response.promise, timeoutMs).catch((error: unknown) => {
+			throw new Error(`${error instanceof Error ? error.message : String(error)}; host stderr: ${stderrTail.trim() || "(none)"}`);
+		});
 		if (frame.success !== true || frame.command !== "get_available_models") throw new Error("get_available_models was not accepted by the host");
 		const data = asFrame(frame.data);
 		const models = Array.isArray(data?.models) ? data.models : [];
