@@ -406,6 +406,9 @@ async function coverageRow(c: CaseRecord, ctx: Context): Promise<void> {
     // Descent ends at the gold's leaf: its built summary (or verbatim text, when it fits a node) is what the judge sees last.
     const leaf = handle.memory.lineAt(c.gold, 1);
     const needle = fact?.toLowerCase();
+    // Raw-log seeding reaches the gold only if the question's words rank it; a near miss lands on a neighbour.
+    const ranked = handle.memory.rankMessages(c.question, { limit: RECALL_SEEDS_MAX });
+    const nearest = ranked.reduce<number | null>((best, id) => (best === null || Math.abs(id - c.gold) < Math.abs(best - c.gold) ? id : best), null);
     const row = {
       prompt_id: c.id,
       covered: covering !== undefined,
@@ -414,6 +417,8 @@ async function coverageRow(c: CaseRecord, ctx: Context): Promise<void> {
       fact,
       fact_in_covering: needle && covering ? covering.text.toLowerCase().includes(needle) : null,
       fact_in_leaf: needle && leaf ? leaf.text.toLowerCase().includes(needle) : null,
+      gold_seed_rank: ranked.indexOf(c.gold),
+      nearest_seed_offset: nearest === null ? null : nearest - c.gold,
     };
     await appendFile(ctx.coverage, `${JSON.stringify(row)}\n`);
   } finally {
