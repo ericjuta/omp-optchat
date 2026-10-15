@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **`evals/recall/` accepts more than one right answer for a real case:** a `real-spec.json` entry may list `also`, other messages of the same store that answer the question as well as the gold, and the grader passes either. The sets came from blind pooling: candidates were the gold's neighbours, the question's word-search matches and every message a recorded run answered, and assessors judged them from the chat text alone, without seeing which message any run picked. Coverage mode also reports where the gold ranks in raw-log word search. The real set grew from 18 to 60 cases, with questions written blind from the chat text. Real cases stay in gitignored files.
+- **`evals/recall/` accepts more than one right answer for a real case:** a `real-spec.json` entry may list `also`, other messages of the same store that answer the question as well as the gold, and the grader passes either. It also lists `no` (messages judged not to answer) and a required answer `key`: an answer nobody judged passes iff the page recall returned contains every phrase of one key alternative. The builder checks that each key matches the gold and every `also` page but no `no` page, and result rows record `judged`. The sets came from blind pooling: candidates were the gold's neighbours, the question's word-search matches and every message a recorded run answered, and assessors judged them from the chat text alone, without seeing which message any run picked. Coverage mode also reports where the gold ranks in raw-log word search. The real set grew from 18 to 60 cases, with questions written blind from the chat text. Real cases stay in gitignored files.
 
 ## 0.9.3 — 2026-10-14
 

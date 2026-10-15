@@ -9,12 +9,17 @@
  * Synthetic gold is the planted message index. Real gold is a message index in a read-only snapshot under
  * SNAPSHOT_ROOT; every real entry must hold a token that occurs in exactly one message of its store (chat_search-style
  * whole-word match), must not appear in its question, and its gold message must be free of secret-like text. An
- * optional `also` lists other messages of the same store that answer the question as well, and they also count as correct.
+ * optional `also` lists other messages of the same store that answer the question as well, and they also count as correct;
+ * `no` lists messages judged blind not to answer. Every real entry also carries an answer `key`, which grades an unjudged
+ * answer by the first page recall returns and must match the gold and every `also` message but no `no` message.
  */
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildCorpus, MAX_KEEP } from "../../scripts/retrieval/synthetic.ts";
+import { utf8Prefix } from "../../src/memory.ts";
+import { RECALL_PAGE_BYTES } from "../../src/system1/recall.ts";
+import { type AnswerKey, keyMatches } from "./grade.ts";
 
 export const SNAPSHOT_ROOT = join(homedir(), ".cache", "omp-optchat-evals", "recall", "stores");
 const HERE = dirname(new URL(import.meta.url).pathname);
@@ -49,6 +54,10 @@ export interface CaseRecord {
   readonly fact?: string;
   /** Other message indexes that also count as correct answers; real cases only. */
   readonly also?: readonly number[];
+  /** Messages of the same store judged blind NOT to answer, partial answers included; real cases only. */
+  readonly no?: readonly number[];
+  /** Answer key grading an unjudged answer by the first page recall returns; real cases only. */
+  readonly key?: AnswerKey;
 }
 
 /** Loads a snapshot's message log in store order, verifying the addresses are the contiguous 0..n-1. */
@@ -142,7 +151,16 @@ interface RealSpec {
   readonly paraphrase?: boolean;
   /** Other messages in the same store that answer the question as well as the gold, from a blind assessment of pooled candidates. */
   readonly also?: readonly number[];
+  /** Messages in the same store judged blind NOT to answer the question, partial answers included. */
+  readonly no?: readonly number[];
+  /** Answer alternatives; an alternative matches when all its phrases occur in the page recall returned, ignoring case and whitespace. */
+  readonly key: AnswerKey;
   readonly note: string;
+}
+
+/** The text recall returns for a message: the first RECALL_PAGE_BYTES UTF-8 bytes of its original text (`memory.page(id)` adds no envelope to `text`). */
+export function firstPage(text: string): string {
+  return utf8Prefix(text, RECALL_PAGE_BYTES);
 }
 
 /** Validates each spec entry against its snapshot and returns the case record. Throws on the first violation. */
@@ -166,6 +184,30 @@ export async function realCases(specs: readonly RealSpec[]): Promise<CaseRecord[
     }
     if (new Set(also).size !== also.length) throw new Error(`${spec.id}: also has duplicates`);
     also.sort((a, b) => a - b);
+    const no = [...(spec.no ?? [])];
+    for (const id of no) {
+      if (!Number.isSafeInteger(id) || !store.messages[id]) throw new Error(`${spec.id}: no ${id} is not a message in ${spec.store}`);
+      if (id === spec.gold) throw new Error(`${spec.id}: no contains the gold ${id}`);
+      if (also.includes(id)) throw new Error(`${spec.id}: no ${id} is also in also`);
+    }
+    if (new Set(no).size !== no.length) throw new Error(`${spec.id}: no has duplicates`);
+    no.sort((a, b) => a - b);
+    const key = spec.key;
+    if (!Array.isArray(key) || key.length === 0) throw new Error(`${spec.id}: key must be a non-empty array of alternatives`);
+    for (const alternative of key) {
+      if (!Array.isArray(alternative) || alternative.length === 0) throw new Error(`${spec.id}: key alternative must be a non-empty array of phrases`);
+      for (const phrase of alternative) {
+        if (typeof phrase !== "string" || phrase.trim().length < 3 || /^[\d\s.,:/-]*$/.test(phrase.trim())) {
+          throw new Error(`${spec.id}: key phrase ${JSON.stringify(phrase)} must be at least 3 characters and not only digits and punctuation`);
+        }
+      }
+    }
+    for (const id of [spec.gold, ...also]) {
+      if (!keyMatches(firstPage(store.messages[id]!.text), key)) throw new Error(`${spec.id}: key does not match message ${id}`);
+    }
+    for (const id of no) {
+      if (keyMatches(firstPage(store.messages[id]!.text), key)) throw new Error(`${spec.id}: key matches no message ${id}`);
+    }
     cases.push({
       id: spec.id,
       tags: ["real", spec.difficulty, ...(spec.paraphrase === true ? ["paraphrase"] : [])],
@@ -175,6 +217,8 @@ export async function realCases(specs: readonly RealSpec[]): Promise<CaseRecord[
       source: spec.note,
       fact: spec.fact,
       ...(also.length > 0 ? { also } : {}),
+      ...(no.length > 0 ? { no } : {}),
+      key,
     });
   }
   return cases;

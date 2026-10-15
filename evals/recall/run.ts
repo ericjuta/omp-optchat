@@ -357,7 +357,7 @@ async function writeResult(c: CaseRecord, rep: number, ctx: Context, attemptResu
   const meter = attemptResult.meter;
   let verdict;
   try {
-    verdict = grade(outcome, c.gold, c.also ?? []);
+    verdict = grade(outcome, c);
   } catch (error) {
     await writeError(c, rep, ctx, { ...attemptResult, cls: "grader_crash", message: errorText(error) }, retries);
     return;
@@ -384,6 +384,7 @@ async function writeResult(c: CaseRecord, rep: number, ctx: Context, attemptResu
     depth: verdict.depth,
     raw: outcome.kind === "found" && outcome.raw === true,
   };
+  if (verdict.judged !== undefined) row.judged = verdict.judged;
   if (models.length > 0) row.model = models[0];
   if (meter.usage) row.usage = meter.usage;
   if (meter.usage && meter.usage.cost.total > 0) row.cost_usd = meter.usage.cost.total;
