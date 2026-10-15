@@ -357,7 +357,7 @@ async function writeResult(c: CaseRecord, rep: number, ctx: Context, attemptResu
   const meter = attemptResult.meter;
   let verdict;
   try {
-    verdict = grade(outcome, c.gold);
+    verdict = grade(outcome, c.gold, c.also ?? []);
   } catch (error) {
     await writeError(c, rep, ctx, { ...attemptResult, cls: "grader_crash", message: errorText(error) }, retries);
     return;

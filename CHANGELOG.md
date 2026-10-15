@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **`evals/recall/` accepts more than one right answer for a real case:** a `real-spec.json` entry may list `also`, other messages of the same store that answer the question as well as the gold, and the grader passes either. The sets came from blind pooling: candidates were the gold's neighbours, the question's word-search matches and every message a recorded run answered, and assessors judged them from the chat text alone, without seeing which message any run picked. Coverage mode also reports where the gold ranks in raw-log word search. The real set grew from 18 to 60 cases, with questions written blind from the chat text. Real cases stay in gitignored files.
+
 ## 0.9.3 — 2026-10-14
 
 - **Compressor replies that open with their own message id are retried.** After 0.9.2 the head guard caught none of the live heads it knows (63.9% → 0%), but colon-less openings that name the task's own ids ("1197 Live …", "Message 1185 records …", "1191 ← store check") still reached 9.9% of new lines here and 29.1% in another store. `compact()` now also treats a leading number inside the task's own message range, with an optional "Message"/"Echo"/"Line" word and arrow or dash, as a head. A number outside that range ("7 rows found") is not. On this repository's live tree the check flags 195 of 2,576 stored lines.

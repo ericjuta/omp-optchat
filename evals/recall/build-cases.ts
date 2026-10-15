@@ -8,7 +8,8 @@
  *
  * Synthetic gold is the planted message index. Real gold is a message index in a read-only snapshot under
  * SNAPSHOT_ROOT; every real entry must hold a token that occurs in exactly one message of its store (chat_search-style
- * whole-word match), must not appear in its question, and its gold message must be free of secret-like text.
+ * whole-word match), must not appear in its question, and its gold message must be free of secret-like text. An
+ * optional `also` lists other messages of the same store that answer the question as well, and they also count as correct.
  */
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -46,6 +47,8 @@ export interface CaseRecord {
   readonly source: string;
   /** Build-time audit only; the runner never sends it to the judge. */
   readonly fact?: string;
+  /** Other message indexes that also count as correct answers; real cases only. */
+  readonly also?: readonly number[];
 }
 
 /** Loads a snapshot's message log in store order, verifying the addresses are the contiguous 0..n-1. */
@@ -137,6 +140,8 @@ interface RealSpec {
   readonly difficulty: "easy" | "hard";
   /** The leaf summary paraphrases the fact, so only a semantic match can reach it (see the coverage diagnostic). */
   readonly paraphrase?: boolean;
+  /** Other messages in the same store that answer the question as well as the gold, from a blind assessment of pooled candidates. */
+  readonly also?: readonly number[];
   readonly note: string;
 }
 
@@ -154,6 +159,13 @@ export async function realCases(specs: readonly RealSpec[]): Promise<CaseRecord[
     const holders = store.messages.filter((message) => WHOLE(spec.fact).test(message.text)).length;
     if (holders !== 1) throw new Error(`${spec.id}: fact "${spec.fact}" appears in ${holders} messages, need exactly 1`);
     if (spec.question.toLowerCase().includes(spec.fact.toLowerCase())) throw new Error(`${spec.id}: question contains the fact`);
+    const also = [...(spec.also ?? [])];
+    for (const id of also) {
+      if (!Number.isSafeInteger(id) || !store.messages[id]) throw new Error(`${spec.id}: also ${id} is not a message in ${spec.store}`);
+      if (id === spec.gold) throw new Error(`${spec.id}: also contains the gold ${id}`);
+    }
+    if (new Set(also).size !== also.length) throw new Error(`${spec.id}: also has duplicates`);
+    also.sort((a, b) => a - b);
     cases.push({
       id: spec.id,
       tags: ["real", spec.difficulty, ...(spec.paraphrase === true ? ["paraphrase"] : [])],
@@ -162,6 +174,7 @@ export async function realCases(specs: readonly RealSpec[]): Promise<CaseRecord[
       store: { kind: "snapshot", name: spec.store },
       source: spec.note,
       fact: spec.fact,
+      ...(also.length > 0 ? { also } : {}),
     });
   }
   return cases;
