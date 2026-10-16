@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.9.4 — 2026-10-15
 
+- **macOS support for `Store`:** on `darwin`, `Store.open` acquires an exclusive non-blocking `flock` lease on the held root directory descriptor and resolves open file and directory descriptor paths through `fcntl(F_GETPATH)` (`fdPath`). Like the Linux abstract Unix socket and `/proc/self/fd` implementation, it creates no lock file in the store directory, releases ownership on `close` or `SIGKILL`, and keeps stream and snapshot writes anchored to the leased vnode across renames.
 - **`evals/recall/` accepts more than one right answer for a real case:** a `real-spec.json` entry may list `also`, other messages of the same store that answer the question as well as the gold, and the grader passes either. It also lists `no` (messages judged not to answer) and a required answer `key`: an answer nobody judged passes iff the page recall returned contains every phrase of one key alternative. The builder checks that each key matches the gold and every `also` page but no `no` page, and result rows record `judged`. The sets came from blind pooling: candidates were the gold's neighbours, the question's word-search matches and every message a recorded run answered, and assessors judged them from the chat text alone, without seeing which message any run picked. Coverage mode also reports where the gold ranks in raw-log word search. The real set grew from 18 to 60 cases, with questions written blind from the chat text. Real cases stay in gitignored files.
 
 ## 0.9.3 — 2026-10-14

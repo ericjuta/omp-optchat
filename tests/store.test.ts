@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { DEFAULT_PAGE_BYTES, MAX_PAGE_BYTES, type ImageDescriptor, type ImageMimeType } from "../src/archive.ts";
-import { Store, nodeKey, type Kind, type Message, type TreeNode } from "../src/store.ts";
+import { Store, fdPath, nodeKey, type Kind, type Message, type TreeNode } from "../src/store.ts";
 
 const storeModule = fileURLToPath(new URL("../src/store.ts", import.meta.url));
 const livenessTimeoutMs = 5_000;
@@ -295,7 +295,7 @@ describe("Store real-filesystem persistence", () => {
       const fsync = fs.fsyncSync;
       const synced: string[] = [];
       const spy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
-        synced.push(fs.readlinkSync(`/proc/self/fd/${fd}`));
+        synced.push(fdPath(fd));
         fsync(fd);
       });
       try {
@@ -303,7 +303,7 @@ describe("Store real-filesystem persistence", () => {
         expect(targets.filter((target) => !synced.includes(target))).toEqual([]);
         await store.close();
         spy.mockImplementation((fd: number) => {
-          if (fs.readlinkSync(`/proc/self/fd/${fd}`) === targets[1]) {
+          if (fdPath(fd) === targets[1]) {
             throw Object.assign(new Error("injected replay fsync failure"), { code: "EIO" });
           }
           fsync(fd);
@@ -840,7 +840,7 @@ describe("Store view snapshot durability faults", () => {
           let temporarySize = 0;
           let fullSize = 0;
           const fsyncSpy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
-            const target = fs.readlinkSync(`/proc/self/fd/${fd}`);
+            const target = fdPath(fd);
             if ((fault === "file fsync" && isTemporary(target)) || (fault === "root fsync" && target === root)) {
               hits++;
               throw failure;
@@ -848,7 +848,7 @@ describe("Store view snapshot durability faults", () => {
             fsync(fd);
           });
           const writeSpy = spyOn(fs, "writeSync").mockImplementation(((fd: number, bytes: Buffer, ...args: unknown[]) => {
-            if (fault === "partial write" && isTemporary(fs.readlinkSync(`/proc/self/fd/${fd}`))) {
+            if (fault === "partial write" && isTemporary(fdPath(fd))) {
               hits++;
               fullSize = bytes.length;
               // Write actual bytes to the actual file, not a fabricated count.
@@ -928,7 +928,7 @@ describe("Store view snapshot durability faults", () => {
       let snapshotSynced = false;
       let hits = 0;
       const spy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
-        const target = fs.readlinkSync(`/proc/self/fd/${fd}`);
+        const target = fdPath(fd);
         if (target === join(root, "view.json")) {
           if (fault === "file") {
             hits++;
@@ -1773,7 +1773,7 @@ describe("Store image storage and message attachments", () => {
         const nativeRename = fs.renameSync;
         let hits = 0;
         const fsyncSpy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
-          const target = fs.readlinkSync(`/proc/self/fd/${fd}`);
+          const target = fdPath(fd);
           if ((fault === "temporary fsync" && isTemporary(target)) || (fault === "directory fsync after publish" && target === images)) {
             hits++;
             throw failure;
@@ -1781,7 +1781,7 @@ describe("Store image storage and message attachments", () => {
           nativeFsync(fd);
         });
         const writeSpy = spyOn(fs, "writeSync").mockImplementation(((fd: number, bytes: Buffer, ...args: unknown[]) => {
-          if (fault === "short write" && isTemporary(fs.readlinkSync(`/proc/self/fd/${fd}`))) {
+          if (fault === "short write" && isTemporary(fdPath(fd))) {
             hits++;
             return nativeWrite(fd, bytes.subarray(0, Math.max(1, Math.floor(bytes.length / 2))));
           }
@@ -2042,7 +2042,7 @@ describe("Store image storage and message attachments", () => {
     const counts = { root: 0, images: 0 };
     const nativeFsync = fs.fsyncSync;
     const fsyncSpy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
-      const target = fs.readlinkSync(`/proc/self/fd/${fd}`);
+      const target = fdPath(fd);
       if (target === root) counts.root++;
       else if (target === images) counts.images++;
       nativeFsync(fd);
@@ -2113,7 +2113,7 @@ describe("Store image storage and message attachments", () => {
       const link = hexName("link");
       const linkTemporary = `.image-${randomUUID()}.tmp`;
       const ignoredFiles = [
-        candidate.toUpperCase(),
+        hexName("uppercase").toUpperCase(),
         candidate.slice(1),
         `${candidate}\n`,
         `.image-${randomUUID().toUpperCase()}.tmp`,

@@ -247,7 +247,7 @@ OMP's public provider hooks carry no request identity: side requests share them,
 
 Keep the memory directory private and back it up. The extension never commits or publishes it. HTML exports contain the original log. No telemetry or external storage service is added. Stop the enabled session before restoring backups or copying a consistent set of log, tree, and view files.
 
-The Linux lock uses an OS-owned abstract Unix socket keyed by the directory's filesystem identity, avoiding PID-age guesses and stale-file unlink races. A second writer in the same network namespace fails; process death releases the lock. Filesystem operations stay anchored to held directory descriptors through `/proc/self/fd`, even if a path is renamed. Linux procfs and a local fsync-capable filesystem are required; containers in different network namespaces must not share a writable chat. Other operating systems are not supported by this release.
+On Linux, the single-writer lock uses an OS-owned abstract Unix socket keyed by the directory's filesystem identity; filesystem operations stay anchored to held directory descriptors through `/proc/self/fd`, even if a path is renamed. A second writer in the same network namespace fails; containers in different network namespaces must not share a writable chat. Linux procfs is required. On macOS, the single-writer lock uses an exclusive non-blocking `flock` on the held root directory descriptor; filesystem operations resolve held descriptor paths via `F_GETPATH`. Both locks avoid PID-age guesses and stale-file unlink races, and process death releases the lock. A local fsync-capable POSIX filesystem is required.
 
 ## Development
 

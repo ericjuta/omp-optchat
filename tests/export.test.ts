@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { writeExportFile } from "../src/export-file.ts";
+import { fdPath } from "../src/store.ts";
 
 // Captured before any spy replaces the namespace properties.
 const nativeFsync = fs.fsyncSync;
@@ -34,10 +35,6 @@ function errorCode(action: () => void): string | undefined {
 		return (error as NodeJS.ErrnoException).code ?? "unknown";
 	}
 	return undefined;
-}
-
-function fdPath(fd: number): string {
-	return fs.readlinkSync(`/proc/self/fd/${fd}`);
 }
 
 describe("writeExportFile", () => {

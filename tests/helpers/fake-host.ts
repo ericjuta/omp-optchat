@@ -3,7 +3,7 @@
  * No SDK session, registry, credentials or provider transport; the compressor model is never called
  * unless a test appends a message longer than the node budget.
  */
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
@@ -89,7 +89,7 @@ export async function openFakeHost(
   options: FakeHostOptions = {},
 ): Promise<FakeHost> {
   const owned = options.directory === undefined;
-  const directory = options.directory ?? (await mkdtemp(join(tmpdir(), "optchat-system1-")));
+  const directory = options.directory ?? (await realpath(await mkdtemp(join(tmpdir(), "optchat-system1-"))));
   const flags: Record<string, string | boolean> = {
     "optchat-dir": directory,
     "optchat-model": "fake/fake",

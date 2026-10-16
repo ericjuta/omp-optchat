@@ -4,7 +4,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readdir, readFile, rename, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, realpath, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -39,7 +39,7 @@ afterEach(async () => {
 
 /** A fresh workspace. The store sits at `<root>/chat`, so its archives are siblings named `chat.<stamp>`. */
 async function workspace(): Promise<{ root: string; directory: string }> {
-  const root = await mkdtemp(join(tmpdir(), "optchat-new-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "optchat-new-")));
   roots.push(root);
   return { root, directory: join(root, "chat") };
 }

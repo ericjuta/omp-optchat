@@ -1,3 +1,4 @@
+import { dlopen, FFIType, ptr, read } from "bun:ffi";
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -78,7 +79,9 @@ type Stream = {
   fd: number;
   writer?: { day: string; fd: number };
 };
-type Lease = { server: Server; failure?: Error };
+type Lease =
+  | { kind: "socket"; server: Server; failure?: Error }
+  | { kind: "flock"; active: boolean };
 /** Another live writer holds this directory's lease. Nothing was read or changed in the directory. */
 export class StoreLeaseConflictError extends Error {
   override name = "StoreLeaseConflictError";
@@ -255,12 +258,41 @@ function checkOwner(fd: number, path: string, directory: boolean): void {
   }
 }
 
-// Procfs exposes each descriptor as a magic link to its inode, not to the path
-// used to open it. Node has no *at() calls, so `at(fd, name)` stands in for
-// openat/mkdirat(fd, name): renaming or replacing any ancestor pathname cannot
-// redirect it, while O_NOFOLLOW still guards the final entry.
+const F_GETPATH = 50;
+const DARWIN_PATH_MAX = 1024;
+const LOCK_EX = 2;
+const LOCK_NB = 4;
+const DARWIN_EWOULDBLOCK = 35;
+const darwinPathBuffer = Buffer.allocUnsafe(DARWIN_PATH_MAX);
+const darwinLibc = process.platform === "darwin"
+  ? dlopen("libSystem.B.dylib", {
+    __fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+    flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+    __error: { args: [], returns: FFIType.ptr },
+  })
+  : undefined;
+
+function darwinFdPath(fd: number): string {
+  if (!darwinLibc || darwinLibc.symbols.__fcntl(fd, F_GETPATH, ptr(darwinPathBuffer)) === -1) {
+    throw new Error(`Failed to resolve path for descriptor ${fd}`);
+  }
+  const end = darwinPathBuffer.indexOf(0);
+  if (end <= 0) throw new Error(`Resolved empty path for descriptor ${fd}`);
+  return darwinPathBuffer.toString("utf8", 0, end);
+}
+
+/** Canonical filesystem path of an open file or directory descriptor. */
+export function fdPath(fd: number): string {
+  return process.platform === "darwin" ? darwinFdPath(fd) : readlinkSync(`/proc/self/fd/${fd}`);
+}
+
+// Linux procfs exposes each descriptor as a magic link to its inode; macOS
+// F_GETPATH resolves the held vnode's canonical path from its parent chain.
+// Node has no *at() calls, so `at(fd, name)` stands in for openat/mkdirat(fd, name):
+// renaming or replacing the root or stream pathnames cannot redirect it, while
+// O_NOFOLLOW still guards the final entry.
 function descriptorPath(fd: number): string {
-  return `/proc/self/fd/${fd}`;
+  return process.platform === "darwin" ? darwinFdPath(fd) : `/proc/self/fd/${fd}`;
 }
 
 function at(directoryFd: number, name: string): string {
@@ -353,10 +385,23 @@ function openFile(path: string, display: string, flags: number): number {
 }
 
 async function acquireLease(rootFd: number): Promise<Lease> {
+  if (process.platform === "darwin") {
+    // BSD flock on the open directory descriptor binds the vnode description directly:
+    // no lock file is created, same-process reopens fail, and close/process death releases it.
+    if (!darwinLibc || darwinLibc.symbols.flock(rootFd, LOCK_EX | LOCK_NB) === -1) {
+      const errnoPtr = darwinLibc?.symbols.__error();
+      const errno = errnoPtr ? read.i32(errnoPtr, 0) : 0;
+      if (errno === DARWIN_EWOULDBLOCK) {
+        throw new StoreLeaseConflictError("Store is already open by another writer");
+      }
+      throw new Error(`Failed to lock Store directory (errno ${errno})`);
+    }
+    return { kind: "flock", active: true };
+  }
   const identity = fstatSync(rootFd, { bigint: true });
   const key = createHash("sha256").update(`${identity.dev}:${identity.ino}`).digest("hex");
   const server = createServer((socket) => socket.destroy());
-  const lease: Lease = { server };
+  const lease: Lease = { kind: "socket", server };
   const ready = Promise.withResolvers<void>();
   let listening = false;
   server.on("error", (error: Error) => {
@@ -380,6 +425,10 @@ async function acquireLease(rootFd: number): Promise<Lease> {
 }
 
 function closeLease(lease: Lease): Promise<void> {
+  if (lease.kind === "flock") {
+    lease.active = false;
+    return Promise.resolve();
+  }
   if (!lease.server.listening) return Promise.resolve();
   const closed = Promise.withResolvers<void>();
   lease.server.close((error?: Error) => error ? closed.reject(error) : closed.resolve());
@@ -690,15 +739,16 @@ function collectGarbage(rootFd: number, images: Stream, messages: readonly Messa
 }
 
 /**
- * Private append-only storage on a local Linux filesystem supporting fsync.
- * The abstract Unix socket owns the lock until close/process death; there is no
- * PID, age timeout, stale pathname, or lock takeover. Published records are frozen.
- * The collections are Store-owned; callers read them, never mutate them.
- * After open, all I/O is relative to held directory descriptors (Linux procfs
- * links), so renaming or replacing the root or stream pathnames cannot redirect
- * replay, repairs, or writer rollover away from the leased inode. Daily files are
- * named by local write day; each message keeps its caller-supplied date.
- * `view.json` holds the latest committed ViewSnapshot, replaced atomically.
+ * Private append-only storage on a local Linux or macOS filesystem supporting fsync.
+ * An abstract Unix socket (Linux) or root-descriptor flock (macOS) owns the lock
+ * until close/process death; there is no PID, age timeout, stale pathname, or lock
+ * takeover. Published records are frozen. The collections are Store-owned; callers
+ * read them, never mutate them. After open, all I/O is relative to held directory
+ * descriptors (Linux procfs links or macOS F_GETPATH), so renaming or replacing the
+ * root or stream pathnames cannot redirect replay, repairs, or writer rollover away
+ * from the leased inode. Daily files are named by local write day; each message
+ * keeps its caller-supplied date. `view.json` holds the latest committed
+ * ViewSnapshot, replaced atomically.
  */
 export class Store {
   readonly messages: Message[] = [];
@@ -719,8 +769,11 @@ export class Store {
   ) {}
 
   static async open(directory: string, report?: Report): Promise<Store> {
-    if (process.platform !== "linux" || typeof process.getuid !== "function" || !existsSync("/proc/self/fd")) {
-      throw new Error("Store requires Linux procfs descriptor links, abstract Unix sockets and private POSIX filesystem permissions");
+    const supportedPlatform =
+      (process.platform === "linux" && existsSync("/proc/self/fd")) ||
+      process.platform === "darwin";
+    if (!supportedPlatform || typeof process.getuid !== "function") {
+      throw new Error("Store requires Linux procfs descriptor links or macOS descriptor path resolution, kernel writer locks and private POSIX filesystem permissions");
     }
     if (typeof directory !== "string" || directory.length === 0) {
       throw new Error("Store directory must be a nonempty path");
@@ -729,7 +782,7 @@ export class Store {
     const streams: Stream[] = [];
     let lease: Lease | undefined;
     try {
-      const canonical = readlinkSync(descriptorPath(rootFd));
+      const canonical = fdPath(rootFd);
       lease = await acquireLease(rootFd);
       const main = openStream(rootFd, canonical, "main");
       streams.push(main);
@@ -758,7 +811,10 @@ export class Store {
 
   private assertWritable(): void {
     if (this.closed) throw new Error("Store is closing or closed");
-    if (this.failed || this.lease.failure || !this.lease.server.listening) {
+    const leaseActive = this.lease.kind === "flock"
+      ? this.lease.active
+      : !this.lease.failure && this.lease.server.listening;
+    if (this.failed || !leaseActive) {
       throw new Error("Store write or lock failed; close and reopen before writing again");
     }
   }

@@ -7,7 +7,7 @@ import { deflateSync } from "node:zlib";
 import type { ImageDescriptor } from "../../src/archive.ts";
 import { importHistory } from "../../src/history.ts";
 import { Memory, type Summarize } from "../../src/memory.ts";
-import { Store, type Message } from "../../src/store.ts";
+import { Store, fdPath, type Message } from "../../src/store.ts";
 
 export const STAGES = [
   "image temp write",
@@ -156,7 +156,7 @@ export async function runChild(plan: Plan): Promise<void> {
       process.kill(process.pid, "SIGKILL");
       throw new Error("SIGKILL did not terminate the crash child");
     };
-    const pathOf = (fd: number): string => fs.readlinkSync(`/proc/self/fd/${fd}`);
+    const pathOf = fdPath;
 
     spyOn(fs, "writeSync").mockImplementation(((fd: number, buffer: Uint8Array, ...rest: unknown[]) => {
       const target = pathOf(fd);
