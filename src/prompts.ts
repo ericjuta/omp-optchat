@@ -98,9 +98,9 @@ Memory tools, when available on an ordinary turn:
   Use it when a summary dropped a name, path, number or error.
 - chat_recall(question), when the recall gate is on, asks a relevance
   judge to score view lines and messages whose words match the question,
-  then opens one half per level down to the message that best answers
-  it; it returns the path and that message's first page. Check its
-  answer like any summary.
+  then scores every message under the top lines and picks the one that
+  best answers it; it returns the path and that message's first page.
+  Check its answer like any summary.
 - date(id) gives the date and time of message id.
 - work(name, offset) pages through a captured subagent or background report,
   by its recorded id, agent id or name; follow next the same way.

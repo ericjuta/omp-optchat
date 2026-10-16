@@ -50,9 +50,9 @@ export interface GateConfig {
   prefetchK: number;
   /** Minimum P(relevant) for a prefetch line, in (0, 1]. */
   prefetchMin: number;
-  /** Minimum P(answer) for a recall descent's first line, in (0, 1]. */
+  /** Minimum P(answer) for a line or message that recall scans or answers from, in (0, 1]. */
   recallMin: number;
-  /** How many of the top lines at or above recallMin the recall tool descends from, from 1 to 8. */
+  /** How many of the top lines at or above recallMin the recall tool scans (always at least 4), from 1 to 8; above 1 it lists the messages that lost. */
   recallK: number;
   /** How many raw-log matches for the question are added as single-message recall candidates, from 0 to 32. */
   recallSeeds: number;
@@ -147,7 +147,8 @@ export function registerFlags(api: FlagRegistrar): void {
   api.registerFlag("optchat-recall-k", {
     type: "string",
     default: String(DEFAULTS.recallK),
-    description: "System One: view lines at or above recall-min that recall descends from, from 1 to 8 (default: 1)",
+    description:
+      "System One: widens recall's scan beyond the top 4 view lines at or above recall-min, and above 1 lists the losing candidates, from 1 to 8 (default: 1)",
   });
   api.registerFlag("optchat-recall-seeds", {
     type: "string",
@@ -160,7 +161,7 @@ const GATE_FLAGS = [
   { key: "rules", flag: "optchat-rules", name: "rules gate", what: "keep standing user rules from messages" },
   { key: "prefetch", flag: "optchat-prefetch", name: "prefetch gate", what: "zoom view lines relevant to each new user message" },
   { key: "valueScore", flag: "optchat-value-score", name: "value-score gate", what: "give the compressor a one-sentence importance hint per leaf" },
-  { key: "recall", flag: "optchat-recall", name: "recall gate", what: "answer questions from stored history by descending the view (chat_recall tool)" },
+  { key: "recall", flag: "optchat-recall", name: "recall gate", what: "answer questions from stored history by scanning the best view lines for one message (chat_recall tool)" },
 ] as const;
 
 /** One gate: its opt-out wins over its flag; a malformed value of either fails closed. */

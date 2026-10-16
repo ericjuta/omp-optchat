@@ -5,7 +5,6 @@ import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "@oh-my
 import { utf8Length } from "../src/system1/judge.ts";
 import { PREFETCH_QUESTIONS } from "../src/system1/prefetch.ts";
 import {
-  RECALL_DESCENT_IN_FLIGHT,
   RECALL_K_MAX,
   RECALL_PAGE_BYTES,
   RECALL_SEEDS_MAX,
@@ -18,7 +17,7 @@ import {
   type RecallOutcome,
 } from "../src/system1/recall.ts";
 import { DEFAULTS, readConfig } from "../src/config.ts";
-import { choice, fakeJudge, noul } from "./helpers/fake-judge.ts";
+import { choice, fakeJudge, noul, type FakeJudge } from "./helpers/fake-judge.ts";
 
 interface Span {
   readonly id: number;
@@ -30,7 +29,7 @@ interface TreeOptions {
   readonly view?: readonly Span[];
   /** Lines that are not built: the view omits them and lineAt reports them missing. */
   readonly missing?: readonly string[];
-  /** What `rank` returns, best first; recall takes the first `seeds` of it. */
+  /** What `rank` returns, best first; recall re-ranks the first SEARCH_MAX_LIMIT of it and takes the top `seeds`. */
   readonly ranked?: readonly number[];
 }
 
@@ -65,29 +64,51 @@ type Answers = Record<string, Answer>;
 interface Probed {
   readonly question?: string;
   readonly lines?: Readonly<Record<string, string>>;
-  readonly first?: string;
-  readonly second?: string;
 }
 
 /**
- * A judge that holds a line when its text contains `word`: P = high, or low otherwise. A choice picks the side
- * that holds the word, and gives each side its probability.
+ * A judge that holds a line when its text contains `word`: P = high, or low otherwise. The pick favours the messages
+ * that hold the word, each with its probability.
  */
 function answerFor(word: string, high = 0.9, low = 0.1): (request: JudgmentRequest<Questions>) => Answers {
   return (request) => {
     // Recall built this state itself, so its shape is the contract under test rather than untrusted input.
     const probed = request.state as Probed;
+    const holds = (key: string): boolean => probed.lines?.[key]?.includes(word) ?? false;
     const answers: Answers = {};
     for (const [key, question] of Object.entries(request.questions)) {
       if (question.type === "choice") {
-        const firstHolds = probed.first?.includes(word) ?? false;
-        const secondHolds = probed.second?.includes(word) ?? false;
-        answers[key] = choice(firstHolds ? "first" : "second", {
-          first: firstHolds ? high : low,
-          second: secondHolds ? high : low,
-        });
+        const keys = Object.keys(question.criteria);
+        answers[key] = choice(keys.find(holds) ?? keys[0]!, Object.fromEntries(keys.map((id) => [id, holds(id) ? high : low])));
       } else {
-        answers[key] = noul(probed.lines?.[key]?.includes(word) ? high : low);
+        answers[key] = noul(holds(key) ? high : low);
+      }
+    }
+    return answers;
+  };
+}
+
+interface Script {
+  /** What a line or message scores, by its `id+n` key. */
+  readonly scores: Readonly<Record<string, number>>;
+  /** What a key that `scores` does not name scores. Absent means 0. */
+  readonly otherwise?: number;
+  /** The pick's probability for each message key it is shown, 0 for a key not named. Absent: the pick request fails. */
+  readonly pick?: Readonly<Record<string, number>>;
+}
+
+/** A judge scripted by key, so a test states each candidate's score and the pick's answer outright. */
+function scripted(script: Script): (request: JudgmentRequest<Questions>) => Answers {
+  return (request) => {
+    const answers: Answers = {};
+    for (const [key, question] of Object.entries(request.questions)) {
+      if (question.type === "choice") {
+        if (script.pick === undefined) throw new Error("pick unavailable");
+        const probabilities = Object.fromEntries(Object.keys(question.criteria).map((id) => [id, script.pick![id] ?? 0]));
+        const best = Object.entries(probabilities).sort((a, b) => b[1] - a[1])[0]![0];
+        answers[key] = choice(best, probabilities);
+      } else {
+        answers[key] = noul(script.scores[key] ?? script.otherwise ?? 0);
       }
     }
     return answers;
@@ -107,25 +128,80 @@ function judged(outcome: RecallOutcome): Extract<RecallOutcome, { kind: "found" 
   return outcome;
 }
 
-const SEVEN = ["m0", "m1", "m2", "m3", "m4", "invoice 5", "m6", "m7"];
+/** The keys the judge was asked to score, over every request (the pick is not a score). */
+const scoredKeys = (judge: FakeJudge): string[] =>
+  judge.requests.flatMap((request) => Object.keys(request.questions).filter((key) => key !== "pick"));
 
-describe("recall: scoring and descent", () => {
-  test("picks the line that holds the answer, then descends to the message that holds it", async () => {
-    const memory = treeMemory(SEVEN);
-    const judge = fakeJudge(answerFor("invoice"));
+/** The requests that asked the pick. */
+const picks = (judge: FakeJudge): JudgmentRequest<Questions>[] => judge.requests.filter((request) => "pick" in request.questions);
+
+const SEVEN = ["m0", "m1", "m2", "m3", "m4", "invoice 5", "m6", "m7"];
+const EIGHT_M = ["m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"];
+
+describe("recall: scoring and the scan", () => {
+  test("a message under the top line is found by the scan: the path is the covering line, then the message", async () => {
+    const memory = treeMemory(SEVEN, { view: [{ id: 0, n: 4 }, { id: 4, n: 4 }] });
+    const judge = fakeJudge(scripted({ scores: { "4+4": 0.9, "0+4": 0.2, "5+1": 0.95 } }));
     const outcome = judged(await recall(memory, { judge, question: "where is the invoice?", min: 0.5 }));
-    expect(outcome.message.id).toBe(5);
-    expect(outcome.message.text).toBe("invoice 5");
-    expect(outcome.path.at(-1)).toMatchObject({ id: 5, n: 1 });
-    for (const step of outcome.path) expect(step.id <= 5 && 5 < step.id + step.n).toBe(true);
+    expect(outcome.message).toMatchObject({ id: 5, text: "invoice 5" });
+    expect(outcome.path).toMatchObject([{ id: 4, n: 4, p: 0.9 }, { id: 5, n: 1, p: 0.95 }]);
+    expect(outcome.others).toEqual([]);
+    // One request for the lines, one for the messages under the scanned line, no pick: one message leads.
+    expect(judge.requests).toHaveLength(2);
+    expect(picks(judge)).toHaveLength(0);
+    expect(memory.pages).toEqual([5]);
+  });
+
+  test("a message under the 2nd to 4th ranked line at min is reachable though another line scored higher", async () => {
+    for (const line of [2, 4, 6]) {
+      const memory = treeMemory(EIGHT_M, { view: [{ id: 0, n: 2 }, { id: 2, n: 2 }, { id: 4, n: 2 }, { id: 6, n: 2 }] });
+      const scores = { "0+2": 0.9, "2+2": 0.8, "4+2": 0.7, "6+2": 0.6, [`${line + 1}+1`]: 0.95 };
+      const outcome = judged(await recall(memory, { judge: fakeJudge(scripted({ scores })), question: "q", min: 0.5 }));
+      expect(outcome.message.id).toBe(line + 1);
+      expect(outcome.path[0]).toMatchObject({ id: line, n: 2 });
+    }
+  });
+
+  test("k widens the scan beyond four lines: the fifth line is scanned only when k allows it", async () => {
+    const texts = Array.from({ length: 10 }, (_, index) => `m${index}`);
+    const view = [0, 2, 4, 6, 8].map((id) => ({ id, n: 2 }));
+    const scores = { "0+2": 0.9, "2+2": 0.8, "4+2": 0.7, "6+2": 0.6, "8+2": 0.5, "9+1": 0.95 };
+
+    const narrow = fakeJudge(scripted({ scores }));
+    const four = judged(await recall(treeMemory(texts, { view }), { judge: narrow, question: "q", min: 0.5 }));
+    expect(scoredKeys(narrow)).not.toContain("9+1");
+    expect(four.message.id).not.toBe(9);
+
+    const wide = fakeJudge(scripted({ scores }));
+    const five = judged(await recall(treeMemory(texts, { view }), { judge: wide, question: "q", min: 0.5, k: 5 }));
+    expect(five.message.id).toBe(9);
+    expect(five.path[0]).toMatchObject({ id: 8, n: 2 });
+  });
+
+  test("lines below min are never scanned, whatever k is", async () => {
+    const memory = treeMemory(SEVEN, { view: [{ id: 0, n: 4 }, { id: 4, n: 4 }] });
+    const judge = fakeJudge(scripted({ scores: { "0+4": 0.9, "4+4": 0.3, "2+1": 0.95, "5+1": 1 } }));
+    const outcome = judged(await recall(memory, { judge, question: "q", min: 0.5, k: RECALL_K_MAX }));
+    expect(outcome.message.id).toBe(2);
+    expect(outcome.others.every((other) => other.id < 4)).toBe(true);
+    for (const id of [4, 5, 6, 7]) expect(scoredKeys(judge)).not.toContain(`${id}+1`);
   });
 
   test("returns none, with the best probability, when no line reaches min", async () => {
     const memory = treeMemory(SEVEN);
-    const outcome = await recall(memory, { judge: fakeJudge(answerFor("nothing-holds-this")), question: "where", min: 0.5 });
+    const judge = fakeJudge(answerFor("nothing-holds-this"));
+    const outcome = await recall(memory, { judge, question: "where", min: 0.5 });
     expect(outcome).toEqual({ kind: "none", min: 0.5, best: 0.1 });
+    // Nothing reached min, so nothing was scanned: one scoring request, no page.
+    expect(judge.requests).toHaveLength(1);
     expect(memory.pages).toHaveLength(0);
     expect(renderRecall(outcome)).toBe("[optchat recall] no view line reached recall-min 0.5 (best p=0.10); try chat_search or zoom");
+  });
+
+  test("an empty store is none, and the judge is never asked", async () => {
+    const judge = fakeJudge(answerFor("invoice"));
+    expect(await recall(treeMemory([]), { judge, question: "invoice", min: 0.5 })).toEqual({ kind: "none", min: 0.5 });
+    expect(judge.requests).toHaveLength(0);
   });
 
   test("a line whose probability equals min qualifies", async () => {
@@ -133,41 +209,198 @@ describe("recall: scoring and descent", () => {
     expect(judged(outcome).message.id).toBe(5);
   });
 
-  test("ties go to the newer line, and a choice tie goes to the second, newer, child", async () => {
-    const memory = treeMemory(["m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"], {
-      view: [{ id: 0, n: 2 }, { id: 2, n: 2 }, { id: 4, n: 2 }, { id: 6, n: 2 }],
-    });
-    // Every line and every child holds the word, so every probability ties.
-    const outcome = judged(await recall(memory, { judge: fakeJudge(answerFor("m")), question: "anything", min: 0.5 }));
-    expect(outcome.path[0]).toMatchObject({ id: 6, n: 2 });
+  test("ties go to the newer message, in the ranking and in the pick", async () => {
+    const memory = treeMemory(EIGHT_M, { view: [{ id: 0, n: 2 }, { id: 2, n: 2 }, { id: 4, n: 2 }, { id: 6, n: 2 }] });
+    // Every line and every message holds the word, so every probability ties, the pick's too.
+    const judge = fakeJudge(answerFor("m"));
+    const outcome = judged(await recall(memory, { judge, question: "anything", min: 0.5 }));
+    expect(picks(judge)).toHaveLength(1);
     expect(outcome.message.id).toBe(7);
+    expect(outcome.path[0]).toMatchObject({ id: 6, n: 2 });
   });
 
-  test("a missing child is skipped: the other child is followed without a judge call", async () => {
-    const texts = ["m0", "m1", "m2", "m3", "m4", "m5", "invoice 6", "m7"];
-    const memory = treeMemory(texts, { view: [{ id: 4, n: 4 }], missing: ["4+2"] });
+  test("a message whose node is not built is left out of the scan", async () => {
+    const texts = ["m0", "m1", "m2", "m3", "m4", "m5", "m6", "invoice 7"];
+    const memory = treeMemory(texts, { view: [{ id: 4, n: 4 }], missing: ["6+1"] });
     const judge = fakeJudge(answerFor("invoice"));
     const outcome = judged(await recall(memory, { judge, question: "invoice", min: 0.5 }));
-    expect(outcome.message.id).toBe(6);
-    expect(outcome.path[1]).toMatchObject({ id: 6, n: 2 });
-    expect(outcome.path[1]!.p).toBeUndefined();
-    // One scoring request, then one choice between 6+1 and 7+1.
-    expect(judge.requests).toHaveLength(2);
+    expect(outcome.message.id).toBe(7);
+    expect(scoredKeys(judge).sort()).toEqual(["4+1", "4+4", "5+1", "7+1"]);
   });
 
-  test("a line whose children are both missing fails honestly, without a page", async () => {
-    const memory = treeMemory(SEVEN, { view: [{ id: 4, n: 4 }], missing: ["4+2", "6+2"] });
-    const outcome = await recall(memory, { judge: fakeJudge(answerFor("invoice")), question: "invoice", min: 0.5 });
-    expect(outcome).toEqual({ kind: "failed", reason: "no built children under line 4+4" });
+  test("a line with no built message under it fails honestly, without a page", async () => {
+    const memory = treeMemory(SEVEN, { view: [{ id: 4, n: 4 }], missing: ["4+1", "5+1", "6+1", "7+1"] });
+    const judge = fakeJudge(answerFor("invoice"));
+    const outcome = await recall(memory, { judge, question: "invoice", min: 0.5 });
+    expect(outcome).toEqual({ kind: "failed", reason: "no built message under the top lines" });
+    expect(judge.requests).toHaveLength(1);
     expect(memory.pages).toHaveLength(0);
   });
 
-  test("judge calls are ceil(lines / PREFETCH_QUESTIONS) for scoring plus log2(n) choices", async () => {
-    const texts = Array.from({ length: 128 }, (_, index) => (index === 77 ? "invoice 77" : `m${index}`));
-    const judge = fakeJudge(answerFor("invoice"));
-    const outcome = judged(await recall(treeMemory(texts), { judge, question: "invoice", min: 0.5 }));
-    expect(outcome.message.id).toBe(77);
-    expect(judge.requests).toHaveLength(Math.ceil(127 / PREFETCH_QUESTIONS) + Math.log2(outcome.path[0]!.n));
+  test("a message under several scanned lines is scored once and takes the highest-ranked line as its cover", async () => {
+    const memory = treeMemory(SEVEN, { view: [{ id: 0, n: 8 }, { id: 4, n: 4 }] });
+    const judge = fakeJudge(scripted({ scores: { "0+8": 0.7, "4+4": 0.9, "5+1": 0.95 } }));
+    const outcome = judged(await recall(memory, { judge, question: "invoice", min: 0.5 }));
+    expect(outcome.message.id).toBe(5);
+    expect(outcome.path[0]).toMatchObject({ id: 4, n: 4 });
+    const keys = scoredKeys(judge);
+    expect(keys.filter((key) => key === "5+1")).toHaveLength(1);
+    // Eight messages, each once, though two scanned lines cover most of them.
+    expect(keys.filter((key) => key.endsWith("+1"))).toHaveLength(8);
+  });
+
+  test("a message the first round already scored is not scored again by the scan", async () => {
+    const memory = treeMemory(SEVEN, { view: [{ id: 0, n: 4 }, { id: 2, n: 1 }] });
+    const judge = fakeJudge(scripted({ scores: { "0+4": 0.9, "2+1": 0.8 } }));
+    const outcome = judged(await recall(memory, { judge, question: "q", min: 0.5 }));
+    expect(scoredKeys(judge).filter((key) => key === "2+1")).toHaveLength(1);
+    // The scanned line still covers it, so it answers under that line with its own round-one score.
+    expect(outcome.message.id).toBe(2);
+    expect(outcome.path).toMatchObject([{ id: 0, n: 4 }, { id: 2, n: 1, p: 0.8 }]);
+  });
+
+  test("judge calls are one scoring request per 64 lines, one per 64 scanned messages (up to 256), and one pick when two contend", async () => {
+    const texts = Array.from({ length: 256 }, (_, index) => `m${index}`);
+    const view = [0, 64, 128, 192].map((id) => ({ id, n: 64 }));
+    const scores = { "0+64": 0.9, "64+64": 0.8, "128+64": 0.7, "192+64": 0.6, "10+1": 0.95, "200+1": 0.9 };
+    const judge = fakeJudge(scripted({ scores, pick: { "200+1": 0.8, "10+1": 0.2 } }));
+    const outcome = judged(await recall(treeMemory(texts, { view }), { judge, question: "q", min: 0.5 }));
+    // All 256 messages sit under the four scanned lines, exactly the scan's cap.
+    expect(scoredKeys(judge).filter((key) => key.endsWith("+1"))).toHaveLength(256);
+    expect(judge.requests).toHaveLength(Math.ceil(4 / PREFETCH_QUESTIONS) + Math.ceil(256 / PREFETCH_QUESTIONS) + 1);
+    expect(picks(judge)).toHaveLength(1);
+    expect(outcome.message.id).toBe(200);
+  });
+
+  test("a line whose messages would pass the scan cap is skipped whole; with k above 1 it is listed as failed", async () => {
+    const texts = Array.from({ length: 300 }, (_, index) => `m${index}`);
+    const view = [0, 100, 200].map((id) => ({ id, n: 100 }));
+    const scores = { "0+100": 0.9, "100+100": 0.8, "200+100": 0.7, "150+1": 0.95, "250+1": 0.99 };
+
+    const single = fakeJudge(scripted({ scores }));
+    const one = judged(await recall(treeMemory(texts, { view }), { judge: single, question: "q", min: 0.5 }));
+    // The third line would bring the scan to 300 messages, so none of its messages is scored, even the best one.
+    expect(one.message.id).toBe(150);
+    expect(one.path[0]).toMatchObject({ id: 100, n: 100 });
+    for (let id = 200; id < 300; id++) expect(scoredKeys(single)).not.toContain(`${id}+1`);
+    expect(one.others).toEqual([]);
+
+    const several = fakeJudge(scripted({ scores }));
+    const two = judged(await recall(treeMemory(texts, { view }), { judge: several, question: "q", min: 0.5, k: 2 }));
+    expect(two.message.id).toBe(150);
+    expect(two.others.at(-1)).toMatchObject({ kind: "failed", id: 200, n: 100 });
+    expect(renderRecall(two)).toContain("other 200+100 failed");
+  });
+});
+
+describe("recall: the pick", () => {
+  // Messages 3 and 1 lead within 0.1 of each other; message 2 is far behind. Line 0+8 covers all of them.
+  const view = [{ id: 0, n: 8 }];
+  const scores = { "0+8": 0.9, "3+1": 0.92, "1+1": 0.85, "2+1": 0.5 };
+
+  test("decides among the messages within 0.1 of the best, shown side by side in message order", async () => {
+    const judge = fakeJudge(scripted({ scores, pick: { "1+1": 0.7, "3+1": 0.3 } }));
+    const outcome = judged(await recall(treeMemory(SEVEN, { view }), { judge, question: "q", min: 0.5 }));
+    // Message 1 scored lower in the scan and wins the pick.
+    expect(outcome.message.id).toBe(1);
+    expect(outcome.path).toMatchObject([{ id: 0, n: 8 }, { id: 1, n: 1, p: 0.85 }]);
+    expect(picks(judge)).toHaveLength(1);
+    // Message 3 ranked first, yet it is listed after message 1; 2+1 is further than 0.1 from the best and is not offered.
+    expect(Object.keys((picks(judge)[0]!.state as Probed).lines!)).toEqual(["1+1", "3+1"]);
+  });
+
+  test("a pick that fails or answers nothing keeps the score order", async () => {
+    for (const pick of [undefined, {}]) {
+      const judge = fakeJudge(scripted({ scores, pick }));
+      const outcome = judged(await recall(treeMemory(SEVEN, { view }), { judge, question: "q", min: 0.5 }));
+      expect(picks(judge)).toHaveLength(1);
+      expect(outcome.message.id).toBe(3);
+      expect(outcome.path.at(-1)).toMatchObject({ id: 3, p: 0.92 });
+    }
+  });
+
+  test("at most 8 messages are offered, and their texts share 20,000 bytes", async () => {
+    const texts = Array.from({ length: 10 }, (_, index) => `m${index} ${"a".repeat(4_500)}`);
+    const judge = fakeJudge(scripted({ scores: {}, otherwise: 0.9, pick: {} }));
+    judged(await recall(treeMemory(texts, { view: [{ id: 0, n: 10 }] }), { judge, question: "q", min: 0.5 }));
+    expect(picks(judge)).toHaveLength(1);
+    const lines = (picks(judge)[0]!.state as Probed).lines!;
+    expect(Object.keys(lines)).toHaveLength(8);
+    expect(Object.values(lines).reduce((sum, text) => sum + utf8Length(text), 0)).toBeLessThanOrEqual(20_000);
+    // Each message keeps a real share of its text, so the pick has something to read.
+    for (const text of Object.values(lines)) expect(text.startsWith("m")).toBe(true);
+  });
+});
+
+describe("recall: k and the other candidates", () => {
+  test("k=1 is the default: the same outcome and judge requests as leaving k out, and no others", async () => {
+    const omitted = fakeJudge(answerFor("invoice"));
+    const explicit = fakeJudge(answerFor("invoice"));
+    const left = await recall(treeMemory(SEVEN), { judge: omitted, question: "invoice", min: 0.5 });
+    const one = await recall(treeMemory(SEVEN), { judge: explicit, question: "invoice", min: 0.5, k: 1 });
+    expect(one).toEqual(left);
+    expect(explicit.requests).toEqual(omitted.requests);
+    expect(judged(one).others).toEqual([]);
+  });
+
+  test("with k above 1 the losing messages are listed as others, best first; with k=1 none are", async () => {
+    const scores = { "0+4": 0.9, "1+1": 0.95, "2+1": 0.6, "3+1": 0.4 };
+    const outcomeFor = async (k: number) =>
+      judged(await recall(treeMemory(SEVEN, { view: [{ id: 0, n: 4 }] }), { judge: fakeJudge(scripted({ scores })), question: "q", min: 0.5, k }));
+    const one = await outcomeFor(1);
+    expect(one.message.id).toBe(1);
+    expect(one.others).toEqual([]);
+    expect((await outcomeFor(2)).others).toEqual([{ kind: "answer", id: 2, p: 0.6 }]);
+    const three = await outcomeFor(3);
+    expect(three.others).toEqual([{ kind: "answer", id: 2, p: 0.6 }, { kind: "answer", id: 3, p: 0.4 }]);
+    const text = renderRecall(three);
+    expect(text).toContain("other message 2");
+    expect(text).toContain("other message 3");
+  });
+
+  test("after a pick, the message it beat is listed as an other with its own score", async () => {
+    const scores = { "0+8": 0.9, "3+1": 0.92, "1+1": 0.85, "2+1": 0.5 };
+    const judge = fakeJudge(scripted({ scores, pick: { "1+1": 0.7, "3+1": 0.3 } }));
+    const outcome = judged(await recall(treeMemory(SEVEN, { view: [{ id: 0, n: 8 }] }), { judge, question: "q", min: 0.5, k: 2 }));
+    expect(outcome.message.id).toBe(1);
+    expect(outcome.others).toEqual([{ kind: "answer", id: 3, p: 0.92 }]);
+  });
+
+  test("with k above 1, a line that holds no built message is listed as failed; with k=1 it is not", async () => {
+    const view = [{ id: 0, n: 4 }, { id: 4, n: 4 }];
+    const missing = ["4+1", "5+1", "6+1", "7+1"];
+    const scores = { "0+4": 0.9, "4+4": 0.8, "1+1": 0.95, "2+1": 0.6, "3+1": 0.4 };
+    const two = judged(
+      await recall(treeMemory(SEVEN, { view, missing }), { judge: fakeJudge(scripted({ scores })), question: "q", min: 0.5, k: 2 }),
+    );
+    expect(two.message.id).toBe(1);
+    expect(two.others).toEqual([{ kind: "answer", id: 2, p: 0.6 }, { kind: "failed", id: 4, n: 4, reason: expect.any(String) }]);
+    expect(renderRecall(two)).toContain("other 4+4 failed");
+
+    const one = judged(
+      await recall(treeMemory(SEVEN, { view, missing }), { judge: fakeJudge(scripted({ scores })), question: "q", min: 0.5 }),
+    );
+    expect(one.message.id).toBe(1);
+    expect(one.others).toEqual([]);
+  });
+
+  test("single messages below min are neither answered nor listed", async () => {
+    const memory = treeMemory(["m0", "m1", "m2"], { view: [{ id: 0, n: 1 }, { id: 1, n: 1 }, { id: 2, n: 1 }] });
+    const judge = fakeJudge(scripted({ scores: { "0+1": 0.9, "1+1": 0.3, "2+1": 0.6 } }));
+    const outcome = judged(await recall(memory, { judge, question: "q", min: 0.5, k: 3 }));
+    expect(outcome.message.id).toBe(0);
+    expect(outcome.others).toEqual([{ kind: "answer", id: 2, p: 0.6 }]);
+  });
+
+  test("k outside 1 to RECALL_K_MAX, or not an integer, fails before any judge call", async () => {
+    for (const k of [0, RECALL_K_MAX + 1, 1.5, Number.NaN]) {
+      const judge = fakeJudge(answerFor("invoice"));
+      expect(await recall(treeMemory(SEVEN), { judge, question: "invoice", min: 0.5, k })).toEqual({
+        kind: "failed",
+        reason: `k must be an integer from 1 to ${RECALL_K_MAX}`,
+      });
+      expect(judge.requests).toHaveLength(0);
+    }
   });
 });
 
@@ -181,14 +414,30 @@ describe("recall: failures and bounds", () => {
     expect(memory.pages).toHaveLength(0);
   });
 
-  test("a judge failure during descent is failed, with no page read", async () => {
-    const memory = treeMemory(SEVEN);
-    const scoring = answerFor("invoice");
+  test("a judge failure in the scan still answers from the first round when a message already reached min", async () => {
+    // The view line is scanned, the scan request fails, and the raw-log match that reached min answers.
+    const memory = treeMemory(SEVEN, { view: [{ id: 0, n: 4 }], ranked: [5] });
+    const first = scripted({ scores: { "0+4": 0.9, "5+1": 0.95 } });
+    let calls = 0;
     const judge = fakeJudge((request) => {
-      if ("side" in request.questions) throw new Error("step failed");
-      return scoring(request);
+      if (++calls === 1) return first(request);
+      throw new Error("scan failed");
     });
-    expect(await recall(memory, { judge, question: "invoice", min: 0.5 })).toEqual({ kind: "failed", reason: "step failed" });
+    const outcome = judged(await recall(memory, { judge, question: "invoice", min: 0.5, seeds: 1 }));
+    expect(judge.requests).toHaveLength(2);
+    expect(outcome.message.id).toBe(5);
+    expect(outcome.raw).toBe(true);
+  });
+
+  test("when the scan fails and the first round left no answer, the recall fails with the scan's reason and reads no page", async () => {
+    const memory = treeMemory(SEVEN, { view: [{ id: 0, n: 4 }] });
+    const first = scripted({ scores: { "0+4": 0.9 } });
+    let calls = 0;
+    const judge = fakeJudge((request) => {
+      if (++calls === 1) return first(request);
+      throw new Error("scan failed");
+    });
+    expect(await recall(memory, { judge, question: "invoice", min: 0.5 })).toEqual({ kind: "failed", reason: "scan failed" });
     expect(memory.pages).toHaveLength(0);
   });
 
@@ -197,6 +446,28 @@ describe("recall: failures and bounds", () => {
     const outcome = await recall(memory, { judge: fakeJudge(hung), question: "invoice", min: 0.5, timeoutMs: 50 });
     expect(outcome).toEqual({ kind: "failed", reason: "the recall bound passed" });
     expect(memory.pages).toHaveLength(0);
+  });
+
+  test("the recall bound cuts a hung scan, with no page read", async () => {
+    const memory = treeMemory(SEVEN, { view: [{ id: 0, n: 4 }] });
+    const first = scripted({ scores: { "0+4": 0.9 } });
+    let calls = 0;
+    const judge = fakeJudge((request, signal) => (++calls === 1 ? first(request) : hung(request, signal)));
+    expect(await recall(memory, { judge, question: "invoice", min: 0.5, timeoutMs: 50 })).toEqual({
+      kind: "failed",
+      reason: "the recall bound passed",
+    });
+    expect(judge.requests).toHaveLength(2);
+    expect(memory.pages).toHaveLength(0);
+  });
+
+  test("the recall bound cuts a hung pick", async () => {
+    const scores = { "0+8": 0.9, "3+1": 0.92, "1+1": 0.85 };
+    const scoring = scripted({ scores });
+    const judge = fakeJudge((request, signal) => ("pick" in request.questions ? hung(request, signal) : scoring(request)));
+    const outcome = await recall(treeMemory(SEVEN, { view: [{ id: 0, n: 8 }] }), { judge, question: "q", min: 0.5, timeoutMs: 50 });
+    expect(picks(judge)).toHaveLength(1);
+    expect(outcome).toEqual({ kind: "failed", reason: "the recall bound passed" });
   });
 
   test("an abort before the call sends nothing to the judge", async () => {
@@ -324,156 +595,6 @@ describe("renderRecall", () => {
   });
 });
 
-/**
- * Scores lines by key. A choice favours its first side when that text starts with "a" (0.6 against 0.4), and the
- * second side otherwise (0.95). `refusal` makes the descents fail: on "a" sides only, or on every side.
- */
-function halvesJudge(
-  scores: Readonly<Record<string, number>>,
-  refusal: "none" | "a-side" | "every-side" = "none",
-): (request: JudgmentRequest<Questions>) => Answers {
-  return (request) => {
-    const probed = request.state as Probed;
-    const answers: Answers = {};
-    for (const [key, question] of Object.entries(request.questions)) {
-      if (question.type === "noul") {
-        answers[key] = noul(scores[key] ?? 0);
-        continue;
-      }
-      const onA = probed.first?.startsWith("a") ?? false;
-      if (refusal === "every-side" || (refusal === "a-side" && onA)) throw new Error("step failed");
-      answers[key] = onA ? choice("first", { first: 0.6, second: 0.4 }) : choice("second", { first: 0.05, second: 0.95 });
-    }
-    return answers;
-  };
-}
-
-/** Eight messages in two halves: "a" messages 0 to 3, "b" messages 4 to 7. The view holds one line per half. */
-const AB = ["a0", "a1", "a2", "a3", "b4", "b5", "b6", "b7"];
-const HALVES = [
-  { id: 0, n: 4 },
-  { id: 4, n: 4 },
-];
-
-describe("recall: top-k descents", () => {
-  test("k=1 is the single argmax descent: the same outcome and judge requests as leaving k out", async () => {
-    const omitted = fakeJudge(answerFor("invoice"));
-    const explicit = fakeJudge(answerFor("invoice"));
-    const left = await recall(treeMemory(SEVEN), { judge: omitted, question: "invoice", min: 0.5 });
-    const one = await recall(treeMemory(SEVEN), { judge: explicit, question: "invoice", min: 0.5, k: 1 });
-    expect(one).toEqual(left);
-    expect(explicit.requests).toEqual(omitted.requests);
-    expect(judged(one).others).toEqual([]);
-  });
-
-  test("with k above 1, a lower-scored line wins when its descent is more probable", async () => {
-    const scores = { "0+4": 0.9, "4+4": 0.8 };
-    const single = judged(await recall(treeMemory(AB, { view: HALVES }), { judge: fakeJudge(halvesJudge(scores)), question: "q", min: 0.5 }));
-    expect(single.message.id).toBe(0);
-
-    const top = judged(
-      await recall(treeMemory(AB, { view: HALVES }), { judge: fakeJudge(halvesJudge(scores)), question: "q", min: 0.5, k: 3 }),
-    );
-    // 0.8 x 0.95 x 0.95 = 0.722 beats 0.9 x 0.6 x 0.6 = 0.324.
-    expect(top.message.id).toBe(7);
-    expect(top.path.map((step) => `${step.id}+${step.n}`)).toEqual(["4+4", "6+2", "7+1"]);
-    expect(top.others).toHaveLength(1);
-    const other = top.others[0];
-    expect(other?.kind === "answer" && other.id === 0 && Math.abs(other.p - 0.324) < 1e-9).toBe(true);
-    expect(renderRecall(top)).toContain("chosen message 7 (path p=0.722)");
-    expect(renderRecall(top)).toContain("other message 0 (path p=0.324)");
-  });
-
-  test("a message reached by several descents counts once, with its likeliest chain", async () => {
-    // Every line of the default view holds "invoice 5" or covers it, so the three top starts all descend to message 5.
-    const judge = fakeJudge(answerFor("invoice"));
-    const outcome = judged(await recall(treeMemory(SEVEN), { judge, question: "invoice", min: 0.5, k: 3 }));
-    expect(outcome.message.id).toBe(5);
-    expect(outcome.path[0]).toMatchObject({ id: 4, n: 2 });
-    expect(outcome.others).toEqual([]);
-  });
-
-  test("lines below min are never descended from or listed", async () => {
-    const memory = treeMemory(["m0", "m1", "m2"], { view: [{ id: 0, n: 1 }, { id: 1, n: 1 }, { id: 2, n: 1 }] });
-    const judge = fakeJudge(halvesJudge({ "0+1": 0.9, "1+1": 0.3, "2+1": 0.6 }));
-    const outcome = judged(await recall(memory, { judge, question: "q", min: 0.5, k: 3 }));
-    expect(outcome.message.id).toBe(0);
-    expect(outcome.others).toEqual([{ kind: "answer", id: 2, p: 0.6 }]);
-  });
-
-  test("descents run concurrently, never more than RECALL_DESCENT_IN_FLIGHT at once", async () => {
-    const texts = Array.from({ length: 16 }, (_, index) => `m${index}`);
-    const view = Array.from({ length: 8 }, (_, index) => ({ id: index * 2, n: 2 }));
-    // Every choice parks until the test releases it, so the cap is observed exactly, not raced.
-    const full = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<void>();
-    let inFlight = 0;
-    let peak = 0;
-    const judge = fakeJudge(async (request) => {
-      const answers: Answers = {};
-      for (const [key, question] of Object.entries(request.questions)) {
-        if (question.type === "noul") {
-          answers[key] = noul(0.9);
-          continue;
-        }
-        inFlight++;
-        peak = Math.max(peak, inFlight);
-        if (inFlight === RECALL_DESCENT_IN_FLIGHT) full.resolve();
-        await release.promise;
-        inFlight--;
-        answers[key] = choice("first", { first: 0.9, second: 0.1 });
-      }
-      return answers;
-    });
-    const running = recall(treeMemory(texts, { view }), { judge, question: "q", min: 0.5, k: RECALL_K_MAX });
-    await full.promise;
-    expect(peak).toBe(RECALL_DESCENT_IN_FLIGHT);
-    release.resolve();
-    const outcome = judged(await running);
-    expect(peak).toBe(RECALL_DESCENT_IN_FLIGHT);
-    // Equal chains tie on probability; the higher-ranked (newer) start wins, and every other start is listed.
-    expect(outcome.message.id).toBe(14);
-    expect(outcome.others).toHaveLength(7);
-  });
-
-  test("a failed descent is listed among the others, and the best of the rest answers", async () => {
-    const judge = fakeJudge(halvesJudge({ "0+4": 0.9, "4+4": 0.8 }, "a-side"));
-    const outcome = judged(await recall(treeMemory(AB, { view: HALVES }), { judge, question: "q", min: 0.5, k: 3 }));
-    expect(outcome.message.id).toBe(7);
-    expect(outcome.others).toEqual([{ kind: "failed", id: 0, n: 4, reason: "step failed" }]);
-    expect(renderRecall(outcome)).toContain("other 0+4 failed: step failed");
-  });
-
-  test("when every descent fails, the recall fails with the first descent's reason and reads no page", async () => {
-    const memory = treeMemory(AB, { view: HALVES });
-    const judge = fakeJudge(halvesJudge({ "0+4": 0.9, "4+4": 0.8 }, "every-side"));
-    expect(await recall(memory, { judge, question: "q", min: 0.5, k: 3 })).toEqual({ kind: "failed", reason: "step failed" });
-    expect(memory.pages).toHaveLength(0);
-  });
-
-  test("the recall bound also cuts every descent, with no page read", async () => {
-    const scoring = answerFor("invoice");
-    const judge = fakeJudge((request, signal) => ("side" in request.questions ? hung(request, signal) : scoring(request)));
-    const memory = treeMemory(SEVEN);
-    expect(await recall(memory, { judge, question: "invoice", min: 0.5, k: 3, timeoutMs: 50 })).toEqual({
-      kind: "failed",
-      reason: "the recall bound passed",
-    });
-    expect(memory.pages).toHaveLength(0);
-  });
-
-  test("k outside 1 to RECALL_K_MAX, or not an integer, fails before any judge call", async () => {
-    for (const k of [0, RECALL_K_MAX + 1, 1.5, Number.NaN]) {
-      const judge = fakeJudge(answerFor("invoice"));
-      expect(await recall(treeMemory(SEVEN), { judge, question: "invoice", min: 0.5, k })).toEqual({
-        kind: "failed",
-        reason: `k must be an integer from 1 to ${RECALL_K_MAX}`,
-      });
-      expect(judge.requests).toHaveLength(0);
-    }
-  });
-});
-
 describe("recall: raw-log seeds", () => {
   test("seeds 0 is the same recall as leaving seeds out: judge requests, outcome, rendering, and no rank call", async () => {
     const memory = treeMemory(SEVEN, { ranked: [5] });
@@ -528,10 +649,11 @@ describe("recall: raw-log seeds", () => {
     expect(outcome.message.id).toBe(5);
   });
 
-  test("seeds takes the first `seeds` ids the raw log ranks; a bad count fails before any judge call", async () => {
+  test("seeds takes the top `seeds` of the raw-log ranking, ties keeping its order; a bad count fails before any judge call", async () => {
     const texts = Array.from({ length: 16 }, (_, index) => `m${index}`);
     const memory = treeMemory(texts, { view: [{ id: 0, n: 4 }], ranked: [10, 11, 12, 13, 14] });
     const judge = fakeJudge(answerFor("zzz"));
+    // The question has no word of three or more characters, so no message outranks another and the search order stands.
     await recall(memory, { judge, question: "q", min: 0.5, seeds: 2 });
     expect(Object.keys((judge.requests[0]!.state as Probed).lines!).sort()).toEqual(["0+4", "10+1", "11+1"]);
     for (const seeds of [-1, RECALL_SEEDS_MAX + 1, 1.5, Number.NaN]) {
@@ -544,14 +666,26 @@ describe("recall: raw-log seeds", () => {
     }
   });
 
-  test("a seed competes in the descent ranking with view lines: with k=2 both descend and the seed answers", async () => {
+  test("the seeds are re-ranked for length: a short message with the question's rare word beats a long one with common words", async () => {
+    // The word search would list the long dump first: it holds three of the question's words, the short answer one.
+    const dump = `vault staging password ${"filler text ".repeat(700)}`;
+    const texts = [dump, "zanzibar code is 4417", "vault staging", "vault staging", "vault password", "staging password"];
+    const memory = treeMemory(texts, { view: [], ranked: [0, 1, 2, 3, 4, 5] });
+    const judge = fakeJudge(scripted({ scores: { "1+1": 0.9 } }));
+    const outcome = judged(await recall(memory, { judge, question: "zanzibar vault staging password", min: 0.5, seeds: 1 }));
+    expect(Object.keys((judge.requests[0]!.state as Probed).lines!)).toEqual(["1+1"]);
+    expect(outcome.message).toMatchObject({ id: 1, text: "zanzibar code is 4417" });
+    expect(outcome.raw).toBe(true);
+  });
+
+  test("a seed competes with the messages under a scanned line: with k=2 the seed answers and the best scanned message is listed", async () => {
     const memory = treeMemory(SEVEN, { view: [{ id: 0, n: 4 }], ranked: [5] });
     const judge = fakeJudge(answerFor("invoice"));
     const outcome = judged(await recall(memory, { judge, question: "invoice", min: 0.05, k: 2, seeds: 1 }));
     expect(outcome.message.id).toBe(5);
     expect(outcome.raw).toBe(true);
-    expect(outcome.others).toHaveLength(1);
-    expect(outcome.others[0]?.kind).toBe("answer");
+    // The line 0+4 reached min, so its messages were scored too; the newest of the equal ones is listed.
+    expect(outcome.others).toEqual([{ kind: "answer", id: 3, p: 0.1 }]);
   });
 });
 

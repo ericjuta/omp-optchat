@@ -38,7 +38,7 @@ interface Options {
   reps: number;
   concurrency: number;
   maxJudgeCalls: number;
-  /** View lines each recall descends from, 1 to RECALL_K_MAX. */
+  /** How many view lines each recall scans, at least 4 whatever k is, up to RECALL_K_MAX; above 1 the losing candidates are listed. */
   k: number;
   /** Raw-log matches recall adds as single-message candidates, 0 to RECALL_SEEDS_MAX. */
   seeds: number;
@@ -105,7 +105,7 @@ function parse(argv: readonly string[]): Options {
     else if (flag === "--induce-error") opts.induce = value;
     else throw new Error(`unknown or invalid argument ${flag}`);
   }
-  // A topk-k<N> variant names its k; --k may repeat it but never disagree. Other variants default to the single descent.
+  // A topk-k<N> variant names its k; --k may repeat it but never disagree. Other variants default to k = 1.
   const variantK = /^topk-k([1-8])$/.exec(opts.variant);
   if (!variantK && !/^(baseline|v[1-9][0-9]*)$/.test(opts.variant)) {
     throw new Error('--variant must be "baseline", v<N> or topk-k<1..8>');
@@ -404,7 +404,7 @@ async function coverageRow(c: CaseRecord, ctx: Context): Promise<void> {
   try {
     const covering = handle.memory.viewLines(true).find((line) => line.id <= c.gold && c.gold < line.id + line.n);
     const fact = await factOf(c, ctx.trees);
-    // Descent ends at the gold's leaf: its built summary (or verbatim text, when it fits a node) is what the judge sees last.
+    // The scan scores the gold's built message: its built summary (or verbatim text, when it fits a node) is what the judge sees.
     const leaf = handle.memory.lineAt(c.gold, 1);
     const needle = fact?.toLowerCase();
     // Raw-log seeding reaches the gold only if the question's words rank it; a near miss lands on a neighbour.

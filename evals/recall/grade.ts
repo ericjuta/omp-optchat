@@ -21,7 +21,7 @@ export interface Verdict {
   readonly explanation: string;
   /** The message recall answered, when it answered one; it can be the gold. */
   readonly found?: number;
-  /** Descent path length (levels walked, including the view line). */
+  /** Path length: 1 for a message answered directly, 2 when a scanned view line covers it. */
   readonly depth?: number;
   /** Whether the answered message was judged (gold, `also` or `no`) rather than graded by the answer key. Found outcomes only. */
   readonly judged?: boolean;

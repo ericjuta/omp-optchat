@@ -1,5 +1,5 @@
 /**
- * Golden pin of the main model's bytes with every System One gate opted out (the 0.9.0 memory-only path).
+ * Golden pin of the main model's bytes with every System One gate opted out (the 0.10.0 memory-only path).
  *
  * `tests/fixtures/system1-off.golden.json` is the spec: the system prompt OptChat hands the host, the encoded
  * Anthropic request (system, tool definitions, messages) after OptChat's payload hook, the context hook's
@@ -112,7 +112,7 @@ describe("every System One gate opted out", () => {
     else process.env.PI_OPENAI_STATEFUL = statefulBefore;
   });
 
-  test("the main model receives the pinned 0.9.0 bytes; no judge is resolved and no tool_call hook is registered", async () => {
+  test("the main model receives the pinned 0.10.0 bytes; no judge is resolved and no tool_call hook is registered", async () => {
     let judgeResolutions = 0;
     const judge = fakeJudge(() => {
       throw new Error("no judgment is expected with every gate off");

@@ -629,7 +629,7 @@ class OptChat {
 		}, UNGUARDED);
 	}
 
-	/** The recall gate's tool: a judge-guided descent from a view line to one stored message. Main sessions only. */
+	/** The recall gate's tool: a judge-guided scan of the best view lines that returns one stored message. Main sessions only. */
 	private registerRecall(): void {
 		if (this.pi.getAllTools().some((tool) => tool.name === "chat_recall")) {
 			throw new Error('tool name "chat_recall" is already registered');
