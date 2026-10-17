@@ -14,7 +14,10 @@ export type Summarize = (
   signal: AbortSignal,
 ) => Promise<string>;
 
-/** The compressor refused every model eligible for one compaction. The message carries no provider text. */
+/**
+ * The compressor refused every model eligible for one compaction, or every try
+ * opened with the reserved stand-in marker. The message carries no provider text.
+ */
 export class CompressorRefusedError extends Error {
   constructor() {
     super("compressor refused the compaction");
@@ -119,6 +122,8 @@ const MIN_PAGE_BYTES = 4;
 /** Marks and joins a source-derived stand-in: an excerpt of the source, never a summary. */
 const EXTRACTIVE_MARK = "[unsummarized: compressor refused] ";
 const EXTRACTIVE_JOIN = " | ";
+/** The marker as a reply may echo it: reserved for code-made stand-ins, never accepted from the compressor. */
+const MARK_TEXT = EXTRACTIVE_MARK.trimEnd();
 
 /*
  * One forbidden head at the start of a compressor reply: the id+n| heads,
@@ -150,6 +155,8 @@ const HEAD = new RegExp(
 );
 const HEAD_FEEDBACK =
   "Your line began with a head or preamble. Write only the summary line for the same <input>, with no id+n| head, label, tag or commentary.";
+const MARK_FEEDBACK =
+  `Your line began with "${MARK_TEXT}", a marker only the code writes. Write the summary line itself for the same <input>, without that marker.`;
 
 /*
  * A colon-less opening that names the task's own message ids ("1197 Live …",
@@ -1070,6 +1077,9 @@ export class Memory {
    * whole reply. Replies beyond the safety ceiling are never stored or
    * replayed in full. If no whole candidate fits that ceiling, fail rather than
    * truncate content. Only forbidden heads are ever cut; summary text is never rewritten.
+   * A reply opening with the reserved stand-in marker (after its heads) is never
+   * a candidate: it is retried like a head, and when no other candidate is left
+   * the compaction is refused, so the caller stores a marked source excerpt.
    */
   private async compact(
     context: string,
@@ -1080,6 +1090,7 @@ export class Memory {
     let feedback: CompactionRequest["feedback"] = [];
     let headed: { text: string; head: number } | undefined;
     let shortest: { text: string; size: number } | undefined;
+    let marked = false;
     for (let attempt = 0; attempt < this.tries; attempt++) {
       if (this.stopped || signal.aborted) return undefined;
       this.compressorCalls++;
@@ -1088,17 +1099,19 @@ export class Memory {
       if (!reply) throw new Error("Compactor returned an empty summary");
       const size = utf8Bytes(reply);
       const head = replyHead(reply, own);
+      const mark = reply.startsWith(MARK_TEXT, head);
       const fits = size <= this.nodeBytes;
-      if (fits && head === 0) return reply;
-      if (fits) headed ??= { text: reply, head };
+      if (mark) marked = true;
+      else if (fits && head === 0) return reply;
+      else if (fits) headed ??= { text: reply, head };
       else if (size <= this.summaryLimit && (!shortest || size < shortest.size)) shortest = { text: reply, size };
       if (attempt + 1 === this.tries) break;
-      if (head > 0) this.headRetries++;
+      if (head > 0 || mark) this.headRetries++;
       if (!fits) this.lengthRetries++;
-      // The head is cut from the echoed reply so no ids go back into compressor input.
-      const body = reply.slice(head);
+      // The head and the marker are cut from the echoed reply so neither goes back into compressor input.
+      const body = mark ? reply.slice(head + MARK_TEXT.length).trimStart() : reply.slice(head);
       const excerpt = utf8Prefix(body, this.summaryLimit);
-      const notes = head > 0 ? [HEAD_FEEDBACK] : [];
+      const notes = mark ? [MARK_FEEDBACK] : head > 0 ? [HEAD_FEEDBACK] : [];
       if (!fits) {
         notes.push(`${utf8Bytes(body) > this.summaryLimit ? "Previous reply excerpt only; omitted bytes are not a complete summary. " : ""}Too long: your line is ${size} bytes, over the ${this.nodeBytes}-byte limit. Write\nthe whole line again for the same <input>, cutting just enough of the\nleast valuable items to fit before this cut:\n${utf8Prefix(excerpt, this.nodeBytes)}| ← LIMIT`);
       }
@@ -1108,6 +1121,7 @@ export class Memory {
       feedback = [{ reply: excerpt || "…", instruction: notes.join("\n") }];
     }
     if (headed !== undefined) return headed.text.length > headed.head ? headed.text.slice(headed.head) : headed.text;
+    if (!shortest && marked) throw new CompressorRefusedError();
     if (!shortest) throw new Error(`Compactor returned no whole summary within the ${this.summaryLimit}-byte safety ceiling`);
     return shortest.text;
   }

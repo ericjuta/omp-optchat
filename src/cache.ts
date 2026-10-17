@@ -355,7 +355,10 @@ export function applyOptChatCache(payload: unknown, model: Model): unknown {
 export type OptChatCacheRelease = (responseStarted?: boolean) => void;
 
 interface CachePrefixes {
-	/** Only explicit message marks, never a shared tools/system-only anchor. */
+	/**
+	 * Explicit message marks. A writer's set also holds its model/tools/system head
+	 * when that head carries an anchor; a main wait never keys the head.
+	 */
 	marked: Set<string>;
 	/** Exact marks plus Anthropic's preceding twenty-block lookup window. */
 	lookup: Set<string>;
@@ -388,8 +391,13 @@ function hashValue(hash: Hash, value: unknown, omit?: string): void {
  * Coordination is intentionally Anthropic-only: other APIs expose no equivalent
  * cache-write visibility contract. The caller passes the FINAL encoded payload,
  * after applyOptChatCache; neither credentials nor a model's headers enter keys.
+ *
+ * `head` is true only for a request that may become a writer (a compressor call).
+ * Concurrent compressor calls differ in their task text, so their message marks
+ * never match, yet they share the host's anchored tools/system head: without keying
+ * it, every cold call writes that head and none reads it.
  */
-function cachePrefixes(payload: unknown, model: Model): CachePrefixes | undefined {
+function cachePrefixes(payload: unknown, model: Model, head: boolean): CachePrefixes | undefined {
 	if (!object(payload) || !officialAnthropic(model) || payload.previous_response_id != null) return;
 	const messages = payload.messages;
 	if (!Array.isArray(messages) || !leadingView(messages, "text")) return;
@@ -410,6 +418,12 @@ function cachePrefixes(payload: unknown, model: Model): CachePrefixes | undefine
 			hash.update("]");
 		} else hashValue(hash, value);
 	}
+	// Only an anchored head is a cache entry of its own.
+	const anchored = head && (["tools", "system"] as const).some((field) => {
+		const value = payload[field];
+		return Array.isArray(value) && value.some((block) => object(block) && block.cache_control != null);
+	});
+	const headDigest = anchored ? hash.copy().digest("hex") : undefined;
 	// These alter Anthropic's prompt/cache identity rather than the generated text.
 	for (const field of ["tool_choice", "thinking", "context_management"]) {
 		hash.update(field);
@@ -449,6 +463,10 @@ function cachePrefixes(payload: unknown, model: Model): CachePrefixes | undefine
 			}
 		}
 		hash.update("]");
+	}
+	if (headDigest) {
+		marked.add(headDigest);
+		lookup.add(headDigest);
 	}
 	return marked.size === 0 ? undefined : { marked, lookup };
 }
@@ -505,7 +523,7 @@ export class OptChatCacheCoordinator {
 		claim: boolean,
 	): Promise<OptChatCacheRelease> {
 		signal?.throwIfAborted();
-		const prefixes = cachePrefixes(payload, model);
+		const prefixes = cachePrefixes(payload, model, claim);
 		if (!prefixes) return NO_CACHE_WRITER;
 		const release = await new Promise<OptChatCacheRelease>((resolve, reject) => {
 			let settled = false;

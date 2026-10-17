@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.3 — 2026-10-17
+
+- **Fixed: concurrent cold compressor calls no longer each write the whole system prefix.** The cache coordinator keyed only on message marks, and each compressor call's last mark is its own task line, so no two calls ever waited for each other: in a cold 64-message build, 7 concurrent leaf calls each wrote about 66K tokens and read none ($0.167–0.173 each). A compressor call now also keys on its anchored tools and system head, so later calls wait for the first writer's response to start and then read the prefix. Main requests never wait on a head alone, the 20 s fail-open stays, and no prompt or tool bytes change. Live check after the change, n = 3 with no same-session control: the first call wrote 65,171 tokens ($0.1646), the next two read 61,980 each ($0.0163, $0.0158). Tests in `tests/cache.test.ts`.
+- **Fixed: no stored line is the bare `[unsummarized: compressor refused]` marker.** Eight lines in one live store were exactly the marker, all written by the compressor copying it (the code's own stand-in always carries an excerpt). A reply that opens with the marker, after any heads, is now retried like a head, and when no other reply is usable the compaction falls back to the marked source excerpt. A summary that mentions the marker later in the line is kept. Earlier lines are unchanged. Tests in `tests/memory.test.ts`.
+- **Not changed:** the compressor keeps the host system prompt as its shared prefix (prompt bytes and the G5 golden unchanged). No rules round on precision: the three non-rule messages the gate added on the fresh set are borderline standing instructions, and 6 labeled rules in 120 messages cannot ground a ratchet; rule-add stays 0.8.
+
 ## 0.10.2 — 2026-10-17
 
 - **Fixed: summary lines no longer keep a compressor head after the retries run out.** When every retry still opened with a head (for example `2272+8|…` on line 2272+16, or `Merged 2328+4 and 2332+4.`), `compact()` stored the first fitting reply unchanged. It now stores that reply with its detected heads cut; a reply that is nothing but heads is kept whole. `Merged a+n and b+n.` naming the line's own range and `Compaction output:` are now detected as heads. Earlier lines are unchanged; this only affects lines built from now on. Regression tests in `tests/memory.test.ts`.

@@ -692,6 +692,105 @@ describe("merge replies that open with their own ids or a label", () => {
   });
 });
 
+describe("a compressor reply that is, or opens with, the reserved stand-in marker", () => {
+  const mark = "[unsummarized: compressor refused]";
+  const text = "[m0] a message that needs a summary, long enough, and then some more words";
+
+  for (const [name, reply] of [
+    ["exactly the marker", mark],
+    ["the marker with its space", `${mark} `],
+    ["the marker then a line", `${mark}\ncli output kept as a summary`],
+    ["a head, then the marker", `0+1|${mark}`],
+  ] as const) {
+    test(`${name} is never stored: every try repeats it, so a marked source excerpt is stored`, async () => {
+      const store = await openStore();
+      const model = new Model();
+      const reports: string[] = [];
+      const memory = memoryFor(store, model, { nodeBytes: 60, tries: 2, jobs: 1, report: (message) => reports.push(message) });
+      memory.append("user", text);
+
+      await until(() => model.calls.length === 1, "first try");
+      model.calls[0]!.resolve(reply);
+      await until(() => model.calls.length === 2, "second try");
+      model.calls[1]!.resolve(reply);
+
+      expect(await memory.settle()).toBe(true);
+      const node = store.nodes.get(nodeKey(0, 0))!;
+      expect(node.text).toBe(utf8Prefix(`${mark} ${text}`, 60));
+      expect(node.text.length).toBeGreaterThan(`${mark} `.length);
+      expect(node.size).toBe(utf8Bytes(node.text));
+      expect(memory.status()).toMatchObject({ compressorCalls: 2, headRetries: 1, extractive: 1 });
+      expect(reports.some((line) => line.startsWith("unsummarized at 0+1:"))).toBe(true);
+    });
+  }
+
+  test("a marked first reply is retried, its feedback echo drops the marker, and the clean reply is stored", async () => {
+    const store = await openStore();
+    const model = new Model();
+    const memory = memoryFor(store, model, { nodeBytes: 60, tries: 3, jobs: 1 });
+    memory.append("user", text);
+
+    await until(() => model.calls.length === 1, "first try");
+    model.calls[0]!.resolve(`${mark} user kept a note about the plan`);
+    await until(() => model.calls.length === 2, "second try");
+    const turn = model.calls[1]!.request.feedback[0]!;
+    expect(turn.reply).toBe("user kept a note about the plan");
+    expect(turn.reply).not.toContain("unsummarized");
+    expect(turn.instruction).toContain("a marker only the code writes");
+    model.calls[1]!.resolve("user kept a plan note");
+
+    await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("user kept a plan note");
+    expect(memory.status()).toMatchObject({ compressorCalls: 2, headRetries: 1, extractive: 0 });
+  });
+
+  test("a clean fitting reply from a later try wins over earlier marked replies", async () => {
+    const store = await openStore();
+    const model = new Model();
+    const memory = memoryFor(store, model, { nodeBytes: 60, tries: 3, jobs: 1 });
+    memory.append("user", text);
+
+    await until(() => model.calls.length === 1, "first try");
+    model.calls[0]!.resolve(mark);
+    await until(() => model.calls.length === 2, "second try");
+    model.calls[1]!.resolve(mark);
+    await until(() => model.calls.length === 3, "third try");
+    model.calls[2]!.resolve("user wants more words");
+
+    await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("user wants more words");
+  });
+
+  test("a merge reply that is the marker falls back to a marked excerpt of both children", async () => {
+    const { store, merge, model, memory } = await openMerge({ nodeBytes: 40, tries: 2 });
+    merge.resolve(mark);
+    await until(() => model.open().length === 1, "second merge try");
+    model.open()[0]!.resolve(mark);
+
+    await until(() => store.nodes.has(nodeKey(1, 0)), "merge saved");
+    const node = store.nodes.get(nodeKey(1, 0))!;
+    expect(node.text.startsWith(`${mark} `)).toBe(true);
+    expect(node.text).not.toBe(mark);
+    expect(node.size).toBeLessThanOrEqual(40);
+    expect(memory.status()).toMatchObject({ extractive: 1 });
+  });
+
+  test("a summary that only mentions the marker later in the line is content and is not retried", async () => {
+    const store = await openStore();
+    const model = new Model();
+    const memory = memoryFor(store, model, { nodeBytes: 60, tries: 3, jobs: 1 });
+    memory.append("user", text);
+
+    await until(() => model.calls.length === 1, "first try");
+    const reply = `user asks why ${mark} shows`;
+    model.calls[0]!.resolve(reply);
+
+    await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(reply);
+    expect(model.calls).toHaveLength(1);
+  });
+});
+
 test("a reply that is both headed and over-long gets one feedback turn covering both", async () => {
   const store = await openStore();
   const model = new Model();

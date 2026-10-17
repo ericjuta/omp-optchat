@@ -1323,6 +1323,22 @@ describe("cache-prefix writer coordination", () => {
     return result;
   };
   const encoded = (rows = 8): WireObject => apply(nativePayload(labeledView(rows)), anthropicModel());
+  /**
+   * A compressor request as the host encodes it: the effective system prompt with its host anchor, then one user
+   * message holding the view and the task, which carries the host's request-end anchor. The default view is the
+   * context of concurrent leaves in a fresh store: no built line yet, so no four-line view block to mark.
+   */
+  const compressorPayload = (task: string, view = "<chat>\n</chat>", system = "Host system prompt."): WireObject => apply({
+    model: "claude-fixture",
+    max_tokens: 8_192,
+    stream: true,
+    system: [{ type: "text", text: system, cache_control: hostMarker() }],
+    messages: [{ role: "user", content: [...nativeViewBlocks(view), { type: "text", text: task, cache_control: hostMarker() }] }],
+  }, anthropicModel());
+  /** Drain the microtask queue: every continuation of an unblocked acquire or wait has run. */
+  const flush = async (): Promise<void> => {
+    for (let turn = 0; turn < 16; turn++) await Promise.resolve();
+  };
 
   afterEach(() => {
     for (const gate of coordinators) gate.clear();
@@ -1393,8 +1409,9 @@ describe("cache-prefix writer coordination", () => {
     const first = await gate.acquire(payload, model);
     let settled = false;
     const waiting = gate.wait(payload, model).then(() => { settled = true; });
-    const different = apply(nativePayload(labeledView(8).replace("0+1|", "0+1|different ")), model);
-    const disjoint = await gate.acquire(different, model);
+    const disjointInput = nativePayload(labeledView(8).replace("0+1|", "0+1|different "));
+    disjointInput.system[0].text = "A different system prompt";
+    const disjoint = await gate.acquire(apply(disjointInput, model), model);
     expect(settled).toBe(false);
     disjoint();
     const next = gate.acquire(payload, model);
@@ -1467,14 +1484,19 @@ describe("cache-prefix writer coordination", () => {
     expect(thirdStarted).toBe(true);
   });
 
-  test("distinct marked view prefixes do not wait merely because tools and system match", async () => {
+  test("distinct marked views that share tools and system: a compressor waits for the head writer, a main wait does not", async () => {
     const gate = coordinator();
     const model = anthropicModel();
     const first = await gate.acquire(encoded(), model);
     const different = apply(nativePayload(labeledView(8).replace("0+1|", "0+1|different ")), model);
-    const second = await gate.acquire(different, model);
-    second();
-    first();
+    await gate.wait(different, model);
+    let started = false;
+    const second = gate.acquire(different, model).then((release) => { started = true; return release; });
+    await flush();
+    expect(started).toBe(false);
+    first(true);
+    (await second)();
+    expect(started).toBe(true);
   });
 
   test("a growing view waits for an earlier marked whole block despite different marker positions", async () => {
@@ -1494,8 +1516,8 @@ describe("cache-prefix writer coordination", () => {
     const gate = coordinator();
     const model = anthropicModel();
     const first = await gate.acquire(encoded(4), model);
-    const second = await gate.acquire(encoded(88), model);
-    second();
+    // A main wait keys only message marks, so the head both requests share does not hold it.
+    await gate.wait(encoded(88), model);
     first();
   });
 
@@ -1519,18 +1541,125 @@ describe("cache-prefix writer coordination", () => {
     for (const release of releases) release();
   });
 
-  test.each(["tools", "system", "thinking", "wire model", "message envelope"])("the actual encoded %s contributes to prefix identity", async (field) => {
+  test.each(["tools", "system", "wire model"])("the actual encoded %s contributes to prefix identity", async (field) => {
     const gate = coordinator();
     const model = anthropicModel();
     const first = await gate.acquire(encoded(), model);
     const different = nativePayload(labeledView(8));
     if (field === "tools") different.tools[0].description = "A different tool description";
     else if (field === "system") different.system[0].text = "A different system prompt";
-    else if (field === "thinking") different.thinking = { type: "enabled", budget_tokens: 2_048 };
-    else if (field === "wire model") different.model = "claude-other-wire-model";
-    else different.messages[0].name = "another-user";
+    else different.model = "claude-other-wire-model";
     const second = await gate.acquire(apply(different, model), model);
     second();
+    first();
+  });
+
+  test("the encoded thinking setting keys the view marks, not the shared head", async () => {
+    const gate = coordinator();
+    const model = anthropicModel();
+    const first = await gate.acquire(encoded(), model);
+    const different = nativePayload(labeledView(8));
+    different.thinking = { type: "enabled", budget_tokens: 2_048 };
+    const payload = apply(different, model);
+    await gate.wait(payload, model);
+    let started = false;
+    const second = gate.acquire(payload, model).then((release) => { started = true; return release; });
+    await flush();
+    expect(started).toBe(false);
+    first(true);
+    (await second)();
+  });
+
+  test("the encoded message envelope keys the view marks, not the shared head", async () => {
+    const gate = coordinator();
+    const model = anthropicModel();
+    const first = await gate.acquire(encoded(), model);
+    const different = nativePayload(labeledView(8));
+    different.messages[0].name = "another-user";
+    const payload = apply(different, model);
+    await gate.wait(payload, model);
+    let started = false;
+    const second = gate.acquire(payload, model).then((release) => { started = true; return release; });
+    await flush();
+    expect(started).toBe(false);
+    first(true);
+    (await second)();
+  });
+
+  test("a fresh-store compressor request shares only the host's system anchor with its concurrent siblings", () => {
+    expect(markersAt(compressorPayload("compress message 0"), "cache_control"))
+      .toEqual(expectedMarkers(FIVE_MINUTES, "$.system.0", "$.messages.0.content.1"));
+  });
+
+  test("concurrent compressor calls sharing only the system anchor wait for the first writer's response start", async () => {
+    const gate = coordinator();
+    const model = anthropicModel();
+    const first = await gate.acquire(compressorPayload("compress message 0"), model);
+    const started: number[] = [];
+    const rest = [1, 2, 3].map((n) =>
+      gate.acquire(compressorPayload(`compress message ${n}`), model).then((release) => { started.push(n); return release; }));
+    await flush();
+    expect(started).toEqual([]);
+    first(true);
+    const releases = await Promise.all(rest);
+    expect(started.toSorted()).toEqual([1, 2, 3]);
+    for (const release of releases) release(true);
+  });
+
+  test("a failed head writer hands the shared system prefix to one waiting compressor, not all", async () => {
+    const gate = coordinator();
+    const model = anthropicModel();
+    const first = await gate.acquire(compressorPayload("compress message 0"), model);
+    const started: number[] = [];
+    const rest = [1, 2].map((n) =>
+      gate.acquire(compressorPayload(`compress message ${n}`), model).then((release) => ({ n, release })));
+    for (const pending of rest) void pending.then(({ n }) => started.push(n));
+    first();
+    await flush();
+    expect(started).toEqual([1]);
+    (await rest[0]!).release(true);
+    (await rest[1]!).release();
+    expect(started).toEqual([1, 2]);
+  });
+
+  test("compressor calls with a different system prefix never wait for each other", async () => {
+    const gate = coordinator();
+    const model = anthropicModel();
+    const first = await gate.acquire(compressorPayload("compress message 0"), model);
+    let started = false;
+    const second = gate.acquire(compressorPayload("compress message 1", undefined, "Another system prompt."), model)
+      .then((release) => { started = true; return release; });
+    await flush();
+    expect(started).toBe(true);
+    (await second)();
+    first();
+  });
+
+  test("a main wait never waits for compressor writers that share only its system anchor", async () => {
+    const gate = coordinator();
+    const model = anthropicModel();
+    const writers = await Promise.all([gate.acquire(compressorPayload("compress message 0"), model)]);
+    const queued = [1, 2].map((n) => gate.acquire(compressorPayload(`compress message ${n}`), model));
+    let settled = false;
+    const waiting = gate.wait(compressorPayload("Current turn.", labeledView(8)), model).then(() => { settled = true; });
+    await flush();
+    expect(settled).toBe(true);
+    await waiting;
+    writers[0]!(true);
+    for (const release of await Promise.all(queued)) release();
+  });
+
+  test("an abandoned head writer still fails open for waiting compressors", async () => {
+    // The coordinator's own fail-safe timer fires; the test awaits the lease and never sleeps.
+    const gate = coordinator(10);
+    const model = anthropicModel();
+    const first = await gate.acquire(compressorPayload("compress message 0"), model);
+    let started = false;
+    const second = gate.acquire(compressorPayload("compress message 1"), model).then((release) => { started = true; return release; });
+    await flush();
+    expect(started).toBe(false);
+    (await second)();
+    expect(started).toBe(true);
     first();
   });
 
