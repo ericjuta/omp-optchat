@@ -216,6 +216,8 @@ async function search(
   if (pool.length === 0) return { kind: "failed", reason: more.failures[0] ?? "no built message under the top lines" };
 
   const ordered = await pick(judge, question, pool, signal);
+  // A pick cut by the bound or a cancel keeps the scored order; the recall fails, so read no page.
+  signal.throwIfAborted();
   const winner = ordered[0]!;
   const step = (entry: Scored): RecallStep => ({ id: entry.line.id, n: entry.line.n, text: entry.line.text, p: entry.p });
   const over = cover.get(winner.line.id);

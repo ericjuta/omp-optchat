@@ -461,13 +461,15 @@ describe("recall: failures and bounds", () => {
     expect(memory.pages).toHaveLength(0);
   });
 
-  test("the recall bound cuts a hung pick", async () => {
+  test("the recall bound cuts a hung pick, with no page read", async () => {
     const scores = { "0+8": 0.9, "3+1": 0.92, "1+1": 0.85 };
     const scoring = scripted({ scores });
     const judge = fakeJudge((request, signal) => ("pick" in request.questions ? hung(request, signal) : scoring(request)));
-    const outcome = await recall(treeMemory(SEVEN, { view: [{ id: 0, n: 8 }] }), { judge, question: "q", min: 0.5, timeoutMs: 50 });
+    const memory = treeMemory(SEVEN, { view: [{ id: 0, n: 8 }] });
+    const outcome = await recall(memory, { judge, question: "q", min: 0.5, timeoutMs: 50 });
     expect(picks(judge)).toHaveLength(1);
     expect(outcome).toEqual({ kind: "failed", reason: "the recall bound passed" });
+    expect(memory.pages).toHaveLength(0);
   });
 
   test("an abort before the call sends nothing to the judge", async () => {
