@@ -10,14 +10,14 @@ permissions:
 jobs:
   verify:
     name: verify (${{ matrix.sdk }} SDK)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         sdk: [pinned, latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.0
