@@ -130,7 +130,7 @@ const EXTRACTIVE_JOIN = " | ";
  */
 const HEAD_ID = String.raw`\d+(?:[+\-–]\d+)?`;
 const HEAD_IDS = String.raw`${HEAD_ID}(?:(?:\s*,\s*|\s+and\s+|\s+)${HEAD_ID})*`;
-const HEAD_WORDS = String.raw`(?:\s*[,;]|\s+(?:\([^)\n]*\)|\d+-byte|${HEAD_ID}|of|for|messages?|msgs?|and|with|merged|covers|within|under|or|less|at|most|max|limit|ruler|respected|bytes|lines?|chat))*`;
+const HEAD_WORDS = String.raw`(?:\s*[,;]|\s+(?:\([^)\n]*\)|\d+-byte|${HEAD_ID}|of|for|messages?|msgs?|and|with|merged|covers|within|under|or|less|at|most|max|limit|ruler|respected|bytes|lines?|chat|output))*`;
 const HEAD_LABEL = String.raw`(?:compact(?:ed|ion)|compress(?:ed|ion)|merged?|lines?|summary)` +
   String.raw`(?:${HEAD_WORDS}\s*:(?!\d)|(?:\s+lines?)?\s*(?:${HEAD_IDS}\s*)?\([^)\n]*\)[^:\n]{0,60}:(?!\d))`;
 const HEAD = new RegExp(
@@ -159,6 +159,12 @@ const HEAD_FEEDBACK =
  */
 const OWN_HEAD = /^(?:(?:message|msg|echo|line|node)s?\s+)?(\d+)(?:[+\-–]\d*)?(?![\d.,%])\s*(?:←|->|→|—|–|-|:|\|)?\s*/iu;
 
+/**
+ * "Merged 2328+4 and 2332+4. …": a merge naming its children as a sentence. Colon forms are HEAD's; this
+ * period form needs the own-range test because "Merged 14 PRs." is content.
+ */
+const OWN_MERGED = /^merged?\s+(?:lines?\s+)?(\d+)(?:[+\-–]\d*)?(?:\s*(?:,|and|&)\s*\d+(?:[+\-–]\d*)?)*\s*\.\s+/iu;
+
 /** Length of the forbidden heads that open `reply`, 0 when it opens with the summary itself. */
 function replyHead(reply: string, own: { lo: number; hi: number }): number {
   let length = 0;
@@ -169,7 +175,7 @@ function replyHead(reply: string, own: { lo: number; hi: number }): number {
       length += match[0].length;
       continue;
     }
-    const id = OWN_HEAD.exec(rest);
+    const id = OWN_HEAD.exec(rest) ?? OWN_MERGED.exec(rest);
     if (id?.[0] && Number(id[1]) >= own.lo && Number(id[1]) <= own.hi) {
       length += id[0].length;
       continue;
@@ -1059,10 +1065,11 @@ export class Memory {
    * At most `tries` calls (five by default). A reply that is over-long or opens
    * with a forbidden head (including one naming the task's own ids, `own`) is
    * retried with one bounded feedback turn. The first
-   * clean fitting reply wins; otherwise the first fitting headed reply, else the
-   * shortest whole reply. Replies beyond the safety ceiling are never stored or
+   * clean fitting reply wins; otherwise the first fitting headed reply with its
+   * heads cut (kept whole when nothing but heads remains), else the shortest
+   * whole reply. Replies beyond the safety ceiling are never stored or
    * replayed in full. If no whole candidate fits that ceiling, fail rather than
-   * truncate content. Stored text is never rewritten.
+   * truncate content. Only forbidden heads are ever cut; summary text is never rewritten.
    */
   private async compact(
     context: string,
@@ -1071,7 +1078,7 @@ export class Memory {
     signal: AbortSignal,
   ): Promise<string | undefined> {
     let feedback: CompactionRequest["feedback"] = [];
-    let headed: string | undefined;
+    let headed: { text: string; head: number } | undefined;
     let shortest: { text: string; size: number } | undefined;
     for (let attempt = 0; attempt < this.tries; attempt++) {
       if (this.stopped || signal.aborted) return undefined;
@@ -1083,7 +1090,7 @@ export class Memory {
       const head = replyHead(reply, own);
       const fits = size <= this.nodeBytes;
       if (fits && head === 0) return reply;
-      if (fits) headed ??= reply;
+      if (fits) headed ??= { text: reply, head };
       else if (size <= this.summaryLimit && (!shortest || size < shortest.size)) shortest = { text: reply, size };
       if (attempt + 1 === this.tries) break;
       if (head > 0) this.headRetries++;
@@ -1100,7 +1107,7 @@ export class Memory {
       // A reply that was only heads is echoed as "…": a provider turn needs text.
       feedback = [{ reply: excerpt || "…", instruction: notes.join("\n") }];
     }
-    if (headed !== undefined) return headed;
+    if (headed !== undefined) return headed.text.length > headed.head ? headed.text.slice(headed.head) : headed.text;
     if (!shortest) throw new Error(`Compactor returned no whole summary within the ${this.summaryLimit}-byte safety ceiling`);
     return shortest.text;
   }

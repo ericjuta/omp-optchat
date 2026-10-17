@@ -6,7 +6,7 @@
  *   results.jsonl   one line per (case, rep) that produced a scorable outcome
  *   errors.jsonl    attempts that produced none: judge/transport error, timeout, budget, unbuilt store, induced
  *   traces/         transcripts for TRAIN ids only (needs --state with train_ids; test traces are never written)
- *   run.json        the run's settings and totals
+ *   run.json        the run's settings and totals, plus `scores`: credited and gold-only pass rates, overall and per gold kind
  *
  *   bun evals/recall/run.ts --variant baseline --out <dir> [--state <flow>/_state.json]
  *     [--reps 2] [--concurrency 4] [--max-judge-calls 3000] [--k 1..8] [--seeds 0..32] [--only id,id] [--cases <file.jsonl>]...
@@ -24,8 +24,8 @@ import { Memory, type Summarize } from "../../src/memory.ts";
 import { Store } from "../../src/store.ts";
 import { RECALL_K_MAX, RECALL_SEEDS_MAX, recall, renderRecall, type RecallMemory, type RecallOutcome } from "../../src/system1/recall.ts";
 import { buildTree, type SyntheticTree } from "../../scripts/retrieval/synthetic.ts";
-import { CASES_DIR, type CaseRecord, SNAPSHOT_ROOT } from "./build-cases.ts";
-import { grade } from "./grade.ts";
+import { CASES_DIR, type CaseRecord, loadSnapshot, SNAPSHOT_ROOT, type SnapshotStore } from "./build-cases.ts";
+import { formatScores, grade, type ScoredRow, type ScoreSummary, scoreSummary } from "./grade.ts";
 import { type HostJudge, JudgeBudget, type Meter, metered, newMeter, openHostJudge } from "./judge.ts";
 
 /** `coverage` is a diagnostic (no judge): is each gold message under a view line, and does that line keep the fact? */
@@ -67,6 +67,8 @@ interface Context {
   readonly errors: string;
   readonly traces: string;
   readonly coverage: string;
+  /** Each case's gold and the store kind of that gold message, for the per-kind rates. */
+  readonly kinds: ReadonlyMap<string, { gold: number; kind: string }>;
 }
 
 /** Wall ceiling for one recall attempt; recall's own bound (RECALL_MS) is shorter and normally fires first. */
@@ -383,6 +385,7 @@ async function writeResult(c: CaseRecord, rep: number, ctx: Context, attemptResu
     found: verdict.found,
     depth: verdict.depth,
     raw: outcome.kind === "found" && outcome.raw === true,
+    gold_kind: ctx.kinds.get(c.id)?.kind,
   };
   if (verdict.judged !== undefined) row.judged = verdict.judged;
   if (models.length > 0) row.model = models[0];
@@ -460,6 +463,40 @@ async function runTrial(c: CaseRecord, rep: number, ctx: Context): Promise<"resu
   }
 }
 
+/** Each case's gold and the store kind of its gold message; "unknown" when the case's snapshot is not on this host. */
+export async function goldKinds(cases: readonly CaseRecord[]): Promise<Map<string, { gold: number; kind: string }>> {
+  const snapshots = new Map<string, Promise<SnapshotStore | undefined>>();
+  const kinds = new Map<string, { gold: number; kind: string }>();
+  for (const c of cases) {
+    if (c.store.kind !== "snapshot") {
+      kinds.set(c.id, { gold: c.gold, kind: String(c.store.kind) });
+      continue;
+    }
+    const name = String(c.store.name);
+    if (!snapshots.has(name)) {
+      snapshots.set(
+        name,
+        loadSnapshot(name).catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+          throw error;
+        }),
+      );
+    }
+    const store = await snapshots.get(name)!;
+    kinds.set(c.id, { gold: c.gold, kind: store?.messages[c.gold]?.kind ?? "unknown" });
+  }
+  return kinds;
+}
+
+/** Scores every recorded result row of the given cases, resumed runs included. */
+export async function summarizeResults(results: string, kinds: ReadonlyMap<string, { gold: number; kind: string }>): Promise<ScoreSummary> {
+  const rows = (await readFile(results, "utf8"))
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as ScoredRow);
+  return scoreSummary(rows, kinds);
+}
+
 async function pool<T>(items: readonly T[], limit: number, run: (item: T) => Promise<void>): Promise<void> {
   let next = 0;
   const worker = async (): Promise<void> => {
@@ -500,6 +537,7 @@ async function main(argv: readonly string[]): Promise<void> {
     errors,
     traces: join(out, "traces"),
     coverage: join(out, "coverage.jsonl"),
+    kinds: await goldKinds(cases),
   };
   const started = new Date().toISOString();
   const trials: Array<{ c: CaseRecord; rep: number }> = [];
@@ -533,9 +571,11 @@ async function main(argv: readonly string[]): Promise<void> {
     started,
     finished: new Date().toISOString(),
     train_traces_enabled: options.state !== undefined,
+    scores: await summarizeResults(results, ctx.kinds),
   };
   await writeFile(join(out, "run.json"), `${JSON.stringify(summary, null, 2)}\n`);
   console.log(`${options.variant}: results ${counts.result}, errors ${counts.error}, judge calls ${budget.used}/${options.maxJudgeCalls} -> ${out}`);
+  console.log(formatScores(summary.scores));
 }
 
 if (import.meta.main) await main(process.argv.slice(2));

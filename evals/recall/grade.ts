@@ -38,6 +38,55 @@ export function keyMatches(text: string, key: AnswerKey): boolean {
   return key.some((alternative) => alternative.every((phrase) => haystack.includes(normalizeForKey(phrase))));
 }
 
+/** A graded result row as results.jsonl stores it. */
+export interface ScoredRow {
+  readonly prompt_id: string;
+  readonly grade: boolean;
+  readonly found?: number;
+}
+
+export interface RateCount {
+  readonly n: number;
+  readonly credited: number;
+  readonly credited_rate: number;
+  /** Passes whose answered message is the gold itself: no `also` or answer-key credit. */
+  readonly gold_only: number;
+  readonly gold_only_rate: number;
+}
+
+export interface ScoreSummary extends RateCount {
+  /** Keyed by the gold message's store kind (user, talk, echo, ...; "synthetic" for synthetic cases). */
+  readonly by_gold_kind: Record<string, RateCount>;
+}
+
+function rates(rows: readonly { pass: boolean; gold: boolean }[]): RateCount {
+  const n = rows.length;
+  const credited = rows.filter((row) => row.pass).length;
+  const goldOnly = rows.filter((row) => row.gold).length;
+  return { n, credited, credited_rate: n === 0 ? 0 : credited / n, gold_only: goldOnly, gold_only_rate: n === 0 ? 0 : goldOnly / n };
+}
+
+/**
+ * Credited and gold-only pass rates, overall and per gold kind. Rows whose case is not in `cases` are skipped. Credited
+ * is the grade as recorded; gold-only counts a row only when it passed by answering the gold message.
+ */
+export function scoreSummary(rows: readonly ScoredRow[], cases: ReadonlyMap<string, { gold: number; kind: string }>): ScoreSummary {
+  const scored: { kind: string; pass: boolean; gold: boolean }[] = [];
+  for (const row of rows) {
+    const c = cases.get(row.prompt_id);
+    if (c === undefined) continue;
+    scored.push({ kind: c.kind, pass: row.grade, gold: row.grade && row.found === c.gold });
+  }
+  const kinds = [...new Set(scored.map((row) => row.kind))].sort();
+  return { ...rates(scored), by_gold_kind: Object.fromEntries(kinds.map((kind) => [kind, rates(scored.filter((row) => row.kind === kind))])) };
+}
+
+export function formatScores(scores: ScoreSummary): string {
+  const line = (label: string, r: RateCount) =>
+    `${label}: n ${r.n}, credited ${r.credited} (${r.credited_rate.toFixed(3)}), gold-only ${r.gold_only} (${r.gold_only_rate.toFixed(3)})`;
+  return [line("all", scores), ...Object.entries(scores.by_gold_kind).map(([kind, r]) => `  ${line(kind, r)}`)].join("\n");
+}
+
 export function grade(outcome: RecallOutcome, expected: Expected): Verdict {
   if (outcome.kind === "found") {
     const depth = outcome.path.length;

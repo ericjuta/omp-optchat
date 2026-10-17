@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.2 — 2026-10-17
+
+- **Fixed: summary lines no longer keep a compressor head after the retries run out.** When every retry still opened with a head (for example `2272+8|…` on line 2272+16, or `Merged 2328+4 and 2332+4.`), `compact()` stored the first fitting reply unchanged. It now stores that reply with its detected heads cut; a reply that is nothing but heads is kept whole. `Merged a+n and b+n.` naming the line's own range and `Compaction output:` are now detected as heads. Earlier lines are unchanged; this only affects lines built from now on. Regression tests in `tests/memory.test.ts`.
+- **New default: compressor calls are recorded in `metrics.jsonl` in the store directory,** counts only and never content (model, token counts as the host reports them, attempt, purpose, latency, reported cost or `null`, stop reason, bounded error). `/optchat status` shows the store's calls and their reported cost; a call without a reported cost is shown as unknown, never as $0. `OPTCHAT_METRICS_FILE` now only redirects the file. `/optchat new` archives it with the old chat.
+- **Evals:** the recall runner reports gold-only and per-gold-kind pass rates next to the credited rate (`run.json` key `scores`, `gold_kind` per row).
+- **CI:** runs on `ubuntu-26.04` with `actions/checkout@v7`.
+- **Not adopted (pre-registered fresh tests; defaults unchanged):**
+  - **`--optchat-rule-add` 0.75:** 120 fresh real messages labeled blind (6 rules), 3 runs each. 0.75 was better on 0 cases and worse on 5, and added 4 non-rules that 0.8 does not (F1 0.286 vs 0.387). The rules 0.8 misses score 0.55–0.73, below 0.75 too. The default stays 0.8.
+  - **Higher `--optchat-prefetch-min`:** on 11 train turns (90 distinct lines selected at 0.5, labeled blind: 58 relevant, 32 off-topic), every candidate dropped relevant lines (0.6 lost 10 of 138 relevant selections, 0.7 lost 52, 0.8 lost 116), so none was frozen and no test ran. The default stays 0.5.
+- **Measured, one cold parallel build (not typical):** 7 Sonnet 5.5 leaf calls each wrote 66–68K cache tokens and cost $0.17; warm compressor cost is unmeasured and is what `metrics.jsonl` now records in live use.
+
 ## 0.10.1 — 2026-10-17
 
 - **Fixed: a `chat_recall` whose pick was cut by the 20 s bound or a cancel no longer reads the winner's first page before failing.** The outcome was already `failed`; the stored page read was wasted work. Regression test in `tests/recall.test.ts`.

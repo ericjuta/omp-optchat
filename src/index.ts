@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { clampThinkingLevelForModel, Effort } from "@oh-my-pi/pi-catalog";
 import { requiresNativeTools } from "@oh-my-pi/pi-catalog/compat/tools";
 import {
@@ -43,7 +43,7 @@ import {
 import { exportHtml, importHistory } from "./history.js";
 import { writeExportFile } from "./export-file.js";
 import { attachChildView, publishChildSource, registerMemoryTools, UNGUARDED, type ChildView, type PageEnvelope, type WorkEnvelope } from "./handoff.js";
-import { appendMetric, boundedProviderError, type CompressorUsage } from "./metrics.js";
+import { appendMetric, boundedProviderError, METRICS_FILE, readCompressorSpend, type CompressorUsage } from "./metrics.js";
 import { captureWorkReports, type ArtifactPathSource } from "./reports.js";
 import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } from "./archive.js";
 import { CompressorRefusedError, Memory, type CompactionRequest, type Summarize } from "./memory.js";
@@ -538,7 +538,9 @@ class OptChat {
 	constructor(
 		private readonly pi: ExtensionAPI,
 		private readonly settleTimeoutMs: number,
-		private readonly observe: (usage: CompressorUsage) => void,
+		private readonly observe: (usage: CompressorUsage, file: string | undefined) => void,
+		/** The compressor metric sink of a store directory. */
+		private readonly metricsFile: (directory: string) => string,
 		private readonly policy: CompressorPolicy = {},
 		private readonly judges: JudgeFactory = hostJudge,
 	) {}
@@ -775,6 +777,7 @@ class OptChat {
 	/** Metric-only: counts and timing of one completed compressor call; never its content. */
 	private observeUsage(model: Model, reply: AssistantMessage, feedback: number, latencyMs: number): void {
 		const total = reply.usage.cost.total;
+		const directory = this.store?.directory;
 		try {
 			this.observe({
 				model: `${model.provider}/${model.id}`,
@@ -788,7 +791,7 @@ class OptChat {
 				costUsd: Number.isFinite(total) ? total : null,
 				stopReason: reply.stopReason,
 				error: reply.stopReason === "error" || reply.stopReason === "aborted" ? boundedProviderError(reply.errorMessage) : null,
-			});
+			}, directory === undefined ? undefined : this.metricsFile(directory));
 		} catch (error) {
 			this.notify(`OptChat metrics: ${errorText(error)}`, "warning");
 		}
@@ -1587,6 +1590,25 @@ class OptChat {
 		}
 	}
 
+	/**
+	 * Compressor calls and their reported cost for this store, from its metric sink; undefined while none were recorded, so an
+	 * idle status stays unchanged. A call without a reported cost is unknown, never $0.
+	 */
+	private compressorSpendLine(): string | undefined {
+		const directory = this.store?.directory;
+		if (directory === undefined) return undefined;
+		try {
+			const { calls, reportedUsd, unknownCost } = readCompressorSpend(this.metricsFile(directory));
+			if (calls === 0) return undefined;
+			const known = calls - unknownCost;
+			if (unknownCost === 0) return `compressor spend (this store): ${calls} calls, $${reportedUsd.toFixed(4)} reported`;
+			if (known === 0) return `compressor spend (this store): ${calls} calls, cost unknown (the host reported none)`;
+			return `compressor spend (this store): ${calls} calls, $${reportedUsd.toFixed(4)} reported for ${known}; cost unknown for ${unknownCost}`;
+		} catch (error) {
+			return `compressor spend (this store): unavailable (${errorText(error)})`;
+		}
+	}
+
 	private statusText(): string {
 		const state = this.state;
 		const lines = [`OptChat: ${state.kind === "failed" || state.kind === "inactive" ? `${state.kind}: ${state.reason}` : state.kind}`];
@@ -1608,6 +1630,8 @@ class OptChat {
 				);
 			}
 		}
+		const spend = this.compressorSpendLine();
+		if (spend) lines.push(spend);
 		lines.push(...this.gateStatus());
 		lines.push(
 			`stateless OpenAI: ${process.env.PI_OPENAI_STATEFUL === "0" ? "requested (PI_OPENAI_STATEFUL=0)" : "not set; official OpenAI main requests may chain responses"}`,
@@ -1858,10 +1882,15 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 		// Flags are parsed after factories run: register unconditionally, read in session_start.
 		registerFlags(pi);
 		let chat: OptChat | undefined;
-		const metricsFile = process.env.OPTCHAT_METRICS_FILE;
-		const observe = (usage: CompressorUsage): void => {
-			options.onCompressorUsage?.(usage);
-			if (metricsFile) appendMetric(metricsFile, usage);
+		const override = process.env.OPTCHAT_METRICS_FILE;
+		// The default sink is the store's own `metrics.jsonl`; the evidence runner points each host at a file outside its store copy.
+		const metricsFile = (directory: string): string => override || join(directory, METRICS_FILE);
+		const observe = (usage: CompressorUsage, file: string | undefined): void => {
+			try {
+				if (file) appendMetric(file, usage);
+			} finally {
+				options.onCompressorUsage?.(usage);
+			}
 		};
 
 		pi.registerCommand("optchat", {
@@ -1887,7 +1916,7 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 				// Invalid activation must enter the same fail-closed startup as any other
 				// malformed config: open() reports it and installed context hooks refuse prompts.
 			}
-			const active = new OptChat(pi, settleTimeoutMs, observe, policy, judges);
+			const active = new OptChat(pi, settleTimeoutMs, observe, metricsFile, policy, judges);
 			chat = active;
 			// Registered for every opted-in main session. An inactive one (startup lease conflict) passes through.
 			pi.on("before_agent_start", (event) => (active.passive ? undefined : active.beforeAgentStart(event.systemPrompt)));

@@ -585,7 +585,7 @@ test("a reply that opens with a head is retried once; the echo drops the head an
   expect(model.calls).toHaveLength(2);
 });
 
-test("when every try opens with a head, the first fitting headed reply is stored and the leaf completes", async () => {
+test("when every try opens with a head, the first fitting reply is stored with its heads cut and the leaf completes", async () => {
   const store = await openStore();
   const model = new Model();
   const memory = memoryFor(store, model, { nodeBytes: 20, tries: 3, jobs: 1 });
@@ -599,8 +599,97 @@ test("when every try opens with a head, the first fitting headed reply is stored
   model.calls[2]!.resolve("3+1|head three");
 
   await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
-  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("1+1|head one");
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("head one");
   expect(model.calls).toHaveLength(3);
+});
+
+test("retry exhaustion cuts every stacked head from the stored reply (id+n|id+n|user: ...)", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const memory = memoryFor(store, model, { nodeBytes: 30, tries: 2, jobs: 1 });
+  memory.append("user", "[m0] a message that needs a summary, long enough");
+
+  await until(() => model.calls.length === 1, "first try");
+  model.calls[0]!.resolve("0+1|0+1|user: a line");
+  await until(() => model.calls.length === 2, "second try");
+  model.calls[1]!.resolve("0+1|0+1|user: again");
+
+  await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("user: a line");
+  expect(memory.status()).toMatchObject({ compressorCalls: 2, headRetries: 1 });
+});
+
+test("retry exhaustion keeps a reply that is nothing but heads, since cutting would leave an empty line", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const memory = memoryFor(store, model, { nodeBytes: 20, tries: 2, jobs: 1 });
+  memory.append("user", "[m0] a message that needs a summary");
+
+  await until(() => model.calls.length === 1, "first try");
+  model.calls[0]!.resolve("0+1|");
+  await until(() => model.calls.length === 2, "second try");
+  model.calls[1]!.resolve("0+1|0+1|");
+
+  await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("0+1|");
+});
+
+/** Two leaves summarized, then the pair's merge call (own ids 0 and 1) is returned open. */
+async function openMerge(options: MemoryOptions): Promise<{ store: Store; model: Model; memory: Memory; merge: Call }> {
+  const store = await openStore();
+  const model = new Model();
+  const memory = memoryFor(store, model, { jobs: 2, ...options });
+  memory.append("user", "[m0] a message that needs a summary, long enough");
+  memory.append("user", "[m1] another message that needs a summary, too");
+  await until(() => model.open().length === 2, "two leaf calls");
+  model.take("[m0]").resolve(`[s0]${"a".repeat(26)}`);
+  model.take("[m1]").resolve(`[s1]${"b".repeat(26)}`);
+  await until(() => model.open().length === 1, "merge call");
+  return { store, model, memory, merge: model.take("[s0]", "[s1]") };
+}
+
+describe("merge replies that open with their own ids or a label", () => {
+  const cases: ReadonlyArray<readonly [string, string, string]> = [
+    ["stacked child head", "0+1|0+1|Eric wants it kept", "Eric wants it kept"],
+    ["id+n head over a kind", "0+1|user: Eric wants it", "user: Eric wants it"],
+    ["Merged a+n and b+n.", "Merged 0+1 and 1+1. Eric wants it kept", "Eric wants it kept"],
+    ["Merged line (a+n and b+n):", "Merged line (0+1 and 1+1): Eric wants it", "Eric wants it"],
+    ["Compaction output: a-b:", "Compaction output: 0-1: Eric wants it", "Eric wants it"],
+    ["merged-line tag", `<merged-line id="0+2">Eric wants it`, "Eric wants it"],
+  ];
+  for (const [name, reply, echo] of cases) {
+    test(`${name} is retried, the echo drops it, and the clean reply is stored`, async () => {
+      const { store, model, memory, merge } = await openMerge({ nodeBytes: 40, tries: 3 });
+      merge.resolve(reply);
+      await until(() => model.open().length === 1, "second merge try");
+      const turn = model.open()[0]!.request.feedback[0]!;
+      expect(turn.reply).toBe(echo);
+      expect(turn.instruction).toContain("Your line began with a head or preamble.");
+      model.open()[0]!.resolve("Eric wants it done");
+      await until(() => store.nodes.has(nodeKey(1, 0)), "merge saved");
+      expect(store.nodes.get(nodeKey(1, 0))?.text).toBe("Eric wants it done");
+      expect(memory.status()).toMatchObject({ headRetries: 1 });
+    });
+
+    test(`${name}: when every try repeats it, the stored line is the reply with the head cut`, async () => {
+      const { store, model, merge } = await openMerge({ nodeBytes: 40, tries: 2 });
+      merge.resolve(reply);
+      await until(() => model.open().length === 1, "second merge try");
+      model.open()[0]!.resolve(reply);
+      await until(() => store.nodes.has(nodeKey(1, 0)), "merge saved");
+      expect(store.nodes.get(nodeKey(1, 0))?.text).toBe(echo);
+    });
+  }
+
+  test("a number outside the merge's own range, or a count, is content and is not retried", async () => {
+    for (const reply of ["Merged 14 PRs, 9 green", "45 tests pass in 3 files", "Compaction of 14 files: all kept", "2026 roadmap: ship it"]) {
+      const { store, model, merge } = await openMerge({ nodeBytes: 40, tries: 3 });
+      merge.resolve(reply);
+      await until(() => store.nodes.has(nodeKey(1, 0)), `merge saved for ${reply}`);
+      expect(store.nodes.get(nodeKey(1, 0))?.text).toBe(reply);
+      expect(model.calls).toHaveLength(3);
+    }
+  });
 });
 
 test("a reply that is both headed and over-long gets one feedback turn covering both", async () => {
