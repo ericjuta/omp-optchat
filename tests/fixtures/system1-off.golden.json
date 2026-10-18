@@ -243,7 +243,7 @@
     "settlement deadline: 25000 ms (host handler limit 30000 ms)",
     "host maintenance: automatic compaction can bypass the plugin veto; OptChat cannot disable it",
     "correlation: main provider responses carry no request identity; cache writers are compressor-only",
-    "child view: off",
+    "child view: unavailable: this session has no artifact manager",
     "side turns (/btw, recaps): the host gives no typed purpose; see issue #1"
   ]
 }

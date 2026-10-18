@@ -126,19 +126,19 @@ describe("childLaunch and overlay", () => {
 		overlayFile: "work/child-overlay.yml",
 	};
 
-	test("view arm adds the child-view flag, blind arm does not; both keep OptChat on, tools to task, and per-task files", () => {
+	test("view arm adds the child-view flag, blind arm opts out; both keep OptChat on, tools to task, and per-task files", () => {
 		const view = childLaunch(base, "view", files);
 		const blind = childLaunch(base, "blind", files);
 		expect(view).toMatchObject({ optchat: true, tools: ["task"], memory: "task/memory", sessionDir: "task/session", metricsFile: "task/metrics.jsonl", admissionFile: "task/admission.json" });
 		expect(view.extraArgs).toEqual(["--optchat-child-view", "--config=work/child-overlay.yml"]);
 		expect(blind).toMatchObject({ optchat: true, tools: ["task"] });
-		expect(blind.extraArgs).toEqual(["--config=work/child-overlay.yml"]);
+		expect(blind.extraArgs).toEqual(["--no-optchat-child-view", "--config=work/child-overlay.yml"]);
 	});
 
 	test("preserves fixture extension arguments while normalizing the arm flag and overlay", () => {
-		const configured: ArmBase = { ...base, extraArgs: ["-e", "fixture.ts", "--optchat-child-view", "--config=stale.yml"] };
+		const configured: ArmBase = { ...base, extraArgs: ["-e", "fixture.ts", "--optchat-child-view", "--no-optchat-child-view", "--config=stale.yml"] };
 		expect(childLaunch(configured, "view", files).extraArgs).toEqual(["-e", "fixture.ts", "--optchat-child-view", "--config=work/child-overlay.yml"]);
-		expect(childLaunch(configured, "blind", files).extraArgs).toEqual(["-e", "fixture.ts", "--config=work/child-overlay.yml"]);
+		expect(childLaunch(configured, "blind", files).extraArgs).toEqual(["-e", "fixture.ts", "--no-optchat-child-view", "--config=work/child-overlay.yml"]);
 	});
 });
 

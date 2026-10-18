@@ -16,7 +16,8 @@ type FlagName =
   | "optchat-jobs"
   | "optchat-tries"
   | "optchat-tool-cap"
-  | "optchat-child-view";
+  | "optchat-child-view"
+  | "no-optchat-child-view";
 type Flags = Partial<Record<FlagName, FlagValue>>;
 
 const MAX = Number.MAX_SAFE_INTEGER;
@@ -292,10 +293,13 @@ describe("numeric flags", () => {
     expect(registered).not.toContain("optchat-retry-ms");
   });
 
-  test("child view is opt-in and boolean-valued", () => {
-    expect(read({}).childView).toBe(false);
-    expect(read({ "optchat-child-view": "true" }).childView).toBe(true);
+  test("child view is on by default, the opt-out wins, and both flags are boolean-valued", () => {
+    expect(read({}).childView).toBe(true);
+    expect(read({ "optchat-child-view": "false" }).childView).toBe(false);
+    expect(read({ "no-optchat-child-view": true }).childView).toBe(false);
+    expect(read({ "optchat-child-view": true, "no-optchat-child-view": true }).childView).toBe(false);
     expectRejected({ "optchat-child-view": "yes" }, "optchat-child-view");
+    expectRejected({ "no-optchat-child-view": "yes" }, "no-optchat-child-view");
   });
 
   test("accepts leading zeros as decimal digits", () => {

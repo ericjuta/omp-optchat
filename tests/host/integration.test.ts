@@ -2831,7 +2831,8 @@ async function withFakeHost(
   const flags: Record<string, string | boolean> = {
     ...defaultFlags(memory),
     "optchat-model": "fake/fake",
-    ...(options.childView ? { "optchat-child-view": true } : {}),
+    // Memory cases run without a child view unless a case asks for one; the default is covered in config.test.ts.
+    ...(options.childView ? { "optchat-child-view": true } : { "no-optchat-child-view": true }),
   };
   const handlers = new Map<string, FakeHostHandler[]>();
   const registeredTools: Array<{ name: string }> = [];

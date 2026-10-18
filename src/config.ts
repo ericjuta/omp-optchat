@@ -11,7 +11,7 @@ export const DEFAULTS = Object.freeze({
   jobs: 8,
   tries: 5,
   toolCap: 30_000,
-  childView: false,
+  childView: true,
   rules: true,
   prefetch: true,
   valueScore: true,
@@ -110,7 +110,12 @@ export function registerFlags(api: FlagRegistrar): void {
   api.registerFlag("optchat-child-view", {
     type: "boolean",
     default: DEFAULTS.childView,
-    description: "Give subagents a read-only frozen snapshot of this chat (zoom, date, work and chat_search only)",
+    description: "Give subagents a read-only frozen snapshot of this chat: zoom, date, work and chat_search only (default: on; --no-optchat-child-view takes precedence)",
+  });
+  api.registerFlag("no-optchat-child-view", {
+    type: "boolean",
+    default: false,
+    description: "Give subagents no snapshot of this chat, even when --optchat-child-view is present",
   });
   for (const gate of GATE_FLAGS) {
     api.registerFlag(gate.flag, {
@@ -262,7 +267,9 @@ export function readConfig(api: FlagReader, defaultDirectory: string): OptChatCo
     jobs: integer(api, "optchat-jobs", DEFAULTS.jobs, 1, 64),
     tries: integer(api, "optchat-tries", DEFAULTS.tries, 1, 100),
     toolCap: integer(api, "optchat-tool-cap", DEFAULTS.toolCap, 128),
-    childView: boolean(api.getFlag("optchat-child-view"), "optchat-child-view", DEFAULTS.childView),
+    childView: boolean(api.getFlag("no-optchat-child-view"), "no-optchat-child-view", false)
+      ? false
+      : boolean(api.getFlag("optchat-child-view"), "optchat-child-view", DEFAULTS.childView),
     gates: gates(api),
   };
 }

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.0 — 2026-10-18
+
+- **Changed: the child view is on by default.** Subagents get the parent's frozen, read-only snapshot (`zoom`, `date`, `work`, `chat_search`) without `--optchat-child-view`. `--no-optchat-child-view` turns it off and wins over `--optchat-child-view`, like the gate opt-outs. Evidence: the 0.5.0 child experiment answered 4/4 with the view and 0/4 without (child cost $0.20 vs $0.09, n = 4 per arm). The evidence runner's blind arm now passes the opt-out. No prompt or tool bytes change for the parent; `/optchat status` reports the child view as published, or unavailable when the session has no artifact manager.
+
 ## 0.10.3 — 2026-10-17
 
 - **Fixed: concurrent cold compressor calls no longer each write the whole system prefix.** The cache coordinator keyed only on message marks, and each compressor call's last mark is its own task line, so no two calls ever waited for each other: in a cold 64-message build, 7 concurrent leaf calls each wrote about 66K tokens and read none ($0.167–0.173 each). A compressor call now also keys on its anchored tools and system head, so later calls wait for the first writer's response to start and then read the prefix. Main requests never wait on a head alone, the 20 s fail-open stays, and no prompt or tool bytes change. Live check after the change, n = 3 with no same-session control: the first call wrote 65,171 tokens ($0.1646), the next two read 61,980 each ($0.0163, $0.0158). Tests in `tests/cache.test.ts`.

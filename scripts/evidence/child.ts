@@ -9,7 +9,8 @@ import { answerInstruction, scoreAnswers, type Failure, type Outcome, type Retri
 /**
  * #13 child memory experiment. Each task runs on its own fresh parent host with OptChat on and the
  * built-in `task` tool. The parent must delegate the question to a subagent. The `view` arm passes
- * `--optchat-child-view`, the `blind` arm does not. Grading uses the child's delegated output only.
+ * `--optchat-child-view`, the `blind` arm passes `--no-optchat-child-view` (the view is on by default).
+ * Grading uses the child's delegated output only.
  */
 
 export type ChildArm = "view" | "blind";
@@ -234,11 +235,13 @@ export async function writeSyncTaskOverlay(file: string): Promise<void> {
 
 /**
  * Host launch for one task of one arm. The overlay applies `async.enabled=false`. Caller extraArgs are kept,
- * except the child-view flag and an earlier overlay, which this function replaces.
+ * except the child-view flags and an earlier overlay, which this function replaces.
  */
 export function childLaunch(base: ArmBase, arm: ChildArm, files: TaskFiles): ChildHostLaunch {
-	const extraArgs = (base.extraArgs ?? []).filter((arg) => arg !== "--optchat-child-view" && !arg.startsWith("--config="));
-	if (arm === "view") extraArgs.push("--optchat-child-view");
+	const extraArgs = (base.extraArgs ?? []).filter(
+		(arg) => arg !== "--optchat-child-view" && arg !== "--no-optchat-child-view" && !arg.startsWith("--config="),
+	);
+	extraArgs.push(arm === "view" ? "--optchat-child-view" : "--no-optchat-child-view");
 	extraArgs.push(`--config=${files.overlayFile}`);
 	return {
 		...base,

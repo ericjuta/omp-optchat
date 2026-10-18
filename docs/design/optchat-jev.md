@@ -82,7 +82,7 @@ Recomputing the view from scratch each turn; putting whole messages in the view;
 | Compactor context | not specified | separate 16,000-32,000-byte sawtooth view of built lines | research §2, row "Compactor context" |
 | Cache marks | 50k / 80k / 100k characters | provider-specific; official Anthropic image-capable routes use four-line blocks | `src/cache.ts:17-19,52-123,213-323` |
 | Subagent reports | not specified (the spec's report is a user message) | logged as kind `work` with source and completeness | `src/index.ts:232-256`; `src/reports.ts` |
-| Child views | not specified | opt-in (`--optchat-child-view`, default off) | `src/config.ts:14,78-82`; `src/index.ts:578-622` |
+| Child views | not specified | on by default since 0.11.0 (`--no-optchat-child-view` opts out) | `src/config.ts:14,78-82`; `src/index.ts:578-622` |
 | Writer lock | Unix socket | abstract Unix socket lease keyed by device and inode | `src/store.ts:353-378` |
 
 ## 3. System One additions
@@ -219,7 +219,7 @@ Why writes stay fixed: the compactor must run on every message, in order, before
 ### 4.1 What omp-optchat and OMP do today
 
 - **Spawn.** The `task` tool runs subagents in parallel; results come back as messages. Ids return at once.
-- **Starting context.** A subagent does not automatically inherit the parent's view. With `--optchat-child-view` on (default off), it gets a frozen render of the parent's view plus read-only `zoom`, `date` and `work`, bounded to the spawn point (`src/config.ts:14,78-82`; `src/index.ts:578-622`; `src/handoff.ts:77-233`).
+- **Starting context.** A subagent does not automatically inherit the parent's view. With the child view on (the default since 0.11.0; `--no-optchat-child-view` opts out), it gets a frozen render of the parent's view plus read-only `zoom`, `date` and `work`, bounded to the spawn point (`src/config.ts:14,78-82`; `src/index.ts:578-622`; `src/handoff.ts:77-233`).
 - **Tool approval.** Subagents run with approval set to yolo (`src/task/executor.ts:1144-1146`), so OMP's approval of the parent's `task` call is the only approval point for the subagent's work.
 - **Written back.** A subagent's report is logged as a `work` message with its source (task, async result, or launch completion) and completeness (full or pointer only) (`src/index.ts:232-256`; `src/reports.ts`).
 
