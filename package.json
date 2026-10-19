@@ -1,6 +1,6 @@
 {
   "name": "@ericjuta/omp-optchat",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "An endless OMP chat backed by a durable log and binary summary memory tree, inspired by Victor Taelin's OptChat.",
   "type": "module",
   "private": true,

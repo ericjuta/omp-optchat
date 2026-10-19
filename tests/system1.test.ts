@@ -21,6 +21,7 @@ import {
 import { valueHint } from "../src/system1/value.ts";
 import { choice, fakeJudge, noul, score, sessionFallbackJudge, type FakeJudge } from "./helpers/fake-judge.ts";
 import { openFakeHost, type FakeHost, type FakeHostOptions, type HostMessage } from "./helpers/fake-host.ts";
+import { holdTimers } from "./helpers/held-timer.ts";
 
 const dirs: string[] = [];
 const hosts: FakeHost[] = [];
@@ -306,13 +307,29 @@ describe("prefetch", () => {
     expect(await prefetchBlock(viewOf([line(1, "x")]), { judge, message: "hi", k: 8, min: 0.5 })).toBeUndefined();
   });
 
-  // Real timer on purpose: the bound is a wall-clock constant of prefetchBlock, and the test asserts it holds.
   test("a judge that never answers is abandoned at the bound", async () => {
-    const hung = { label: "hung", judge: () => Promise.withResolvers<never>().promise };
-    const started = Date.now();
-    const block = await prefetchBlock(viewOf([line(1, "x")]), { judge: hung, message: "hi", k: 8, min: 0.5, timeoutMs: 50 });
-    expect(block).toBeUndefined();
-    expect(Date.now() - started).toBeLessThan(1_000);
+    // The bound's timers are held, then fired by the test: the bound passing is an event, not elapsed time.
+    const BOUND_MS = 7_773;
+    const timers = holdTimers(BOUND_MS);
+    try {
+      let judgeSignal: AbortSignal | undefined;
+      const hung = {
+        label: "hung",
+        judge: (_request: unknown, options?: { signal?: AbortSignal }) => {
+          judgeSignal = options?.signal;
+          return Promise.withResolvers<never>().promise;
+        },
+      };
+      const pending = prefetchBlock(viewOf([line(1, "x")]), { judge: hung, message: "hi", k: 8, min: 0.5, timeoutMs: BOUND_MS });
+      await waitFor(() => judgeSignal !== undefined, "the hung judge to be called");
+      expect(judgeSignal!.aborted).toBe(false);
+
+      expect(timers.fire()).toBeGreaterThan(0);
+      expect(await pending).toBeUndefined();
+      expect(judgeSignal!.aborted).toBe(true);
+    } finally {
+      timers.restore();
+    }
   });
 
   test("the judged lines are packed into requests within the state and question bounds", async () => {
@@ -473,7 +490,6 @@ describe("System One through OptChat", () => {
     expect(host.notices.some((notice) => notice.message.startsWith(RULE_ADDED))).toBe(true);
   });
 
-  // Real timer on purpose: the shutdown bound is a wall-clock constant (1.5 s), and the test asserts it holds.
   test("a hung judge is abandoned at the shutdown bound, and its late answer writes nothing", async () => {
     const never = Promise.withResolvers<Record<string, Answer>>();
     const judge = fakeJudge(() => never.promise);
@@ -481,11 +497,23 @@ describe("System One through OptChat", () => {
     await contextTexts(host, [host.user(RULE_TEXT)]);
     await waitFor(() => judge.requests.length === 1, "the triage judgment to start");
 
-    const started = Date.now();
-    await host.shutdown();
-    const elapsed = Date.now() - started;
-    expect(elapsed).toBeGreaterThanOrEqual(1_400);
-    expect(elapsed).toBeLessThan(2_000);
+    // SHUTDOWN_TRIAGE_MS (1.5 s) is held, then fired by the test: the bound passing is an event, not elapsed time.
+    const timers = holdTimers(1_500);
+    try {
+      let closed = false;
+      const closing = host.shutdown().then(() => {
+        closed = true;
+      });
+      await waitFor(() => timers.armed === 1, "shutdown to arm its triage bound");
+      // Shutdown waits on the hung triage until the bound passes.
+      await macrotask();
+      expect(closed).toBe(false);
+
+      expect(timers.fire()).toBe(1);
+      await closing;
+    } finally {
+      timers.restore();
+    }
 
     never.resolve({ rule: noul(0.95) });
     await macrotask();

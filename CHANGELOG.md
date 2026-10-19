@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.1 — 2026-10-19
+
+- **Tests: the three real-timer bound tests are deterministic.** The shutdown (1.5 s), prefetch (50 ms) and memory-hint (20 ms) bounds now fire through held timers (`tests/helpers/held-timer.ts`) instead of wall-clock waits; each test still fails when its bound is broken. No runtime change.
+- **Not adopted (pre-registered, plan Decision Log 2026-10-19):** a rules prompt stating the standing-instruction boundary cut false adds 6 → 2 on relabeled train data, but the fresh test set held only 6 labeled rules of 120 (minimum 20), so it was not run. A recall pick that also reads the 4 messages after each contender lost on 38 fresh blind cases (74 vs 68 of 114 runs, 2 better, 6 worse, p = 0.965). Rule-add stays 0.8 and recall is unchanged.
+
 ## 0.11.0 — 2026-10-18
 
 - **Changed: the child view is on by default.** Subagents get the parent's frozen, read-only snapshot (`zoom`, `date`, `work`, `chat_search`) without `--optchat-child-view`. `--no-optchat-child-view` turns it off and wins over `--optchat-child-view`, like the gate opt-outs. Evidence: the 0.5.0 child experiment answered 4/4 with the view and 0/4 without (child cost $0.20 vs $0.09, n = 4 per arm). The evidence runner's blind arm now passes the opt-out. No prompt or tool bytes change for the parent; `/optchat status` reports the child view as published, or unavailable when the session has no artifact manager.

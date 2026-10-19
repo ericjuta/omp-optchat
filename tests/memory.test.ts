@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CompressorRefusedError, Memory, utf8Bytes, utf8Prefix, type CompactionRequest, type MemoryOptions, type Summarize } from "../src/memory.ts";
 import { Store, nodeKey } from "../src/store.ts";
+import { holdTimers } from "./helpers/held-timer.ts";
 
 const PLACEHOLDER = "(not summarized yet: zoom it)";
 const cleanups: Array<() => Promise<unknown>> = [];
@@ -263,23 +264,37 @@ test("a failing hint leaves the leaf compacted as if no hint existed", async () 
   expect(model.take("[m0]").request.instruction).not.toContain("importance");
 });
 
-// Real timers on purpose: hintTimeoutMs is a wall-clock bound, and observing that the leaf proceeds past it needs real time.
 test("a hint that never answers is abandoned at hintTimeoutMs, and the leaf compacts without it", async () => {
-  const store = await openStore();
-  const model = new Model();
-  const memory = memoryFor(store, model, {
-    nodeBytes: 16,
-    jobs: 4,
-    viewBytes: 1_000_000,
-    hintTimeoutMs: 20,
-    hint: () => Promise.withResolvers<string>().promise,
-  });
-  memory.append("user", "[m0] a long user message");
-  const { promise: past, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, 60);
-  await past;
-  await until(() => model.labels().includes("[m0]"), "leaf m0 after the hint bound");
-  expect(model.take("[m0]").request.instruction).not.toContain("importance");
+  // The bound's timer is held, then fired by the test: the bound passing is an event, not elapsed time.
+  const BOUND_MS = 7_771;
+  const timers = holdTimers(BOUND_MS);
+  try {
+    const store = await openStore();
+    const model = new Model();
+    let hintSignal: AbortSignal | undefined;
+    const memory = memoryFor(store, model, {
+      nodeBytes: 16,
+      jobs: 4,
+      viewBytes: 1_000_000,
+      hintTimeoutMs: BOUND_MS,
+      hint: (_source, signal) => {
+        hintSignal = signal;
+        return Promise.withResolvers<string>().promise;
+      },
+    });
+    memory.append("user", "[m0] a long user message");
+    await until(() => hintSignal !== undefined, "the hint call to start");
+    // While the hint is pending, the leaf waits for it: no compactor call yet.
+    await flush();
+    expect(model.labels()).toEqual([]);
+
+    expect(timers.fire()).toBe(1);
+    await until(() => model.labels().includes("[m0]"), "leaf m0 after the hint bound");
+    expect(hintSignal!.aborted).toBe(true);
+    expect(model.take("[m0]").request.instruction).not.toContain("importance");
+  } finally {
+    timers.restore();
+  }
 });
 
 test("a failed leaf keeps its admission slot until a retry succeeds", async () => {
