@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { HOST_COMPACTION_SUMMARY } from "../../src/prompts.ts";
 import type { Price, UsageRecord } from "./artifact.ts";
 import { isRecord } from "./scoring.ts";
 
@@ -140,6 +141,11 @@ export interface MaintenanceEstimate {
  * incomplete, unpriceable, or count-mismatched frame yields an unavailable estimate with null bounds.
  * Zero observed compactions cost zero.
  *
+ * A frame whose summary is OptChat's `HOST_COMPACTION_SUMMARY` costs exactly zero and still counts as a
+ * compaction: OptChat answers host compaction with that fixed marker, so by construction no model was
+ * called. Only that exact text is free; every other frame is priced as above, and an unknown cost stays
+ * unavailable, never zero.
+ *
  * OMP 18.9.1 can report `tokensBefore: 0` for a compaction that summarized real history. A zero is then
  * not a measurement: the low bound bills no input and the high bound bills `inputTokensCeiling` (the
  * compaction model's context window, which its request cannot exceed) at the dearest input-side rate.
@@ -190,6 +196,7 @@ export function estimateMaintenanceUsage(input: {
 		) {
 			return unavailable("compaction end carries no numeric tokensBefore and string summary");
 		}
+		if (result.summary === HOST_COMPACTION_SUMMARY) continue;
 		const model = end.model === undefined ? input.mainModel : end.model;
 		if (typeof model !== "string" || !Object.hasOwn(input.prices, model)) {
 			return unavailable(`no known price for compaction model ${String(model)}`);

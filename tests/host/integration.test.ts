@@ -56,10 +56,12 @@ import type {
 } from "@oh-my-pi/pi-coding-agent";
 import type { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import type { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
+import type { cfgCompactionThresholdTokens } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type * as Zod from "zod";
 import type { viewBlocks } from "../../src/cache.ts";
 import type * as OptChatModule from "../../src/index.ts";
+import { HOST_COMPACTION_SUMMARY } from "../../src/prompts.ts";
 import type { Kind, Store } from "../../src/store.ts";
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
@@ -146,6 +148,9 @@ const CASE_TITLES = {
   "cap-text": "capText keeps head and tail within the cap without splitting surrogate pairs",
   "view-blocks": "viewBlocks cuts only at stable line ends and joins back to the view",
   "fake-rejected-custom-image": "a custom message nothing admits stores no image; an admitted report stores exactly its own",
+  "host-compaction-rollover": "a threshold rollover gets OptChat's marker summary with no model call; the next request carries the view and the prompt, and the history stays under the threshold",
+  "host-compaction-classic": "classic threshold compaction gets OptChat's marker summary with no model call; the next request carries the view and the prompt, and the history stays under the threshold",
+  "host-compaction-open-turn": "a mid-run compaction keeps the open turn whole: older turns are dropped and the tool loop reaches the model verbatim",
 } as const;
 type CaseName = keyof typeof CASE_TITLES;
 
@@ -239,6 +244,7 @@ interface Libraries {
   Store: typeof Store;
   completeSimple: typeof completeSimple;
   clampThinkingLevelForModel: typeof clampThinkingLevelForModel;
+  cfgCompactionThresholdTokens: typeof cfgCompactionThresholdTokens;
 }
 
 /**
@@ -259,11 +265,12 @@ async function loadLibraries(): Promise<Libraries> {
   const { Store } = await import("../../src/store.ts");
   const { completeSimple } = await import("@oh-my-pi/pi-ai");
   const { clampThinkingLevelForModel } = await import("@oh-my-pi/pi-catalog");
+  const { cfgCompactionThresholdTokens } = await import("@oh-my-pi/pi-coding-agent/session/context-settings");
   // Keep the fake-host schema dependency behind the same child-only loading boundary.
   const zod = await import("zod");
   return {
     sdk, ThinkingLevel, zod, EventBus, initializeExtensions, parseArgs, optchat, viewBlocks, getBundledModels, Store,
-    completeSimple, clampThinkingLevelForModel,
+    completeSimple, clampThinkingLevelForModel, cfgCompactionThresholdTokens,
   };
 }
 
@@ -988,6 +995,10 @@ interface HostOptions {
   anthropic?: boolean;
   /** compressorMaxTokens for createOptChat. */
   compressorMaxTokens?: number;
+  /** Merged over HOST_SETTINGS, e.g. to turn host compaction on. */
+  settings?: Record<string, unknown>;
+  /** Built-in tools for createAgentSession; omitted means none. */
+  toolNames?: string[];
 }
 
 function defaultFlags(memory: string): Record<string, string | boolean> {
@@ -1075,7 +1086,7 @@ class Host {
 
   static async start(ctx: CaseContext, options: HostOptions): Promise<Host> {
     const { sdk, ThinkingLevel, EventBus, initializeExtensions, optchat } = ctx.lib;
-    const settings = sdk.Settings.isolated(HOST_SETTINGS);
+    const settings = sdk.Settings.isolated({ ...HOST_SETTINGS, ...options.settings });
     const auth = await sdk.AuthStorage.create(join(ctx.agentDir, "auth.db"));
     let host: Host | undefined;
     try {
@@ -1148,7 +1159,7 @@ class Host {
         contextFiles: [],
         promptTemplates: [],
         slashCommands: [],
-        toolNames: [],
+        toolNames: options.toolNames ?? [],
         enableMCP: false,
         enableLsp: false,
         enableIrc: false,
@@ -3683,6 +3694,265 @@ async function viewBlocksUnit(ctx: CaseContext): Promise<Evidence> {
 }
 
 // ---------------------------------------------------------------------------
+// Host compaction: OptChat answers with its marker summary, never a model call
+// ---------------------------------------------------------------------------
+
+/**
+ * The host's compaction trigger is a local estimate of its stored conversation (system prompt and
+ * tool schemas plus every stored message), floored against provider usage. The fixture reports
+ * 64 prompt tokens, so the estimate alone decides. A threshold a little above the fixed overhead
+ * plus two large messages trips on the third.
+ */
+const HC_FILLER = "alpha beta gamma delta ";
+/**
+ * Prompt sizes of the four turns, at the fixture tokenizer's 4 characters per token: about 4,000, 400, 4,000 and 200
+ * tokens. The compressor splits a message over 16 KiB into parts, so the large ones stay under it. Rollover mode keeps
+ * the last user message across a cut, so the second turn is small: the history then stays under the threshold after
+ * the third turn's compaction in both modes.
+ */
+const HC_TURN_CHARS = [16_000, 1_600, 16_000, 800];
+/** Trips on the third turn (overhead + 8,400 tokens), not on the second (4,400), and not again on the fourth (under 5,000). */
+const HC_THRESHOLD_ABOVE_OVERHEAD = 6_400;
+const HC_KEEP_RECENT_TOKENS = 1_000;
+
+/** A message of about `chars` characters that starts with `label`, so the wire can be searched for it. */
+function hcText(label: string, chars: number): string {
+  return `${label} ${HC_FILLER.repeat(Math.ceil(chars / HC_FILLER.length))}`.trim();
+}
+
+const HC_WORDS = [
+  "amber", "basalt", "cobalt", "dune", "ember", "fjord", "garnet", "harbor", "indigo", "juniper", "kestrel", "lagoon", "meadow", "nimbus", "onyx",
+  "prairie", "quartz", "ridge", "sable", "tundra", "umber", "valley", "willow", "xenon", "yarrow", "zephyr", "alder", "birch", "cedar", "delta",
+];
+
+/**
+ * Like hcText, but without a short cycle: the host stops a model reply that repeats one (its thinking-loop guard),
+ * which it would do to the repeated filler of a prompt if a model said it.
+ */
+function hcVaried(label: string, chars: number, seed: number): string {
+  let state = seed;
+  let text = `${label} `;
+  while (text.length < chars) {
+    state = (state * 1_103_515_245 + 12_345) % 2_147_483_648;
+    text += `${HC_WORDS[state % HC_WORDS.length]} `;
+  }
+  return text.trim();
+}
+
+/**
+ * The host's own measure of what every request carries besides messages: system prompt, tool schemas and the system
+ * context (which holds OptChat's system block once a turn has run). The maintenance estimate adds this to the stored
+ * messages, so a threshold relative to it holds whatever the host prompt or tool set weighs.
+ */
+function hostOverheadTokens(host: Host): number {
+  const breakdown = host.session.getContextBreakdown();
+  assert(breakdown, "the session reports its context breakdown");
+  return breakdown.systemPromptTokens + breakdown.systemToolsTokens + breakdown.systemContextTokens + breakdown.skillsTokens;
+}
+
+/**
+ * Sets the compaction threshold `above` tokens over the measured overhead, on the session's live settings (maintenance
+ * reads them on every check). Cases call it after the first turn: before any turn the system context lacks OptChat's block.
+ */
+function setThresholdAboveOverhead(ctx: CaseContext, host: Host, above: number): number {
+  const thresholdTokens = hostOverheadTokens(host) + above;
+  ctx.lib.cfgCompactionThresholdTokens.override(host.session.settings, thresholdTokens);
+  return thresholdTokens;
+}
+
+type CompactionEnd = Extract<AgentSessionEvent, { type: "auto_compaction_end" }>;
+
+function compactionStarts(host: Host): number {
+  return host.events.filter((event) => event.type === "auto_compaction_start").length;
+}
+
+function compactionEnds(host: Host): CompactionEnd[] {
+  return host.events.filter((event): event is CompactionEnd => event.type === "auto_compaction_end");
+}
+
+/** The host's maintenance warnings (dead ends, blocked continuation), as the TUI would show them. */
+function compactionWarnings(host: Host): string[] {
+  return host.events.flatMap((event) => (event.type === "notice" && event.source === "compaction" ? [event.message] : []));
+}
+
+/** The session branch's compaction entries, oldest first. */
+function compactionEntries(host: Host): Array<{ id: string; summary: string; firstKeptEntryId: string }> {
+  return host.session.sessionManager.getBranch().flatMap((entry) =>
+    entry.type === "compaction" ? [{ id: entry.id, summary: entry.summary, firstKeptEntryId: entry.firstKeptEntryId }] : []);
+}
+
+/** The compaction frames of one case: every one ended, unaborted, unskipped, with exactly the marker summary. */
+function assertMarkerFrames(host: Host, summary: string): CompactionEnd[] {
+  const ends = compactionEnds(host);
+  assert(ends.length >= 1, "the host threshold tripped and ran maintenance");
+  assert.equal(compactionStarts(host), ends.length, "every maintenance start has its end");
+  assert.equal(ends.filter((end) => end.aborted).length, 0, "OptChat never cancels host compaction while it is ready");
+  for (const end of ends) {
+    assert.equal(end.skipped ?? false, false, "maintenance was not skipped");
+    assert.equal(end.errorMessage, undefined, "maintenance did not fail");
+    assert.equal(end.result?.summary, summary, "the compaction result is OptChat's marker summary");
+  }
+  const entries = compactionEntries(host);
+  assert.equal(entries.at(-1)?.summary, summary, "the session's latest compaction entry carries the marker summary");
+  assert.deepEqual(compactionWarnings(host), [], "no dead-end or blocked-continuation warning");
+  return ends;
+}
+
+/** A request sent after compaction: the view and the new prompt, never the host's stand-in or raw older turns. */
+function assertPostCompactionRequest(body: WireObject, prompt: string, summary: string, older: readonly string[], label: string): void {
+  soleView(body, label);
+  assert.equal(occurrences(outsideTexts(body), prompt), 1, `${label}: the new prompt is sent once, outside the view`);
+  const wire = JSON.stringify(body);
+  assert(!wire.includes(summary), `${label}: the marker summary never reaches the model`);
+  for (const text of older) assert(!wire.includes(text), `${label}: dropped raw history ${text.slice(0, 24)} stays out of the request`);
+}
+
+/**
+ * Two large turns fill the host history, the third trips the threshold. The host answers through
+ * OptChat's hook with its marker summary and asks no model, so its history drops raw turns the
+ * model reads through the view anyway; the turn after that stays under the threshold.
+ */
+async function hostCompactionMarker(ctx: CaseContext, experimental: boolean): Promise<Evidence> {
+  const { fixture, memory } = ctx;
+  const summary = HOST_COMPACTION_SUMMARY;
+  const labels = [1, 2, 3, 4].map((n) => `OPTCHAT_IT_HC${experimental ? "R" : "C"}_${n}`);
+  const prompts = labels.map((label, index) => hcText(label, HC_TURN_CHARS[index]!));
+  // Rollover mode tells the model once per context window, when the history nears the threshold, to save its notes;
+  // the host answers that reminder with one more request. The window starts at the session and at each compaction.
+  const reminderTurns = experimental ? [1, 3] : [];
+  const reminders = (turn: number): string[] => (reminderTurns.includes(turn) ? [`OPTCHAT_IT_HC notes reply ${turn + 1}`] : []);
+  const followUps = reminderTurns.length;
+  return withHost(ctx, {
+    settleTimeoutMs: POSITIVE_SETTLE_MS,
+    settings: {
+      "compaction.enabled": true,
+      "compaction.keepRecentTokens": HC_KEEP_RECENT_TOKENS,
+      "compaction.experimentalContextManagement": experimental,
+    },
+    // The rollover is offered only when the session can recover from notes: read and grep, then context_notes and new_context.
+    ...(experimental ? { toolNames: ["read", "grep"] } : {}),
+  }, async (host) => {
+    await hcTurn(ctx, host, prompts[0]!, "OPTCHAT_IT_HC reply 1", reminders(0));
+    const thresholdTokens = setThresholdAboveOverhead(ctx, host, HC_THRESHOLD_ABOVE_OVERHEAD);
+    await hcTurn(ctx, host, prompts[1]!, "OPTCHAT_IT_HC reply 2", reminders(1));
+    assert.equal(compactionStarts(host), 0, "two large turns stay under the threshold");
+
+    const third = await hcTurn(ctx, host, prompts[2]!, "OPTCHAT_IT_HC reply 3", reminders(2));
+    const ends = assertMarkerFrames(host, summary);
+    assertPostCompactionRequest(third.body, prompts[2]!, summary, [labels[0]!, labels[1]!], "the request after compaction");
+    assert(!mainRows(memory).some((row) => row.text.includes(summary)), "the host stand-in is never logged as chat");
+
+    const entry = compactionEntries(host).at(-1)!;
+    const branchIds = host.session.sessionManager.getBranch().map((candidate) => candidate.id);
+    assert(branchIds.includes(entry.firstKeptEntryId), "the kept tail starts at an entry of the branch");
+    const kept = host.session.messages;
+    assert.equal(kept[0]?.role, "compactionSummary", "the host history starts with its stand-in");
+    assert(!JSON.stringify(kept).includes(labels[0]!), "the dropped raw turn is gone from the host history");
+
+    // One more large turn: the compaction left room, so maintenance stays quiet and the request is plain.
+    const startsBefore = compactionStarts(host);
+    const fourth = await hcTurn(ctx, host, prompts[3]!, "OPTCHAT_IT_HC reply 4", reminders(3));
+    assert.equal(compactionStarts(host), startsBefore, "no new maintenance after the compaction");
+    assertPostCompactionRequest(fourth.body, prompts[3]!, summary, [labels[0]!, labels[1]!], "the next request");
+
+    assert.equal(fixture.chat().length, 4 + followUps, "one chat request per prompt and reminder: compaction asked no model");
+    assert(fixture.compact().every((capture) => capture.model === COMPACT_MODEL), "only the compressor ever served a compaction task");
+    assert.deepEqual(host.runtimeErrors, [], "no extension runtime errors");
+    fixture.assertScriptsConsumed();
+    return { frames: ends.length, thresholdTokens, experimental, chatRequests: fixture.chat().length };
+  });
+}
+
+/**
+ * An ordinary prompt plus the host's own follow-up requests, each scripted. Returns the prompt's request.
+ * The prompt and its reply are durable, in that order; the follow-ups are the host's, not the chat's.
+ */
+async function hcTurn(ctx: CaseContext, host: Host, prompt: string, reply: string, followUps: readonly string[]): Promise<Capture> {
+  const { fixture, memory } = ctx;
+  const chatBefore = fixture.chat().length;
+  fixture.queueChat(prompt, { text: reply });
+  for (const text of followUps) fixture.queueChat(text, { text });
+  expectCompleted(await bounded(`prompt ${prompt.slice(0, 24)}`, host.prompt(prompt), STEP_MS, fixture.fatal), prompt.slice(0, 24));
+  await host.idle();
+  await fixture.until(`durable reply to ${prompt.slice(0, 24)}`, () => {
+    const rows = mainRows(memory);
+    const at = rows.findIndex((row) => row.kind === "user" && row.text === prompt);
+    return at >= 0 && rows.slice(at).some((row) => row.kind === "talk" && row.text === reply) ? rows : undefined;
+  });
+  assert.equal(fixture.chat().length, chatBefore + 1 + followUps.length, "the prompt and each scripted follow-up reach the chat queue once");
+  fixture.assertScriptsConsumed();
+  return fixture.chat()[chatBefore]!;
+}
+
+const HC_OPEN_USER = "OPTCHAT_IT_HCO_OPEN: run the probe three times, then answer.";
+const HC_OPEN_FINAL = "OPTCHAT_IT_HCO_FINAL: the probes are done.";
+
+/**
+ * Two older turns, then one turn whose tool loop crosses the threshold between requests. The
+ * compaction drops the older turns and keeps the open turn whole, so the loop's later requests still
+ * carry its prompt and every tool result.
+ */
+async function hostCompactionOpenTurn(ctx: CaseContext): Promise<Evidence> {
+  const { fixture, memory } = ctx;
+  const summary = HOST_COMPACTION_SUMMARY;
+  const older = [1, 2].map((n) => hcText(`OPTCHAT_IT_HCO_OLD${n}`, 12_000));
+  const roundChars = 4_000;
+  const rounds = [1, 2, 3].map((n) => ({ id: `optchat-it-hco-probe-${n}`, text: hcVaried(`OPTCHAT_IT_HCO_ROUND${n}`, roundChars, n) }));
+  return withHost(ctx, {
+    settleTimeoutMs: POSITIVE_SETTLE_MS,
+    settings: {
+      "compaction.enabled": true,
+      "compaction.midTurnEnabled": true,
+      "compaction.keepRecentTokens": HC_KEEP_RECENT_TOKENS,
+    },
+  }, async (host) => {
+    await ordinaryTurn(ctx, host, older[0]!, "OPTCHAT_IT_HCO reply 1");
+    // Two older turns of 3,000 tokens fit; the loop's rounds of about 1,000 tokens each cross it before the fourth request.
+    const thresholdTokens = setThresholdAboveOverhead(ctx, host, 3_000 + 3_000 + 2_500);
+    await ordinaryTurn(ctx, host, older[1]!, "OPTCHAT_IT_HCO reply 2");
+    assert.equal(compactionStarts(host), 0, "the older turns stay under the threshold");
+
+    for (const round of rounds) {
+      fixture.queueChat(`open turn ${round.id}`, { text: round.text, calls: [{ id: round.id, name: "probe", args: { label: round.id } }] });
+    }
+    fixture.queueChat("open turn final", { text: HC_OPEN_FINAL });
+    expectCompleted(await bounded("open turn", host.prompt(HC_OPEN_USER), STEP_MS, fixture.fatal), "open turn");
+    await host.idle();
+    await fixture.until("the open turn's final reply is durable", () => mainRows(memory).at(-1)?.text === HC_OPEN_FINAL);
+    await fixture.until("maintenance ended", () => compactionEnds(host).length >= 1 && compactionEnds(host).length === compactionStarts(host));
+    const ends = assertMarkerFrames(host, summary);
+    assert.equal(ends.length, 1, "one compaction was enough: the kept open turn leaves the history under the threshold");
+    const openRun = host.events.findLastIndex((event) => event.type === "agent_start");
+    assert(host.events.findIndex((event, index) => index > openRun && event.type === "auto_compaction_start") > openRun, "the compaction ran inside the open turn's run");
+    fixture.assertScriptsConsumed();
+    assert.equal(fixture.chat().length, 2 + rounds.length + 1, "two older turns, one request per tool round and the final reply: compaction asked no model");
+    assert(fixture.compact().every((capture) => capture.model === COMPACT_MODEL), "only the compressor ever served a compaction task");
+
+    // Every request of the open turn, before and after the compaction, carries its prompt and all tool results so far.
+    const loop = fixture.chat().slice(2).map((capture) => capture.body);
+    for (const [index, body] of loop.entries()) {
+      const label = `open-turn request ${index + 1}`;
+      assertPostCompactionRequest(body, HC_OPEN_USER, summary, older, label);
+      for (const round of rounds.slice(0, index)) {
+        assert.equal(toolResultText(body, round.id), PROBE_RESULT, `${label}: the tool result of ${round.id} is still sent`);
+        assert(wireText(replayedCall(body, round.id).message).includes(round.text.slice(0, 32)), `${label}: the assistant text of ${round.id} is still sent`);
+      }
+    }
+
+    // The host history dropped the older turns and kept the open turn from its own first message.
+    const kept = JSON.stringify(host.session.messages);
+    for (const text of older) assert(!kept.includes(text.slice(0, 24)), "the older turn is dropped from the host history");
+    assert(kept.includes(HC_OPEN_USER), "the open turn's first message stays in the host history");
+    const openEntry = host.session.sessionManager.getBranch().find((entry) =>
+      entry.type === "message" && entry.message.role === "user" && JSON.stringify(entry.message).includes(HC_OPEN_USER));
+    assert(openEntry, "the open turn's prompt is a branch entry");
+    assert.equal(compactionEntries(host)[0]?.firstKeptEntryId, openEntry.id, "the first compaction keeps the open turn whole, from its prompt");
+    assert.deepEqual(host.runtimeErrors, [], "no extension runtime errors");
+    return { frames: ends.length, thresholdTokens, chatRequests: fixture.chat().length };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -3744,6 +4014,9 @@ const CASES: Record<CaseName, (ctx: CaseContext) => Promise<Evidence>> = {
   "fake-rejected-custom-image": fakeRejectedCustomImage,
   "cap-text": capTextUnit,
   "view-blocks": viewBlocksUnit,
+  "host-compaction-rollover": (ctx) => hostCompactionMarker(ctx, true),
+  "host-compaction-classic": (ctx) => hostCompactionMarker(ctx, false),
+  "host-compaction-open-turn": hostCompactionOpenTurn,
 };
 
 function isCaseName(name: string): name is CaseName {

@@ -21,6 +21,9 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
+	SessionBeforeCompactEvent,
+	SessionBeforeCompactResult,
+	SessionEntry,
 	ToolResultEvent,
 	ToolResultEventResult,
 } from "@oh-my-pi/pi-coding-agent";
@@ -47,7 +50,7 @@ import { appendMetric, boundedProviderError, METRICS_FILE, readCompressorSpend, 
 import { captureWorkReports, type ArtifactPathSource } from "./reports.js";
 import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } from "./archive.js";
 import { CompressorRefusedError, Memory, type CompactionRequest, type Summarize } from "./memory.js";
-import { VIEW_DOC } from "./prompts.js";
+import { HOST_COMPACTION_SUMMARY, VIEW_DOC } from "./prompts.js";
 import { archiveStoreDirectory, nextArchivePath, Store, StoreLeaseConflictError, type Kind, type Message } from "./store.js";
 import { boundedGateError, hostJudge, judgeWithin, sessionFallbackOf, utf8Length, type JudgeFactory, type NamedJudge } from "./system1/judge.js";
 import { counted, GATE_KEYS, GATE_LABEL, GATE_PURPOSE, GateCounts, INACTIVE_REASON, type GateKey, type Judging } from "./system1/gates.js";
@@ -386,6 +389,46 @@ function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * The message a branch entry gives the host's compaction preparation, built the way the host builds it
+ * (pi-agent-core `getMessageFromEntry`), so `stamp` and `keyOf` identify it as they identify the live message.
+ */
+function branchEntryMessage(entry: SessionEntry): AgentMessage | undefined {
+	switch (entry.type) {
+		case "message":
+			return entry.message;
+		case "custom_message":
+			return {
+				role: "custom",
+				customType: entry.customType,
+				content: entry.content,
+				display: entry.display,
+				details: entry.details,
+				attribution: entry.attribution,
+				timestamp: new Date(entry.timestamp).getTime(),
+			};
+		case "branch_summary":
+			return { role: "branchSummary", summary: entry.summary, fromId: entry.fromId, timestamp: new Date(entry.timestamp).getTime() };
+		default:
+			return undefined;
+	}
+}
+
+/** Roles of `message` entries where the host may cut a compaction (pi-agent-core `findValidCutPoints`); never toolResult. */
+const CUT_ROLES: Readonly<Record<string, true>> = {
+	bashExecution: true,
+	hookMessage: true,
+	branchSummary: true,
+	compactionSummary: true,
+	user: true,
+	assistant: true,
+};
+
+function isCutPoint(entry: SessionEntry): boolean {
+	if (entry.type === "message") return Object.hasOwn(CUT_ROLES, entry.message.role);
+	return entry.type === "branch_summary" || entry.type === "custom_message";
+}
+
 interface Mark {
 	key: string;
 	stamp: number;
@@ -545,7 +588,7 @@ class OptChat {
 		private readonly judges: JudgeFactory = hostJudge,
 	) {}
 
-	/** Inactive sessions pass every host hook through unchanged: no view, no capture, no compaction veto. */
+	/** Inactive sessions pass every host hook through unchanged: no view, no capture, no compaction answer. */
 	get passive(): boolean {
 		return this.state.kind === "inactive";
 	}
@@ -1194,12 +1237,15 @@ class OptChat {
 		return tail.every((message) => !persisted.has(keyOf(message)));
 	}
 
-	/** Index where the unlogged suffix starts: the new prompt batch and the host context queued with it. */
+	/**
+	 * Index where the unlogged suffix starts: the new prompt batch and the host context queued with it. A host
+	 * compaction summary ends it: it stands in for dropped history, so it is never chat input and never logged.
+	 */
 	private unloggedStart(messages: AgentMessage[]): number {
 		let start = messages.length;
 		while (start > 0) {
 			const message = messages[start - 1]!;
-			if (stamp(message) < this.cutoff || this.logged.has(keyOf(message))) break;
+			if (message.role === "compactionSummary" || stamp(message) < this.cutoff || this.logged.has(keyOf(message))) break;
 			start--;
 		}
 		return start;
@@ -1405,6 +1451,35 @@ class OptChat {
 		} catch (error) {
 			this.fail(`OptChat stopped logging: ${errorText(error)}. Every prompt will be refused until restart.`);
 		}
+	}
+
+	/**
+	 * Host compaction (threshold, overflow, rollover, /compact). The model reads the OptChat view, not the host history,
+	 * so the raw messages the host keeps only grow its local estimate and re-trigger maintenance. Answer with a fixed
+	 * marker summary, no model call: the host drops the raw messages, which the memory log already holds. The open turn
+	 * is never cut, because its tool loop must reach the model verbatim: a cut that would drop its first message moves
+	 * to that message, or is cancelled when nothing older than the turn can be dropped.
+	 */
+	beforeCompact(event: SessionBeforeCompactEvent): SessionBeforeCompactResult | undefined {
+		if (this.passive) return undefined;
+		if (this.state.kind !== "ready") return { cancel: true };
+		const { preparation } = event;
+		const marker = (firstKeptEntryId: string): SessionBeforeCompactResult => ({
+			compaction: { summary: HOST_COMPACTION_SUMMARY, firstKeptEntryId, tokensBefore: preparation.tokensBefore },
+		});
+		const anchor = this.turn?.first ?? this.turn?.after;
+		const dropped = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
+		const at = anchor ? this.find(dropped, anchor) : -1;
+		if (!anchor || at < 0) return marker(preparation.firstKeptEntryId);
+		// Nothing older than the open turn to drop, or a host stand-in for history that was dropped before.
+		if (at === 0 || dropped[at]!.role === "compactionSummary") return { cancel: true };
+		for (let index = event.branchEntries.length - 1; index >= 0; index--) {
+			const entry = event.branchEntries[index]!;
+			const message = branchEntryMessage(entry);
+			if (!message || stamp(message) !== anchor.stamp || keyOf(message) !== anchor.key) continue;
+			return isCutPoint(entry) ? marker(entry.id) : { cancel: true };
+		}
+		return { cancel: true };
 	}
 
 	toolResult(event: ToolResultEvent): ToolResultEventResult | undefined {
@@ -1636,7 +1711,7 @@ class OptChat {
 		lines.push(
 			`stateless OpenAI: ${process.env.PI_OPENAI_STATEFUL === "0" ? "requested (PI_OPENAI_STATEFUL=0)" : "not set; official OpenAI main requests may chain responses"}`,
 			`settlement deadline: ${this.settleTimeoutMs} ms (host handler limit ${HOST_HANDLER_LIMIT_MS} ms)`,
-			"host maintenance: automatic compaction can bypass the plugin veto; OptChat cannot disable it",
+			"host maintenance: OptChat answers host compaction with a marker summary, never a model call, and keeps the open turn; automatic shake pruning bypasses that hook",
 			"correlation: main provider responses carry no request identity; cache writers are compressor-only",
 			`child view: ${this.childStatus}`,
 			"side turns (/btw, recaps): the host gives no typed purpose; see issue #1",
@@ -1926,8 +2001,8 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 			pi.on("tool_result", (event) => active.toolResult(event));
 			pi.on("message_end", (event) => active.messageEnd(event.message));
 			pi.on("agent_end", (event) => active.agentEnd(event.messages, event.willContinue === true));
-			// The current turn's tool loop must reach the model verbatim: no host compaction.
-			pi.on("session_before_compact", () => (active.passive ? undefined : { cancel: true }));
+			// Host compaction gets OptChat's marker summary and never cuts the open turn: see beforeCompact.
+			pi.on("session_before_compact", (event) => active.beforeCompact(event));
 			pi.on("session_switch", (_event, switchCtx) => active.sessionChanged(switchCtx));
 			pi.on("session_branch", (_event, branchCtx) => active.sessionChanged(branchCtx));
 			pi.on("session_tree", (_event, treeCtx) => active.sessionChanged(treeCtx));

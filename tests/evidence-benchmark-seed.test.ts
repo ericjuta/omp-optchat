@@ -3,6 +3,7 @@ import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent";
+import { HOST_COMPACTION_SUMMARY } from "../src/prompts.ts";
 import {
 	estimateMaintenanceUsage,
 	maintenanceUsageState,
@@ -242,6 +243,43 @@ describe("maintenance estimate", () => {
 		expect(bounded.costUsdHigh).toBeCloseTo((200_000 * 12.5 + 3 * 20) / 1e6, 12);
 		const unknown = estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES, inputTokensCeiling: null });
 		expect(unknown).toMatchObject({ estimated: false, costUsdLow: null, costUsdHigh: null });
+	});
+
+	test("an OptChat marker frame costs exactly zero, even with no known price, and still counts as a compaction", () => {
+		const events = [START, { type: "auto_compaction_end", model: "mystery", result: { tokensBefore: 90_000, summary: HOST_COMPACTION_SUMMARY } }];
+		expect(estimateMaintenanceUsage({ compactionEntries: 1, events, mainModel: "main-model", prices: PRICES, inputTokensCeiling: null })).toEqual({
+			compactions: 1,
+			estimated: true,
+			costUsdLow: 0,
+			costUsdHigh: 0,
+		});
+	});
+
+	test("a marker frame mixed with a native frame prices only the native one", () => {
+		const events = [
+			START,
+			{ type: "auto_compaction_end", result: { tokensBefore: 90_000, summary: HOST_COMPACTION_SUMMARY } },
+			START,
+			{ type: "auto_compaction_end", result: { tokensBefore: 1000, summary: "abcdefghi" } },
+		];
+		const estimate = estimateMaintenanceUsage({ compactionEntries: 2, events, mainModel: "main-model", prices: PRICES, inputTokensCeiling: 200_000 });
+		expect(estimate).toMatchObject({ compactions: 2, estimated: true });
+		expect(estimate.costUsdLow).toBeCloseTo((1000 * 1 + 3 * 20) / 1e6, 12);
+		expect(estimate.costUsdHigh).toBeCloseTo((1000 * 10 + 3 * 20) / 1e6, 12);
+	});
+
+	test("a marker frame does not excuse an incomplete frame or a count mismatch", () => {
+		const marker = { type: "auto_compaction_end", result: { tokensBefore: 1, summary: HOST_COMPACTION_SUMMARY } };
+		const mismatch = estimateMaintenanceUsage({ compactionEntries: 2, events: [START, marker], mainModel: "main-model", prices: PRICES, inputTokensCeiling: 200_000 });
+		expect(mismatch).toMatchObject({ estimated: false, costUsdLow: null, costUsdHigh: null });
+		const unknownNative = estimateMaintenanceUsage({
+			compactionEntries: 2,
+			events: [START, marker, START, { type: "auto_compaction_end", model: "mystery", result: { tokensBefore: 1, summary: "x" } }],
+			mainModel: "main-model",
+			prices: PRICES,
+			inputTokensCeiling: 200_000,
+		});
+		expect(unknownNative).toMatchObject({ estimated: false, costUsdLow: null, costUsdHigh: null });
 	});
 
 	test("a frame naming a known model is priced at that model", () => {

@@ -58,6 +58,11 @@ export const RULER =
   "----------------------------------------------------------------" +
   "----------------------------------------------------------------";
 
+// OptChat's answer to a host compaction: the host stores it in place of the raw
+// messages it drops. No model writes it, and OptChat never sends it after the view.
+export const HOST_COMPACTION_SUMMARY =
+  "OptChat keeps this session's earlier messages in its memory log, and the model reads them through the OptChat view, so the host context keeps only recent messages.";
+
 // Append this complete, stable guide to the host prompt for both turns and
 // compactions. Keep request-specific state, limits and tasks outside it.
 export const VIEW_DOC = `OptChat supplies persistent chat memory to the host agent. Each call is

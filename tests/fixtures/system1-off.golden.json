@@ -241,7 +241,7 @@
     "compressor fallbacks: 0 main-model retries; 0 unsummarized stand-ins",
     "stateless OpenAI: not set; official OpenAI main requests may chain responses",
     "settlement deadline: 25000 ms (host handler limit 30000 ms)",
-    "host maintenance: automatic compaction can bypass the plugin veto; OptChat cannot disable it",
+    "host maintenance: OptChat answers host compaction with a marker summary, never a model call, and keeps the open turn; automatic shake pruning bypasses that hook",
     "correlation: main provider responses carry no request identity; cache writers are compressor-only",
     "child view: unavailable: this session has no artifact manager",
     "side turns (/btw, recaps): the host gives no typed purpose; see issue #1"
