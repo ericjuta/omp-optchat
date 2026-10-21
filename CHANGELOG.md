@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.3 — 2026-10-21
+
+- **Fixed: a huge open turn no longer stalls host compaction.** OptChat moved any cut out of the open turn, so when the turn itself was most of the context the compaction freed too little (one live session went 250,654 → 215,536 tokens) and OMP paused automatic maintenance until the turn reached 851,238 tokens. When the turn's dropped part is larger than the older history (bytes), or the cut cannot move to the turn's first message, the host's cut now stands and the marker names the turn's first message (`zoom(id, 1)`); the metric row says `cut-in-turn`. A turn opening with no new message keeps the old behaviour. Tests: `tests/metrics.test.ts` "larger than the older history" fails on 0.13.2.
+
 ## 0.13.2 — 2026-10-21
 
 - **Changed: a second session outside git no longer runs without memory.** Without `--optchat-dir`, every session outside a git checkout used the one global `optchat/` store, so starting OMP in a second such directory warned "OptChat is inactive: … is in use by another session". When the global store is held, the session now opens its working directory's own store under `optchat-dirs/<name>-<sha16>` beside it and reports the directory in one notice; it goes inactive only if that store is held too. An explicit `--optchat-dir` never falls back.

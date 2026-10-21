@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent";
-import { HOST_COMPACTION_SUMMARY } from "../src/prompts.ts";
+import { HOST_COMPACTION_SUMMARY, hostCompactionSummaryInTurn } from "../src/prompts.ts";
 import type { FakeHost, HostMessage } from "./helpers/fake-host.ts";
 import { branchOf, compact, messageEntry, stampOf } from "./helpers/host-compaction.ts";
 import { ALL_GATES_OFF, Harness, messagesOf, SMALL_NODES, talk, viewContent } from "./helpers/system1-chat.ts";
@@ -133,7 +133,7 @@ describe("host compaction: the open turn is never cut", () => {
     expect(outcome).toEqual({ cancel: true });
   });
 
-  test("an open turn that is the first dropped message: cancel", async () => {
+  test("an open turn that is the first dropped message: the host's cut stands and the summary points at the turn's first message", async () => {
     const host = await open();
     const prompt = host.user("only question");
     await host.context([prompt]);
@@ -141,7 +141,7 @@ describe("host compaction: the open turn is never cut", () => {
     const result = host.toolResult("t1", "read", "file text");
     const all = [prompt, reply, result, host.assistant("done")];
     const outcome = await compact(host, { dropped: [], prefix: [prompt, reply, result], firstKeptEntryId: "e4" }, branchOf(all));
-    expect(outcome).toEqual({ cancel: true });
+    expect(outcome).toEqual({ compaction: { summary: hostCompactionSummaryInTurn(0), firstKeptEntryId: "e4", tokensBefore: 1000 } });
   });
 
   test("an anchor that is itself a compaction summary: cancel", async () => {

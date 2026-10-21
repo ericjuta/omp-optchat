@@ -37,7 +37,7 @@ export interface CompressorUsage {
 }
 
 /** How OptChat answered one host compaction: the fixed marker at the host's cut, the marker with the cut moved to the open turn, or a cancel. */
-export type HostCompactionOutcome = "marker" | "cut-moved" | "cancelled";
+export type HostCompactionOutcome = "marker" | "cut-moved" | "cut-in-turn" | "cancelled";
 
 /** Why a host compaction was cancelled: a closed vocabulary, never message content. */
 export type HostCompactionCancelReason =

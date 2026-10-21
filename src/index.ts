@@ -61,7 +61,7 @@ import {
 import { captureWaitReports, captureWorkReports, type ArtifactPathSource, type CapturedWorkReport } from "./reports.js";
 import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } from "./archive.js";
 import { CompressorRefusedError, Memory, type CompactionRequest, type Summarize } from "./memory.js";
-import { HOST_COMPACTION_SUMMARY, VIEW_DOC } from "./prompts.js";
+import { HOST_COMPACTION_SUMMARY, hostCompactionSummaryInTurn, VIEW_DOC } from "./prompts.js";
 import { nextArchivePath, Store, StoreLeaseConflictError, type Kind, type Message } from "./store.js";
 import { boundedGateError, hostJudge, judgeWithin, sessionFallbackOf, utf8Length, type JudgeFactory, type NamedJudge } from "./system1/judge.js";
 import { counted, GATE_KEYS, GATE_LABEL, GATE_PURPOSE, GateCounts, INACTIVE_REASON, type GateKey, type Judging } from "./system1/gates.js";
@@ -485,6 +485,8 @@ interface Turn {
 	extra: UserMessage[];
 	/** First host message of the turn. */
 	first?: Mark;
+	/** Memory id of the turn's first message once it is durable: a compaction that cuts inside the turn points here. */
+	firstId?: number;
 	/** Last host message before the turn, when the turn began with no new message. */
 	after?: Mark;
 }
@@ -1485,8 +1487,11 @@ class OptChat {
 		this.enqueue(async (memory) => {
 			const date = Number.isFinite(at) ? new Date(at) : undefined;
 			let typed: { source: number; text: string } | undefined;
+			const turn = this.turn;
+			const opens = turn?.first?.key === key;
 			for (const entry of await entriesOf(message, capture)) {
 				const stored = memory.append(entry.kind, entry.text, entry.at === undefined ? date : new Date(entry.at), entry.metadata);
+				if (opens && turn.firstId === undefined) turn.firstId = stored.i;
 				// Only a user's own text can state a rule. Skill prompts, reports and agent-authored messages never reach here as role user.
 				if (message.role === "user" && entry.kind === "user") typed = { source: stored.i, text: entry.text };
 			}
@@ -1554,8 +1559,9 @@ class OptChat {
 	 * Host compaction (threshold, overflow, rollover, /compact). The model reads the OptChat view, not the host history,
 	 * so the raw messages the host keeps only grow its local estimate and re-trigger maintenance. Answer with a fixed
 	 * marker summary, no model call: the host drops the raw messages, which the memory log already holds. The open turn
-	 * is never cut, because its tool loop must reach the model verbatim: a cut that would drop its first message moves
-	 * to that message, or is cancelled when nothing older than the turn can be dropped.
+	 * is cut only when it is most of what the host would drop: a cut that would drop its first message moves to that
+	 * message while the older history is at least as large as the turn's dropped part. Otherwise, or when the cut
+	 * cannot move there, the host's cut stands and the summary names the turn's first message, which the log holds.
 	 */
 	beforeCompact(event: SessionBeforeCompactEvent): SessionBeforeCompactResult | undefined {
 		if (this.passive) return undefined;
@@ -1587,16 +1593,38 @@ class OptChat {
 		const dropped = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
 		const at = anchor ? this.find(dropped, anchor) : -1;
 		if (!anchor || at < 0) return marker(preparation.firstKeptEntryId);
-		// Nothing older than the open turn to drop, or a host stand-in for history that was dropped before.
-		if (at === 0) return cancel("nothing-older");
 		if (dropped[at]!.role === "compactionSummary") return cancel("leftover-summary");
+		const firstId = this.turn?.first ? this.turn.firstId : undefined;
+		// The host's cut inside the open turn, with a pointer to the turn's first message in the log.
+		const inTurn = (): CompactionAnswer | undefined =>
+			firstId === undefined
+				? undefined
+				: {
+						result: {
+							compaction: {
+								summary: hostCompactionSummaryInTurn(firstId),
+								firstKeptEntryId: preparation.firstKeptEntryId,
+								tokensBefore: preparation.tokensBefore,
+							},
+						},
+						outcome: "cut-in-turn",
+						reason: null,
+					};
+		const size = (messages: readonly AgentMessage[]): number => messages.reduce((sum, m) => sum + utf8Length(JSON.stringify(m)), 0);
+		// Moving the cut back frees only the older history: too little when the open turn is most of the drop.
+		if (at === 0 || size(dropped.slice(0, at)) < size(dropped.slice(at))) {
+			const answer = inTurn();
+			if (answer) return answer;
+			if (at === 0) return cancel("nothing-older");
+		}
 		for (let index = event.branchEntries.length - 1; index >= 0; index--) {
 			const entry = event.branchEntries[index]!;
 			const message = branchEntryMessage(entry);
 			if (!message || stamp(message) !== anchor.stamp || keyOf(message) !== anchor.key) continue;
-			return isCutPoint(entry) ? marker(entry.id) : cancel("anchor-not-cut-point");
+			if (isCutPoint(entry)) return marker(entry.id);
+			return inTurn() ?? cancel("anchor-not-cut-point");
 		}
-		return cancel("anchor-not-in-branch");
+		return inTurn() ?? cancel("anchor-not-in-branch");
 	}
 
 	toolResult(event: ToolResultEvent): ToolResultEventResult | undefined {

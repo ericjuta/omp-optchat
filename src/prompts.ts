@@ -63,6 +63,10 @@ export const RULER =
 export const HOST_COMPACTION_SUMMARY =
   "OptChat keeps this session's earlier messages in its memory log, and the model reads them through the OptChat view, so the host context keeps only recent messages.";
 
+// The marker when the host's cut falls inside the open turn: the turn's first message and earlier steps are in the log.
+export const hostCompactionSummaryInTurn = (id: number): string =>
+  `${HOST_COMPACTION_SUMMARY} The current turn was also cut: it began at message ${id}, and its earlier steps are in the log. Read message ${id} with zoom(${id}, 1) before continuing.`;
+
 // Append this complete, stable guide to the host prompt for both turns and
 // compactions. Keep request-specific state, limits and tasks outside it.
 export const VIEW_DOC = `OptChat supplies persistent chat memory to the host agent. Each call is

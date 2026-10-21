@@ -268,7 +268,7 @@ describe("host compaction rows", () => {
     ]);
   });
 
-  test("an open turn that is the first dropped message cancels with the reason nothing-older", async () => {
+  test("an open turn that is the first dropped message is cut where the host put it, pointing at the turn's message", async () => {
     const { host, metrics } = await openChat();
     const prompt = host.user("only question");
     await host.context([prompt]);
@@ -277,7 +277,21 @@ describe("host compaction rows", () => {
     const all = [prompt, reply, result, host.assistant("done")];
     await compact(host, { dropped: [], prefix: [prompt, reply, result], firstKeptEntryId: "e4" }, branchOf(all));
     expect(rowsOfType(metrics, "host-compaction")).toEqual([
-      { type: "host-compaction", at: expect.any(String), outcome: "cancelled", reason: "nothing-older", tokensBefore: 1000 },
+      { type: "host-compaction", at: expect.any(String), outcome: "cut-in-turn", reason: null, tokensBefore: 1000 },
+    ]);
+  });
+
+  test("an open turn larger than the older history is cut inside, not moved back", async () => {
+    const { host, metrics } = await openChat();
+    const history = await talk(host, [], "hi");
+    const prompt = host.user("read the big file");
+    await host.context([...history, prompt]);
+    const reply = host.assistant("reading", { id: "t1", name: "read", arguments: {} });
+    const result = host.toolResult("t1", "read", "x".repeat(20_000));
+    const all = [...history, prompt, reply, result, host.assistant("done")];
+    await compact(host, { dropped: history, prefix: [prompt, reply, result], firstKeptEntryId: "e6", tokensBefore: 9 }, branchOf(all));
+    expect(rowsOfType(metrics, "host-compaction")).toEqual([
+      { type: "host-compaction", at: expect.any(String), outcome: "cut-in-turn", reason: null, tokensBefore: 9 },
     ]);
   });
 
