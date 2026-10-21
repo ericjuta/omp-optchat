@@ -11,7 +11,7 @@ omp-optchat is an OMP extension plugin that gives a session one chat that never 
 - Wayfinder map for the System One work: `.scratch/optchat-jev/map.md` (local markdown draft until charted).
 - Tracker conventions: `docs/agents/issue-tracker.md`. Domain docs: `docs/agents/domain.md`.
 - Eval references (not built): `docs/evals/`.
-- Project skills: `.omp/skills/` (wayfinder, grilling, research, prototype, domain-modeling, execplan). Upstream originals and provenance: `vendor/`, `vendor/SOURCES.md`.
+- Project skills: `.omp/skills/` (wayfinder, grilling, research, prototype, domain-modeling, execplan, verify-store-lease). Upstream originals and provenance: `vendor/`, `vendor/SOURCES.md`.
 
 ## How to start
 
@@ -55,6 +55,8 @@ Run from the repository root. There are no git hooks; these commands are the gat
     OPTCHAT_SMOKE_OMP=/home/ericjuta/.bun/bin/omp bun run smoke
 
 The smoke uses a loopback model and makes no provider calls. `bun run test:host` launches real OMP hosts from `tests/host/` (the real-host integration suite and the paired evidence run). CI (`.github/workflows/ci.yml`) runs the same checks: typecheck, `bun run test`, `bun run test:host`, and smoke.
+
+Changing the store writer lease (`acquireLease`, `Store.open`/`close`, `archiveStoreDirectory`, `/optchat new`, or how `ledger.jsonl` and `metrics.jsonl` are written): also run `bun run verify:lease` (about 12 s, needs Java; `.omp/skills/verify-store-lease/SKILL.md`). It is not in CI.
 
 ## Agent skills
 

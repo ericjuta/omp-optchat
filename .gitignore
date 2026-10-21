@@ -2,6 +2,7 @@ node_modules/
 coverage/
 *.tgz
 .optchat/
+.verify/
 evals/recall/cases/real.jsonl
 evals/recall/real-spec.json
 evals/rules/cases/real.jsonl

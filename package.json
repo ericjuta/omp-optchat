@@ -22,6 +22,7 @@
     "test:host": "bun test tests/host",
     "typecheck": "tsc --noEmit",
     "smoke": "bun run scripts/smoke.ts",
+    "verify:lease": "bun run scripts/verify-store-lease/run.ts",
     "evidence:recall": "bun run scripts/evidence-recall.ts",
     "evidence:retrieval": "bun run scripts/retrieval-compare.ts",
     "evals:recall": "bun run evals/recall/run.ts",
