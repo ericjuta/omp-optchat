@@ -1,6 +1,7 @@
 /**
- * Runs the TLA+ model of the store writer lease (StoreLease.tla) under TLC: the current code, then
- * broken variants that must each violate the property they target, then fixed designs that must hold.
+ * Runs the TLA+ model of the store writer lease (StoreLease.tla) under TLC: the current code, whose five
+ * properties must hold, then broken variants (the code as it was before each fix, and one guard dropped at a time)
+ * that must each violate the property they target.
  */
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
@@ -43,20 +44,18 @@ const CASES: readonly Case[] = [
 	{ id: "current/ExclusiveOpen", role: "guarantee", variant: "Current", externalMove: MOVE, invariant: "ExclusiveOpen", claim: "two sessions never both have the same store directory open" },
 	{ id: "current/StoreWritesUnderLease", role: "guarantee", variant: "Current", externalMove: MOVE, invariant: "StoreWritesUnderLease", claim: "every store write (log, tree, images, view, open-time repair and GC) is made under the lease" },
 	{ id: "current/NoOrphanLease", role: "guarantee", variant: "Current", externalMove: MOVE, invariant: "NoOrphanLease", claim: "a dead, closed or failed session never blocks the next opener" },
-	{ id: "current/ArchiveOnlyClosed", role: "finding", variant: "Current", externalMove: MOVE, invariant: "ArchiveOnlyClosed", claim: "`/optchat new` never renames a store directory another session has open (F1)" },
-	{ id: "current/SidecarWritesUnderLease", role: "finding", variant: "Current", externalMove: MOVE, invariant: "SidecarWritesUnderLease", claim: "rules-ledger and metrics writes land in the directory their writer holds the lease of (F2)" },
-	// The findings need no user `mv`: the `/optchat new` window alone reaches them.
-	{ id: "current-no-mv/ArchiveOnlyClosed", role: "finding", variant: "Current", externalMove: !MOVE, invariant: "ArchiveOnlyClosed", claim: "`/optchat new` never renames a store directory another session has open (F1), reached with two sessions and no user mv" },
-	{ id: "current-no-mv/SidecarWritesUnderLease", role: "finding", variant: "Current", externalMove: !MOVE, invariant: "SidecarWritesUnderLease", claim: "rules-ledger and metrics writes land in the directory their writer holds the lease of (F2), reached with two sessions and no user mv" },
+	{ id: "current/ArchiveOnlyClosed", role: "guarantee", variant: "Current", externalMove: MOVE, invariant: "ArchiveOnlyClosed", claim: "`/optchat new` never renames a store directory another session has open (F1, fixed)" },
+	{ id: "current/SidecarWritesUnderLease", role: "guarantee", variant: "Current", externalMove: MOVE, invariant: "SidecarWritesUnderLease", claim: "rules-ledger and metrics writes land in the directory their writer holds the lease of (F2, fixed)" },
 	// Each guarantee's checker must catch the break it exists to catch.
 	{ id: "broken-NoLease/ExclusiveOpen", role: "broken", variant: "NoLease", externalMove: !MOVE, invariant: "ExclusiveOpen", claim: "EADDRINUSE treated as acquired lets two sessions open one store" },
 	{ id: "broken-PathKey/ExclusiveOpen", role: "broken", variant: "PathKey", externalMove: !MOVE, invariant: "ExclusiveOpen", claim: "a lease keyed by path spelling lets a symlink spelling open the store twice" },
 	{ id: "broken-WriteBeforeLease/StoreWritesUnderLease", role: "broken", variant: "WriteBeforeLease", externalMove: !MOVE, invariant: "StoreWritesUnderLease", claim: "open-time repair and GC before acquireLease write without the lease" },
 	{ id: "broken-NoCrashRelease/NoOrphanLease", role: "broken", variant: "NoCrashRelease", externalMove: !MOVE, invariant: "NoOrphanLease", claim: "a lease that survives its holder's death blocks every later opener" },
 	{ id: "broken-LeakOnFailedOpen/NoOrphanLease", role: "broken", variant: "LeakOnFailedOpen", externalMove: !MOVE, invariant: "NoOrphanLease", claim: "an open that fails after acquireLease and does not release it blocks the store for good" },
-	// The fixes the findings point to: the same properties hold once they are applied.
-	{ id: "fixed-ArchiveUnderLease/ArchiveOnlyClosed", role: "fixed", variant: "ArchiveUnderLease", externalMove: MOVE, invariant: "ArchiveOnlyClosed", claim: "archive while still holding the lease, and only the leased inode: F1 closes" },
-	{ id: "fixed-LedgerAtInode/SidecarWritesUnderLease", role: "fixed", variant: "LedgerAtInode", externalMove: MOVE, invariant: "SidecarWritesUnderLease", claim: "ledger and metrics written relative to rootFd: F2 closes" },
+	// The code before each fix, and each new guard dropped on its own. Without a user `mv` the old archive order reaches F1 alone.
+	{ id: "broken-ArchiveAfterRelease/ArchiveOnlyClosed", role: "broken", variant: "ArchiveAfterRelease", externalMove: !MOVE, invariant: "ArchiveOnlyClosed", claim: "`/optchat new` that releases the lease and then renames the path renames a store another session opened in between (F1 as found)" },
+	{ id: "broken-ArchiveNoInodeCheck/ArchiveOnlyClosed", role: "broken", variant: "ArchiveNoInodeCheck", externalMove: MOVE, invariant: "ArchiveOnlyClosed", claim: "an archive that holds the lease but skips the dev:ino check renames the store now at the path after a user mv" },
+	{ id: "broken-SidecarByPath/SidecarWritesUnderLease", role: "broken", variant: "SidecarByPath", externalMove: MOVE, invariant: "SidecarWritesUnderLease", claim: "ledger and metrics opened by path land in whichever store sits at the old path after a mv (F2 as found)" },
 ];
 
 export interface Toolchain {

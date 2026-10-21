@@ -1,10 +1,10 @@
 /**
  * The store lease on the real code, with real processes: kernel facts the TLA+ model assumes, the model's
- * guarantees replayed as races and kills, the two open findings reproduced, and copies of src/store.ts
+ * guarantees replayed as races and kills, the findings still open (none now), and copies of src/store.ts
  * with a deliberate break that the guarantee checks must catch.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync, renameSync, symlinkSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, renameSync, symlinkSync } from "node:fs";
 import { appendFile, cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
@@ -28,6 +28,12 @@ interface Reply {
 	messages?: number;
 	i?: number;
 	pid?: number;
+	/** `archive`: where the store went, what another process's Store.open got at the rename, and the descriptors left into the archive. */
+	archive?: string;
+	during?: string;
+	leaked?: number;
+	/** `closed-sidecar`: the path a closed store gave out. */
+	path?: string;
 }
 
 /** One child process (child.ts): a command in, one result line out. */
@@ -328,39 +334,90 @@ const closeReleasesAndFences: Probe = {
 	},
 };
 
-const GUARANTEES: readonly Probe[] = [raceOneWinner, rejectedOpenerChangesNothing, sigkillFreesLease, failedOpenReleasesLease, closeReleasesAndFences];
+/** The text of every main log under `dir`, in file order. */
+function mainLog(dir: string): string {
+	const main = join(dir, "main");
+	return existsSync(main) ? readdirSync(main).sort().map((name) => readFileSync(join(main, name), "utf8")).join("") : "";
+}
+
+const ARCHIVE_TIME = "2026-10-21T12:00:00.000Z";
 
 /**
- * F1 (model: ArchiveOnlyClosed). `/optchat new` closes its store, then renames the directory *by path*
- * (index.ts:1631, 1654; store.ts:645-672). A session that opened the directory in between is renamed away
- * with it. Replayed in order: A closes, B opens, A archives.
+ * G6 (model: ArchiveHeld, ReleaseArchived; was F1). `/optchat new` archives through Store.archive (index.ts:1643, 1665;
+ * store.ts:1113-1153). It keeps its lease through the rename: at the rename itself another process's Store.open of the
+ * directory gets the conflict error. Afterwards a fresh store opens at the old path and the archive reopens the old chat.
  */
-const archiveRenamesOpenStore: Probe = {
-	id: "archive-renames-open-store",
-	claim: "`/optchat new` never renames a store directory another session has open (F1)",
+const archiveHoldsTheLease: Probe = {
+	id: "archive-holds-the-lease",
+	claim: "Store.archive keeps the lease through the rename, then frees it and every descriptor: a fresh store opens at the path and the archive reopens (F1, fixed)",
 	async run(box) {
 		const dir = join(box.base, "f1", "chat");
 		await mkdir(dirname(dir), { recursive: true });
-		// Store.archive keeps A's lease through the rename: the old order (A closes, B opens, A archives) no longer exists.
-		const a = await Store.open(dir);
-		a.append("user", "A's chat");
-		try {
-			const archive = await a.archive(new Date("2026-10-21T12:00:00.000Z"));
-			return { violated: false, detail: `Store.archive moved ${relative(box.base, dir)} to ${relative(box.base, archive)} under the lease` };
-		} catch (error) {
-			throw new FixtureError(`Store.archive failed on an undisturbed store: ${error instanceof Error ? error.message : String(error)}`);
+		const a = await box.start();
+		const opened = await a.call({ cmd: "open", dir });
+		if (!opened.ok) throw new FixtureError(`A could not open: ${describe(opened)}`);
+		await a.call({ cmd: "append", text: "A's chat" });
+		const done = await a.call({ cmd: "archive", text: ARCHIVE_TIME });
+		if (!done.ok || done.archive === undefined) return { violated: true, detail: `Store.archive failed on an undisturbed store: ${describe(done)}` };
+		if (done.during !== "StoreLeaseConflictError") {
+			return { violated: true, detail: `at the rename another process's Store.open of the directory got "${done.during}", not the conflict error: the lease was already released` };
 		}
+		if (done.leaked !== 0) return { violated: true, detail: `after the archive ${done.leaked ?? "?"} descriptors of the archiving process still point into the archive` };
+		const fresh = await (await box.start()).call({ cmd: "open", dir });
+		if (!fresh.ok || fresh.messages !== 0) return { violated: true, detail: `after the archive a new open at the old path gave ${describe(fresh)} with ${fresh.messages ?? "?"} messages, not an empty store` };
+		const old = await (await box.start()).call({ cmd: "open", dir: done.archive });
+		if (!old.ok || old.messages !== 1) return { violated: true, detail: `the archive did not reopen with the old chat: ${describe(old)}, ${old.messages ?? "?"} messages` };
+		return {
+			violated: false,
+			detail: `at the rename another process got the conflict error, no descriptor into the archive stayed open; then a fresh store opened at ${relative(box.base, dir)} (0 messages) and ${relative(box.base, done.archive)} reopened with the old message`,
+		};
 	},
 };
 
 /**
- * F2 (model: SidecarWritesUnderLease). The store follows its inode (rootFd), but the rules ledger and the
- * metrics sink open join(store.directory, file) by path on every write (system1/ledger.ts:60, 145; index.ts:2066,
- * 895). When the directory has moved, a write by B lands in whatever store is at the old path, held by someone else.
+ * G7 (model: ArchiveHeld with the dev:ino check; was F1 with a user mv). Session A's directory is moved away and B opens
+ * a store at the old path. A's `/optchat new` finds that the path no longer names the inode it leases and renames
+ * nothing (store.ts:1128-1137); it still releases its lease, so A's own directory reopens.
+ */
+const archiveRefusesDisplacedPath: Probe = {
+	id: "archive-refuses-a-displaced-path",
+	claim: "Store.archive renames nothing when its path no longer names the leased store, and still frees the lease (F1, fixed)",
+	async run(box) {
+		const dir = join(box.base, "f1b", "chat");
+		const moved = join(box.base, "f1b", "moved");
+		await mkdir(dirname(dir), { recursive: true });
+		const a = await box.start();
+		const opened = await a.call({ cmd: "open", dir });
+		if (!opened.ok) throw new FixtureError(`A could not open: ${describe(opened)}`);
+		await a.call({ cmd: "append", text: "A's chat" });
+		renameSync(dir, moved);
+		const b = await box.start();
+		const second = await b.call({ cmd: "open", dir });
+		if (!second.ok) throw new FixtureError(`B could not open at the old path: ${describe(second)}`);
+		await b.call({ cmd: "append", text: "B's chat" });
+		const done = await a.call({ cmd: "archive", text: ARCHIVE_TIME });
+		const siblings = readdirSync(dirname(dir)).sort();
+		if (done.ok) return { violated: true, detail: `Store.archive renamed a path that names B's store: archive ${done.archive}, siblings now [${siblings.join(", ")}]` };
+		if (siblings.join(",") !== "chat,moved") return { violated: true, detail: `a refused archive left [${siblings.join(", ")}] beside the store, not [chat, moved]` };
+		const after = await b.call({ cmd: "append", text: "B after the refusal" });
+		const log = mainLog(dir);
+		if (!after.ok || !log.includes("B's chat") || !log.includes("B after the refusal")) {
+			return { violated: true, detail: `B's directory lost data or its writes after A's refused archive (B's append: ${describe(after)})` };
+		}
+		const reopened = await (await box.start()).call({ cmd: "open", dir: moved });
+		if (!reopened.ok) return { violated: true, detail: `after the refused archive A's process still holds the lease of its own directory: ${describe(reopened)}` };
+		return { violated: false, detail: `the refusal ("${done.message}") renamed nothing, B kept writing at the old path, and A's moved directory reopened with ${reopened.messages} message` };
+	},
+};
+
+/**
+ * G8 (model: SidecarWrite; was F2). The rules ledger and the metrics sink resolve their file through
+ * store.sidecarPath on every write (system1/ledger.ts:143-147, index.ts:677, 892-896, 2079), so after the directory
+ * is moved, B's writes land in the directory B holds the lease of, not in whatever store is at the old path.
  */
 const sidecarWritesFollowTheInode: Probe = {
 	id: "sidecar-writes-follow-the-inode",
-	claim: "rules-ledger and metrics writes land in the directory their writer holds the lease of (F2)",
+	claim: "rules-ledger and metrics writes land in the directory their writer holds the lease of (F2, fixed)",
 	async run(box) {
 		const dir = join(box.base, "f2", "chat");
 		const moved = join(box.base, "f2", "moved");
@@ -369,7 +426,7 @@ const sidecarWritesFollowTheInode: Probe = {
 		const opened = await b.call({ cmd: "open", dir });
 		if (!opened.ok) throw new FixtureError(`B could not open: ${describe(opened)}`);
 		await b.call({ cmd: "ledger" });
-		// A user `mv` (store.ts:747-748 promises the store follows it); F1 reaches the same state without one.
+		// A user `mv` (store.ts:749-752 promises the store follows it).
 		renameSync(dir, moved);
 		const c = await Store.open(dir);
 		try {
@@ -377,23 +434,51 @@ const sidecarWritesFollowTheInode: Probe = {
 			const metric = await b.call({ cmd: "metric" });
 			const store = await b.call({ cmd: "append", text: "B's message" });
 			const landed: string[] = [];
-			if (existsSync(join(dir, "ledger.jsonl")) && readFileSync(join(dir, "ledger.jsonl"), "utf8").includes("B's rule")) landed.push("ledger.jsonl");
+			if (existsSync(join(dir, "ledger.jsonl"))) landed.push("ledger.jsonl");
 			if (existsSync(join(dir, "metrics.jsonl"))) landed.push("metrics.jsonl");
 			const followed = ["ledger.jsonl", "metrics.jsonl"].filter((name) => existsSync(join(moved, name)));
-			return {
-				violated: landed.length > 0,
-				detail:
-					`B holds the lease of the moved directory; C holds a fresh store at the old path. B's store write went to the moved directory (${store.ok ? "ok" : describe(store)}), ` +
-					`B's ledger write (${rule.ok ? "ok" : describe(rule)}) and metrics write (${metric.ok ? "ok" : describe(metric)}) landed in C's directory: [${landed.join(", ") || "none"}]; ` +
-					`the moved directory, which B holds, has [${followed.join(", ") || "neither"}]`,
-			};
+			const where =
+				`B holds the lease of the moved directory; C holds a fresh store at the old path. B's store write (${store.ok ? "ok" : describe(store)}), ` +
+				`ledger write (${rule.ok ? "ok" : describe(rule)}) and metrics write (${metric.ok ? "ok" : describe(metric)}): ` +
+				`C's directory has [${landed.join(", ") || "neither"}], the moved directory has [${followed.join(", ") || "neither"}]`;
+			return { violated: landed.length > 0 || followed.length < 2, detail: where };
 		} finally {
 			await c.close();
 		}
 	},
 };
 
-const FINDINGS: readonly Probe[] = [archiveRenamesOpenStore, sidecarWritesFollowTheInode];
+/**
+ * G9 (model: SidecarWrite needs an open store). A closed store gives out no sidecar path: its descriptor number may
+ * belong to another store by now, and a path built from it would write into that one (store.ts:1098-1104, 818-826).
+ */
+const closedStoreHasNoSidecar: Probe = {
+	id: "closed-store-has-no-sidecar",
+	claim: "a closed store refuses to give out a sidecar path, even when another store in its process holds its old descriptor number",
+	async run(box) {
+		const base = join(box.base, "closed");
+		await mkdir(base, { recursive: true });
+		const child = await box.start();
+		const reply = await child.call({ cmd: "closed-sidecar", dir: base });
+		if (reply.ok) return { violated: true, detail: `a closed store gave out ${reply.path}, while another store of the process, ${reply.directory}, was open` };
+		return { violated: false, detail: `a closed store refused its sidecar path: "${reply.message}"` };
+	},
+};
+
+const GUARANTEES: readonly Probe[] = [
+	raceOneWinner,
+	rejectedOpenerChangesNothing,
+	sigkillFreesLease,
+	failedOpenReleasesLease,
+	closeReleasesAndFences,
+	archiveHoldsTheLease,
+	archiveRefusesDisplacedPath,
+	sidecarWritesFollowTheInode,
+	closedStoreHasNoSidecar,
+];
+
+/** Findings still open: none. A probe the code violates goes here until it is fixed (skill: Update procedure). */
+const FINDINGS: readonly Probe[] = [];
 
 async function sandbox(src: string | undefined): Promise<Sandbox & { dispose(): Promise<void> }> {
 	const base = await mkdtemp(join(tmpdir(), "verify-store-lease-"));
@@ -465,6 +550,48 @@ const MUTANTS: readonly Mutant[] = [
 		anchor: "  if (!lease.server.listening) return Promise.resolve();",
 		replacement: "  return Promise.resolve();",
 	},
+	{
+		id: "archive-releases-before-rename",
+		probe: archiveHoldsTheLease,
+		claim: "an archive that frees the lease before it renames lets another session open the directory it is about to move",
+		anchor: "      archive = moveToArchive(this.directory, now, report);",
+		replacement: "      await release(this.rootFd, [], this.lease);\n      archive = moveToArchive(this.directory, now, report);",
+	},
+	{
+		id: "archive-leaves-stream-descriptors-open",
+		probe: archiveHoldsTheLease,
+		claim: "an archive that leaves the stream descriptors open keeps the log and tree directories of the archived chat open in the process",
+		anchor: "    closeStreams(this.openStreams(), errors);\n    let archive",
+		replacement: "    let archive",
+	},
+	{
+		id: "archive-skips-inode-check",
+		probe: archiveRefusesDisplacedPath,
+		claim: "an archive that renames whatever its path names now moves the live store of whoever opened it after a mv",
+		anchor: "if (named?.dev !== held.dev || named.ino !== held.ino) {",
+		replacement: "if (false) {",
+	},
+	{
+		id: "refused-archive-keeps-lease",
+		probe: archiveRefusesDisplacedPath,
+		claim: "an archive that frees the lease only on success leaves a refused store holding its lease while the process lives",
+		anchor: "      await release(this.rootFd, [], this.lease);\n    } catch (error) {\n      errors.push(error);",
+		replacement: "      if (archive !== undefined) await release(this.rootFd, [], this.lease);\n    } catch (error) {\n      errors.push(error);",
+	},
+	{
+		id: "sidecar-path-by-pathname",
+		probe: sidecarWritesFollowTheInode,
+		claim: "a sidecar path built from store.directory sends ledger and metrics into whichever store sits at the old path",
+		anchor: "    return at(this.rootFd, name);",
+		replacement: "    return join(this.directory, name);",
+	},
+	{
+		id: "sidecar-path-without-writable-check",
+		probe: closedStoreHasNoSidecar,
+		claim: "a sidecar path that skips assertWritable gives a closed store a path through a descriptor number another store may hold",
+		anchor: "    this.assertWritable();\n    return at(this.rootFd, name);",
+		replacement: "    return at(this.rootFd, name);",
+	},
 ];
 
 /** A copy of src/ whose store.ts has the mutant's edit applied once; throws when the anchor is not found exactly once. */
@@ -498,7 +625,7 @@ async function runMutant(mutant: Mutant): Promise<Check> {
 	}
 }
 
-/** The real-process harness: guarantees, then the open findings, then the breaks. */
+/** The real-process harness: guarantees, then the open findings (none now), then the breaks. */
 export async function runReal(): Promise<Check[]> {
 	const checks: Check[] = [];
 	for (const probe of GUARANTEES) checks.push(await runProbe(probe, "guarantee", undefined, `real/${probe.id}`));

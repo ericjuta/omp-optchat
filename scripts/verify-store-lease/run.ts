@@ -2,8 +2,8 @@
 /**
  * One command for the store writer lease check: bun run verify:lease [--model-only | --real-only] [--traces] [--strict]
  *
- * Phase 1 model-checks scripts/verify-store-lease/StoreLease.tla with TLC (current code, broken variants, fixed designs).
- * Phase 2 drives the real src/store.ts with real processes (guarantees, open findings, deliberate breaks).
+ * Phase 1 model-checks scripts/verify-store-lease/StoreLease.tla with TLC (current code, broken variants).
+ * Phase 2 drives the real src/store.ts with real processes (guarantees, open findings if any, deliberate breaks).
  * Exit 0: every guarantee holds, every break is caught, every recorded finding still reproduces.
  * Exit 1: a guarantee broke, a break went uncaught, a check could not run, or a recorded finding no longer reproduces.
  * Exit 2: --strict and the recorded findings are still open.

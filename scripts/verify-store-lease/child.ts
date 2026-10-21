@@ -4,7 +4,8 @@
  * one reply line on stdout (`arm` first sends `{"event":"armed"}`). The source tree under test is
  * $OPTCHAT_SRC (a mutated copy for real.ts's break checks), else this repository's src/.
  */
-import { existsSync } from "node:fs";
+import { spyOn } from "bun:test";
+import * as fs from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -15,7 +16,7 @@ import type * as Ledger from "../../src/system1/ledger.ts";
 // The source tree is chosen at run time ($OPTCHAT_SRC: a mutated copy), so these cannot be static imports.
 const SRC = resolve(process.env.OPTCHAT_SRC ?? join(dirname(fileURLToPath(import.meta.url)), "..", "..", "src"));
 const { Store: StoreClass } = (await import(join(SRC, "store.ts"))) as typeof Store;
-const { RuleLedger: LedgerClass } = (await import(join(SRC, "system1", "ledger.ts"))) as typeof Ledger;
+const { LEDGER_FILE, RuleLedger: LedgerClass } = (await import(join(SRC, "system1", "ledger.ts"))) as typeof Ledger;
 const { appendMetric, METRICS_FILE } = (await import(join(SRC, "metrics.ts"))) as typeof Metrics;
 
 interface Command {
@@ -49,8 +50,62 @@ async function openStore(dir: string): Promise<Record<string, unknown>> {
 /** Spins until the go file exists, so every armed child calls Store.open within microseconds of the others. */
 function waitFor(go: string): void {
 	const deadline = Date.now() + 15_000;
-	while (!existsSync(go)) {
+	while (!fs.existsSync(go)) {
 		if (Date.now() > deadline) throw new Error(`barrier ${go} never opened`);
+	}
+}
+
+/** Another process's Store.open of `directory`: "opened" (it closes again at once) or the error's name. */
+function openFromAnotherProcess(directory: string): string {
+	const code = `import { Store } from ${JSON.stringify(join(SRC, "store.ts"))};
+try { const opened = await Store.open(${JSON.stringify(directory)}); await opened.close(); console.log("opened"); }
+catch (error) { console.log(error.name); }`;
+	return Bun.spawnSync([process.execPath, "-e", code], { stdin: "ignore" }).stdout.toString().trim();
+}
+
+/**
+ * index.ts:1665 archives through Store.archive. At the rename (store.ts:661) another process tries to open the
+ * directory: `during` is what it got. The hook only observes; the rename itself runs unchanged.
+ */
+async function archiveHeld(command: Command): Promise<Record<string, unknown>> {
+	const held = store;
+	if (!held) return { ok: false, name: "Error", message: "no store is open" };
+	const directory = held.directory;
+	const native = fs.renameSync;
+	let during = "no rename ran";
+	const spy = spyOn(fs, "renameSync").mockImplementation(((source: fs.PathLike, destination: fs.PathLike) => {
+		if (String(destination).startsWith(`${directory}.`)) during = openFromAnotherProcess(directory);
+		return native(source, destination);
+	}) as typeof fs.renameSync);
+	try {
+		const archive = await held.archive(new Date(command.text ?? ""));
+		// Descriptors of this process that still point into the archive: Store.archive must have closed them all.
+		const leaked = fs.readdirSync("/proc/self/fd").filter((name) => {
+			try {
+				return fs.readlinkSync(`/proc/self/fd/${name}`).startsWith(archive);
+			} catch {
+				return false;
+			}
+		}).length;
+		return { ok: true, archive, during, leaked };
+	} catch (error) {
+		return { ...failure(error), during };
+	} finally {
+		spy.mockRestore();
+	}
+}
+
+/** A closed store whose descriptor number another store in the same process now holds must not give out a path. */
+async function closedSidecar(base: string): Promise<Record<string, unknown>> {
+	const closed = await StoreClass.open(join(base, "closed"));
+	await closed.close();
+	const other = await StoreClass.open(join(base, "other"));
+	try {
+		return { ok: true, path: closed.sidecarPath("x.jsonl"), directory: other.directory };
+	} catch (error) {
+		return failure(error);
+	} finally {
+		await other.close();
 	}
 }
 
@@ -76,9 +131,13 @@ async function handle(command: Command): Promise<Record<string, unknown>> {
 			} catch (error) {
 				return failure(error);
 			}
+		case "archive":
+			return archiveHeld(command);
+		case "closed-sidecar":
+			return closedSidecar(command.dir ?? "");
 		case "ledger":
-			// index.ts:677 opens the rules ledger at join(store.directory, "ledger.jsonl") right after Store.open.
-			ledger = LedgerClass.open(() => store?.sidecarPath("ledger.jsonl") ?? "");
+			// index.ts:677 opens the rules ledger right after Store.open, through the store's descriptor.
+			ledger = LedgerClass.open(() => store?.sidecarPath(LEDGER_FILE) ?? "");
 			return { ok: true };
 		case "rule":
 			try {
@@ -88,7 +147,7 @@ async function handle(command: Command): Promise<Record<string, unknown>> {
 				return failure(error);
 			}
 		case "metric":
-			// index.ts:2066 builds the metric sink as join(store.directory, METRICS_FILE); index.ts:895 appends to it.
+			// index.ts:2079 builds the metric sink as store.sidecarPath(METRICS_FILE); index.ts:896 resolves it per row.
 			try {
 				appendMetric(store?.sidecarPath(METRICS_FILE) ?? "", { type: "rules", at: new Date().toISOString(), pRule: null, pSentenceMax: null, sentences: 0, cutoff: 0.5, added: false });
 				return { ok: true };

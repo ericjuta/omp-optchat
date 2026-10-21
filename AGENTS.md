@@ -56,7 +56,7 @@ Run from the repository root. There are no git hooks; these commands are the gat
 
 The smoke uses a loopback model and makes no provider calls. `bun run test:host` launches real OMP hosts from `tests/host/` (the real-host integration suite and the paired evidence run). CI (`.github/workflows/ci.yml`) runs the same checks: typecheck, `bun run test`, `bun run test:host`, and smoke.
 
-Changing the store writer lease (`acquireLease`, `Store.open`/`close`, `archiveStoreDirectory`, `/optchat new`, or how `ledger.jsonl` and `metrics.jsonl` are written): also run `bun run verify:lease` (about 12 s, needs Java; `.omp/skills/verify-store-lease/SKILL.md`). It is not in CI.
+Changing the store writer lease (`acquireLease`, `Store.open`/`close`/`archive`/`sidecarPath`, `/optchat new`, or how `ledger.jsonl` and `metrics.jsonl` are written): also run `bun run verify:lease` (about 12 s, needs Java; `.omp/skills/verify-store-lease/SKILL.md`). It is not in CI.
 
 ## Agent skills
 

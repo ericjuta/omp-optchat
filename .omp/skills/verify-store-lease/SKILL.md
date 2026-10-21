@@ -1,22 +1,22 @@
 ---
 name: verify-store-lease
-description: Check OptChat's store writer lease (one writer per store directory, every write made under it) with a TLA+ model and real-process tests against src/store.ts. Use when a change touches the lease, Store.open/close, /optchat new, or how the rules ledger and metrics are written, or when asked whether the single-writer lock holds.
+description: Check OptChat's store writer lease (one writer per store directory, every write made under it) with a TLA+ model and real-process tests against src/store.ts. Use when a change touches the lease, Store.open/close/archive, Store.sidecarPath, /optchat new, or how the rules ledger and metrics are written, or when asked whether the single-writer lock holds.
 ---
 
 ## What it verifies
 
-**Promise.** One OMP session at a time has a store directory open, and everything written into that directory is written by the session that holds its lease. A second opener gets `StoreLeaseConflictError("Store is already open by another writer")` and changes nothing.
+**Promise.** One OMP session at a time has a store directory open, and everything written into that directory is written by the session that holds its lease. A second opener gets `StoreLeaseConflictError("Store is already open by another writer")` and changes nothing. `/optchat new` never moves a directory another session has open.
 
 **Harm if it breaks.** Two sessions append to one history and give out the same message ids (replay refuses duplicate ids, `tests/store.test.ts` "identical duplicate message", so the chat then fails to open), or one session's rules, metrics or archive land in another session's chat.
 
-The lease is a kernel object bound to the directory's inode: an abstract Unix socket named `omp-optchat-sha256(dev:ino)` on Linux (`acquireLease`, `src/store.ts:387-425`), a `flock` on the root descriptor on macOS (391). Death of the process frees it; there is no lock file, pid, or timeout.
+The lease is a kernel object bound to the directory's inode: an abstract Unix socket named `omp-optchat-sha256(dev:ino)` on Linux (`acquireLease`, `src/store.ts:388-426`), a `flock` on the root descriptor on macOS (392). Death of the process frees it; there is no lock file, pid, or timeout.
 
 ## Run it
 
 ```sh
-bun run verify:lease                 # model, then real code: about 12 s (model 10 s, real code 1.5 s)
-bun run verify:lease --traces        # also print each open finding's counterexample
-bun run verify:lease --real-only     # real code only, 1.5 s
+bun run verify:lease                 # model, then real code: about 12 s (model 9 s, real code 2 s)
+bun run verify:lease --traces        # also print each counterexample
+bun run verify:lease --real-only     # real code only, 2 s
 bun run verify:lease --model-only    # TLC only
 bun run verify:lease --strict        # exit 2 while a finding is still open
 ```
@@ -36,28 +36,23 @@ Each line has a role and a status.
 | `fixed` | the model of a proposed fix | the property holds | `FAIL`: the fix does not fix it |
 | `finding` | a property the current code violates | `FINDING`: it reproduced, as recorded | `GONE`: the code was fixed, so update this skill |
 
+There are no `finding` or `fixed` rows now (the harness keeps both roles for the next one). Current result: 32 ok, 0 open findings, 0 failed, and `--strict` exits 0.
+
 What each guarantee says, in the order the output lists them:
 
 - `ExclusiveOpen` / `race-one-winner`: two sessions never both have the same directory open. The harness races six processes, 20 rounds, through the path and through a symlink to it.
 - `StoreWritesUnderLease` / `rejected-opener-changes-nothing`: nothing is written without the lease. The harness leaves a torn log tail, an orphan temp file and an unreferenced blob in a held directory; three rejected opens change none of them, and the successful open afterwards does (the control that proves the check can see a change).
 - `NoOrphanLease` / `sigkill-frees-lease`, `failed-open-releases-lease`, `close-releases-and-fences`: a dead, failed or closed session never blocks the next opener, and a closed `Store` refuses writes.
+- `ArchiveOnlyClosed` / `archive-holds-the-lease`, `archive-refuses-a-displaced-path` (F1, fixed): `/optchat new` never renames a store directory another session has open. At the rename itself a second process's `Store.open` gets the conflict error (a hook on `renameSync` runs the opener); afterwards a fresh store opens at the path, the archive reopens with the old message, and no descriptor into the archive stays open. When the path was displaced (a user `mv`, then another session opens a store at the old path), the archive renames nothing, the other store keeps writing, and the archiving session's lease is released.
+- `SidecarWritesUnderLease` / `sidecar-writes-follow-the-inode`, `closed-store-has-no-sidecar` (F2, fixed): the rules ledger and the metrics file land in the directory their writer holds the lease of, also after that directory is moved and another store sits at the old path. A closed store gives out no sidecar path, even when another store in its process holds its old descriptor number.
 
-## Open findings
+## Fixed findings
 
-Both are real code paths, reproduced by the real-process harness (`real/archive-renames-open-store`, `real/sidecar-writes-follow-the-inode`) and found by TLC without any user action beyond two OMP sessions on one directory. Nothing in the product code was changed.
+Both were found by this check at `687d0f9` (its first run) and are fixed in `ff05706`; the old behavior stays as broken variants (`ArchiveAfterRelease`, `SidecarByPath`) that must still be caught.
 
-**F1: `/optchat new` can rename a store another session has open.** `ArchiveOnlyClosed`. Steps, in the code's words:
+**F1: `/optchat new` could rename a store another session had open.** At 687d0f9, `shutdown()` closed the store and released the lease, then `archiveStoreDirectory(directory)` renamed the path holding nothing; a session that opened the directory in between lost its live store to the archive. Now `Store.archive` (`store.ts:1113-1153`) keeps rootFd and the lease through the rename, renames only while `statSync(this.directory)` and `fstatSync(rootFd)` give the same dev:ino (1128-1137), and releases both once, on success or failure. `OptChat.shutdown(archiveAt)` (`index.ts:1619-1644`) calls it for `/optchat new` (1665). Residual: a user `mv` between the stat and the rename (rename takes a pathname) is not prevented; the doc comment says so.
 
-1. Session p1 runs `/optchat new`: `shutdown()` closes the rules ledger and `store.close()` (`index.ts:1619, 1631`); `release` frees the lease (`store.ts:449-450`).
-2. Session p2 starts and calls `Store.open(config.directory)` (`index.ts:662`): `openRoot` opens the same directory, `acquireLease` binds its lease: p2 holds the store.
-3. p1 calls `archiveStoreDirectory(store.directory)` (`index.ts:1654`): it claims the archive name with `mkdir` and `renameSync(directory, archive)` (`store.ts:649, 655`). It renames by path and holds no lease, so p2's live store moves to the archive.
-4. p1 reopens `config.directory` (`index.ts:1665`): a fresh empty store, its own lease, so it succeeds.
-
-Harm: p2 keeps writing into the directory the user was told is a closed archive, while p1's new chat sits at the old path; while p2 lives, `--optchat-dir <archive>` fails with the conflict error. The window is the time between `closeLease` (`store.ts:434`) and `renameSync` (`store.ts:655`): narrow, but real. Fix direction, modeled as `ArchiveUnderLease` and verified: keep the lease through the rename, and rename only if `store.directory` still names the leased inode.
-
-**F2: the rules ledger and the metrics file are written by path, not through the store's root descriptor.** `SidecarWritesUnderLease`. The store follows its inode after a move (`store.ts:746-749`), but `RuleLedger.write` opens `join(store.directory, "ledger.jsonl")` on every event (`system1/ledger.ts:60, 145`) and `appendMetric` opens `join(store.directory, "metrics.jsonl")` (`index.ts:2066, 895`; `metrics.ts:140`). After the directory is displaced (a user `mv`, or F1), session B's ledger and metrics writes land in whichever store is now at that path, held by another session. This contradicts `ledger.ts:50` ("Only the leased session writes it"). Harness replay: B opens D and its ledger; D is renamed away; C opens a fresh store at D; B's `rule` and `metric` land in C's directory, B's `append` goes to the moved directory. Fix direction, modeled as `LedgerAtInode` and verified: open the ledger and metrics files relative to the root descriptor.
-
-Do not weaken either property to make the check pass. When one is fixed, the finding row turns `GONE` and the exit code is 1; follow the update procedure to make it a guarantee.
+**F2: the rules ledger and the metrics file were written by pathname.** At 687d0f9, `RuleLedger.write` opened `join(store.directory, "ledger.jsonl")` and `appendMetric` `join(store.directory, "metrics.jsonl")` on every write, so after the directory was displaced they wrote into whichever store was at that path. Now `Store.sidecarPath(name)` (`store.ts:1098-1104`) runs `assertWritable` and returns `at(rootFd, name)`; `RuleLedger.open(() => store.sidecarPath(LEDGER_FILE))` (`index.ts:677`; `system1/ledger.ts:61-70, 108-111, 143-147`) and `metricsFile(store)` (`index.ts:892-896, 2079`) resolve per write. A metric row for a store that is closed or failed is dropped without a warning; `OPTCHAT_METRICS_FILE` still wins.
 
 ## What the model is, and how it maps to code
 
@@ -65,30 +60,33 @@ Do not weaken either property to make the check pass. When one is fixed, the fin
 
 | Action | Code | Atomic because |
 |---|---|---|
-| `Mkdir`, `OpenRootFd`, `FdPath` | `openRoot` 346-355, `makeDirectory` 316-323, `fdPath` 285, `Store.open` 781-785 | one syscall each; a symlink spelling resolves once, at `openat` |
-| `Acquire` | `acquireLease` 387-425 | one kernel `bind` (`server.listen`, 422) or `flock` (391) |
-| `Recover`, `StoreWrite` | `openStream` 787-797, `replay` torn-line repair, `collectGarbage` 702-739, `assertWritable` 812-820, appends | synchronous fd-relative writes after the lease |
-| `LedgerOpen`, `SidecarWrite` | `index.ts:677`, `system1/ledger.ts:141-156`, `index.ts:892-899`, `metrics.ts:137-146` | one `open` by pathname per event |
-| `OpenFails` | `Store.open` catch 802-809, `index.ts:683-686` | `release` closes descriptors, then the lease |
-| `Shutdown`, `Release`, `Archive` | `index.ts:1611-1632, 1638-1673`, `store.ts:1086-1091, 438-453, 645-672` | `close()` is synchronous up to `release`; the rename is one syscall |
-| `Crash`, `Restart` | `store.ts:420-421`, the module doc 743-745 | the kernel frees sockets and descriptors on death |
-| `MoveRoot` | doc comment 746-749, `tests/store.test.ts:1032-1043, 1253-1254` | a user `mv` of an open store directory |
+| `Mkdir`, `OpenRootFd`, `FdPath` | `openRoot` 347-356, `makeDirectory` 317-324, `fdPath` 286, `Store.open` 787-791 | one syscall each; a symlink spelling resolves once, at `openat` |
+| `Acquire` | `acquireLease` 388-426 | one kernel `bind` (`server.listen`, 423) or `flock` (392) |
+| `Recover`, `StoreWrite` | `openStream` 793-803, `replay` torn-line repair 910-915, `collectGarbage` 708-745, `assertWritable` 818-826, appends | synchronous fd-relative writes after the lease |
+| `LedgerOpen`, `SidecarWrite` | `index.ts:677`, `system1/ledger.ts:143-147`, `index.ts:892-896`, `metrics.ts:138-147`, `Store.sidecarPath` 1098-1104 | one `open` per event, descriptor-relative, only while the store is open |
+| `OpenFails` | `Store.open` catch 808-815, `index.ts:683-686` | `release` closes descriptors, then the lease |
+| `Shutdown`, `Release` | `index.ts:1619-1644`, `store.ts:1159-1164, 450-459` | `close()` is synchronous up to `release` |
+| `ArchiveHeld`, `ReleaseArchived` | `Store.archive` 1113-1153, `moveToArchive` 651-679 | the dev:ino check and the rename are two syscalls (residual race, not modelled); the final release is one step |
+| `Crash`, `Restart` | `store.ts:421-422`, the module doc 749-751 | the kernel frees sockets and descriptors on death |
+| `MoveRoot` | doc comment 752-755, `tests/store.test.ts:1032-1043, 1253-1254` | a user `mv` of an open store directory |
 
-Variants of `Variant`: `Current`; broken: `NoLease`, `PathKey`, `WriteBeforeLease`, `NoCrashRelease`, `LeakOnFailedOpen`; fixed: `ArchiveUnderLease`, `LedgerAtInode`. Each broken variant must violate exactly the property it names, and `model.ts` lists the pairs.
+Variants of `Variant`: `Current`; broken: `NoLease`, `PathKey`, `WriteBeforeLease`, `NoCrashRelease`, `LeakOnFailedOpen`, `ArchiveAfterRelease` (the pre-fix F1 order), `ArchiveNoInodeCheck`, `SidecarByPath` (the pre-fix F2). Each broken variant must violate exactly the property it names, and `model.ts` lists the pairs.
 
 The model does not read the code. A change to `src/store.ts` is caught by the real-process harness; the model only changes when someone updates it. That is why the update procedure below is not optional.
 
 ## Bounds and assumptions
 
-- Two sessions (`Procs`), three directory inodes (`Inodes`), two spellings of the path (`"D"` and a symlink `"L"`). About 71,000 states for the largest run. A third session is not checked.
+- Two sessions (`Procs`), three directory inodes (`Inodes`), two spellings of the path (`"D"` and a symlink `"L"`). About 72,000 states for the largest run. A third session is not checked.
 - One store path. Two different directories never interact in the code, so they are not modelled.
-- Linux and macOS leases are the same action (`Acquire`). The model cannot tell them apart; only the Linux lease runs here. All writers must share a network namespace (`store.ts:421`).
-- The real-process harness runs only against this machine's platform and filesystem (local, private POSIX permissions).
+- Linux and macOS leases are the same action (`Acquire`). The model cannot tell them apart; only the Linux lease runs here. All writers must share a network namespace (`store.ts:422`).
+- The real-process harness runs only against this machine's platform and filesystem (local, private POSIX permissions); the archive probe reads `/proc/self/fd`.
 
 ## Not covered
 
-- macOS `flock` (391-398), run only by reading the code.
-- Lease loss while open (`assertWritable`, 812-820, checks `server.listening`): the model has no event that closes a server under a live store.
+- macOS `flock` (392-399), run only by reading the code.
+- Lease loss while open (`assertWritable`, 818-826, checks `server.listening`): the model has no event that closes a server under a live store.
+- A user `mv` between `Store.archive`'s dev:ino check and its rename (`store.ts:1128-1138`): two syscalls, a pathname rename; named in the doc comment, not prevented and not modelled.
+- Which file `index.ts` hands `RuleLedger.open` and `metricsFile`, and how `record` drops a row for a closed store: `verify:lease` drives `store.ts`, `system1/ledger.ts` and `metrics.ts` from a child, not `index.ts`. Those are checked by `tests/metrics.test.ts` ("the metric sink follows the store's inode"), `tests/new-chat.test.ts` ("refuses to archive a path that now names another session's store") and `tests/store.test.ts` ("Store archive and sidecar files").
 - Network namespaces, NFS and filesystems without fsync or with unstable inode numbers (the lease key is `dev:ino`).
 - Content of the logs, replay, compression, the view: only the lease and who writes under it.
 - A hostile process that connects to the abstract socket name (`createServer((socket) => socket.destroy())` answers and closes it; only existence matters).
@@ -108,14 +106,14 @@ A `FAIL` or `GONE` from TLC on a `current/*` check: replay the counterexample st
 
 ## Coverage record
 
-Sync commit: `8d8b9964e09b79c2caf8dd5d615ed40f51e4d5d6` (the verification was confirmed against the code at this commit; the last commit that changed a covered file is `a4094a0`, v0.13.0).
+Sync commit: `ff05706d1cb7ba9617c6951f60dbf8432ce1be92` (the product fix for F1 and F2; the verification was updated against the code at this commit, the next commit).
 
 | File | Covered |
 |---|---|
-| `src/store.ts` | `StoreLeaseConflictError` 86, `fdPath` 285, `makeDirectory` 316-323, `openRoot` 346-355, `openStream`/`openExistingStream` 357-373, `acquireLease` 387-425, `closeLease` 427-436, `release` 438-453, `archiveStoreDirectory` 645-672, `collectGarbage` 702-739, `Store.open` 771-810, `assertWritable` 812-820, `replay` repair 904-909, `close` 1086-1091 |
-| `src/index.ts` | `open` 649-706, `record` 892-899, `shutdown` 1611-1632, `startNewChat` 1638-1673, `reopen` 1688-1697, `metricsFile` 2066 |
-| `src/system1/ledger.ts` | `RuleLedger.open` 64-68, `write` 141-156, the doc comment 50 |
-| `src/metrics.ts` | `appendMetric` 137-146 |
+| `src/store.ts` | `StoreLeaseConflictError` 87, `fdPath` 286, `descriptorPath`/`at` 295-301, `makeDirectory` 317-324, `openRoot` 347-356, `openStream`/`openExistingStream` 358-374, `acquireLease` 388-426, `closeLease` 428-437, `closeDescriptor`/`closeStreams`/`release` 439-459, `moveToArchive` 651-679, `collectGarbage` 708-745, `Store.open` 777-816, `assertWritable` 818-826, `replay` repair 910-915, `sidecarPath` 1098-1104, `archive`/`archiveHeld` 1113-1153, `close` 1159-1164 |
+| `src/index.ts` | `open` 649-706, `record` 892-905, `shutdown` 1619-1644, `startNewChat` 1650-1685, `reopen` 1701-1710, `session_shutdown` 2127, `metricsFile` 2079 |
+| `src/system1/ledger.ts` | `RuleLedger.open` 61-70, `replay` 108-111, `write` 143-147, the doc comment 47-53 |
+| `src/metrics.ts` | `appendMetric` 138-147 |
 
 Files of the verification: `scripts/verify-store-lease/` (`run.ts` the command, `model.ts` TLC, `StoreLease.tla`, `real.ts` and `child.ts` the real-process harness, `check.ts` result types), `package.json` script `verify:lease`, `.gitignore` entry `.verify/`.
 
@@ -123,18 +121,23 @@ Files of the verification: `scripts/verify-store-lease/` (`run.ts` the command, 
 
 Use this when a change touches covered code, and for `/maintain-formal-verification-skill`.
 
-1. Does the change touch covered code? `git diff --stat 8d8b996 -- src/store.ts src/index.ts src/system1/ledger.ts src/metrics.ts` (use the sync commit above; after you move it, use the new one). Also look for code that moved, and for new code that opens a file in the store directory, or acquires or releases a lease.
+1. Does the change touch covered code? `git diff --stat ff05706 -- src/store.ts src/index.ts src/system1/ledger.ts src/metrics.ts` (use the sync commit above; after you move it, use the new one). Also look for code that moved, and for new code that opens a file in the store directory, or acquires or releases a lease.
 2. Run `bun run verify:lease` before you edit anything and keep the output.
 3. Read each change. If it alters a step the model describes (a step now two, a check moved, a new path writes into the store directory), update `StoreLease.tla`, `real.ts` or `child.ts` from the code, not from the result. If the promise changed on purpose, change the property and write the old wording, the new wording and the evidence (doc comment, tests, changelog) in the commit message.
 4. Rerun. New or edited covered code needs a proof that the check can still fail: add a model variant or a `MUTANTS` entry in `real.ts` for the new guard, and see it caught.
-5. When a finding is fixed: move its property from the `finding` rows to `guarantee` in `model.ts`, turn its `real.ts` probe from `FINDINGS` into `GUARANTEES` (flip the assertion), and keep the fixed variant as a broken one.
+5. When a finding is fixed: move its property from the `finding` rows to `guarantee` in `model.ts`, turn its `real.ts` probe from `FINDINGS` into `GUARANTEES` (flip the assertion), and keep the old behavior as a broken variant or mutant. (F1 and F2 were closed this way.)
 6. Update this skill's line numbers and coverage record, and move the sync commit to the commit you checked only after the verification describes the code at that commit. Put verification changes in their own commit, apart from any product fix.
 
 ## Prove it can fail: the scratch break
 
-`bun run verify:lease` already breaks four copies of `store.ts` (`MUTANTS` in `real.ts`) and requires each to be caught. To check the check on the real file, edit `src/store.ts` in place and run it:
+`bun run verify:lease` already breaks ten copies of `store.ts` (`MUTANTS` in `real.ts`) and requires each to be caught: the four lease breaks (`lease-name-per-process`, `failed-open-keeps-lease`, `gc-before-lease`, `close-keeps-lease`) and six for `Store.archive` and `sidecarPath` (`archive-releases-before-rename`, `archive-leaves-stream-descriptors-open`, `archive-skips-inode-check`, `refused-archive-keeps-lease`, `sidecar-path-by-pathname`, `sidecar-path-without-writable-check`). To check the check on the real file, edit `src/store.ts` in place and run `bun run verify:lease --real-only`:
 
 - In `acquireLease`, make `EADDRINUSE` resolve the lease: replace `ready.reject(hasCode(error, "EADDRINUSE")` ... with `ready.resolve()`. Expect `FAIL guarantee real/race-one-winner`: all six processes open the directory.
 - In `Store.open`, delete the `await release(rootFd, streams, lease);` in the catch. Expect `FAIL real/failed-open-releases-lease`.
+- In `archiveHeld`, put `await release(this.rootFd, [], this.lease);` before `moveToArchive`. Expect `FAIL real/archive-holds-the-lease`.
+- In `archiveHeld`, turn the dev:ino test into `if (false) {`. Expect `FAIL real/archive-refuses-a-displaced-path`.
+- In `sidecarPath`, return `join(this.directory, name)`. Expect `FAIL real/sidecar-writes-follow-the-inode`; delete `this.assertWritable();` there instead and expect `FAIL real/closed-store-has-no-sidecar`.
+- In `archiveHeld`, delete `closeStreams(this.openStreams(), errors);`. Expect `FAIL real/archive-holds-the-lease` (descriptors still point into the archive).
+- In `archiveHeld`, release only when `archive !== undefined`. Expect `FAIL real/archive-refuses-a-displaced-path` (the refused store keeps its lease).
 
-The `broken` lines copy `src/store.ts` too, so a break in the file can make some of them fail on their own (a copy that never conflicts cannot show a leak). Read the `guarantee` lines first. Then `git checkout src/store.ts` and rerun: 19 ok, 6 open findings, 0 failed. Never commit the break.
+The `broken` lines copy `src/store.ts` too, so a break in the file can make some of them fail on their own (a copy that never conflicts cannot show a leak; a break whose anchor an earlier break removed reports `its anchor now matches 0 places`). Read the `guarantee` lines first. Then `git checkout src/store.ts` and rerun: 32 ok, 0 open findings, 0 failed. Never commit the break. Done at this commit: the two lease breaks and the six `archiveHeld`/`sidecarPath` breaks each failed the expected guarantee, and `src/store.ts` was restored byte for byte.
