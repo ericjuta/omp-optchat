@@ -9,6 +9,7 @@
  * Everything the run writes is under evals/compressor/runs/<run>/ (gitignored: it holds real chat text).
  *
  * Usage: bun evals/compressor/run.ts [--run ab-20261021] [--rev HEAD] [--limit N] [--check]
+ * The seed and scoring basis are the run's own, frozen by build.ts in sample.json.
  *   --check  builds each arm's wire request for the first task and prints its shape; no provider call is made.
  * The run is resumable: finished arms and judgments are skipped. It stops, without exceeding the cap, when the next
  * task could not be paid for (cap $5 over every compress and judge call), and says so.
@@ -31,6 +32,8 @@ import {
 	BUDGET_USD,
 	compactNode,
 	DEFAULT_RUN,
+	type Design,
+	designOf,
 	flag,
 	keyedPrng,
 	loadSnapshot,
@@ -38,7 +41,6 @@ import {
 	NODE_BYTES,
 	nodesBefore,
 	runDir,
-	SEED,
 	sha256,
 	type Snapshot,
 	storeDirectories,
@@ -118,9 +120,10 @@ function buildArms(snapshot: Snapshot, host: HostPrefix, models: Models): { arms
 }
 
 /** What is frozen before any provider call. */
-function frozenRecord(snapshot: Snapshot, host: HostPrefix, arms: Arms, toolsShared: boolean, models: Models, run: string, rev: string) {
+function frozenRecord(snapshot: Snapshot, host: HostPrefix, arms: Arms, toolsShared: boolean, models: Models, run: string, rev: string, design: Design) {
+	const stored = design.basis === "stored";
 	return {
-		seed: SEED,
+		seed: design.seed,
 		sourceRev: snapshot.sha,
 		requestedRev: rev,
 		models: { compressor: selectorOf(models.compressor), main: selectorOf(models.main), judge: selectorOf(models.judge) },
@@ -138,9 +141,14 @@ function frozenRecord(snapshot: Snapshot, host: HostPrefix, arms: Arms, toolsSha
 		rubricSha256: rubricHash(snapshot.COMPACT),
 		definitions: {
 			hardRules: "over the 512-byte node limit; a forbidden head (replyHead, with the task's own ids); a `user:` tag when the covered range has no user record",
-			hardRuleBasis: "first-attempt replies: the compressor's own output before OptChat's retry and cut; stored-line counts are reported beside them",
+			hardRuleBasis: stored
+				? "stored lines: the line OptChat's retry and cut path keeps, plus refused tasks; first-attempt counts are reported beside them"
+				: "first-attempt replies: the compressor's own output before OptChat's retry and cut; stored-line counts are reported beside them",
 			promptCost: "provider-reported cost.input + cost.cacheRead + cost.cacheWrite, per provider call (retries included)",
-			adopt: "C adopted iff #C-worse <= #C-better (ties and invalid excluded) AND C hard violations <= H AND C mean prompt cost per call < H",
+			...(stored ? { taskCost: "provider-reported total cost of every compressor attempt for one task" } : {}),
+			adopt: stored
+				? "C adopted iff #C-worse <= #C-better (ties and invalid excluded) AND C stored-line hard violations + refused tasks <= H AND C mean total compressor cost per task < H"
+				: "C adopted iff #C-worse <= #C-better (ties and invalid excluded) AND C hard violations <= H AND C mean prompt cost per call < H",
 			judgeInput: "task statement, limit and input exactly as the compressor saw them; not the chat context",
 		},
 	};
@@ -182,6 +190,7 @@ async function main(args: string[]): Promise<void> {
 	const limit = Number(flag(args, "--limit", "1000"));
 	const check = args.includes("--check");
 	const dir = runDir(run);
+	const design = designOf(dir);
 	const snapshot = await loadSnapshot(run, rev);
 	const tasks = jsonl<Task>(join(dir, "tasks.jsonl")).slice(0, limit);
 	if (tasks.length === 0) throw new Error("no tasks: run build.ts first");
@@ -246,7 +255,7 @@ async function main(args: string[]): Promise<void> {
 			return;
 		}
 
-		ensureFrozen(dir, frozenRecord(snapshot, host, arms, toolsShared, models, run, rev));
+		ensureFrozen(dir, frozenRecord(snapshot, host, arms, toolsShared, models, run, rev, design));
 		const resultsFile = join(dir, "results.jsonl");
 		const judgmentsFile = join(dir, "judgments.jsonl");
 		const stores = new Map(storeDirectories().map((directory) => [directory.split("/").at(-1)!, loadStore(directory)]));
@@ -327,7 +336,7 @@ async function main(args: string[]): Promise<void> {
 				const taskReserve = 2 * seenMax.compress * 1.6 + seenMax.judge;
 				if (usd + taskReserve > BUDGET_USD) throw new BudgetStop(`next task could pass the $${BUDGET_USD} cap (spent $${usd.toFixed(4)})`);
 				// Execution order per task is a seeded coin, so neither arm always runs first (cache warmth, wall clock).
-				const order: Array<"H" | "C"> = keyedPrng(SEED, `exec:${task.id}`)() < 0.5 ? ["H", "C"] : ["C", "H"];
+				const order: Array<"H" | "C"> = keyedPrng(design.seed, `exec:${task.id}`)() < 0.5 ? ["H", "C"] : ["C", "H"];
 				const got: Partial<Record<"H" | "C", ArmResult>> = {};
 				for (const arm of order) {
 					got[arm] = doneArm(arm);
@@ -344,7 +353,7 @@ async function main(args: string[]): Promise<void> {
 				if (H.final !== undefined && C.final !== undefined && !judged) {
 					guard("judge");
 					const before = ledger.total().usd;
-					const judgment = await judgePair(models, ledger, snapshot.COMPACT, task, { H: H.final, C: C.final });
+					const judgment = await judgePair(models, ledger, snapshot.COMPACT, task, { H: H.final, C: C.final }, design.seed);
 					appendFileSync(judgmentsFile, `${JSON.stringify(judgment)}\n`, { mode: 0o600 });
 					seenMax.judge = Math.max(seenMax.judge, (ledger.total().usd - before) * 1.5);
 					console.log(`${task.id} judged first=${judgment.first} winner=${judgment.winner}`);

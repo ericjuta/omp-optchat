@@ -16,6 +16,7 @@ import type { Store } from "../../src/store.ts";
 
 export const ROOT = resolve(import.meta.dir, "../..");
 export const RUNS_DIR = join(ROOT, "evals/compressor/runs");
+/** The first run's seed; a later run sets its own with build.ts `--seed`. */
 export const SEED = 20261021;
 export const DEFAULT_RUN = "ab-20261021";
 export const NODE_BYTES = 512;
@@ -30,6 +31,24 @@ export function runDir(run: string): string {
 	const dir = join(RUNS_DIR, run);
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	return dir;
+}
+
+/** Which replies the hard rules score: the compressor's first reply, or the line OptChat's retry path stores. */
+export type Basis = "first" | "stored";
+
+export interface Design {
+	readonly seed: number;
+	readonly basis: Basis;
+}
+
+/** A run's seed and scoring basis as build.ts froze them in sample.json; runs built before `basis` existed score first replies. */
+export function designOf(dir: string): Design {
+	const file = join(dir, "sample.json");
+	if (!existsSync(file)) throw new Error("no sample.json: run build.ts first");
+	const sample = JSON.parse(readFileSync(file, "utf8")) as { seed?: unknown; basis?: unknown };
+	if (typeof sample.seed !== "number") throw new Error(`${file} has no seed`);
+	if (sample.basis !== undefined && sample.basis !== "first" && sample.basis !== "stored") throw new Error(`${file} has an unknown basis`);
+	return { seed: sample.seed, basis: sample.basis ?? "first" };
 }
 
 export function flag(args: string[], name: string, fallback: string): string {

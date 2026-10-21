@@ -6,7 +6,7 @@
  */
 import type { Model } from "@oh-my-pi/pi-ai";
 import { call, type Ledger, type Models, textOf } from "./host.ts";
-import { keyedPrng, SEED, sha256, type Task } from "./lib.ts";
+import { keyedPrng, sha256, type Task } from "./lib.ts";
 
 export const RUBRIC = (guide: string): string => `You compare two candidate lines for a chat-memory compaction task.
 
@@ -48,7 +48,7 @@ export function parseVerdict(text: string): { better: Verdict; reason: string } 
 }
 
 /** The arm listed first for this task: a fair coin keyed by the seed and the task id. */
-export const firstArm = (task: string): "H" | "C" => (keyedPrng(SEED, `order:${task}`)() < 0.5 ? "H" : "C");
+export const firstArm = (seed: number, task: string): "H" | "C" => (keyedPrng(seed, `order:${task}`)() < 0.5 ? "H" : "C");
 
 export const rubricHash = (guide: string): string => sha256(RUBRIC(guide));
 
@@ -58,8 +58,9 @@ export async function judgePair(
 	guide: string,
 	task: Task,
 	lines: { readonly H: string; readonly C: string },
+	seed: number,
 ): Promise<Judgment> {
-	const first = firstArm(task.id);
+	const first = firstArm(seed, task.id);
 	const second = first === "H" ? "C" : "H";
 	const prompt = `<task>\n${task.instruction}\n</task>\n\n<line_A>\n${lines[first]}\n</line_A>\n\n<line_B>\n${lines[second]}\n</line_B>`;
 	const model: Model = models.judge;

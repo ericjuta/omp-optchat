@@ -4,9 +4,12 @@
  * written. The tasks hold real chat text, so they live only under evals/compressor/runs/ (gitignored).
  *
  * Usage: bun evals/compressor/build.ts [--run ab-20261021] [--rev HEAD] [--leaves 20] [--merges 20] [--per-store 6]
- * Output: runs/<run>/tasks.jsonl and runs/<run>/sample.json (composition only, no text).
+ *          [--seed 20261021] [--basis first|stored] [--exclude run1,run2]
+ *   --basis    which replies the hard rules score (frozen in sample.json, read by run.ts and report.ts)
+ *   --exclude  earlier runs whose sampled nodes may not be sampled again
+ * Output: runs/<run>/tasks.jsonl and runs/<run>/sample.json (composition and design only, no text).
  */
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import {
 	compactNode,
@@ -21,6 +24,7 @@ import {
 	NODE_BYTES,
 	nodesBefore,
 	PAGE_BYTES,
+	type Basis,
 	runDir,
 	SEED,
 	shuffled,
@@ -94,13 +98,28 @@ async function main(args: string[]): Promise<void> {
 	const wantMerges = Number(flag(args, "--merges", "20"));
 	const perStore = Number(flag(args, "--per-store", "6"));
 	const userMin = Number(flag(args, "--user-min", "5"));
+	const seed = Number(flag(args, "--seed", String(SEED)));
+	const basis = flag(args, "--basis", "first");
+	if (!Number.isInteger(seed)) throw new Error("--seed must be an integer");
+	if (basis !== "first" && basis !== "stored") throw new Error("--basis must be first or stored");
+	const excludedRuns = flag(args, "--exclude", "").split(",").filter(Boolean);
 	const dir = runDir(run);
+	if (existsSync(join(dir, "frozen.json"))) throw new Error(`${run} already ran: its tasks are frozen; use a new --run`);
+	const excluded = new Set<string>();
+	for (const earlier of excludedRuns) {
+		const file = join(runDir(earlier), "tasks.jsonl");
+		if (!existsSync(file)) throw new Error(`--exclude ${earlier}: no tasks.jsonl`);
+		for (const line of readFileSync(file, "utf8").split("\n").filter(Boolean)) {
+			const task = JSON.parse(line) as Task;
+			excluded.add(`${task.store}:${nodeKey(task.l, task.i)}`);
+		}
+	}
 	const snapshot = await loadSnapshot(run, rev);
 	const stores = storeDirectories().map(loadStore);
-	const all = stores.flatMap(candidates);
+	const all = stores.flatMap(candidates).filter((candidate) => !excluded.has(`${basename(candidate.store.directory)}:${nodeKey(candidate.l, candidate.i)}`));
 	const leafPool = all.filter((candidate) => candidate.l === 0);
 	const mergePool = all.filter((candidate) => candidate.l > 0);
-	const random = keyedPrng(SEED, "sample");
+	const random = keyedPrng(seed, "sample");
 	const chosen = [
 		...pick(leafPool, wantLeaves, perStore, userMin, random).map((candidate) => ({ candidate, node: "leaf" as const })),
 		...pick(mergePool, wantMerges, perStore, userMin, random).map((candidate) => ({ candidate, node: "merge" as const })),
@@ -148,7 +167,9 @@ async function main(args: string[]): Promise<void> {
 		return counts;
 	};
 	const sample = {
-		seed: SEED,
+		seed,
+		basis: basis satisfies Basis,
+		excluded: { runs: excludedRuns, nodes: excluded.size },
 		sourceRev: snapshot.sha,
 		stores: stores.length,
 		eligible: { leaves: leafPool.length, merges: mergePool.length },

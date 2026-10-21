@@ -9,7 +9,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger, type SpendRow } from "./host.ts";
 import type { Judgment } from "./judge.ts";
-import { DEFAULT_RUN, flag, loadSnapshot, NODE_BYTES, runDir, type Task, utf8Bytes } from "./lib.ts";
+import { DEFAULT_RUN, designOf, flag, loadSnapshot, NODE_BYTES, runDir, type Task, utf8Bytes } from "./lib.ts";
 import type { ArmResult } from "./run.ts";
 
 const USER_TAG = /(?:^|;\s+)user:/i;
@@ -41,6 +41,7 @@ async function main(args: string[]): Promise<void> {
 	const run = flag(args, "--run", DEFAULT_RUN);
 	const rev = flag(args, "--rev", "HEAD");
 	const dir = runDir(run);
+	const design = designOf(dir);
 	const snapshot = await loadSnapshot(run, rev);
 	const tasks = jsonl<Task>(join(dir, "tasks.jsonl"));
 	const byId = new Map(tasks.map((task) => [task.id, task]));
@@ -57,9 +58,9 @@ async function main(args: string[]): Promise<void> {
 	const pairedIds = new Set(paired.map((task) => task.id));
 
 	const arms = {} as Record<"H" | "C", Record<string, unknown>>;
-	const rate: Record<"H" | "C", { first: Violations; stored: Violations; calls: number; retries: number; refused: number; promptCosts: number[]; totalCosts: number[]; unknownCost: number; cacheRead: number; cacheWrite: number; input: number; output: number }> = {
-		H: { first: empty(), stored: empty(), calls: 0, retries: 0, refused: 0, promptCosts: [], totalCosts: [], unknownCost: 0, cacheRead: 0, cacheWrite: 0, input: 0, output: 0 },
-		C: { first: empty(), stored: empty(), calls: 0, retries: 0, refused: 0, promptCosts: [], totalCosts: [], unknownCost: 0, cacheRead: 0, cacheWrite: 0, input: 0, output: 0 },
+	const rate: Record<"H" | "C", { first: Violations; stored: Violations; calls: number; retries: number; refused: number; promptCosts: number[]; totalCosts: number[]; taskCosts: number[]; unknownCost: number; cacheRead: number; cacheWrite: number; input: number; output: number }> = {
+		H: { first: empty(), stored: empty(), calls: 0, retries: 0, refused: 0, promptCosts: [], totalCosts: [], taskCosts: [], unknownCost: 0, cacheRead: 0, cacheWrite: 0, input: 0, output: 0 },
+		C: { first: empty(), stored: empty(), calls: 0, retries: 0, refused: 0, promptCosts: [], totalCosts: [], taskCosts: [], unknownCost: 0, cacheRead: 0, cacheWrite: 0, input: 0, output: 0 },
 	};
 	for (const task of paired) {
 		const own = { lo: task.node === "leaf" ? task.i : task.start, hi: task.node === "leaf" ? task.i : task.end - 1 };
@@ -81,6 +82,9 @@ async function main(args: string[]): Promise<void> {
 				}
 				if (index === 0) add(r.first, attempt);
 			});
+			if (result.attempts.every((attempt) => attempt.costUsd !== null)) {
+				r.taskCosts.push(result.attempts.reduce((sum, attempt) => sum + attempt.costUsd!, 0));
+			}
 			if (result.final !== undefined) {
 				const head = snapshot.replyHead(result.final, own);
 				add(r.stored, {
@@ -102,6 +106,7 @@ async function main(args: string[]): Promise<void> {
 			hardViolationsStoredLine: r.stored,
 			meanPromptCostPerCallUsd: round(mean(r.promptCosts)),
 			meanTotalCostPerCallUsd: round(mean(r.totalCosts)),
+			meanCompressorCostPerTaskUsd: round(mean(r.taskCosts)),
 			totalCostUsd: r.unknownCost > 0 ? "unknown" : round(r.totalCosts.reduce((a, b) => a + b, 0), 4),
 			knownCostUsd: round(r.totalCosts.reduce((a, b) => a + b, 0), 4),
 			callsWithUnknownCost: r.unknownCost,
@@ -152,14 +157,18 @@ async function main(args: string[]): Promise<void> {
 	const judgeTotal = sum(judgeRows);
 	const compressTotal = sum(compressRows);
 
-	const meanH = mean(rate.H.promptCosts);
-	const meanC = mean(rate.C.promptCosts);
-	const violH = rate.H.first.replies;
-	const violC = rate.C.first.replies;
+	// The basis was frozen by build.ts before any call: first replies (the first run) or stored lines plus refusals.
+	const stored = design.basis === "stored";
+	const meanH = mean(stored ? rate.H.taskCosts : rate.H.promptCosts);
+	const meanC = mean(stored ? rate.C.taskCosts : rate.C.promptCosts);
+	const violH = stored ? rate.H.stored.replies + rate.H.refused : rate.H.first.replies;
+	const violC = stored ? rate.C.stored.replies + rate.C.refused : rate.C.first.replies;
+	const costOk = meanH !== "unknown" && meanC !== "unknown" && meanC < meanH;
 	const rule = {
+		basis: design.basis,
 		pairwiseOk: tally.cWorse <= tally.cBetter,
 		hardViolationsOk: violC <= violH,
-		promptCostOk: meanH !== "unknown" && meanC !== "unknown" && meanC < meanH,
+		...(stored ? { taskCostOk: costOk } : { promptCostOk: costOk }),
 	};
 	const complete = paired.length === tasks.length && rate.H.unknownCost === 0 && rate.C.unknownCost === 0;
 	const report = {
@@ -197,7 +206,7 @@ async function main(args: string[]): Promise<void> {
 			judgeUsd: round(judgeTotal.usd, 4),
 			callsWithUnknownCost: total.unknown,
 		},
-		rule: { ...rule, adoptC: complete && rule.pairwiseOk && rule.hardViolationsOk && rule.promptCostOk },
+		rule: { ...rule, adoptC: complete && rule.pairwiseOk && rule.hardViolationsOk && costOk },
 		complete,
 		artifacts: {
 			tasks: join(dir, "tasks.jsonl"),
