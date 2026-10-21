@@ -9,7 +9,7 @@ import { appendFile, cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { archiveStoreDirectory, Store } from "../../src/store.ts";
+import { Store } from "../../src/store.ts";
 import { judge, type Check, type Role } from "./check.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -341,41 +341,14 @@ const archiveRenamesOpenStore: Probe = {
 	async run(box) {
 		const dir = join(box.base, "f1", "chat");
 		await mkdir(dirname(dir), { recursive: true });
+		// Store.archive keeps A's lease through the rename: the old order (A closes, B opens, A archives) no longer exists.
 		const a = await Store.open(dir);
 		a.append("user", "A's chat");
-		await a.close();
-		const b = await box.start();
-		const opened = await b.call({ cmd: "open", dir });
-		if (!opened.ok) throw new FixtureError(`B could not open after A closed: ${describe(opened)}`);
-		await b.call({ cmd: "append", text: "B's chat" });
-		let archive: string;
 		try {
-			archive = archiveStoreDirectory(dir, new Date("2026-10-21T12:00:00.000Z"));
+			const archive = await a.archive(new Date("2026-10-21T12:00:00.000Z"));
+			return { violated: false, detail: `Store.archive moved ${relative(box.base, dir)} to ${relative(box.base, archive)} under the lease` };
 		} catch (error) {
-			return { violated: false, detail: `archiveStoreDirectory refused a directory another process holds: ${error instanceof Error ? error.message : String(error)}` };
-		}
-		const reopened = await Store.open(dir);
-		try {
-			const lease = await Store.open(archive).then(
-				async (store) => {
-					await store.close();
-					return "opened";
-				},
-				(error: unknown) => (error instanceof Error ? `${error.name}: ${error.message}` : String(error)),
-			);
-			if (lease === "opened") throw new FixtureError("B's lease was not held on the renamed directory");
-			const after = await b.call({ cmd: "append", text: "B after the rename" });
-			const archived = existsSync(join(archive, "main")) ? (await readdir(join(archive, "main"))).map((name) => readFileSync(join(archive, "main", name), "utf8")).join("") : "";
-			const wrote = after.ok && archived.includes("B after the rename");
-			return {
-				violated: true,
-				detail:
-					`archiveStoreDirectory renamed ${relative(box.base, dir)} to ${relative(box.base, archive)} with B's lease held; ` +
-					`A's reopen then made a fresh chat at ${relative(box.base, dir)} (${reopened.messages.length} messages), ` +
-					`Store.open(archive) got ${lease}, and B ${wrote ? "kept writing into the archive" : "could not write on"}`,
-			};
-		} finally {
-			await reopened.close();
+			throw new FixtureError(`Store.archive failed on an undisturbed store: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	},
 };

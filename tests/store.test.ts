@@ -7,7 +7,9 @@ import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { DEFAULT_PAGE_BYTES, MAX_PAGE_BYTES, type ImageDescriptor, type ImageMimeType } from "../src/archive.ts";
-import { Store, fdPath, nodeKey, type Kind, type Message, type TreeNode } from "../src/store.ts";
+import { appendMetric, METRICS_FILE } from "../src/metrics.ts";
+import { Store, StoreLeaseConflictError, fdPath, nodeKey, type Kind, type Message, type TreeNode } from "../src/store.ts";
+import { LEDGER_FILE, RuleLedger } from "../src/system1/ledger.ts";
 
 const storeModule = fileURLToPath(new URL("../src/store.ts", import.meta.url));
 const livenessTimeoutMs = 5_000;
@@ -1365,6 +1367,159 @@ describe("Store privacy and lifecycle", () => {
       await expect(fixture.open()).rejects.toThrow();
       await aliasOwner.close();
       expect((await fixture.open()).messages.length).toBe(2);
+    });
+  });
+});
+
+// Opens `directory` in a fresh process and reports "opened" or the error's name, without blocking on a lease holder.
+function openFromAnotherProcess(directory: string): string {
+  const code = `import { Store } from ${JSON.stringify(storeModule)};
+try { const store = await Store.open(${JSON.stringify(directory)}); await store.close(); console.log("opened"); }
+catch (error) { console.log(error.name); }`;
+  return Bun.spawnSync([process.execPath, "-e", code], { stdin: "ignore" }).stdout.toString().trim();
+}
+
+describe("Store archive and sidecar files", () => {
+  const archiveTime = new Date("2026-10-21T12:00:00.000Z");
+  const metricRow = { type: "rules", at: "2026-10-21T12:00:00.000Z", pRule: null, pSentenceMax: null, sentences: 0, cutoff: 0.5, added: false } as const;
+
+  test("archive refuses, renaming nothing, when its directory path now names another store", async () => {
+    await withFixture(async (fixture) => {
+      const first = await fixture.open();
+      first.append("user", "first chat");
+      const moved = join(fixture.root, "moved");
+      await rename(fixture.directory, moved);
+      const second = await fixture.open();
+      second.append("user", "second chat");
+      const secondMain = await streamContents(fixture.directory, "main");
+
+      await expect(first.archive(archiveTime)).rejects.toThrow("no longer names the store this session holds");
+      expect((await readdir(fixture.root)).sort()).toEqual(["chat", "moved"]);
+      expect(await streamContents(fixture.directory, "main")).toBe(secondMain);
+      expect(second.append("talk", "second still writes").i).toBe(1);
+
+      // The refused archive still released its lease exactly once, and close() afterwards is a no-op.
+      await first.close();
+      const reopened = await fixture.open(undefined, moved);
+      expect(reopened.messages.map((record) => record.text)).toEqual(["first chat"]);
+    });
+  });
+
+  test("archive refuses when the directory path no longer exists", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      store.append("user", "kept");
+      const moved = join(fixture.root, "moved");
+      await rename(fixture.directory, moved);
+      await expect(store.archive(archiveTime)).rejects.toThrow("no longer names the store this session holds");
+      expect(await readdir(fixture.root)).toEqual(["moved"]);
+      expect((await fixture.open(undefined, moved)).messages.map((record) => record.text)).toEqual(["kept"]);
+    });
+  });
+
+  test("archive holds the lease through the rename, then frees it: a fresh store opens at the path and the archive reopens", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      store.append("user", "old chat");
+      store.saveNode(node(0, 0));
+      await expect(fixture.open()).rejects.toBeInstanceOf(StoreLeaseConflictError);
+      const archivePath = `${store.directory}.20261021T120000Z`;
+
+      // At the rename itself another process still cannot open the directory.
+      const nativeRename = fs.renameSync;
+      let during: string | undefined;
+      const renameSpy = spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+        if (String(destination) === archivePath) during = openFromAnotherProcess(store.directory);
+        nativeRename(source, destination);
+      });
+      let archive: string;
+      try {
+        archive = await store.archive(archiveTime);
+      } finally {
+        renameSpy.mockRestore();
+      }
+      expect(during).toBe("StoreLeaseConflictError");
+      expect(archive).toBe(archivePath);
+
+      expect(() => store.append("talk", "too late")).toThrow();
+      await store.close();
+      const fresh = await fixture.open();
+      expect(fresh.messages).toEqual([]);
+      const old = await fixture.open(undefined, archive);
+      expect(old.messages.map((record) => record.text)).toEqual(["old chat"]);
+      expect(old.nodes.get(nodeKey(0, 0))).toEqual(node(0, 0));
+    });
+  });
+
+  test("archive on a closed or archived store is refused", async () => {
+    await withFixture(async (fixture) => {
+      const closed = await fixture.open();
+      await closed.close();
+      await expect(closed.archive(archiveTime)).rejects.toThrow("closed");
+      const store = await fixture.open();
+      await store.archive(archiveTime);
+      await expect(store.archive(archiveTime)).rejects.toThrow("closed");
+      await store.close();
+    });
+  });
+
+  test("a failed archive claim leaves the directory, releases the lease, and a later close is clean", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      store.append("user", "kept");
+      const claimed = `${store.directory}.20261021T120000Z`;
+      const nativeRename = fs.renameSync;
+      const renameSpy = spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+        if (String(destination) === claimed) throw Object.assign(new Error("injected rename failure"), { code: "EIO" });
+        nativeRename(source, destination);
+      });
+      try {
+        await expect(store.archive(archiveTime)).rejects.toThrow("injected rename failure");
+      } finally {
+        renameSpy.mockRestore();
+      }
+      expect(await readdir(fixture.root)).toEqual(["chat"]);
+      await store.close();
+      expect((await fixture.open()).messages.map((record) => record.text)).toEqual(["kept"]);
+    });
+  });
+
+  test("ledger and metrics writes follow the leased inode after the directory is displaced", async () => {
+    await withFixture(async (fixture) => {
+      const first = await fixture.open();
+      const ledger = RuleLedger.open(() => first.sidecarPath(LEDGER_FILE));
+      const moved = join(fixture.root, "moved");
+      await rename(fixture.directory, moved);
+      const second = await fixture.open();
+      const secondFiles = (await readdir(fixture.directory)).sort();
+
+      ledger.add(1, "rule of the first chat", 1);
+      appendMetric(first.sidecarPath(METRICS_FILE), metricRow);
+
+      expect(await readFile(join(moved, LEDGER_FILE), "utf8")).toContain("rule of the first chat");
+      expect(await readFile(join(moved, METRICS_FILE), "utf8")).toContain('"type":"rules"');
+      expect((await readdir(fixture.directory)).sort()).toEqual(secondFiles);
+      expect(secondFiles).not.toContain(LEDGER_FILE);
+      expect(secondFiles).not.toContain(METRICS_FILE);
+      expect(second.messages).toEqual([]);
+    });
+  });
+
+  test("sidecarPath refuses a closed or archived store and any name that is not a single plain file name", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      expect(store.sidecarPath("x.jsonl").endsWith("/x.jsonl")).toBe(true);
+      for (const name of ["", ".", "..", "a/b", "/etc/passwd", "../x", "a\0b"]) {
+        expect(() => store.sidecarPath(name)).toThrow("single plain file name");
+      }
+      const closing = store.close();
+      expect(() => store.sidecarPath("x.jsonl")).toThrow("closed");
+      await closing;
+      expect(() => store.sidecarPath("x.jsonl")).toThrow("closed");
+
+      const archived = await fixture.open();
+      await archived.archive(archiveTime);
+      expect(() => archived.sidecarPath("x.jsonl")).toThrow("closed");
     });
   });
 });

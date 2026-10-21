@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { clampThinkingLevelForModel, Effort } from "@oh-my-pi/pi-catalog";
 import { requiresNativeTools } from "@oh-my-pi/pi-catalog/compat/tools";
 import {
@@ -60,10 +60,10 @@ import { captureWaitReports, captureWorkReports, type ArtifactPathSource, type C
 import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } from "./archive.js";
 import { CompressorRefusedError, Memory, type CompactionRequest, type Summarize } from "./memory.js";
 import { HOST_COMPACTION_SUMMARY, VIEW_DOC } from "./prompts.js";
-import { archiveStoreDirectory, nextArchivePath, Store, StoreLeaseConflictError, type Kind, type Message } from "./store.js";
+import { nextArchivePath, Store, StoreLeaseConflictError, type Kind, type Message } from "./store.js";
 import { boundedGateError, hostJudge, judgeWithin, sessionFallbackOf, utf8Length, type JudgeFactory, type NamedJudge } from "./system1/judge.js";
 import { counted, GATE_KEYS, GATE_LABEL, GATE_PURPOSE, GateCounts, INACTIVE_REASON, type GateKey, type Judging } from "./system1/gates.js";
-import { RuleLedger, renderRules, type Rule } from "./system1/ledger.js";
+import { LEDGER_FILE, RuleLedger, renderRules, type Rule } from "./system1/ledger.js";
 import { prefetchBlock, PREFETCH_MS } from "./system1/prefetch.js";
 import { recall, registerRecallTool, renderRecall } from "./system1/recall.js";
 import { decideTriage, offeredRules, ruleSentences, triageProbabilities, triageQuestions, triageState } from "./system1/rules.js";
@@ -626,8 +626,8 @@ class OptChat {
 		private readonly pi: ExtensionAPI,
 		private readonly settleTimeoutMs: number,
 		private readonly observe: (row: MetricRow, file: string | undefined) => void,
-		/** The metric sink of a store directory. */
-		private readonly metricsFile: (directory: string) => string,
+		/** The metric sink of a store: descriptor-relative to it unless OPTCHAT_METRICS_FILE redirects it. */
+		private readonly metricsFile: (store: Store) => string,
 		private readonly policy: CompressorPolicy = {},
 		private readonly judges: JudgeFactory = hostJudge,
 	) {}
@@ -674,7 +674,7 @@ class OptChat {
 		}
 		let rules: RuleLedger | undefined;
 		try {
-			rules = config.gates.rules ? RuleLedger.open(store.directory) : undefined;
+			rules = config.gates.rules ? RuleLedger.open(() => store.sidecarPath(LEDGER_FILE)) : undefined;
 			if (!this.toolsRegistered) {
 				this.registerTools();
 				if (config.gates.recall) this.registerRecall();
@@ -890,9 +890,15 @@ class OptChat {
 
 	/** Appends one row to the store's metric sink. Best effort: a failed write is a warning and never stops the chat. */
 	private record(row: MetricRow): void {
-		const directory = this.store?.directory;
+		const store = this.store;
+		let file: string | undefined;
 		try {
-			this.observe(row, directory === undefined ? undefined : this.metricsFile(directory));
+			file = store === undefined ? undefined : this.metricsFile(store);
+		} catch {
+			// Only a store that is closed or failed refuses its sidecar path, and it reported that itself: drop the row.
+		}
+		try {
+			this.observe(row, file);
 		} catch (error) {
 			this.notify(`OptChat metrics: ${errorText(error)}`, "warning");
 		}
@@ -1605,10 +1611,12 @@ class OptChat {
 	}
 
 	/**
-	 * Ends this chat's memory, as session_shutdown does and as `/optchat new` does before it archives the store: appends
-	 * and triage settle, compressor jobs stop, and the store closes with its lease released. Nothing reaches it afterwards.
+	 * Ends this chat's memory, as session_shutdown does and as `/optchat new` does: appends and triage settle,
+	 * compressor jobs stop, and the store closes with its lease released. Nothing reaches it afterwards. With `archiveAt`
+	 * the store is archived instead of just closed (`Store.archive` renames while still holding its lease) and the
+	 * archive path is returned.
 	 */
-	async shutdown(): Promise<void> {
+	async shutdown(archiveAt?: Date): Promise<string | undefined> {
 		this.saveUnanswered();
 		this.turn = undefined;
 		// Queued appends settle while the store is still open.
@@ -1628,7 +1636,11 @@ class OptChat {
 		this.memory = undefined;
 		this.store = undefined;
 		await memory?.close();
-		await store?.close();
+		if (archiveAt === undefined) {
+			await store?.close();
+			return undefined;
+		}
+		return store?.archive(archiveAt, (message) => this.notify(message, "warning"));
 	}
 
 	/**
@@ -1650,8 +1662,9 @@ class OptChat {
 		}
 		let archive: string;
 		try {
-			await this.shutdown();
-			archive = archiveStoreDirectory(directory, now, (message) => this.notify(message, "warning"));
+			const archived = await this.shutdown(now);
+			if (archived === undefined) throw new Error("the store was not archived");
+			archive = archived;
 		} catch (error) {
 			const failure = await this.reopen(ctx);
 			const state = failure === undefined ? `the chat is open again at ${directory}` : `reopening ${directory} failed (${failure})`;
@@ -1765,10 +1778,10 @@ class OptChat {
 	 * idle status stays unchanged. A call without a reported cost is unknown, never $0.
 	 */
 	private compressorSpendLine(): string | undefined {
-		const directory = this.store?.directory;
-		if (directory === undefined) return undefined;
+		const store = this.store;
+		if (store === undefined) return undefined;
 		try {
-			const { calls, reportedUsd, unknownCost } = readCompressorSpend(this.metricsFile(directory));
+			const { calls, reportedUsd, unknownCost } = readCompressorSpend(this.metricsFile(store));
 			if (calls === 0) return undefined;
 			const known = calls - unknownCost;
 			if (unknownCost === 0) return `compressor spend (this store): ${calls} calls, $${reportedUsd.toFixed(4)} reported`;
@@ -2063,7 +2076,7 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 		let chat: OptChat | undefined;
 		const override = process.env.OPTCHAT_METRICS_FILE;
 		// The default sink is the store's own `metrics.jsonl`; the evidence runner points each host at a file outside its store copy.
-		const metricsFile = (directory: string): string => override || join(directory, METRICS_FILE);
+		const metricsFile = (store: Store): string => override || store.sidecarPath(METRICS_FILE);
 		const observe = (row: MetricRow, file: string | undefined): void => {
 			try {
 				if (file) appendMetric(file, row);
@@ -2111,7 +2124,9 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 			pi.on("session_switch", (_event, switchCtx) => active.sessionChanged(switchCtx));
 			pi.on("session_branch", (_event, branchCtx) => active.sessionChanged(branchCtx));
 			pi.on("session_tree", (_event, treeCtx) => active.sessionChanged(treeCtx));
-			pi.on("session_shutdown", () => active.shutdown());
+			pi.on("session_shutdown", async () => {
+				await active.shutdown();
+			});
 			await active.start(ctx);
 		});
 	};

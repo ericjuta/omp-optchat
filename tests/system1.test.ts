@@ -147,7 +147,7 @@ describe("System One config", () => {
 describe("rules ledger", () => {
   test("adds, replaces and removes rules, and replays the same state", async () => {
     const dir = await tempDir();
-    const ledger = RuleLedger.open(dir);
+    const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
     const first = ledger.add(3, "reply in French", 1);
     ledger.add(5, "use tabs", 2);
     const replaced = ledger.replace(first.id, 7, "reply in German", 3);
@@ -157,17 +157,17 @@ describe("rules ledger", () => {
     expect(ledger.remove("r2", 5)).toBe(false);
     ledger.close();
 
-    const replayed = RuleLedger.open(dir);
+    const replayed = RuleLedger.open(() => join(dir, LEDGER_FILE));
     expect(replayed.active()).toEqual([{ id: "r3", text: "reply in German", source: 7, at: 3 }]);
   });
 
   test("an id is never reused, even after the newest rule is removed", async () => {
     const dir = await tempDir();
-    const ledger = RuleLedger.open(dir);
+    const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
     ledger.add(1, "first", 1);
     ledger.remove("r1", 2);
     ledger.close();
-    const reopened = RuleLedger.open(dir);
+    const reopened = RuleLedger.open(() => join(dir, LEDGER_FILE));
     expect(reopened.add(2, "second", 3).id).toBe("r2");
   });
 
@@ -175,23 +175,23 @@ describe("rules ledger", () => {
     const dir = await tempDir();
     const good = JSON.stringify({ op: "add", id: "r1", text: "kept", source: 1, at: 1 });
     await writeFile(join(dir, LEDGER_FILE), `${good}\n{"op":"add","id":"r2"`);
-    const ledger = RuleLedger.open(dir);
+    const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
     expect(ledger.active().map((rule) => rule.id)).toEqual(["r1"]);
     ledger.add(2, "after the tear", 2);
     ledger.close();
-    expect(RuleLedger.open(dir).active().map((rule) => rule.text)).toEqual(["kept", "after the tear"]);
+    expect(RuleLedger.open(() => join(dir, LEDGER_FILE)).active().map((rule) => rule.text)).toEqual(["kept", "after the tear"]);
   });
 
   test("malformed lines are skipped, not fatal", async () => {
     const dir = await tempDir();
     const good = JSON.stringify({ op: "add", id: "r1", text: "kept", source: 1, at: 1 });
     await writeFile(join(dir, LEDGER_FILE), `not json\n[1,2]\n${good}\n`);
-    expect(RuleLedger.open(dir).active().map((rule) => rule.id)).toEqual(["r1"]);
+    expect(RuleLedger.open(() => join(dir, LEDGER_FILE)).active().map((rule) => rule.id)).toEqual(["r1"]);
   });
 
   test("a closed ledger refuses writes, and replace needs an active rule", async () => {
     const dir = await tempDir();
-    const ledger = RuleLedger.open(dir);
+    const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
     expect(() => ledger.replace("r9", 1, "x", 1)).toThrow("no active rule r9");
     ledger.close();
     expect(() => ledger.add(1, "late", 1)).toThrow("closed");

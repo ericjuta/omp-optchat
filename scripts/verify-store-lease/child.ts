@@ -78,7 +78,7 @@ async function handle(command: Command): Promise<Record<string, unknown>> {
 			}
 		case "ledger":
 			// index.ts:677 opens the rules ledger at join(store.directory, "ledger.jsonl") right after Store.open.
-			ledger = LedgerClass.open(store?.directory ?? "");
+			ledger = LedgerClass.open(() => store?.sidecarPath("ledger.jsonl") ?? "");
 			return { ok: true };
 		case "rule":
 			try {
@@ -90,7 +90,7 @@ async function handle(command: Command): Promise<Record<string, unknown>> {
 		case "metric":
 			// index.ts:2066 builds the metric sink as join(store.directory, METRICS_FILE); index.ts:895 appends to it.
 			try {
-				appendMetric(join(store?.directory ?? "", METRICS_FILE), { type: "rules", at: new Date().toISOString(), pRule: null, pSentenceMax: null, sentences: 0, cutoff: 0.5, added: false });
+				appendMetric(store?.sidecarPath(METRICS_FILE) ?? "", { type: "rules", at: new Date().toISOString(), pRule: null, pSentenceMax: null, sentences: 0, cutoff: 0.5, added: false });
 				return { ok: true };
 			} catch (error) {
 				return failure(error);

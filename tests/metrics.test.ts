@@ -6,7 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULTS } from "../src/config.ts";
@@ -163,6 +163,22 @@ describe("compressor metric sink", () => {
     expect(seen.length).toBeGreaterThan(0);
     expect(readFileSync(redirected, "utf8").split("\n").filter((line) => line.length > 0)).toHaveLength(seen.length);
     expect(existsSync(metrics)).toBe(false);
+  });
+});
+
+describe("the metric sink follows the store's inode", () => {
+  test("rows go to the directory the session holds, not to whatever now sits at its old path", async () => {
+    const { host, metrics, seen } = await openChat();
+    const moved = `${host.directory}-moved`;
+    await rename(host.directory, moved);
+    // Another store's directory now sits at the old path.
+    await mkdir(host.directory, { mode: 0o700 });
+    await seed(host);
+
+    expect(seen.length).toBeGreaterThan(0);
+    expect(existsSync(metrics)).toBe(false);
+    expect(readFileSync(join(moved, METRICS_FILE), "utf8").split("\n").filter((line) => line.length > 0)).toHaveLength(seen.length);
+    expect(hasNotice(host, "OptChat metrics")).toBe(false);
   });
 });
 

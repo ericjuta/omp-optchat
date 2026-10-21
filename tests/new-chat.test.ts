@@ -310,6 +310,26 @@ describe("/optchat new", () => {
     expect(messageCount(await statusOf(host))).toBe(count + 2);
   });
 
+  test("refuses to archive a path that now names another session's store, and leaves that store untouched", async () => {
+    const { root, directory } = await workspace();
+    const host = await openChat(directory);
+    await seed(host);
+    // The first session's directory is displaced, and another session opens a store at the old path.
+    const moved = join(root, "moved");
+    await rename(directory, moved);
+    const other = await openChat(directory);
+    expect(messageCount(await statusOf(other))).toBe(0);
+    const before = await snapshot(directory);
+
+    const notices = await runNew(host);
+    expect(notices.at(-1)?.type).toBe("error");
+    expect(notices.at(-1)?.message).toContain("could not archive the chat (Refusing to archive");
+    expect(await archivesOf(root)).toEqual([]);
+    expect(await snapshot(directory)).toEqual(before);
+    expect(messageCount(await statusOf(other))).toBe(0);
+    expect((await readdir(moved)).length).toBeGreaterThan(0);
+  });
+
   test("a crash between the rename and the reopen leaves the archive intact; the next start creates a fresh store", async () => {
     const { root, directory } = await workspace();
     const host = await openChat(directory);

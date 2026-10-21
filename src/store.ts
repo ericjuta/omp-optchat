@@ -16,6 +16,7 @@ import {
   readSync,
   renameSync,
   rmdirSync,
+  statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -435,16 +436,21 @@ function closeLease(lease: Lease): Promise<void> {
   return closed.promise;
 }
 
+function closeDescriptor(fd: number, errors: unknown[]): void {
+  try { closeSync(fd); } catch (error) { errors.push(error); }
+}
+
+function closeStreams(streams: Stream[], errors: unknown[]): void {
+  for (const stream of streams) {
+    if (stream.writer) closeDescriptor(stream.writer.fd, errors);
+    closeDescriptor(stream.fd, errors);
+  }
+}
+
 async function release(rootFd: number, streams: Stream[], lease?: Lease): Promise<void> {
   const errors: unknown[] = [];
-  const close = (fd: number) => {
-    try { closeSync(fd); } catch (error) { errors.push(error); }
-  };
-  for (const stream of streams) {
-    if (stream.writer) close(stream.writer.fd);
-    close(stream.fd);
-  }
-  close(rootFd);
+  closeStreams(streams, errors);
+  closeDescriptor(rootFd, errors);
   // Release ownership only after every synchronous writer descriptor is closed.
   if (lease) {
     try { await closeLease(lease); } catch (error) { errors.push(error); }
@@ -624,7 +630,7 @@ function fsyncDirectory(path: string): void {
   }
 }
 
-/** The first archive name for `directory` that is free now. Advisory: archiveStoreDirectory claims the name itself. */
+/** The first archive name for `directory` that is free now. Advisory: `Store.archive` claims the name itself. */
 export function nextArchivePath(directory: string, now: Date): string {
   for (let attempt = 1; ; attempt++) {
     const candidate = archiveName(directory, now, attempt);
@@ -638,11 +644,11 @@ export function nextArchivePath(directory: string, now: Date): string {
 }
 
 /**
- * Moves a closed store's directory to a sibling archive and returns its path. The name is claimed with mkdir first:
- * rename(2) would silently replace an empty directory, and a taken name must never be replaced. Only the directory
- * entry moves, so every file keeps its bytes. The caller closes the Store first.
+ * Moves `directory` to a sibling archive and returns its path. The name is claimed with mkdir first: rename(2) would
+ * silently replace an empty directory, and a taken name must never be replaced. Only the directory entry moves, so
+ * every file keeps its bytes. `Store.archive` is the only caller and holds the store's lease throughout.
  */
-export function archiveStoreDirectory(directory: string, now: Date, report?: Report): string {
+function moveToArchive(directory: string, now: Date, report?: Report): string {
   for (let attempt = 1; ; attempt++) {
     const archive = archiveName(directory, now, attempt);
     try {
@@ -1083,10 +1089,77 @@ export class Store {
     this.view = view;
   }
 
+  /**
+   * The path of `name` inside this store's directory, relative to the held root descriptor: it follows the leased
+   * inode when the directory is renamed or replaced, as every other Store write does. Valid only synchronously and
+   * while the store is open: a closed store, or one whose lease failed, throws, because its descriptor number may
+   * already belong to something else. `name` must be a single plain file name.
+   */
+  sidecarPath(name: string): string {
+    if (name.length === 0 || name === "." || name === ".." || name.includes("/") || name.includes("\0")) {
+      throw new Error(`Store sidecar name must be a single plain file name: ${JSON.stringify(name)}`);
+    }
+    this.assertWritable();
+    return at(this.rootFd, name);
+  }
+
+  /**
+   * Closes the store and moves its directory to a sibling archive, returning the archive path. The lease and the root
+   * descriptor are kept until after the rename, so no other session can open the directory in between. The move is
+   * refused, with nothing renamed, when `directory` no longer names the leased inode (it was moved or replaced).
+   * A concurrent user `mv` between that check and the rename stays possible: rename(2) takes a pathname. Always
+   * releases the descriptors and the lease exactly once; a later `close()` is a no-op.
+   */
+  archive(now: Date, report?: Report): Promise<string> {
+    if (this.closed) return Promise.reject(new Error("Store is closing or closed"));
+    // No await between marking closed and stopping writes, as in close().
+    this.closed = true;
+    const archived = this.archiveHeld(now, report);
+    this.closing = archived.then(() => undefined, () => undefined);
+    return archived;
+  }
+
+  private async archiveHeld(now: Date, report?: Report): Promise<string> {
+    const errors: unknown[] = [];
+    closeStreams(this.openStreams(), errors);
+    let archive: string | undefined;
+    let failure: unknown;
+    try {
+      const held = fstatSync(this.rootFd, { bigint: true });
+      let named: { dev: bigint; ino: bigint } | undefined;
+      try {
+        named = statSync(this.directory, { bigint: true });
+      } catch (error) {
+        if (!hasCode(error, "ENOENT")) throw error;
+      }
+      if (named?.dev !== held.dev || named.ino !== held.ino) {
+        throw new Error(`Refusing to archive ${this.directory}: that path no longer names the store this session holds`);
+      }
+      archive = moveToArchive(this.directory, now, report);
+    } catch (error) {
+      failure = error;
+    }
+    try {
+      await release(this.rootFd, [], this.lease);
+    } catch (error) {
+      errors.push(error);
+    }
+    if (failure !== undefined) {
+      if (errors.length === 0) throw failure;
+      throw new AggregateError([failure, ...errors], `Store archive and cleanup failed at ${this.directory}`, { cause: failure });
+    }
+    if (errors.length) throw new AggregateError(errors, "Failed to close Store resources");
+    return archive!;
+  }
+
+  private openStreams(): Stream[] {
+    return [this.main, this.tree, ...(this.images === undefined ? [] : [this.images])];
+  }
+
   close(): Promise<void> {
     // No await between marking closed and stopping writes. In-flight writes are
     // synchronous, so they finish/fsync before close can begin on the same thread.
     this.closed = true;
-    return this.closing ??= release(this.rootFd, [this.main, this.tree, ...(this.images === undefined ? [] : [this.images])], this.lease);
+    return this.closing ??= release(this.rootFd, this.openStreams(), this.lease);
   }
 }

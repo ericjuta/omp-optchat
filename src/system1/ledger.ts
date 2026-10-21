@@ -1,6 +1,5 @@
 import { Buffer } from "node:buffer";
 import { closeSync, constants, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
-import { join } from "node:path";
 import { utf8Prefix, utf8Bytes } from "../memory.js";
 
 /** File name beside the chat log in the store directory. */
@@ -47,22 +46,25 @@ function eventOf(value: unknown): Event | undefined {
 
 /**
  * The rules ledger: append-only JSON lines, one fsynced write per event. Replay keeps every well-formed line and
- * skips a torn or malformed one; the next append starts on a fresh line. Only the leased session writes it.
+ * skips a torn or malformed one; the next append starts on a fresh line. The file is named by a resolver that is
+ * called at open and again at every write, so a caller can resolve it relative to a held store descriptor
+ * (`Store.sidecarPath`): a write then lands in the directory the writer holds the lease of, wherever that directory's
+ * pathname leads now.
  */
 export class RuleLedger {
-  private readonly path: string;
+  private readonly file: () => string;
   private readonly rules = new Map<string, Rule>();
   private sequence = 0;
   private needsNewline = false;
   private closed = false;
 
-  private constructor(directory: string) {
-    this.path = join(directory, LEDGER_FILE);
+  private constructor(file: () => string) {
+    this.file = file;
   }
 
-  /** Replays the ledger at `directory`; a missing file is an empty ledger and is not created until the first event. */
-  static open(directory: string): RuleLedger {
-    const ledger = new RuleLedger(directory);
+  /** Replays the ledger at `file()`; a missing file is an empty ledger and is not created until the first event. */
+  static open(file: () => string): RuleLedger {
+    const ledger = new RuleLedger(file);
     ledger.replay();
     return ledger;
   }
@@ -106,7 +108,7 @@ export class RuleLedger {
   private replay(): void {
     let text: string;
     try {
-      text = readFileSync(this.path, "utf8");
+      text = readFileSync(this.file(), "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
       throw error;
@@ -142,7 +144,7 @@ export class RuleLedger {
     if (this.closed) throw new Error("the rules ledger is closed");
     const prefix = this.needsNewline ? "\n" : "";
     const bytes = Buffer.from(`${prefix}${JSON.stringify(event)}\n`, "utf8");
-    const fd = openSync(this.path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+    const fd = openSync(this.file(), constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
     try {
       // Set before the write: a failed or short write may leave a torn line, and the next append must start fresh.
       this.needsNewline = true;

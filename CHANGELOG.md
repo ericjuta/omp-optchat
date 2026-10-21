@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+Two findings of `bun run verify:lease` (the TLA+ model and real-process checks of the store's writer lease), both fixed. Each fix has regression tests that fail on 0.13.0.
+
+- **Fixed: `/optchat new` could archive a store that another session had open.** It closed the store, which released the lease, and then renamed the directory by pathname holding nothing. A session that opened the directory in that gap lost its live store to the archive, and kept writing into the directory the user was told was closed. The store now archives itself (`Store.archive`): it keeps its lease and root descriptor through the rename and releases them after. It renames only while the path still names the leased inode; if the path was moved or replaced, `/optchat new` fails with "Refusing to archive …", renames nothing, and reopens as it does for any archive failure. A concurrent user `mv` between that check and the rename stays possible, since rename takes a pathname.
+- **Fixed: the rules ledger and `metrics.jsonl` were written by pathname, not into the store the session holds.** The store follows its inode after the directory is moved, but `ledger.jsonl` and `metrics.jsonl` were opened as `<directory>/…` on every write, so after a move (a user `mv`, or the archive race above) rules and metric rows landed in whichever store was now at that path. Both are now resolved through the held root descriptor (`Store.sidecarPath(name)`, valid only synchronously and only while the store is open). A metric row for a store that is closed or whose lease failed is dropped without a warning per row; the store already reported its failure. `OPTCHAT_METRICS_FILE` still wins.
+- **Changed (internal API): `archiveStoreDirectory` is removed** in favor of `Store.archive(now, report?)`, and `RuleLedger.open` takes a resolver `() => string` (called at open and at each write) instead of a directory. `nextArchivePath` stays.
+
 ## 0.13.0 — 2026-10-21
 
 From a read-only audit of 15 real sessions, 10 stores and 9,920 compressor metric rows, and Jev verdicts on 121 memory-tool calls (found 77, partial 29, miss 11, error 3, unclear 1). Every fix has a test that fails on 0.12.0.
