@@ -117,7 +117,7 @@ omp-optchat is an OMP extension plugin (`omp.extensions: ["./src/index.ts"]`, OM
 | Message kinds | implemented, plus `work` | OPTCHAT/src/store.ts:26; src/index.ts:232-333 | Kinds are user, talk, tool, echo, note, work. `work` holds subagent and background-job reports; `note` comes only from import; `think` is never logged (src/index.ts:60). |
 | Log (append-only, fsync) | implemented | src/store.ts:404-410,727-787 | Daily files `main/YYYY-MM-DD.jsonl`; torn lines skipped and reported; id gaps refused. Replaces kit milestone 0's log. |
 | Single writer | implemented differently | src/store.ts:353-378,657-658; src/index.ts:529-534 | Abstract Unix socket lease keyed by the directory's device and inode, Linux only. A conflict makes the session inactive, as with `--no-optchat`. Replaces the kit's file socket lock. |
-| Store location | implemented | src/config.ts:173-184 | Per git worktree: `<agentDir>/optchat-worktrees/<slug>-<sha16>`; outside git `<agentDir>/optchat`; `--optchat-dir` overrides. Replaces `chat/` and `OPTCHAT_HOME`. |
+| Store location | implemented | src/config.ts:173-184 | Per git worktree: `<agentDir>/optchat-worktrees/<slug>-<sha16>`; outside git `<agentDir>/optchat`, or `<agentDir>/optchat-dirs/<slug>-<sha16>` of the cwd while that is held; `--optchat-dir` overrides. Replaces `chat/` and `OPTCHAT_HOME`. |
 | Node, tree, `NODE` = 512 | implemented | src/config.ts:9; src/memory.ts:192,201 | Tree records `{l,i,text,size}` in `tree/`. Safety ceiling 16,384 bytes. |
 | Address `id+n` | implemented | src/memory.ts:276-285,334-337 | — |
 | Free node | implemented | src/memory.ts:582-592 | — |

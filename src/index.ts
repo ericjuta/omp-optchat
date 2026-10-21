@@ -38,6 +38,8 @@ import {
 import { dialectKey, sharedToolsAllowed } from "./dialect.js";
 import {
 	defaultStoreDirectory,
+	fallbackStoreDirectory,
+	globalStoreDirectory,
 	readConfig,
 	readEnabled,
 	registerFlags,
@@ -647,7 +649,8 @@ class OptChat {
 	}
 
 	private async open(ctx: ExtensionContext): Promise<void> {
-		const config = readConfig(this.pi, defaultStoreDirectory(this.pi.pi.getAgentDir(), ctx.cwd));
+		const agentDirectory = this.pi.pi.getAgentDir();
+		let config = readConfig(this.pi, defaultStoreDirectory(agentDirectory, ctx.cwd));
 		this.config = config;
 		const model = ctx.models.resolve(config.model);
 		if (!model) {
@@ -657,16 +660,29 @@ class OptChat {
 			throw new Error(`compressor model "${config.model}" requires native tools that cannot be disabled; choose a model with tool-free inference`);
 		}
 		this.compressor = model;
+		const report = (message: string) => this.notify(message, "warning");
 		let store: Store;
 		try {
-			store = await Store.open(config.directory, (message) => this.notify(message, "warning"));
+			store = await Store.open(config.directory, report);
 		} catch (error) {
 			// A live writer owns this directory: run without memory, as --no-optchat does. Other failures stay fail-closed.
-			if (error instanceof StoreLeaseConflictError && this.state.kind === "starting") {
-				this.inactivate(`${config.directory} is in use by another session`);
+			if (!(error instanceof StoreLeaseConflictError) || this.state.kind !== "starting") throw error;
+			// Outside git with no --optchat-dir, a held global store falls back to this directory's own store.
+			const held = config.directory;
+			if (this.pi.getFlag("optchat-dir") !== undefined || held !== globalStoreDirectory(agentDirectory)) {
+				this.inactivate(`${held} is in use by another session`);
 				return;
 			}
-			throw error;
+			config = { ...config, directory: fallbackStoreDirectory(agentDirectory, ctx.cwd) };
+			this.config = config;
+			try {
+				store = await Store.open(config.directory, report);
+			} catch (fallbackError) {
+				if (!(fallbackError instanceof StoreLeaseConflictError) || this.state.kind !== "starting") throw fallbackError;
+				this.inactivate(`${held} and ${config.directory} are in use by other sessions`);
+				return;
+			}
+			this.notify(`OptChat: ${held} is in use by another session, so this session uses ${config.directory}.`, "info");
 		}
 		if (this.state.kind !== "starting") {
 			await store.close();

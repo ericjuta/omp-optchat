@@ -1484,6 +1484,43 @@ describe("Store archive and sidecar files", () => {
     });
   });
 
+  test("a close failure after a successful rename still returns the archive, warns, and frees the path", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      store.append("user", "kept");
+      const archivePath = `${store.directory}.20261021T120000Z`;
+      const nativeClose = fs.closeSync;
+      let injected = 0;
+      // The root descriptor is closed after the rename; it then resolves to the archive. Close it for real, then fail.
+      const closeSpy = spyOn(fs, "closeSync").mockImplementation((fd: number) => {
+        const target = fdPath(fd);
+        nativeClose(fd);
+        if (target === archivePath) {
+          injected++;
+          throw Object.assign(new Error("injected close failure"), { code: "EIO" });
+        }
+      });
+      const warnings: string[] = [];
+      let archive: string;
+      try {
+        archive = await store.archive(archiveTime, (message) => warnings.push(message));
+      } finally {
+        closeSpy.mockRestore();
+      }
+      expect(injected).toBe(1);
+      expect(archive).toBe(archivePath);
+      expect((await readdir(fixture.root)).sort()).toEqual(["chat.20261021T120000Z"]);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(archivePath);
+      expect(warnings[0]).toContain("injected close failure");
+
+      // The lease was released exactly once: close() is a no-op, a fresh store opens at the path, the archive reopens.
+      await store.close();
+      expect((await fixture.open()).messages).toEqual([]);
+      expect((await fixture.open(undefined, archive)).messages.map((record) => record.text)).toEqual(["kept"]);
+    });
+  });
+
   test("ledger and metrics writes follow the leased inode after the directory is displaced", async () => {
     await withFixture(async (fixture) => {
       const first = await fixture.open();

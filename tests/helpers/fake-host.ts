@@ -24,8 +24,8 @@ export interface Confirm {
 }
 
 export interface FakeHostOptions {
-  /** Extra or overriding flags; the memory directory flag is always set. */
-  flags?: Record<string, string | boolean>;
+  /** Extra or overriding flags; the memory directory flag is set unless overridden with undefined (absent). */
+  flags?: Record<string, string | boolean | undefined>;
   /** Reuse a directory (seeded or from an earlier host); otherwise a fresh temporary one. */
   directory?: string;
   hasUI?: boolean;
@@ -98,7 +98,7 @@ export async function openFakeHost(
 ): Promise<FakeHost> {
   const owned = options.directory === undefined;
   const directory = options.directory ?? (await realpath(await mkdtemp(join(tmpdir(), "optchat-system1-"))));
-  const flags: Record<string, string | boolean> = {
+  const flags: Record<string, string | boolean | undefined> = {
     "optchat-dir": directory,
     "optchat-model": "fake/fake",
     ...options.flags,

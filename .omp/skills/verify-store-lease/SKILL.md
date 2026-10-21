@@ -14,10 +14,11 @@ The lease is a kernel object bound to the directory's inode: an abstract Unix so
 ## Run it
 
 ```sh
-bun run verify:lease                 # model, then real code: about 12 s (model 9 s, real code 2 s)
+bun run verify:lease                 # model, then real code: about 15 s (model 13 s, real code 2 s)
 bun run verify:lease --traces        # also print each counterexample
 bun run verify:lease --real-only     # real code only, 2 s
 bun run verify:lease --model-only    # TLC only
+bun run verify:lease --model-only --deep  # also the five guarantees with three sessions: about 5.5 minutes, 6 GB per TLC
 bun run verify:lease --strict        # exit 2 while a finding is still open
 ```
 
@@ -76,7 +77,9 @@ The model does not read the code. A change to `src/store.ts` is caught by the re
 
 ## Bounds and assumptions
 
-- Two sessions (`Procs`), three directory inodes (`Inodes`), two spellings of the path (`"D"` and a symlink `"L"`). About 72,000 states for the largest run. A third session is not checked.
+- Default run: two sessions (`Procs = {p1, p2}`), three directory inodes (`Inodes`), two spellings of the path (`"D"` and a symlink `"L"`), user `mv` on. The five `current/*` guarantees each explore 70,553 distinct states in 4-5 s; the largest run is `broken-ArchiveNoInodeCheck` at 17,461.
+- `--deep`: the same five guarantees with three sessions (`Procs = {p1, p2, p3}`, same inodes, spellings, `ExternalMove = TRUE`), ids `current3/<Invariant>`. Measured on the 8-core, 61 GB workstation with Temurin 21.0.12, TLC 2.19, one TLC worker per case: each case explores 4,098,579 distinct states (34,603,933 generated, depth 41) and takes 146-201 s when four run at once (148 s alone), 334 s wall for the five at `CONCURRENCY` 4 (two waves). A lone case peaked at 5.8 GB resident (the JVM takes up to a quarter of RAM as heap; a smaller host makes TLC spill to disk and slow down), so four at once want about 24 GB. That is over the three-minute budget of the default run, so three sessions are checked only with `--deep`. All five hold: no three-session violation (2026-10-21, at the sync commit below). `--deep` needs the model, so it cannot be combined with `--real-only`.
+- Run `--deep` when you change `StoreLease.tla` or what an action does, or before a release that touches the lease; it is not in CI.
 - One store path. Two different directories never interact in the code, so they are not modelled.
 - Linux and macOS leases are the same action (`Acquire`). The model cannot tell them apart; only the Linux lease runs here. All writers must share a network namespace (`store.ts:422`).
 - The real-process harness runs only against this machine's platform and filesystem (local, private POSIX permissions); the archive probe reads `/proc/self/fd`.
@@ -90,7 +93,7 @@ The model does not read the code. A change to `src/store.ts` is caught by the re
 - Network namespaces, NFS and filesystems without fsync or with unstable inode numbers (the lease key is `dev:ino`).
 - Content of the logs, replay, compression, the view: only the lease and who writes under it.
 - A hostile process that connects to the abstract socket name (`createServer((socket) => socket.destroy())` answers and closes it; only existence matters).
-- Interleavings of three or more sessions.
+- Interleavings of four or more sessions. Three sessions are checked only by `--deep`; the default run checks two.
 
 ## Real bug or model drift?
 

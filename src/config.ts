@@ -75,7 +75,7 @@ export function registerFlags(api: FlagRegistrar): void {
   });
   api.registerFlag("optchat-dir", {
     type: "string",
-    description: "Private memory directory (default: one per git worktree under optchat-worktrees, else optchat, both under the OMP agent directory)",
+    description: "Private memory directory (default: one per git worktree under optchat-worktrees, else optchat, or one per working directory under optchat-dirs while optchat is in use; all under the OMP agent directory)",
   });
   api.registerFlag("optchat-model", {
     type: "string",
@@ -300,8 +300,27 @@ function gitRoot(cwd: string): string | undefined {
  */
 export function defaultStoreDirectory(agentDirectory: string, cwd: string): string {
   const root = gitRoot(cwd);
-  if (root === undefined) return join(agentDirectory, "optchat");
-  const slug = basename(root).toLowerCase().replace(/[^a-z0-9._-]/g, "-").slice(0, 40) || "repo";
-  const key = createHash("sha256").update(root).digest("hex").slice(0, 16);
-  return join(agentDirectory, "optchat-worktrees", `${slug}-${key}`);
+  if (root === undefined) return globalStoreDirectory(agentDirectory);
+  return join(agentDirectory, "optchat-worktrees", keyedName(root, "repo"));
+}
+
+/** The shared store of sessions outside git when --optchat-dir is absent. */
+export function globalStoreDirectory(agentDirectory: string): string {
+  return join(agentDirectory, "optchat");
+}
+
+/**
+ * Store of a session outside git that found the global store held by another session: one per working
+ * directory under optchat-dirs, keyed by the canonical cwd, so the session keeps a memory instead of
+ * running without one. Pure apart from filesystem lookups, runs no subprocess and never throws.
+ */
+export function fallbackStoreDirectory(agentDirectory: string, cwd: string): string {
+  return join(agentDirectory, "optchat-dirs", keyedName(canonical(cwd), "dir"));
+}
+
+// The sanitized, bounded basename of a canonical path plus the first 16 hex digits of its SHA-256.
+function keyedName(path: string, empty: string): string {
+  const slug = basename(path).toLowerCase().replace(/[^a-z0-9._-]/g, "-").slice(0, 40) || empty;
+  const key = createHash("sha256").update(path).digest("hex").slice(0, 16);
+  return `${slug}-${key}`;
 }

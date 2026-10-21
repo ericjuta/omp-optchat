@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
 /**
- * One command for the store writer lease check: bun run verify:lease [--model-only | --real-only] [--traces] [--strict]
+ * One command for the store writer lease check:
+ *   bun run verify:lease [--model-only | --real-only] [--deep] [--traces] [--strict]
  *
- * Phase 1 model-checks scripts/verify-store-lease/StoreLease.tla with TLC (current code, broken variants).
+ * Phase 1 model-checks scripts/verify-store-lease/StoreLease.tla with TLC (current code, broken variants);
+ * --deep adds the guarantees with three sessions (minutes, not seconds).
  * Phase 2 drives the real src/store.ts with real processes (guarantees, open findings if any, deliberate breaks).
  * Exit 0: every guarantee holds, every break is caught, every recorded finding still reproduces.
  * Exit 1: a guarantee broke, a break went uncaught, a check could not run, or a recorded finding no longer reproduces.
@@ -14,9 +16,9 @@ import { runModel, toolchain } from "./model.ts";
 import { runReal } from "./real.ts";
 
 const args = new Set(process.argv.slice(2));
-const unknown = [...args].filter((arg) => !["--model-only", "--real-only", "--traces", "--strict"].includes(arg));
-if (unknown.length > 0 || (args.has("--model-only") && args.has("--real-only"))) {
-	console.error(`usage: bun run verify:lease [--model-only | --real-only] [--traces] [--strict]${unknown.length ? ` (unknown: ${unknown.join(" ")})` : ""}`);
+const unknown = [...args].filter((arg) => !["--model-only", "--real-only", "--deep", "--traces", "--strict"].includes(arg));
+if (unknown.length > 0 || (args.has("--model-only") && args.has("--real-only")) || (args.has("--deep") && args.has("--real-only"))) {
+	console.error(`usage: bun run verify:lease [--model-only | --real-only] [--deep] [--traces] [--strict]${unknown.length ? ` (unknown: ${unknown.join(" ")})` : ""}`);
 	process.exit(64);
 }
 
@@ -40,7 +42,7 @@ if (!args.has("--real-only")) {
 	const tools = await toolchain();
 	console.log(`TLC: java via ${tools.via} (${tools.java}), ${tools.jar}`);
 	const t0 = Date.now();
-	const checks = await runModel(tools);
+	const checks = await runModel(tools, args.has("--deep"));
 	report(`model: StoreLease.tla under TLC (${seconds(t0)})`, checks);
 }
 if (!args.has("--model-only")) {

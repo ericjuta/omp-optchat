@@ -97,12 +97,14 @@ export interface StoreRow {
 	size: number;
 }
 
-/** The real stores, read-only: `~/.omp/agent/optchat` and `~/.omp/agent/optchat-worktrees/*`. */
+/** The real stores, read-only: `~/.omp/agent/optchat`, `~/.omp/agent/optchat-worktrees/*` and `~/.omp/agent/optchat-dirs/*`. */
 export function storeDirectories(): string[] {
 	const agent = join(homedir(), ".omp/agent");
 	const dirs = [join(agent, "optchat")];
-	const worktrees = join(agent, "optchat-worktrees");
-	if (existsSync(worktrees)) for (const name of readdirSync(worktrees).sort()) dirs.push(join(worktrees, name));
+	for (const group of ["optchat-worktrees", "optchat-dirs"]) {
+		const parent = join(agent, group);
+		if (existsSync(parent)) for (const name of readdirSync(parent).sort()) dirs.push(join(parent, name));
+	}
 	return dirs.filter((dir) => existsSync(join(dir, "main")) && existsSync(join(dir, "tree")));
 }
 

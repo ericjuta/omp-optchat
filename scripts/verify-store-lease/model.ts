@@ -23,8 +23,12 @@ const JAR_URL = "https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla
 const JAR_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88";
 const CONCURRENCY = 4;
 
-/** The model's bounds: two sessions, three directory inodes, the path D and a symlink spelling L of it. */
-const BOUNDS = `    Procs = {p1, p2}
+/**
+ * The model's bounds: two sessions (three for the `--deep` cases), three directory inodes, the path D and a
+ * symlink spelling L of it.
+ */
+const PROCS = { 2: "{p1, p2}", 3: "{p1, p2, p3}" } as const;
+const boundsFor = (procs: keyof typeof PROCS): string => `    Procs = ${PROCS[procs]}
     Inodes = {i1, i2, i3}
     None = None
     Spellings = {"D", "L"}`;
@@ -36,6 +40,8 @@ interface Case {
 	readonly externalMove: boolean;
 	readonly invariant: string;
 	readonly claim: string;
+	/** Sessions in the model; 2 unless given. */
+	readonly procs?: keyof typeof PROCS;
 }
 
 const MOVE = true;
@@ -57,6 +63,17 @@ const CASES: readonly Case[] = [
 	{ id: "broken-ArchiveNoInodeCheck/ArchiveOnlyClosed", role: "broken", variant: "ArchiveNoInodeCheck", externalMove: MOVE, invariant: "ArchiveOnlyClosed", claim: "an archive that holds the lease but skips the dev:ino check renames the store now at the path after a user mv" },
 	{ id: "broken-SidecarByPath/SidecarWritesUnderLease", role: "broken", variant: "SidecarByPath", externalMove: MOVE, invariant: "SidecarWritesUnderLease", claim: "ledger and metrics opened by path land in whichever store sits at the old path after a mv (F2 as found)" },
 ];
+
+/**
+ * `--deep`: the five guarantees with three sessions. About 4.1 million distinct states and 2.5 minutes on one
+ * TLC worker each (two sessions: about 72,000 states), so they are not in the default run.
+ */
+const DEEP_CASES: readonly Case[] = CASES.filter((c) => c.variant === "Current").map((c) => ({
+	...c,
+	id: c.id.replace(/^current\//, "current3/"),
+	procs: 3,
+	claim: `${c.claim}, with three sessions`,
+}));
 
 export interface Toolchain {
 	readonly java: string;
@@ -111,7 +128,7 @@ export async function toolchain(): Promise<Toolchain> {
 function configFor(c: Case): string {
 	return `SPECIFICATION Spec
 CONSTANTS
-${BOUNDS}
+${boundsFor(c.procs ?? 2)}
     ExternalMove = ${c.externalMove ? "TRUE" : "FALSE"}
     Variant = "${c.variant}"
 VIEW View
@@ -159,10 +176,11 @@ async function check(tools: Toolchain, c: Case): Promise<Check> {
 	await mkdir(join(dir, "tmp"), { recursive: true });
 	const config = join(dir, "model.cfg");
 	await writeFile(config, configFor(c));
+	const started = Date.now();
 	try {
 		const { output, exit } = await run(tools, join(dir, "tmp"), ["-config", relative(HERE, config), "-metadir", relative(HERE, join(dir, "states")), "-workers", "1", "-nowarning", SPEC]);
 		const found = /(\d+) states generated, (\d+) distinct states found/.exec(output);
-		const stats = found ? `${found[2]} states` : "no state count";
+		const stats = `${found ? `${found[2]} states` : "no state count"}, ${((Date.now() - started) / 1000).toFixed(1)}s`;
 		const violated = new RegExp(`Invariant ${c.invariant} is violated`).test(output);
 		const clean = exit === 0 && /Model checking completed\. No error has been found\./.test(output);
 		if (!violated && !clean) {
@@ -183,13 +201,14 @@ async function check(tools: Toolchain, c: Case): Promise<Check> {
 	}
 }
 
-/** All model cases, CONCURRENCY at a time, in table order. */
-export async function runModel(tools: Toolchain): Promise<Check[]> {
-	const results: Check[] = new Array(CASES.length);
+/** All model cases (with `deep`, the three-session cases first), CONCURRENCY at a time, in table order. */
+export async function runModel(tools: Toolchain, deep: boolean): Promise<Check[]> {
+	const cases = deep ? [...DEEP_CASES, ...CASES] : CASES;
+	const results: Check[] = new Array(cases.length);
 	let next = 0;
 	const worker = async (): Promise<void> => {
-		for (let index = next++; index < CASES.length; index = next++) {
-			const c = CASES[index];
+		for (let index = next++; index < cases.length; index = next++) {
+			const c = cases[index];
 			if (c) results[index] = await check(tools, c);
 		}
 	};

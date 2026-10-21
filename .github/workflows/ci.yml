@@ -39,3 +39,47 @@ jobs:
       - run: bun run smoke
         env:
           OPTCHAT_SMOKE_OMP: ./node_modules/.bin/omp
+
+  # The store writer lease: TLA+ model under TLC plus real-process tests of src/store.ts
+  # (scripts/verify-store-lease, .omp/skills/verify-store-lease/SKILL.md). Linux runs both phases.
+  verify-lease:
+    name: verify lease (linux, model + real processes)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - name: Install pinned lockfile
+        run: bun install --frozen-lockfile
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      # run.ts downloads the jar when absent and refuses any file whose sha256 differs from JAR_SHA256 in model.ts.
+      # The key carries that sha256: a new pin is a new cache entry.
+      - name: Cache TLA+ tools 1.7.4
+        uses: actions/cache@v6
+        with:
+          path: ~/.local/share/tlaplus/1.7.4
+          key: tla2tools-1.7.4-936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+      - name: Point the check at setup-java's JDK
+        run: echo "JAVA=$JAVA_HOME/bin/java" >> "$GITHUB_ENV"
+      - run: bun run verify:lease --strict
+
+  # macOS takes the flock path of acquireLease and F_GETPATH descriptor paths (src/store.ts), which Linux never runs.
+  # The TLA+ model is platform-independent and stays on Linux: this job runs the real-process phase and the store suites.
+  verify-lease-macos:
+    name: verify lease (macOS, real processes)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - name: Install pinned lockfile
+        run: bun install --frozen-lockfile
+      - run: bun run verify:lease --real-only --strict
+      - run: bun test tests/store.test.ts tests/store-directory.test.ts tests/crash.test.ts tests/new-chat.test.ts

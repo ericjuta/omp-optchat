@@ -512,13 +512,23 @@ async function runProbe(probe: Probe, role: Role, src: string | undefined, id: s
 	}
 }
 
-/** A deliberate break of src/store.ts that one guarantee probe must catch. */
-interface Mutant {
+/** One edit of src/store.ts, applied once. */
+interface Edit {
+	readonly anchor: string;
+	readonly replacement: string;
+}
+
+/**
+ * A deliberate break of src/store.ts that one guarantee probe must catch. The lease is a Linux abstract socket or a
+ * macOS flock on the root descriptor (store.ts:acquireLease), so a break of the lease itself is written once per
+ * mechanism: `anchor`/`replacement` is the Linux edit, `darwin` the same break of the flock path. A mutant without
+ * `darwin` breaks code both platforms run. Every mutant keeps one id and one probe on both platforms.
+ */
+interface Mutant extends Edit {
 	readonly id: string;
 	readonly probe: Probe;
 	readonly claim: string;
-	readonly anchor: string;
-	readonly replacement: string;
+	readonly darwin?: Edit;
 }
 
 const MUTANTS: readonly Mutant[] = [
@@ -528,6 +538,11 @@ const MUTANTS: readonly Mutant[] = [
 		claim: "a lease name that includes the pid excludes nobody: two processes both open the store",
 		anchor: "`${identity.dev}:${identity.ino}`",
 		replacement: "`${identity.dev}:${identity.ino}:${process.pid}`",
+		// flock has no name to key: the equivalent is a lock call whose failure is never taken for a conflict.
+		darwin: {
+			anchor: "darwinLibc.symbols.flock(rootFd, LOCK_EX | LOCK_NB) === -1",
+			replacement: "darwinLibc.symbols.flock(rootFd, LOCK_EX | LOCK_NB) === -2",
+		},
 	},
 	{
 		id: "failed-open-keeps-lease",
@@ -535,6 +550,11 @@ const MUTANTS: readonly Mutant[] = [
 		claim: "an open that fails after the lease and does not release it blocks the directory while its process lives",
 		anchor: "await release(rootFd, streams, lease);\n      } catch (cleanupError)",
 		replacement: "await release(rootFd, streams);\n      } catch (cleanupError)",
+		// Closing the root descriptor is what frees a flock, so the break must leave that descriptor open.
+		darwin: {
+			anchor: "await release(rootFd, streams, lease);\n      } catch (cleanupError)",
+			replacement: "closeStreams(streams, []);\n      } catch (cleanupError)",
+		},
 	},
 	{
 		id: "gc-before-lease",
@@ -542,6 +562,11 @@ const MUTANTS: readonly Mutant[] = [
 		claim: "garbage collection ahead of the lease lets a rejected opener delete files of the live store",
 		anchor: "  const identity = fstatSync(rootFd, { bigint: true });",
 		replacement: "  for (const name of readdirSync(descriptorPath(rootFd))) if (viewTempName.test(name)) unlinkSync(at(rootFd, name));\n  const identity = fstatSync(rootFd, { bigint: true });",
+		// On macOS acquireLease returns before that line, so the same break goes in front of the flock.
+		darwin: {
+			anchor: "async function acquireLease(rootFd: number): Promise<Lease> {\n",
+			replacement: "async function acquireLease(rootFd: number): Promise<Lease> {\n  for (const name of readdirSync(descriptorPath(rootFd))) if (viewTempName.test(name)) unlinkSync(at(rootFd, name));\n",
+		},
 	},
 	{
 		id: "close-keeps-lease",
@@ -549,6 +574,11 @@ const MUTANTS: readonly Mutant[] = [
 		claim: "a close that leaves the lease bound blocks every later opener while the process lives",
 		anchor: "  if (!lease.server.listening) return Promise.resolve();",
 		replacement: "  return Promise.resolve();",
+		// The flock lives as long as the root descriptor, so the break leaves that descriptor open.
+		darwin: {
+			anchor: "  closeDescriptor(rootFd, errors);\n  // Release ownership",
+			replacement: "  // Release ownership",
+		},
 	},
 	{
 		id: "archive-releases-before-rename",
@@ -594,18 +624,19 @@ const MUTANTS: readonly Mutant[] = [
 	},
 ];
 
-/** A copy of src/ whose store.ts has the mutant's edit applied once; throws when the anchor is not found exactly once. */
+/** A copy of src/ whose store.ts has the mutant's edit for this platform applied once; throws when the anchor is not found exactly once. */
 async function mutate(mutant: Mutant): Promise<string> {
+	const edit: Edit = process.platform === "darwin" && mutant.darwin ? mutant.darwin : mutant;
 	const dir = join(ROOT, ".verify", `mutant-${mutant.id}`);
 	await rm(dir, { recursive: true, force: true });
 	await cp(join(ROOT, "src"), join(dir, "src"), { recursive: true });
 	const path = join(dir, "src", "store.ts");
 	const text = await readFile(path, "utf8");
-	const parts = text.split(mutant.anchor);
+	const parts = text.split(edit.anchor);
 	if (parts.length !== 2) {
 		throw new Error(`mutant ${mutant.id}: its anchor now matches ${parts.length - 1} places in src/store.ts, not 1; the lease code moved, so update the anchor in real.ts (maintain skill)`);
 	}
-	await writeFile(path, parts.join(mutant.replacement));
+	await writeFile(path, parts.join(edit.replacement));
 	return join(dir, "src");
 }
 

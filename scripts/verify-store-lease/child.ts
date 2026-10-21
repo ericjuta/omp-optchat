@@ -15,7 +15,7 @@ import type * as Ledger from "../../src/system1/ledger.ts";
 
 // The source tree is chosen at run time ($OPTCHAT_SRC: a mutated copy), so these cannot be static imports.
 const SRC = resolve(process.env.OPTCHAT_SRC ?? join(dirname(fileURLToPath(import.meta.url)), "..", "..", "src"));
-const { Store: StoreClass } = (await import(join(SRC, "store.ts"))) as typeof Store;
+const { fdPath, Store: StoreClass } = (await import(join(SRC, "store.ts"))) as typeof Store;
 const { LEDGER_FILE, RuleLedger: LedgerClass } = (await import(join(SRC, "system1", "ledger.ts"))) as typeof Ledger;
 const { appendMetric, METRICS_FILE } = (await import(join(SRC, "metrics.ts"))) as typeof Metrics;
 
@@ -80,9 +80,14 @@ async function archiveHeld(command: Command): Promise<Record<string, unknown>> {
 	try {
 		const archive = await held.archive(new Date(command.text ?? ""));
 		// Descriptors of this process that still point into the archive: Store.archive must have closed them all.
-		const leaked = fs.readdirSync("/proc/self/fd").filter((name) => {
+		// Linux lists /proc/self/fd and reads each link; macOS lists /dev/fd and asks F_GETPATH. Both go through the
+		// store's own fdPath. macOS tmpdirs sit behind a symlink (/var -> /private/var), so a descriptor may name the
+		// archive by its real path.
+		const archives = [archive, fs.realpathSync(archive)];
+		const leaked = fs.readdirSync(process.platform === "darwin" ? "/dev/fd" : "/proc/self/fd").filter((name) => {
 			try {
-				return fs.readlinkSync(`/proc/self/fd/${name}`).startsWith(archive);
+				const path = fdPath(Number(name));
+				return archives.some((prefix) => path.startsWith(prefix));
 			} catch {
 				return false;
 			}

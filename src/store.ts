@@ -1108,7 +1108,9 @@ export class Store {
    * descriptor are kept until after the rename, so no other session can open the directory in between. The move is
    * refused, with nothing renamed, when `directory` no longer names the leased inode (it was moved or replaced).
    * A concurrent user `mv` between that check and the rename stays possible: rename(2) takes a pathname. Always
-   * releases the descriptors and the lease exactly once; a later `close()` is a no-op.
+   * releases the descriptors and the lease exactly once; a later `close()` is a no-op. A failure before or at the
+   * rename rejects with nothing moved. Once the rename has succeeded the archive is done: a descriptor or lease
+   * close error after it is reported as a warning naming the archive, and the archive path is still returned.
    */
   archive(now: Date, report?: Report): Promise<string> {
     if (this.closed) return Promise.reject(new Error("Store is closing or closed"));
@@ -1148,7 +1150,13 @@ export class Store {
       if (errors.length === 0) throw failure;
       throw new AggregateError([failure, ...errors], `Store archive and cleanup failed at ${this.directory}`, { cause: failure });
     }
-    if (errors.length) throw new AggregateError(errors, "Failed to close Store resources");
+    if (errors.length) {
+      // The directory is already moved and nothing can undo that: failing here would leave the caller believing it
+      // still holds an unarchived chat. Surface the close errors without turning the archive into a failure.
+      // release() aggregates its own close errors; list the underlying ones.
+      const causes = errors.flatMap((error) => error instanceof AggregateError ? error.errors : [error]);
+      reportSafely(report, `Store archived to ${archive!}, but closing its resources failed: ${causes.map(String).join("; ")}`);
+    }
     return archive!;
   }
 

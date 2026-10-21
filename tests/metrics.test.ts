@@ -8,8 +8,8 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { DEFAULTS } from "../src/config.ts";
+import { dirname, join } from "node:path";
+import { DEFAULTS, fallbackStoreDirectory, globalStoreDirectory } from "../src/config.ts";
 import { createOptChat } from "../src/index.ts";
 import { appendMetric, METRICS_FILE, readCompressorSpend, type CompressorUsage } from "../src/metrics.ts";
 import { startCompressorServer, type CompressorServer } from "./helpers/compressor-server.ts";
@@ -409,5 +409,65 @@ describe("an inactive session", () => {
     expect(status).toContain(`directory: ${directory}`);
     // The inactive session writes nothing to the holder's store.
     expect(existsSync(join(directory, METRICS_FILE))).toBe(false);
+  });
+});
+
+describe("a held global store", () => {
+  // Outside git with no --optchat-dir: the agent directory's `optchat` store is the default (cwd is the agent directory).
+  async function openDefault(agent: string, compressor: CompressorServer): Promise<FakeHost> {
+    const host = await openFakeHost(createOptChat(), {
+      directory: agent,
+      flags: { ...ALL_GATES_OFF, ...SMALL_NODES, "optchat-dir": undefined },
+      model: compressor.model,
+      mainModel: anthropicModel(),
+      apiKey: "fixture-key",
+    });
+    hosts.push(host);
+    return host;
+  }
+
+  test("a second session falls back to its working directory's own store instead of going inactive", async () => {
+    const agent = await realpath(await mkdtemp(join(tmpdir(), "optchat-agent-")));
+    roots.push(agent);
+    const compressor = await startCompressorServer();
+    servers.push(compressor);
+    const global = globalStoreDirectory(agent);
+    const fallback = fallbackStoreDirectory(agent, agent);
+    const first = await openDefault(agent, compressor);
+    expect(await statusOf(first)).toContain(`directory: ${global}`);
+
+    const second = await openDefault(agent, compressor);
+    expect(hasNotice(second, "OptChat is inactive")).toBe(false);
+    expect(hasNotice(second, `OptChat: ${global} is in use by another session, so this session uses ${fallback}.`)).toBe(true);
+    expect(second.entries).toEqual([]);
+    const status = await statusOf(second);
+    expect(status).toContain("OptChat: ready");
+    expect(status).toContain(`directory: ${fallback}`);
+    expect(dirname(fallback)).toBe(join(agent, "optchat-dirs"));
+
+    // Both stores held: the third session runs without memory and names both.
+    const third = await openDefault(agent, compressor);
+    const reason = `${global} and ${fallback} are in use by other sessions`;
+    expect(third.entries).toEqual([{ customType: "optchat-inactive", data: { reason, directory: fallback } }]);
+  });
+
+  test("an explicit --optchat-dir naming the global store does not fall back", async () => {
+    const agent = await realpath(await mkdtemp(join(tmpdir(), "optchat-agent-")));
+    roots.push(agent);
+    const compressor = await startCompressorServer();
+    servers.push(compressor);
+    const global = globalStoreDirectory(agent);
+    await openDefault(agent, compressor);
+    const explicit = await openFakeHost(createOptChat(), {
+      directory: agent,
+      flags: { ...ALL_GATES_OFF, ...SMALL_NODES, "optchat-dir": global },
+      model: compressor.model,
+      mainModel: anthropicModel(),
+      apiKey: "fixture-key",
+    });
+    hosts.push(explicit);
+    const reason = `${global} is in use by another session`;
+    expect(explicit.entries).toEqual([{ customType: "optchat-inactive", data: { reason, directory: global } }]);
+    expect(existsSync(join(agent, "optchat-dirs"))).toBe(false);
   });
 });
