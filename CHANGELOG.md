@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.1 — 2026-10-21
 
 Two findings of `bun run verify:lease` (the TLA+ model and real-process checks of the store's writer lease), both fixed. Each fix has regression tests that fail on 0.13.0.
 
