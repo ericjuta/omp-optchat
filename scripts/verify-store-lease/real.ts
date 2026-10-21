@@ -343,8 +343,8 @@ function mainLog(dir: string): string {
 const ARCHIVE_TIME = "2026-10-21T12:00:00.000Z";
 
 /**
- * G6 (model: ArchiveHeld, ReleaseArchived; was F1). `/optchat new` archives through Store.archive (index.ts:1643, 1665;
- * store.ts:1113-1153). It keeps its lease through the rename: at the rename itself another process's Store.open of the
+ * G6 (model: ArchiveHeld, ReleaseArchived; was F1). `/optchat new` archives through Store.archive (index.ts:1659, 1681;
+ * store.ts:1115-1161). It keeps its lease through the rename: at the rename itself another process's Store.open of the
  * directory gets the conflict error. Afterwards a fresh store opens at the old path and the archive reopens the old chat.
  */
 const archiveHoldsTheLease: Probe = {
@@ -377,7 +377,7 @@ const archiveHoldsTheLease: Probe = {
 /**
  * G7 (model: ArchiveHeld with the dev:ino check; was F1 with a user mv). Session A's directory is moved away and B opens
  * a store at the old path. A's `/optchat new` finds that the path no longer names the inode it leases and renames
- * nothing (store.ts:1128-1137); it still releases its lease, so A's own directory reopens.
+ * nothing (store.ts:1130-1139); it still releases its lease, so A's own directory reopens.
  */
 const archiveRefusesDisplacedPath: Probe = {
 	id: "archive-refuses-a-displaced-path",
@@ -412,7 +412,7 @@ const archiveRefusesDisplacedPath: Probe = {
 
 /**
  * G8 (model: SidecarWrite; was F2). The rules ledger and the metrics sink resolve their file through
- * store.sidecarPath on every write (system1/ledger.ts:143-147, index.ts:677, 892-896, 2079), so after the directory
+ * store.sidecarPath on every write (system1/ledger.ts:143-147, index.ts:693, 908-912, 2095), so after the directory
  * is moved, B's writes land in the directory B holds the lease of, not in whatever store is at the old path.
  */
 const sidecarWritesFollowTheInode: Probe = {

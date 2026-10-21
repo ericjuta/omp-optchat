@@ -43,8 +43,8 @@ VARIABLES
     spell,    \* the path spelling the session passes to Store.open (config.directory)
     root,     \* inode behind the session's rootFd (store.ts:787, 347-356)
     canon,    \* store.directory: the name fdPath read at store.ts:791
-    ledger,   \* the session's RuleLedger is open (index.ts:677)
-    newChat,  \* this shutdown is `/optchat new` (index.ts:1665)
+    ledger,   \* the session's RuleLedger is open (index.ts:693)
+    newChat,  \* this shutdown is `/optchat new` (index.ts:1681)
     owner,    \* the kernel lease table: abstract socket names (Linux), flocks (macOS)
     atD,      \* the inode the configured path D names now, or None
     used,     \* inodes created so far
@@ -88,12 +88,14 @@ Init ==
     /\ renamed = {}
     /\ last = "init"
 
-\* index.ts:662 (session_start) or a reopen calls Store.open(config.directory); store.ts:777.
+\* index.ts:666 (session_start) or a reopen calls Store.open(config.directory); store.ts:777. When a non-git
+\* session finds the global store held, index.ts:679 opens a different directory (the per-directory fallback);
+\* two directories never interact, so that second open is another Start at another path, not modelled.
 Start(p) ==
     /\ pc[p] = "idle"
     /\ \E s \in Spellings:
          /\ spell' = Set(spell, p, s)
-         /\ last' = SayAt(p, "Store.open(config.directory) starts (index.ts:662, store.ts:777-787)", s)
+         /\ last' = SayAt(p, "Store.open(config.directory) starts (index.ts:666, store.ts:777-787)", s)
     /\ pc' = Set(pc, p, "mkdir")
     /\ wrote' = {} /\ renamed' = {}
     /\ UNCHANGED <<root, canon, ledger, newChat, owner, atD, used>>
@@ -173,18 +175,18 @@ Recover(p) ==
     /\ UNCHANGED <<spell, root, canon, ledger, newChat, owner, atD, used>>
 
 \* Store.open returns; OptChat opens RuleLedger.open(() => store.sidecarPath(LEDGER_FILE))
-\* (index.ts:662, 677; system1/ledger.ts:61-70). Replay reads through the resolver (ledger.ts:108-111).
+\* (index.ts:666, 693; system1/ledger.ts:61-70). Replay reads through the resolver (ledger.ts:108-111).
 LedgerOpen(p) ==
     /\ pc[p] = "ledger"
     /\ ledger' = Set(ledger, p, TRUE)
     /\ pc' = Set(pc, p, "open")
-    /\ last' = SayAt(p, "Store.open returns; RuleLedger.open(() => store.sidecarPath(LEDGER_FILE)) (index.ts:662, 677)", canon[p])
+    /\ last' = SayAt(p, "Store.open returns; RuleLedger.open(() => store.sidecarPath(LEDGER_FILE)) (index.ts:666, 693)", canon[p])
     /\ wrote' = {} /\ renamed' = {}
     /\ UNCHANGED <<spell, root, canon, newChat, owner, atD, used>>
 
 \* Store.open fails after the lease (a stream open or replay throws): the catch releases the
 \* descriptors and the lease (store.ts:808-815); or RuleLedger.open throws and OptChat closes
-\* the store (index.ts:683-686). Either way the session ends with no store and no lease.
+\* the store (index.ts:699-702). Either way the session ends with no store and no lease.
 OpenFails(p) ==
     /\ pc[p] \in {"recover", "ledger"}
     /\ owner' = IF Variant = "LeakOnFailedOpen" THEN owner ELSE Free(p)
@@ -193,7 +195,7 @@ OpenFails(p) ==
     /\ canon' = Set(canon, p, None)
     /\ last' = IF Variant = "LeakOnFailedOpen"
                THEN Say(p, "the open fails after the lease and the lease stays held (broken variant LeakOnFailedOpen)")
-               ELSE Say(p, "the open fails after the lease: the catch releases descriptors and lease (store.ts:808-815; index.ts:683-686)")
+               ELSE Say(p, "the open fails after the lease: the catch releases descriptors and lease (store.ts:808-815; index.ts:699-702)")
     /\ wrote' = {} /\ renamed' = {}
     /\ UNCHANGED <<spell, ledger, newChat, atD, used>>
 
@@ -208,8 +210,8 @@ StoreWrite(p) ==
     /\ UNCHANGED <<pc, spell, root, canon, ledger, newChat, owner, atD, used>>
 
 \* RuleLedger.write resolves its file with this.file() for every event (system1/ledger.ts:143-147),
-\* which is store.sidecarPath(LEDGER_FILE) (index.ts:677); OptChat.record resolves
-\* metricsFile(store) = store.sidecarPath(METRICS_FILE) and appends to it (index.ts:892-896, 2079;
+\* which is store.sidecarPath(LEDGER_FILE) (index.ts:693); OptChat.record resolves
+\* metricsFile(store) = store.sidecarPath(METRICS_FILE) and appends to it (index.ts:908-912, 2095;
 \* metrics.ts:138-147). sidecarPath runs assertWritable (store.ts:1102, 818-826), then returns
 \* at(rootFd, name) (1103, 299-301): the leased inode, whatever D names now. A closed or failed
 \* store refuses the path, so a write needs pc = "open". SidecarByPath is the code before the fix.
@@ -224,25 +226,25 @@ SidecarWrite(p) ==
     /\ renamed' = {}
     /\ UNCHANGED <<pc, spell, root, canon, ledger, newChat, owner, atD, used>>
 
-\* OptChat.shutdown(archiveAt) (index.ts:1619-1644): rules.close() (1627), store = undefined, then
-\* store.close() (1640) or, for `/optchat new`, store.archive(now) (1643, 1665). Both set closed
-\* with no await before the writes stop (store.ts:1116, 1162) and close the stream descriptors
-\* synchronously (1124, 443-448); close() goes on to release rootFd and the lease (1163), archive()
+\* OptChat.shutdown(archiveAt) (index.ts:1635-1660): rules.close() (1643), store = undefined, then
+\* store.close() (1656) or, for `/optchat new`, store.archive(now) (1659, 1681). Both set closed
+\* with no await before the writes stop (store.ts:1118, 1170) and close the stream descriptors
+\* synchronously (1126, 443-448); close() goes on to release rootFd and the lease (1171), archive()
 \* keeps them.
 Shutdown(p) ==
     /\ pc[p] = "open"
     /\ \E nc \in BOOLEAN:
          /\ newChat' = Set(newChat, p, nc)
          /\ last' = IF nc
-                    THEN Say(p, "/optchat new: shutdown closes the rules ledger, then Store.archive sets closed and closes its stream descriptors, keeping rootFd and the lease (index.ts:1665, 1643; store.ts:1116, 1124)")
-                    ELSE Say(p, "session ends: shutdown closes the rules ledger, then store.close sets closed and closes its descriptors (index.ts:1640; store.ts:1162, 443-448)")
+                    THEN Say(p, "/optchat new: shutdown closes the rules ledger, then Store.archive sets closed and closes its stream descriptors, keeping rootFd and the lease (index.ts:1681, 1659; store.ts:1118, 1126)")
+                    ELSE Say(p, "session ends: shutdown closes the rules ledger, then store.close sets closed and closes its descriptors (index.ts:1656; store.ts:1170, 443-448)")
     /\ ledger' = Set(ledger, p, FALSE)
     /\ pc' = Set(pc, p, "closing")
     /\ wrote' = {} /\ renamed' = {}
     /\ UNCHANGED <<spell, root, canon, owner, atD, used>>
 
 \* release, last step of close(): close(rootFd), then closeLease -> server.close frees the socket
-\* name (store.ts:1163, 450-459, 428-437); on macOS close(rootFd) drops the flock. Both follow the
+\* name (store.ts:1171, 450-459, 428-437); on macOS close(rootFd) drops the flock. Both follow the
 \* stream closes above. In ArchiveAfterRelease `/optchat new` released here too, then archived.
 Release(p) ==
     /\ pc[p] = "closing"
@@ -251,15 +253,15 @@ Release(p) ==
     /\ pc' = Set(pc, p, IF newChat[p] THEN "archive" ELSE "idle")
     /\ root' = Set(root, p, None)
     /\ canon' = IF newChat[p] THEN canon ELSE Set(canon, p, None)
-    /\ last' = Say(p, "closeLease frees the lease (store.ts:1163, 450-459; macOS close(rootFd) drops the flock): nothing holds the directory from here")
+    /\ last' = Say(p, "closeLease frees the lease (store.ts:1171, 450-459; macOS close(rootFd) drops the flock): nothing holds the directory from here")
     /\ wrote' = {} /\ renamed' = {}
     /\ UNCHANGED <<spell, ledger, newChat, atD, used>>
 
-\* Store.archive, rename step, lease and rootFd still held (store.ts:1122-1153): fstat(rootFd) and
-\* stat(this.directory) must give the same dev:ino (1128-1137), else it throws and renames nothing;
-\* then moveToArchive claims the archive name with mkdir and renames the path (1138; 651-679, 661).
+\* Store.archive, rename step, lease and rootFd still held (store.ts:1124-1161): fstat(rootFd) and
+\* stat(this.directory) must give the same dev:ino (1130-1139), else it throws and renames nothing;
+\* then moveToArchive claims the archive name with mkdir and renames the path (1140; 651-679, 661).
 \* The stat and the rename are two syscalls: a user `mv` between them is the residual race the doc
-\* comment names (1106-1112), not modelled. ArchiveNoInodeCheck skips the dev:ino check.
+\* comment names (1107-1114), not modelled. ArchiveNoInodeCheck skips the dev:ino check.
 ArchiveHeld(p) ==
     /\ pc[p] = "closing"
     /\ newChat[p]
@@ -270,15 +272,17 @@ ArchiveHeld(p) ==
        IN /\ renamed' = IF moves THEN {[by |-> p, ino |-> target]} ELSE {}
           /\ atD' = IF moves /\ canon[p] = "D" THEN None ELSE atD
           /\ last' = IF moves
-                     THEN SayAt(p, "Store.archive: the path still names the leased inode, so moveToArchive renames it with the lease held (store.ts:1128-1138)", target)
-                     ELSE Say(p, "Store.archive: the path no longer names the leased inode (or names nothing): it throws and renames nothing (store.ts:1128-1137); startNewChat reopens D (index.ts:1668-1672)")
+                     THEN SayAt(p, "Store.archive: the path still names the leased inode, so moveToArchive renames it with the lease held (store.ts:1130-1140)", target)
+                     ELSE Say(p, "Store.archive: the path no longer names the leased inode (or names nothing): it throws and renames nothing (store.ts:1130-1139); startNewChat reopens D (index.ts:1684-1687)")
     /\ pc' = Set(pc, p, "archived")
     /\ wrote' = {}
     /\ UNCHANGED <<spell, root, canon, ledger, newChat, owner, used>>
 
 \* Store.archive, last step, on success and on failure alike: release(rootFd, [], lease) closes
-\* rootFd and frees the lease (store.ts:1143, 450-459); then startNewChat reopens the configured
-\* path (index.ts:1665, 1701-1706).
+\* rootFd and frees the lease (store.ts:1145, 450-459); then startNewChat reopens the configured
+\* path (index.ts:1681, 1717-1722). A descriptor or lease close error after a successful rename (since
+\* b37c5da) is reported as a warning and the archive path is still returned (store.ts:1153-1160): the
+\* release step and its effect on the lease are the same, so this action covers that case too.
 ReleaseArchived(p) ==
     /\ pc[p] = "archived"
     /\ owner' = Free(p)
@@ -286,7 +290,7 @@ ReleaseArchived(p) ==
     /\ root' = Set(root, p, None)
     /\ canon' = Set(canon, p, None)
     /\ newChat' = Set(newChat, p, FALSE)
-    /\ last' = Say(p, "Store.archive releases rootFd and the lease (store.ts:1143); the chat reopens D (index.ts:1665)")
+    /\ last' = Say(p, "Store.archive releases rootFd and the lease (store.ts:1145); the chat reopens D (index.ts:1681)")
     /\ wrote' = {} /\ renamed' = {}
     /\ UNCHANGED <<spell, ledger, atD, used>>
 

@@ -64,7 +64,7 @@ catch (error) { console.log(error.name); }`;
 }
 
 /**
- * index.ts:1665 archives through Store.archive. At the rename (store.ts:661) another process tries to open the
+ * index.ts:1681 archives through Store.archive. At the rename (store.ts:661) another process tries to open the
  * directory: `during` is what it got. The hook only observes; the rename itself runs unchanged.
  */
 async function archiveHeld(command: Command): Promise<Record<string, unknown>> {
@@ -141,7 +141,7 @@ async function handle(command: Command): Promise<Record<string, unknown>> {
 		case "closed-sidecar":
 			return closedSidecar(command.dir ?? "");
 		case "ledger":
-			// index.ts:677 opens the rules ledger right after Store.open, through the store's descriptor.
+			// index.ts:693 opens the rules ledger right after Store.open, through the store's descriptor.
 			ledger = LedgerClass.open(() => store?.sidecarPath(LEDGER_FILE) ?? "");
 			return { ok: true };
 		case "rule":
@@ -152,7 +152,7 @@ async function handle(command: Command): Promise<Record<string, unknown>> {
 				return failure(error);
 			}
 		case "metric":
-			// index.ts:2079 builds the metric sink as store.sidecarPath(METRICS_FILE); index.ts:896 resolves it per row.
+			// index.ts:2095 builds the metric sink as store.sidecarPath(METRICS_FILE); index.ts:912 resolves it per row.
 			try {
 				appendMetric(store?.sidecarPath(METRICS_FILE) ?? "", { type: "rules", at: new Date().toISOString(), pRule: null, pSentenceMax: null, sentences: 0, cutoff: 0.5, added: false });
 				return { ok: true };

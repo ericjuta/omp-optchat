@@ -51,9 +51,9 @@ What each guarantee says, in the order the output lists them:
 
 Both were found by this check at `687d0f9` (its first run) and are fixed in `ff05706`; the old behavior stays as broken variants (`ArchiveAfterRelease`, `SidecarByPath`) that must still be caught.
 
-**F1: `/optchat new` could rename a store another session had open.** At 687d0f9, `shutdown()` closed the store and released the lease, then `archiveStoreDirectory(directory)` renamed the path holding nothing; a session that opened the directory in between lost its live store to the archive. Now `Store.archive` (`store.ts:1113-1153`) keeps rootFd and the lease through the rename, renames only while `statSync(this.directory)` and `fstatSync(rootFd)` give the same dev:ino (1128-1137), and releases both once, on success or failure. `OptChat.shutdown(archiveAt)` (`index.ts:1619-1644`) calls it for `/optchat new` (1665). Residual: a user `mv` between the stat and the rename (rename takes a pathname) is not prevented; the doc comment says so.
+**F1: `/optchat new` could rename a store another session had open.** At 687d0f9, `shutdown()` closed the store and released the lease, then `archiveStoreDirectory(directory)` renamed the path holding nothing; a session that opened the directory in between lost its live store to the archive. Now `Store.archive` (`store.ts:1115-1161`) keeps rootFd and the lease through the rename, renames only while `statSync(this.directory)` and `fstatSync(rootFd)` give the same dev:ino (1130-1139), and releases both once (1145), on success or failure. Since `b37c5da` a descriptor or lease close error after a successful rename is a warning naming the archive, and the archive path is still returned (1153-1160); `release` still runs once and still closes the descriptors before the lease (450-459), so the lease steps are unchanged. `OptChat.shutdown(archiveAt)` (`index.ts:1635-1660`) calls it for `/optchat new` (1681). Residual: a user `mv` between the stat and the rename (rename takes a pathname) is not prevented; the doc comment says so.
 
-**F2: the rules ledger and the metrics file were written by pathname.** At 687d0f9, `RuleLedger.write` opened `join(store.directory, "ledger.jsonl")` and `appendMetric` `join(store.directory, "metrics.jsonl")` on every write, so after the directory was displaced they wrote into whichever store was at that path. Now `Store.sidecarPath(name)` (`store.ts:1098-1104`) runs `assertWritable` and returns `at(rootFd, name)`; `RuleLedger.open(() => store.sidecarPath(LEDGER_FILE))` (`index.ts:677`; `system1/ledger.ts:61-70, 108-111, 143-147`) and `metricsFile(store)` (`index.ts:892-896, 2079`) resolve per write. A metric row for a store that is closed or failed is dropped without a warning; `OPTCHAT_METRICS_FILE` still wins.
+**F2: the rules ledger and the metrics file were written by pathname.** At 687d0f9, `RuleLedger.write` opened `join(store.directory, "ledger.jsonl")` and `appendMetric` `join(store.directory, "metrics.jsonl")` on every write, so after the directory was displaced they wrote into whichever store was at that path. Now `Store.sidecarPath(name)` (`store.ts:1098-1104`) runs `assertWritable` and returns `at(rootFd, name)`; `RuleLedger.open(() => store.sidecarPath(LEDGER_FILE))` (`index.ts:693`; `system1/ledger.ts:61-70, 108-111, 143-147`) and `metricsFile(store)` (`index.ts:908-912, 2095`) resolve per write. A metric row for a store that is closed or failed is dropped without a warning; `OPTCHAT_METRICS_FILE` still wins.
 
 ## What the model is, and how it maps to code
 
@@ -64,10 +64,10 @@ Both were found by this check at `687d0f9` (its first run) and are fixed in `ff0
 | `Mkdir`, `OpenRootFd`, `FdPath` | `openRoot` 347-356, `makeDirectory` 317-324, `fdPath` 286, `Store.open` 787-791 | one syscall each; a symlink spelling resolves once, at `openat` |
 | `Acquire` | `acquireLease` 388-426 | one kernel `bind` (`server.listen`, 423) or `flock` (392) |
 | `Recover`, `StoreWrite` | `openStream` 793-803, `replay` torn-line repair 910-915, `collectGarbage` 708-745, `assertWritable` 818-826, appends | synchronous fd-relative writes after the lease |
-| `LedgerOpen`, `SidecarWrite` | `index.ts:677`, `system1/ledger.ts:143-147`, `index.ts:892-896`, `metrics.ts:138-147`, `Store.sidecarPath` 1098-1104 | one `open` per event, descriptor-relative, only while the store is open |
-| `OpenFails` | `Store.open` catch 808-815, `index.ts:683-686` | `release` closes descriptors, then the lease |
-| `Shutdown`, `Release` | `index.ts:1619-1644`, `store.ts:1159-1164, 450-459` | `close()` is synchronous up to `release` |
-| `ArchiveHeld`, `ReleaseArchived` | `Store.archive` 1113-1153, `moveToArchive` 651-679 | the dev:ino check and the rename are two syscalls (residual race, not modelled); the final release is one step |
+| `LedgerOpen`, `SidecarWrite` | `index.ts:693`, `system1/ledger.ts:143-147`, `index.ts:908-912`, `metrics.ts:138-147`, `Store.sidecarPath` 1098-1104 | one `open` per event, descriptor-relative, only while the store is open |
+| `OpenFails` | `Store.open` catch 808-815, `index.ts:699-702` | `release` closes descriptors, then the lease |
+| `Shutdown`, `Release` | `index.ts:1635-1660`, `store.ts:1167-1172, 450-459` | `close()` is synchronous up to `release` |
+| `ArchiveHeld`, `ReleaseArchived` | `Store.archive`/`archiveHeld` 1115-1161 (release 1145), `moveToArchive` 651-679 | the dev:ino check and the rename are two syscalls (residual race, not modelled); the final release is one step whether or not a close error follows the rename (that error only changes what `archive` returns, 1153-1160) |
 | `Crash`, `Restart` | `store.ts:421-422`, the module doc 749-751 | the kernel frees sockets and descriptors on death |
 | `MoveRoot` | doc comment 752-755, `tests/store.test.ts:1032-1043, 1253-1254` | a user `mv` of an open store directory |
 
@@ -80,7 +80,7 @@ The model does not read the code. A change to `src/store.ts` is caught by the re
 - Default run: two sessions (`Procs = {p1, p2}`), three directory inodes (`Inodes`), two spellings of the path (`"D"` and a symlink `"L"`), user `mv` on. The five `current/*` guarantees each explore 70,553 distinct states in 4-5 s; the largest run is `broken-ArchiveNoInodeCheck` at 17,461.
 - `--deep`: the same five guarantees with three sessions (`Procs = {p1, p2, p3}`, same inodes, spellings, `ExternalMove = TRUE`), ids `current3/<Invariant>`. Measured on the 8-core, 61 GB workstation with Temurin 21.0.12, TLC 2.19, one TLC worker per case: each case explores 4,098,579 distinct states (34,603,933 generated, depth 41) and takes 146-201 s when four run at once (148 s alone), 334 s wall for the five at `CONCURRENCY` 4 (two waves). A lone case peaked at 5.8 GB resident (the JVM takes up to a quarter of RAM as heap; a smaller host makes TLC spill to disk and slow down), so four at once want about 24 GB. That is over the three-minute budget of the default run, so three sessions are checked only with `--deep`. All five hold: no three-session violation (2026-10-21, at the sync commit below). `--deep` needs the model, so it cannot be combined with `--real-only`.
 - Run `--deep` when you change `StoreLease.tla` or what an action does, or before a release that touches the lease; it is not in CI.
-- One store path. Two different directories never interact in the code, so they are not modelled.
+- One store path. Two different directories never interact in the code, so they are not modelled. This includes the fallback in `OptChat.open` (`index.ts:664-686`, since `b37c5da`): a non-git session without `--optchat-dir` whose `Store.open` of the global store gets `StoreLeaseConflictError` (666) opens `optchat-dirs/<name>-<sha16>` of its cwd instead (679), a different directory with its own `dev:ino` lease. At the global store that session is a rejected opener (`OpenFails` before any write); at the fallback directory it is an ordinary opener of another store path.
 - Linux and macOS leases are the same action (`Acquire`). The model cannot tell them apart; only the Linux lease runs here. All writers must share a network namespace (`store.ts:422`).
 - The real-process harness runs only against this machine's platform and filesystem (local, private POSIX permissions); the archive probe reads `/proc/self/fd`.
 
@@ -88,7 +88,9 @@ The model does not read the code. A change to `src/store.ts` is caught by the re
 
 - macOS `flock` (392-399), run only by reading the code.
 - Lease loss while open (`assertWritable`, 818-826, checks `server.listening`): the model has no event that closes a server under a live store.
-- A user `mv` between `Store.archive`'s dev:ino check and its rename (`store.ts:1128-1138`): two syscalls, a pathname rename; named in the doc comment, not prevented and not modelled.
+- A user `mv` between `Store.archive`'s dev:ino check and its rename (`store.ts:1130-1140`): two syscalls, a pathname rename; named in the doc comment, not prevented and not modelled.
+- Close errors in `release`: neither the model nor the harness injects one. That a close error after a successful rename returns the archive with a warning (`store.ts:1153-1160`) is checked by `tests/store.test.ts` ("a close failure after a successful rename still returns the archive, warns, and frees the path").
+- Which directory `OptChat.open` picks (the per-directory fallback, `index.ts:664-686`): checked by `tests/metrics.test.ts` ("a held global store"), not by `verify:lease`.
 - Which file `index.ts` hands `RuleLedger.open` and `metricsFile`, and how `record` drops a row for a closed store: `verify:lease` drives `store.ts`, `system1/ledger.ts` and `metrics.ts` from a child, not `index.ts`. Those are checked by `tests/metrics.test.ts` ("the metric sink follows the store's inode"), `tests/new-chat.test.ts` ("refuses to archive a path that now names another session's store") and `tests/store.test.ts` ("Store archive and sidecar files").
 - Network namespaces, NFS and filesystems without fsync or with unstable inode numbers (the lease key is `dev:ino`).
 - Content of the logs, replay, compression, the view: only the lease and who writes under it.
@@ -109,12 +111,12 @@ A `FAIL` or `GONE` from TLC on a `current/*` check: replay the counterexample st
 
 ## Coverage record
 
-Sync commit: `ff05706d1cb7ba9617c6951f60dbf8432ce1be92` (the product fix for F1 and F2; the verification was updated against the code at this commit, the next commit).
+Sync commit: `b37c5da5937ba22f44c476b635238c4036eb9203` (archive close errors after the rename became a warning and `OptChat.open` gained the per-directory fallback; neither changes a lease step, so only line numbers and notes moved).
 
 | File | Covered |
 |---|---|
-| `src/store.ts` | `StoreLeaseConflictError` 87, `fdPath` 286, `descriptorPath`/`at` 295-301, `makeDirectory` 317-324, `openRoot` 347-356, `openStream`/`openExistingStream` 358-374, `acquireLease` 388-426, `closeLease` 428-437, `closeDescriptor`/`closeStreams`/`release` 439-459, `moveToArchive` 651-679, `collectGarbage` 708-745, `Store.open` 777-816, `assertWritable` 818-826, `replay` repair 910-915, `sidecarPath` 1098-1104, `archive`/`archiveHeld` 1113-1153, `close` 1159-1164 |
-| `src/index.ts` | `open` 649-706, `record` 892-905, `shutdown` 1619-1644, `startNewChat` 1650-1685, `reopen` 1701-1710, `session_shutdown` 2127, `metricsFile` 2079 |
+| `src/store.ts` | `StoreLeaseConflictError` 87, `fdPath` 286, `descriptorPath`/`at` 295-301, `makeDirectory` 317-324, `openRoot` 347-356, `openStream`/`openExistingStream` 358-374, `acquireLease` 388-426, `closeLease` 428-437, `closeDescriptor`/`closeStreams`/`release` 439-459, `moveToArchive` 651-679, `collectGarbage` 708-745, `Store.open` 777-816, `assertWritable` 818-826, `replay` repair 910-915, `sidecarPath` 1098-1104, `archive`/`archiveHeld` 1106-1161, `close` 1167-1172 |
+| `src/index.ts` | `open` 651-722 (lease-conflict fallback 664-686), `record` 908-921, `shutdown` 1635-1660, `startNewChat` 1666-1702, `reopen` 1717-1726, `metricsFile` 2095, `session_shutdown` 2143 |
 | `src/system1/ledger.ts` | `RuleLedger.open` 61-70, `replay` 108-111, `write` 143-147, the doc comment 47-53 |
 | `src/metrics.ts` | `appendMetric` 138-147 |
 
@@ -124,7 +126,7 @@ Files of the verification: `scripts/verify-store-lease/` (`run.ts` the command, 
 
 Use this when a change touches covered code, and for `/maintain-formal-verification-skill`.
 
-1. Does the change touch covered code? `git diff --stat ff05706 -- src/store.ts src/index.ts src/system1/ledger.ts src/metrics.ts` (use the sync commit above; after you move it, use the new one). Also look for code that moved, and for new code that opens a file in the store directory, or acquires or releases a lease.
+1. Does the change touch covered code? `git diff --stat b37c5da -- src/store.ts src/index.ts src/system1/ledger.ts src/metrics.ts` (use the sync commit above; after you move it, use the new one). Also look for code that moved, and for new code that opens a file in the store directory, or acquires or releases a lease.
 2. Run `bun run verify:lease` before you edit anything and keep the output.
 3. Read each change. If it alters a step the model describes (a step now two, a check moved, a new path writes into the store directory), update `StoreLease.tla`, `real.ts` or `child.ts` from the code, not from the result. If the promise changed on purpose, change the property and write the old wording, the new wording and the evidence (doc comment, tests, changelog) in the commit message.
 4. Rerun. New or edited covered code needs a proof that the check can still fail: add a model variant or a `MUTANTS` entry in `real.ts` for the new guard, and see it caught.
@@ -142,5 +144,6 @@ Use this when a change touches covered code, and for `/maintain-formal-verificat
 - In `sidecarPath`, return `join(this.directory, name)`. Expect `FAIL real/sidecar-writes-follow-the-inode`; delete `this.assertWritable();` there instead and expect `FAIL real/closed-store-has-no-sidecar`.
 - In `archiveHeld`, delete `closeStreams(this.openStreams(), errors);`. Expect `FAIL real/archive-holds-the-lease` (descriptors still point into the archive).
 - In `archiveHeld`, release only when `archive !== undefined`. Expect `FAIL real/archive-refuses-a-displaced-path` (the refused store keeps its lease).
+- In `archiveHeld`, delete the `try { await release(this.rootFd, [], this.lease); } catch (error) { errors.push(error); }` block after the rename. Expect `FAIL real/archive-holds-the-lease` and `real/archive-refuses-a-displaced-path` (no path frees the lease). This guards the release that the close-error change at `b37c5da` kept; the warning itself (1153-1160) is not seen by the harness, only by `tests/store.test.ts`.
 
-The `broken` lines copy `src/store.ts` too, so a break in the file can make some of them fail on their own (a copy that never conflicts cannot show a leak; a break whose anchor an earlier break removed reports `its anchor now matches 0 places`). Read the `guarantee` lines first. Then `git checkout src/store.ts` and rerun: 32 ok, 0 open findings, 0 failed. Never commit the break. Done at this commit: the two lease breaks and the six `archiveHeld`/`sidecarPath` breaks each failed the expected guarantee, and `src/store.ts` was restored byte for byte.
+The `broken` lines copy `src/store.ts` too, so a break in the file can make some of them fail on their own (a copy that never conflicts cannot show a leak; a break whose anchor an earlier break removed reports `its anchor now matches 0 places`). Read the `guarantee` lines first. Then `git checkout src/store.ts` and rerun: 32 ok, 0 open findings, 0 failed. Never commit the break. Done at `b37c5da`: the two lease breaks, the six `archiveHeld`/`sidecarPath` breaks and the delete-the-release break each failed the expected guarantee (`--real-only`), and `src/store.ts` was restored byte for byte.
