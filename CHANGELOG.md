@@ -1,10 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.13.2 — 2026-10-21
 
 - **Changed: a second session outside git no longer runs without memory.** Without `--optchat-dir`, every session outside a git checkout used the one global `optchat/` store, so starting OMP in a second such directory warned "OptChat is inactive: … is in use by another session". When the global store is held, the session now opens its working directory's own store under `optchat-dirs/<name>-<sha16>` beside it and reports the directory in one notice; it goes inactive only if that store is held too. An explicit `--optchat-dir` never falls back.
 
 - **Fixed: a close error after a successful `/optchat new` rename no longer reports the archive as failed.** `Store.archive` threw "Failed to close Store resources" when a stream, the root descriptor or the lease failed to close after the directory had already been renamed, so `/optchat new` said it could not archive the chat and did not reopen, though the chat was moved. Once the rename has succeeded, `archive` now returns the archive path and reports the close errors as a warning naming it; a failure before or at the rename still rejects with nothing moved. The lease is still released exactly once.
+
+- **Internal: the store lease check runs in CI.** `bun run verify:lease --strict` runs on Linux (TLA+ model plus real processes), and its real-process phase plus the store suites run on macOS, which takes the `flock` lease path Linux never runs; the lease mutants have flock variants there. `--deep` adds the five guarantees with three sessions (about 4.1 million states each; all hold), kept out of the default run and CI for its time and memory.
 
 ## 0.13.1 — 2026-10-21
 
