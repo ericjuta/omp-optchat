@@ -134,7 +134,7 @@
             },
             "before": {
               "type": "integer",
-              "description": "Only messages with id below this; pass details.next for older hits\n\n{minimum: 0}"
+              "description": "Only messages with id below this; pass details.next for older hits\n\n{minimum: 1}"
             }
           },
           "required": [

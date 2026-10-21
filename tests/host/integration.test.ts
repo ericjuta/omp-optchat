@@ -113,7 +113,7 @@ const CASE_TITLES = {
   "reasoning-tools-compressor-when-thinking": "with base disableReasoningWithTools false and whenThinking true the tool-bearing main request reasons none; the compressor stays medium and tool-free",
   "tool-cap-zoom": "ordinary tool output is capped live but stored whole; zoom pages the original record",
   "lock-held": "a store held by another writer activates inactive: prompts reach the model without memory tools or a compaction veto",
-  "lock-held-hooks": "a session inactive on a lease conflict passes context, provider and compaction hooks through and writes no log",
+  "lock-held-hooks": "a session inactive on a lease conflict passes context, provider and compaction hooks through, writes no store log and records why in the session log",
   "corrupt-store": "a corrupt store still refuses prompts with zero chat requests",
   "missing-compressor": "an unresolvable compressor selector refuses prompts with zero chat requests",
   "settle-timeout": "the settle deadline refuses the request and keeps the prompt durable and unanswered",
@@ -1499,9 +1499,9 @@ async function compressorRefusalMainRetry(ctx: CaseContext): Promise<Evidence> {
     assert.equal(instructionText(requests[1]!), instructionText(requests[0]!), "the fallback repeats the full compaction instruction");
     // The fallback aligns to the main model's captured host prefix, so its system text need not equal the compressor's.
     assert(systemText(requests[1]!.body).includes(ctx.lib.optchat.SYSTEM_BLOCK), "the fallback carries the OptChat guide");
-    assert.deepEqual(lines.map((line) => [line.model, line.attempt, line.purpose, line.stopReason]), [
-      [`${PROVIDER}/${COMPACT_MODEL}`, 1, "leaf", "error"],
-      [`${PROVIDER}/${CHAT_MODEL}`, 1, "leaf", "stop"],
+    assert.deepEqual(lines.map((line) => [line.model, line.node, line.attempt, line.retry, line.stopReason]), [
+      [`${PROVIDER}/${COMPACT_MODEL}`, "leaf", 1, null, "error"],
+      [`${PROVIDER}/${CHAT_MODEL}`, "leaf", 1, null, "stop"],
     ], "each attempt is metered with its own identity and outcome");
     assert(String(lines[0]!.error).includes("Refusal"), "the compressor's metric records the refusal");
     assert.equal(lines[1]!.error, null, "the successful fallback records no error");
@@ -1535,9 +1535,9 @@ async function compressorRefusalStandIn(ctx: CaseContext): Promise<Evidence> {
     assert.equal(instructionText(requests[1]!), instructionText(requests[0]!), "the fallback repeats the full compaction instruction");
     // The fallback aligns to the main model's captured host prefix, so its system text need not equal the compressor's.
     assert(systemText(requests[1]!.body).includes(ctx.lib.optchat.SYSTEM_BLOCK), "the fallback carries the OptChat guide");
-    assert.deepEqual(lines.map((line) => [line.model, line.attempt, line.purpose, line.stopReason]), [
-      [`${PROVIDER}/${COMPACT_MODEL}`, 1, "leaf", "error"],
-      [`${PROVIDER}/${CHAT_MODEL}`, 1, "leaf", "error"],
+    assert.deepEqual(lines.map((line) => [line.model, line.node, line.attempt, line.retry, line.stopReason]), [
+      [`${PROVIDER}/${COMPACT_MODEL}`, "leaf", 1, null, "error"],
+      [`${PROVIDER}/${CHAT_MODEL}`, "leaf", 1, null, "error"],
     ], "both refusals are metered with their own identities");
     assert(lines.every((line) => String(line.error).includes("Refusal")), "both metrics record the refusal");
     await fixture.until("main-model retry notice", () => host.notices.find((notice) =>
@@ -1569,7 +1569,7 @@ async function compressorErrorAppendRetry(ctx: CaseContext): Promise<Evidence> {
       const records = metricRecords(metrics);
       return records.length >= 1 ? records : undefined;
     });
-    assert.deepEqual([failed[0]!.model, failed[0]!.attempt, failed[0]!.purpose, failed[0]!.stopReason], [`${PROVIDER}/${COMPACT_MODEL}`, 1, "leaf", "error"], "the failed compressor attempt is metered");
+    assert.deepEqual([failed[0]!.model, failed[0]!.node, failed[0]!.attempt, failed[0]!.retry, failed[0]!.stopReason], [`${PROVIDER}/${COMPACT_MODEL}`, "leaf", 1, null, "error"], "the failed compressor attempt is metered");
     assert(String(failed[0]!.error).includes("upstream"), "the metric records the non-refusal error, not a refusal");
     await fixture.until("compaction failure warning", () => host.notices.find((notice) =>
       notice.message.includes("OptChat compaction failed at 0+1; retrying on the next appended message")));
@@ -1619,7 +1619,7 @@ async function compressorRefusalSameModel(ctx: CaseContext): Promise<Evidence> {
     });
     assert.equal(lines.length, 1, "one compressor attempt is metered");
     assert.deepEqual(seedRequests(fixture).map((capture) => capture.model), [CHAT_MODEL], "the main model is the compressor, so no retry request is sent");
-    assert.deepEqual([lines[0]!.model, lines[0]!.attempt, lines[0]!.purpose, lines[0]!.stopReason], [`${PROVIDER}/${CHAT_MODEL}`, 1, "leaf", "error"], "the single refusal is metered with its identity");
+    assert.deepEqual([lines[0]!.model, lines[0]!.node, lines[0]!.attempt, lines[0]!.retry, lines[0]!.stopReason], [`${PROVIDER}/${CHAT_MODEL}`, "leaf", 1, null, "error"], "the single refusal is metered with its identity");
     assert(String(lines[0]!.error).includes("Refusal"), "the metric records the refusal");
     await fixture.until("stand-in notice", () => host.notices.find((notice) =>
       notice.message.includes("unsummarized at 0+1") && notice.message.includes("stored a marked source excerpt")));
@@ -1702,9 +1702,9 @@ async function anthropicRefusalMainRetry(ctx: CaseContext): Promise<Evidence> {
     for (const capture of requests) assertAnthropicBudget(capture.body, capture.model);
     assert.equal(instructionText(requests[1]!), instructionText(requests[0]!), "the fallback repeats the full compaction instruction");
     assert(anthropicSystemText(requests[1]!.body).includes(ctx.lib.optchat.SYSTEM_BLOCK), "the fallback carries the OptChat guide");
-    assert.deepEqual(lines.map((line) => [line.model, line.attempt, line.purpose, line.stopReason]), [
-      [`${ANTHROPIC_PROVIDER}/${ANTHROPIC_COMPACT}`, 1, "leaf", "error"],
-      [`${ANTHROPIC_PROVIDER}/${ANTHROPIC_CHAT}`, 1, "leaf", "stop"],
+    assert.deepEqual(lines.map((line) => [line.model, line.node, line.attempt, line.retry, line.stopReason]), [
+      [`${ANTHROPIC_PROVIDER}/${ANTHROPIC_COMPACT}`, "leaf", 1, null, "error"],
+      [`${ANTHROPIC_PROVIDER}/${ANTHROPIC_CHAT}`, "leaf", 1, null, "stop"],
     ], "each attempt is metered with its own identity and outcome");
     assert(String(lines[0]!.error).includes("Refusal (bio)"), "the compressor's metric records the wire refusal with its category");
     assert.equal(lines[1]!.error, null, "the successful fallback records no error");
@@ -1748,8 +1748,8 @@ async function anthropicRefusalDeadlineStandIn(ctx: CaseContext): Promise<Eviden
       const records = metricRecords(metrics);
       return records.length >= 1 ? records : undefined;
     });
-    assert.deepEqual([lines[0]!.model, lines[0]!.attempt, lines[0]!.purpose, lines[0]!.stopReason],
-      [`${ANTHROPIC_PROVIDER}/${ANTHROPIC_COMPACT}`, 1, "leaf", "error"], "the refused compressor attempt is metered first");
+    assert.deepEqual([lines[0]!.model, lines[0]!.node, lines[0]!.attempt, lines[0]!.retry, lines[0]!.stopReason],
+      [`${ANTHROPIC_PROVIDER}/${ANTHROPIC_COMPACT}`, "leaf", 1, null, "error"], "the refused compressor attempt is metered first");
     assert(!lines.some((line) => line.model === `${ANTHROPIC_PROVIDER}/${ANTHROPIC_CHAT}` && line.stopReason === "stop"),
       "the timed-out fallback is never a completed call");
     const requests = seedRequests(fixture);
@@ -2182,6 +2182,9 @@ async function lockHeld(ctx: CaseContext): Promise<Evidence> {
       const inactive = `OptChat is inactive: ${memory} is in use by another session. Use --optchat-dir for a separate memory.`;
       assert(host.notices.some((notice) => notice.type === "warning" && notice.message === inactive), `startup reports the inactive session; notices: ${JSON.stringify(host.notices)}`);
       fixture.queueChat("inactive later reply", { text: LOCK_NEXT_TALK });
+      const recorded = host.session.sessionManager.getBranch().flatMap((entry) =>
+        entry.type === "custom" && entry.customType === "optchat-inactive" ? [entry.data] : []);
+      assert.deepEqual(recorded, [{ reason: `${memory} is in use by another session`, directory: memory }], "the session log keeps why this session ran without memory");
       expectCompleted(await bounded("later prompt", host.prompt(LOCK_NEXT_USER), STEP_MS, fixture.fatal), "later prompt");
       await host.idle();
       return { notices: host.notices.length };
@@ -2811,6 +2814,8 @@ interface FakeHost {
   notices: Notice[];
   /** Names of the tools the session registered at startup. */
   registeredTools: string[];
+  /** Every custom entry the session appended to the host session log, in order. */
+  entries: Array<{ customType: string; data: unknown }>;
 }
 
 interface FakeHostOptions {
@@ -2848,6 +2853,7 @@ async function withFakeHost(
   const handlers = new Map<string, FakeHostHandler[]>();
   const registeredTools: Array<{ name: string }> = [];
   const notices: Notice[] = [];
+  const entries: Array<{ customType: string; data: unknown }> = [];
   const session: { artifactManager: object | undefined; branch: Array<{ type: "message"; message: FakeHostMessage }> } = {
     artifactManager: options.artifactManager,
     branch: [],
@@ -2874,6 +2880,7 @@ async function withFakeHost(
     getAllTools: () => [],
     getActiveTools: () => ["zoom", "date", "work", "chat_search"],
     registerTool: (tool: { name: string }) => { registeredTools.push(tool); },
+    appendEntry: (customType: string, data?: unknown) => { entries.push({ customType, data }); },
     // Plain zod supports the object/number/int/min/describe builders used here.
     // This fake records tool definitions only; it never exports or executes their
     // schemas. Real pi.zod is @oh-my-pi/omptype/zod (loader.ts:8,183), not zod v3;
@@ -2915,6 +2922,7 @@ async function withFakeHost(
       ctx: fakeCase,
       notices,
       registeredTools: registeredTools.map((tool) => tool.name),
+      entries,
       fire,
       timestamp,
       context: async (messages) => {
@@ -2967,6 +2975,11 @@ async function lockHeldHooks(ctx: CaseContext): Promise<Evidence> {
     const inactive = `OptChat is inactive: ${host.ctx.memory} is in use by another session. Use --optchat-dir for a separate memory.`;
     assert(host.notices.some((notice) => notice.type === "warning" && notice.message === inactive), `startup reports the inactive session; notices: ${JSON.stringify(host.notices)}`);
     assert.deepEqual(host.registeredTools, [], "an inactive session registers no memory tools");
+    assert.deepEqual(
+      host.entries,
+      [{ customType: "optchat-inactive", data: { reason: `${host.ctx.memory} is in use by another session`, directory: host.ctx.memory } }],
+      "the reason is recorded once in the host session log, not in the store",
+    );
     const user = host.user("U1");
     assert.equal(await host.context([user]), undefined, "the first request passes through untouched");
     assert.deepEqual(await host.fire({ type: "before_agent_start", systemPrompt: ["base"] }), [undefined], "no OptChat system block is appended");

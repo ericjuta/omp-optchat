@@ -13,6 +13,8 @@ export interface PageEnvelope {
 	readonly next: number | null;
 	readonly totalBytes: number;
 	readonly offset: number;
+	/** For a tool-call message: the id of the record that stores its result, once that is logged. */
+	readonly result?: number;
 	/** The message's stored images in source order; supplied on a first page only. */
 	readonly images?: readonly PageImage[];
 }
@@ -137,14 +139,27 @@ function pageResult(page: PageEnvelope, details: Record<string, unknown> = {}) {
 		content: [
 			{ type: "text" as const, text: page.text },
 			{ type: "text" as const, text: envelope },
+			...(page.result === undefined ? [] : [{ type: "text" as const, text: `[result: message ${page.result}]` }]),
 			...(page.images ?? []).map((image) => ({ type: "image" as const, data: image.data, mimeType: image.mimeType })),
 		],
-		details: { offset: page.offset, next: page.next, totalBytes: page.totalBytes, ...details },
+		details: {
+			offset: page.offset,
+			next: page.next,
+			totalBytes: page.totalBytes,
+			...(page.result === undefined ? {} : { result: page.result }),
+			...details,
+		},
 	};
 }
 
 /** Register the zoom, date, work and chat_search tools over any memory reader; each call is admitted before it reads. */
-export function registerMemoryTools(pi: ExtensionAPI, reader: MemoryReader, admit: Admission): void {
+export function registerMemoryTools(
+	pi: ExtensionAPI,
+	reader: MemoryReader,
+	admit: Admission,
+	/** Whether this session also has `chat_recall`; a zero-hit search suggests it only then. Read per call. */
+	recallRegistered: () => boolean = () => false,
+): void {
 	const z = pi.zod;
 	const zoomParams = z.object({
 		id: z.number().int().min(0).describe("First message id of the line"),
@@ -184,7 +199,7 @@ export function registerMemoryTools(pi: ExtensionAPI, reader: MemoryReader, admi
 		text: z.string().min(1).max(200).describe("Words that must all appear in the message, case-insensitive"),
 		kind: z.enum(MESSAGE_KINDS).optional().describe("Only messages of this kind"),
 		limit: z.number().int().min(1).max(50).optional().describe("Hits to return (default 10)"),
-		before: z.number().int().min(0).optional().describe("Only messages with id below this; pass details.next for older hits"),
+		before: z.number().int().min(1).optional().describe("Only messages with id below this; pass details.next for older hits"),
 	});
 	pi.registerTool<typeof searchParams>({
 		name: "chat_search",
@@ -200,9 +215,20 @@ export function registerMemoryTools(pi: ExtensionAPI, reader: MemoryReader, admi
 			const header = `[optchat search] ${result.hits.length} hits for "${params.text.replace(/\s+/g, " ").trim()}" (newest first)`;
 			const footer = result.next === null ? "[no older hits]" : `[older hits: before=${result.next}]`;
 			const lines = [header, ...result.hits.map((hit) => `${hit.id}|${hit.kind}|${hit.snippet}`), footer];
+			if (result.termCounts !== undefined) {
+				const counts = result.termCounts.map(({ term, messages }) => `"${term}" ${messages}`).join(", ");
+				const advice = recallRegistered()
+					? "drop a word, or ask chat_recall in plain words"
+					: "drop a word that few or no messages contain";
+				lines.push(`[no message has every word; messages containing each word: ${counts}; ${advice}]`);
+			}
 			return {
 				content: [{ type: "text", text: lines.join("\n") }],
-				details: { hits: result.hits.map((hit) => hit.id), next: result.next },
+				details: {
+					hits: result.hits.map((hit) => hit.id),
+					next: result.next,
+					...(result.termCounts === undefined ? {} : { termCounts: result.termCounts }),
+				},
 			};
 		},
 	});

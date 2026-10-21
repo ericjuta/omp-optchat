@@ -1,8 +1,10 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
-import { type ArtifactPathSource, captureWorkReports } from "../src/reports.ts";
+import { afterEach, describe, expect, test } from "bun:test";
+import { type ArtifactPathSource, captureWaitReports, captureWorkReports } from "../src/reports.ts";
+import type { FakeHost, HostMessage } from "./helpers/fake-host.ts";
+import { ALL_GATES_OFF, Harness } from "./helpers/system1-chat.ts";
 
 const TIMESTAMP = 1_767_225_600_000;
 
@@ -602,5 +604,189 @@ describe("captureWorkReports identifiers and inputs", () => {
     expect(capture.completeness).toBe("pointer-only");
     expect(capture.reports).toHaveLength(1);
     expect(capture.reports[0]!.body).toBe("bare text");
+  });
+});
+
+/** One job snapshot of a host `wait` result, as `details.jobs` holds it. */
+interface WaitJob {
+  id: string;
+  type: "task" | "bash";
+  status: "completed" | "failed" | "running";
+  label: string;
+  durationMs?: number;
+  agentUrlId?: string;
+  /** Absent once the host already delivered the job by itself. */
+  resultText?: string;
+  errorText?: string;
+}
+
+/** A `wait` result as the host renders it: the text the model reads and the job snapshots in its details. */
+function waitResult(jobs: readonly WaitJob[]): { text: string; details: Record<string, unknown> } {
+  const finished = jobs.filter((job) => job.status !== "running");
+  const running = jobs.filter((job) => job.status === "running");
+  const lines: string[] = [];
+  if (finished.length > 0) {
+    lines.push(`## Completed (${finished.length})`, "");
+    for (const job of finished) {
+      lines.push(`### ${job.id} [${job.type}] — ${job.status}`, `Label: ${job.label}`);
+      lines.push(job.resultText === undefined ? "Delivery: already delivered or recovered." : "Delivery: not auto-delivered; recovered by this snapshot.");
+      if (job.resultText !== undefined) lines.push("```", job.resultText, "```");
+      if (job.errorText !== undefined) lines.push(`Error: ${job.errorText}`);
+      lines.push("");
+    }
+  }
+  if (running.length > 0) {
+    lines.push(`## Still Running (${running.length})`, "");
+    for (const job of running) lines.push(`- \`${job.id}\` [${job.type}] — ${job.label}`);
+  }
+  return {
+    text: lines.join("\n").trimEnd(),
+    details: { op: "wait", meta: { source: { type: "report", value: "background jobs snapshot" } }, jobs },
+  };
+}
+
+const taskReport = (agent: string, finding: string): string => `<task-result agent="${agent}">\n<output>\n${finding}\n</output>\n</task-result>`;
+
+/** The names are distinct, so a lookup by label, job id or agent id each has to find the report on its own. */
+const AUDIT: WaitJob = {
+  id: "bg_7", type: "task", status: "completed", label: "HostCompaction", agentUrlId: "0-HostCompaction", durationMs: 4200,
+  resultText: taskReport("HostCompaction", "ZEBRAFINDING the veto loops"),
+};
+
+describe("captureWaitReports", () => {
+  test("a finished task job is one full report under its job id, label and agent id", async () => {
+    const capture = await captureWaitReports({ ...waitResult([AUDIT]), timestamp: TIMESTAMP });
+    expect(capture.completeness).toBe("full");
+    expect(capture.reports).toHaveLength(1);
+    const [report] = capture.reports;
+    expect(report!.work).toEqual({ source: "async-result", completeness: "full", id: "bg_7", name: "HostCompaction", agentId: "0-HostCompaction" });
+    expect(report!.provenance).toEqual({ type: "task", status: "completed", durationMs: 4200 });
+    expect(report!.timestamp).toBe(TIMESTAMP);
+    expect(report!.body).toContain("ZEBRAFINDING the veto loops");
+    expect(report!.body).toContain("bg_7");
+    // Everything the result said was the report: nothing is left to echo.
+    expect(capture.rest).toBeUndefined();
+  });
+
+  test("beside a bash job and a running job only the task is a report, and the rest of the result remains", async () => {
+    const build: WaitJob = { id: "bg_3", type: "bash", status: "completed", label: "bun run build", resultText: "BUILDLOG compiled 40 files" };
+    const running: WaitJob = { id: "bg_9", type: "task", status: "running", label: "StillWorking" };
+    const capture = await captureWaitReports({ ...waitResult([AUDIT, build, running]), timestamp: TIMESTAMP });
+    expect(capture.reports.map((report) => report.work.id)).toEqual(["bg_7"]);
+    expect(capture.reports[0]!.body).not.toContain("BUILDLOG");
+    expect(capture.rest).toContain("BUILDLOG compiled 40 files");
+    expect(capture.rest).toContain("bg_9");
+    expect(capture.rest).not.toContain("ZEBRAFINDING");
+  });
+
+  test("two finished tasks are two reports, each with only its own output", async () => {
+    const second: WaitJob = { id: "bg_8", type: "task", status: "completed", label: "RealHost", agentUrlId: "1-RealHost", resultText: taskReport("RealHost", "QUOKKAFINDING three cases") };
+    const capture = await captureWaitReports({ ...waitResult([AUDIT, second]), timestamp: TIMESTAMP });
+    expect(capture.reports.map((report) => report.work.name)).toEqual(["HostCompaction", "RealHost"]);
+    expect(capture.reports[0]!.body).toContain("ZEBRAFINDING");
+    expect(capture.reports[0]!.body).not.toContain("QUOKKAFINDING");
+    expect(capture.reports[1]!.body).toContain("QUOKKAFINDING");
+    expect(capture.reports[1]!.body).not.toContain("ZEBRAFINDING");
+  });
+
+  test("a job the host already delivered carries no text and is not recaptured, so its first report stays the newest", async () => {
+    const delivery = waitResult([{ id: "bg_7", type: "task", status: "completed", label: "HostCompaction", agentUrlId: "0-HostCompaction" }]);
+    const capture = await captureWaitReports({ ...delivery, timestamp: TIMESTAMP });
+    expect(capture.reports).toEqual([]);
+    expect(capture.rest).toBe(delivery.text);
+  });
+
+  test("a failed task keeps the error it delivered", async () => {
+    const failed: WaitJob = { id: "bg_4", type: "task", status: "failed", label: "Crashed", errorText: "agent exited with code 1" };
+    const capture = await captureWaitReports({ ...waitResult([failed]), timestamp: TIMESTAMP });
+    expect(capture.reports).toHaveLength(1);
+    expect(capture.reports[0]!.provenance.status).toBe("failed");
+    expect(capture.reports[0]!.body).toContain("agent exited with code 1");
+  });
+
+  test("a preview of a report is never claimed as the full report", async () => {
+    const reader = artifactReader({});
+    const previewed: WaitJob = { ...AUDIT, resultText: nestedPreview("0-HostCompaction") };
+    const capture = await captureWaitReports({ ...waitResult([previewed]), timestamp: TIMESTAMP, sessionManager: reader });
+    expect(capture.completeness).toBe("pointer-only");
+    expect(capture.reports[0]!.work.completeness).toBe("pointer-only");
+    expect(capture.reports[0]!.reason).toBe("the host delivered a preview; the full output is referenced only in text");
+    expect(capture.reports[0]!.body).toContain("first part of the review");
+    expect(reader.calls).toEqual([]);
+  });
+
+  test("a non-finite timestamp is rejected", async () => {
+    await expect(captureWaitReports({ ...waitResult([AUDIT]), timestamp: Number.NaN })).rejects.toThrow("finite");
+  });
+});
+
+describe("a wait result in the chat log", () => {
+  const harness = new Harness();
+
+  afterEach(async () => {
+    await harness.close();
+  });
+
+  async function open(): Promise<FakeHost> {
+    return (await harness.open({ flags: ALL_GATES_OFF })).host;
+  }
+
+  /**
+   * One turn: the user delegates, the spawn result names no agent, the agent waits, and the wait result carries
+   * `delivery`. `between` is delivered after the spawn and before the wait.
+   */
+  async function waitTurn(host: FakeHost, delivery: { text: string; details: Record<string, unknown> }, between: HostMessage[] = []): Promise<void> {
+    const messages: HostMessage[] = [
+      host.user("delegate the audit, then collect it"),
+      host.assistant("spawning", { id: "t1", name: "task", arguments: {} }),
+      host.toolResult("t1", "task", "Started the audit in the background"),
+      ...between,
+      host.assistant("waiting", { id: "t2", name: "wait", arguments: {} }),
+      { ...host.toolResult("t2", "wait", delivery.text), details: delivery.details } as HostMessage,
+    ];
+    await host.context(messages);
+    await host.fire("agent_end", { messages: [...messages, host.assistant("collected")], willContinue: false });
+  }
+
+  /** The kind of each hit a `chat_search` for `text` returned, newest first. */
+  async function hitKinds(host: FakeHost, text: string): Promise<string[]> {
+    const result = await host.callTool("chat_search", { text });
+    return [...result.matchAll(/^\d+\|(\w+)\|/gm)].map((match) => match[1]!);
+  }
+
+  test("work(name) returns the report a wait delivered, by label, job id or agent id", async () => {
+    const host = await open();
+    await waitTurn(host, waitResult([AUDIT]));
+    for (const name of ["HostCompaction", "bg_7", "0-HostCompaction"]) {
+      expect(await host.callTool("work", { name })).toContain("ZEBRAFINDING the veto loops");
+    }
+  });
+
+  test("the report is logged once, as work and not also as an echo", async () => {
+    const host = await open();
+    await waitTurn(host, waitResult([AUDIT]));
+    expect(await hitKinds(host, "ZEBRAFINDING")).toEqual(["work"]);
+  });
+
+  test("a bash job in the same wait stays an echo that no work lookup finds, while the task report is work", async () => {
+    const host = await open();
+    const build: WaitJob = { id: "bg_3", type: "bash", status: "completed", label: "bun run build", resultText: "BUILDLOG compiled 40 files" };
+    await waitTurn(host, waitResult([AUDIT, build]));
+    expect(await hitKinds(host, "BUILDLOG")).toEqual(["echo"]);
+    expect(await hitKinds(host, "ZEBRAFINDING")).toEqual(["work"]);
+    expect(await host.callTool("work", { name: "HostCompaction" })).toContain("ZEBRAFINDING");
+    await expect(host.callTool("work", { name: "bg_3" })).rejects.toThrow();
+  });
+
+  test("a wait that only snapshots a job the host already delivered leaves the delivered report as the work", async () => {
+    const host = await open();
+    const delivered = {
+      role: "custom", customType: "async-result", display: true, timestamp: Date.now(),
+      content: taskReport("Auditor", "QUOKKAFINDING three cases"),
+      details: { jobs: [{ jobId: "bg_5", agentId: "0-Auditor", label: "Auditor", type: "task", status: "completed" }] },
+    } as unknown as HostMessage;
+    const snapshot = waitResult([{ id: "bg_5", type: "task", status: "completed", label: "Auditor", agentUrlId: "0-Auditor" }]);
+    await waitTurn(host, snapshot, [delivered]);
+    expect(await host.callTool("work", { name: "Auditor" })).toContain("QUOKKAFINDING three cases");
   });
 });

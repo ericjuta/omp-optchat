@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CompressorRefusedError, Memory, utf8Bytes, utf8Prefix, type CompactionRequest, type MemoryOptions, type Summarize } from "../src/memory.ts";
-import { Store, nodeKey } from "../src/store.ts";
+import { Store, nodeKey, type Kind } from "../src/store.ts";
 import { holdTimers } from "./helpers/held-timer.ts";
 
 const PLACEHOLDER = "(not summarized yet: zoom it)";
@@ -198,6 +198,12 @@ const addresses = (memory: Memory): string[] =>
 
 const summary = (tag: string): string => `[${tag}]`.padEnd(12, ".");
 
+/** A compressor's answer for a leaf. Code stores it behind the message's kind, so the stored line is as long as `summary`. */
+const leafReply = (tag: string): string => `[${tag}]`.padEnd(6, ".");
+
+/** The stored line of a leaf of `kind` whose compressor answered `leafReply(tag)`. */
+const leafLine = (tag: string, kind: Kind = "user"): string => `${kind}: ${leafReply(tag)}`;
+
 const contextBytes = (context: string): number =>
   chatLines(context).reduce((bytes, line) => bytes + utf8Bytes(line.slice(line.indexOf("|") + 1)), 0);
 
@@ -222,7 +228,7 @@ test("admission stops eight unbuilt leaves ahead, however many jobs are free", a
   expect(model.labels()).toEqual(["[m0]", "[m1]", "[m2]", "[m3]", "[m4]", "[m5]", "[m6]", "[m7]"]);
 
   // Each built leaf admits exactly one more: the window counts unbuilt leaves, not jobs.
-  model.take("[m0]").resolve(summary("s0"));
+  model.take("[m0]").resolve(leafReply("s0"));
   await until(() => model.labels().includes("[m8]"), "window admits leaf 8");
   await flush();
   expect(model.labels()).toEqual(["[m1]", "[m2]", "[m3]", "[m4]", "[m5]", "[m6]", "[m7]", "[m8]"]);
@@ -311,7 +317,7 @@ test("a failed leaf keeps its admission slot until a retry succeeds", async () =
   await until(() => model.open().length === 8, "eight admitted leaves");
 
   model.take("[m0]").reject(new Error("offline"));
-  model.take("[m1]").resolve(summary("s1"));
+  model.take("[m1]").resolve(leafReply("s1"));
   await until(() => model.labels().includes("[m8]"), "window admits leaf 8");
   await flush();
   // Leaf 0 is still unbuilt, so leaf 9 waits behind the window.
@@ -368,16 +374,17 @@ test("an over-long source is summarized through every page, then reduced to one 
   );
   // Context is the built prefix only, never the message being summarized.
   expect(chatLines(pageCalls[0]!.request.context)).toEqual(["0+1|user: hi"]);
-  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe("ok");
+  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe("echo: ok");
 });
 
 test("reduction keeps exact order over bounded groups and rounds; each output is consumed once", async () => {
   const store = await openStore();
-  // 16-byte ids: two summaries plus their newline are exactly the 33-byte group budget.
+  // 16-byte ids; the final leaf is stored behind "echo: ", so its line limit is 22. Two ids plus their
+  // newline (33 bytes) fit the 45-byte group budget, three (50) do not.
   const id = (n: number): string => String(n).padStart(16, "0");
   let produced = 0;
   const model = new Model({ auto: () => id(++produced) });
-  const memory = memoryFor(store, model, { nodeBytes: 16, pageBytes: 16, jobs: 1, viewBytes: 1_000_000 });
+  const memory = memoryFor(store, model, { nodeBytes: 22, pageBytes: 16, jobs: 1, viewBytes: 1_000_000 });
   const body = "abcdefghij".repeat(10);
   const source = `echo: ${body}`; // 106 bytes: six full 16-byte pages, then 10 bytes
   memory.append("echo", body);
@@ -413,7 +420,7 @@ test("reduction keeps exact order over bounded groups and rounds; each output is
     expect(utf8Bytes(call.request.context)).toBeLessThanOrEqual(36_096);
     expect(utf8Bytes(inputOf(call))).toBeLessThanOrEqual(utf8Bytes(prefix) + 33);
   }
-  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(id(13));
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(`echo: ${id(13)}`);
 });
 
 test("close cancels a paged summary midway and publishes no partial leaf", async () => {
@@ -490,11 +497,13 @@ test("short sources become nodes verbatim without a model call, measured in UTF-
 
   model.calls[0]!.resolve("[s2] short");
   await until(() => model.calls.length === 2, "merge 0+4");
-  expect(store.nodes.get(nodeKey(1, 1))?.text).toBe(`[s2] short\n${leaf3}`);
+  // The model's line is stored behind the message's kind.
+  const leaf2 = "user: [s2] short";
+  expect(store.nodes.get(nodeKey(1, 1))?.text).toBe(`${leaf2}\n${leaf3}`);
   const merge = model.calls[1]!;
-  // 40 + 1 + 31 bytes exceeds the target, so the top merge asks the model.
-  expect(merge.request.instruction).toContain(`\n${leaf0} ${leaf1}\n[s2] short ${leaf3}`);
-  expect(chatLines(merge.request.context)).toEqual([`0+1|${leaf0}`, `1+1|${leaf1}`, "2+1|[s2] short", `3+1|${leaf3}`]);
+  // 40 + 1 + 37 bytes exceeds the target, so the top merge asks the model.
+  expect(merge.request.instruction).toContain(`\n${leaf0} ${leaf1}\n${leaf2} ${leaf3}`);
+  expect(chatLines(merge.request.context)).toEqual([`0+1|${leaf0}`, `1+1|${leaf1}`, `2+1|${leaf2}`, `3+1|${leaf3}`]);
 });
 
 test("size enforcement trims whitespace, cuts feedback to the limit, keeps the whole shortest reply, and stops early", async () => {
@@ -514,50 +523,52 @@ test("size enforcement trims whitespace, cuts feedback to the limit, keeps the w
   expect(second.request.instruction).toBe(first.request.instruction);
   expect(second.request.feedback.map((turn) => turn.reply.trim())).toEqual(["x".repeat(30)]);
   const cut = second.request.feedback[0]!.instruction;
-  expect(cut).toContain("30 bytes");
+  // The stored line is "user: " + the reply: 36 bytes. The cut leaves room for those 6 bytes.
+  expect(cut).toContain("36 bytes");
+  expect(cut).toContain("6-byte kind label");
   expect(cut).toContain("20-byte limit");
-  expect(cut).toContain(`\n${"x".repeat(20)}| ← LIMIT`);
-  expect(cut).not.toContain("x".repeat(21));
+  expect(cut).toContain(`\n${"x".repeat(14)}| ← LIMIT`);
+  expect(cut).not.toContain("x".repeat(15));
   second.resolve(`${"y".repeat(25)}  `);
 
   await until(() => model.calls.length === 3, "third try");
   const third = model.calls[2]!;
   // Only the latest try is replayed: the x30 reply is no longer in feedback.
   expect(third.request.feedback.map((turn) => turn.reply)).toEqual(["y".repeat(25)]);
-  expect(third.request.feedback[0]!.instruction).toContain("25 bytes");
-  expect(third.request.feedback[0]!.instruction).toContain(`\n${"y".repeat(20)}| ← LIMIT`);
+  expect(third.request.feedback[0]!.instruction).toContain("31 bytes");
+  expect(third.request.feedback[0]!.instruction).toContain(`\n${"y".repeat(14)}| ← LIMIT`);
   third.resolve("z".repeat(27));
 
   // Every try overflowed the 20-byte target but fit the ceiling: the shortest
-  // whole reply (25 bytes) is kept intact, never cut.
+  // whole reply (25 bytes) is kept intact, never cut, behind the leaf's kind.
   await until(() => store.nodes.has(nodeKey(0, 0)), "leaf 0 saved");
-  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("y".repeat(25));
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(`user: ${"y".repeat(25)}`);
 
   await until(() => model.calls.length === 4, "leaf 1");
   expect(label(model.calls[3]!)).toBe("[m1]");
   model.calls[3]!.resolve("w".repeat(24));
   await until(() => model.calls.length === 5, "leaf 1 second try");
-  model.calls[4]!.resolve("  keep  inner  spaces \n");
+  model.calls[4]!.resolve("  keep  a  b \n");
   await until(() => store.nodes.has(nodeKey(0, 1)), "leaf 1 saved");
-  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe("keep  inner  spaces");
+  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe("user: keep  a  b");
 
   // The next call is the merge, not a third try for leaf 1.
   await until(() => model.calls.length === 6, "merge 0+2");
   expect(model.calls[5]!.request.feedback).toEqual([]);
-  expect(model.calls[5]!.request.instruction).toContain(`\n${"y".repeat(25)}\nkeep  inner  spaces`);
+  expect(model.calls[5]!.request.instruction).toContain(`\nuser: ${"y".repeat(25)}\nuser: keep  a  b`);
 });
 
 test("feedback cuts on UTF-8 boundaries and the shortest try is measured in bytes", async () => {
   const store = await openStore();
   const model = new Model();
-  const memory = memoryFor(store, model, { nodeBytes: 7, tries: 3 });
+  const memory = memoryFor(store, model, { nodeBytes: 13, tries: 3 });
   memory.append("user", "[m0] needs a summary");
 
   await until(() => model.calls.length === 1, "first try");
   model.calls[0]!.resolve("ééééé"); // 10 bytes, 5 UTF-16 units
   await until(() => model.calls.length === 2, "second try");
   const firstCut = model.calls[1]!.request.feedback[0]!.instruction;
-  expect(firstCut).toContain("10 bytes");
+  expect(firstCut).toContain("16 bytes"); // behind "user: "
   expect(firstCut).toContain("\nééé| ← LIMIT");
   expect(firstCut).not.toContain("\uFFFD");
 
@@ -565,14 +576,14 @@ test("feedback cuts on UTF-8 boundaries and the shortest try is measured in byte
   await until(() => model.calls.length === 3, "third try");
   expect(model.calls[2]!.request.feedback).toHaveLength(1); // latest try only
   const secondCut = model.calls[2]!.request.feedback[0]!.instruction;
-  expect(secondCut).toContain("12 bytes");
+  expect(secondCut).toContain("18 bytes");
   expect(secondCut).toContain("\nabc🙂| ← LIMIT");
 
   // 8 bytes versus ééééé's 10 bytes (5 UTF-16 units): bytes decide, and the
   // whole shortest reply is kept without cutting.
   model.calls[2]!.resolve("abcdefgh");
   await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
-  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("abcdefgh");
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("user: abcdefgh");
 });
 
 test("a reply that opens with a head is retried once; the echo drops the head and the clean reply is stored", async () => {
@@ -614,7 +625,7 @@ test("when every try opens with a head, the first fitting reply is stored with i
   model.calls[2]!.resolve("3+1|head three");
 
   await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
-  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("head one");
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("user: head one");
   expect(model.calls).toHaveLength(3);
 });
 
@@ -755,7 +766,7 @@ describe("a compressor reply that is, or opens with, the reserved stand-in marke
     model.calls[1]!.resolve("user kept a plan note");
 
     await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
-    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("user kept a plan note");
+    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("user: user kept a plan note");
     expect(memory.status()).toMatchObject({ compressorCalls: 2, headRetries: 1, extractive: 0 });
   });
 
@@ -773,7 +784,7 @@ describe("a compressor reply that is, or opens with, the reserved stand-in marke
     model.calls[2]!.resolve("user wants more words");
 
     await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
-    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("user wants more words");
+    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("user: user wants more words");
   });
 
   test("a merge reply that is the marker falls back to a marked excerpt of both children", async () => {
@@ -801,7 +812,7 @@ describe("a compressor reply that is, or opens with, the reserved stand-in marke
     model.calls[0]!.resolve(reply);
 
     await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
-    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(reply);
+    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(`user: ${reply}`);
     expect(model.calls).toHaveLength(1);
   });
 });
@@ -821,12 +832,13 @@ test("a reply that is both headed and over-long gets one feedback turn covering 
   const turn = second.request.feedback[0]!;
   expect(turn.reply).toBe("x".repeat(30));
   expect(turn.instruction).toContain("Your line began with a head or preamble.");
-  expect(turn.instruction).toContain("your line is 36 bytes, over the 20-byte limit");
+  expect(turn.instruction).toContain("your line is 42 bytes");
+  expect(turn.instruction).toContain("over the 20-byte limit");
   expect(JSON.stringify(second.request.feedback)).not.toContain("476");
-  second.resolve("y".repeat(15));
+  second.resolve("y".repeat(14));
 
   await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
-  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("y".repeat(15));
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(`user: ${"y".repeat(14)}`);
   expect(model.calls).toHaveLength(2);
 });
 
@@ -845,7 +857,7 @@ test("a colon-less opening naming the leaf's own id is retried and counted; othe
   model.calls[1]!.resolve("7 rows found in the store");
 
   await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
-  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("7 rows found in the store");
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("user: 7 rows found in the store");
   expect(memory.status()).toMatchObject({ compressorCalls: 2, headRetries: 1, lengthRetries: 0 });
 });
 
@@ -876,11 +888,11 @@ test("an unresolved early leaf stalls only its ancestors; the right subtree stil
   await until(() => model.labels().join() === "[m0],[m1],[m2]", "three started leaves");
   const early = model.take("[m0]");
 
-  model.take("[m1]").resolve(summary("s1"));
+  model.take("[m1]").resolve(leafReply("s1"));
   await until(() => model.labels().join() === "[m0],[m2],[m3]", "last leaf admitted");
-  model.take("[m2]").resolve(summary("s2"));
+  model.take("[m2]").resolve(leafReply("s2"));
   await until(() => store.nodes.has(nodeKey(0, 2)), "leaf 2 saved");
-  model.take("[m3]").resolve(summary("s3"));
+  model.take("[m3]").resolve(leafReply("s3"));
   await until(() => model.labels().join() === "[m0],[s2]+[s3]", "right parent starts");
   model.take("[s2]", "[s3]").resolve(summary("p2-3"));
   await until(() => store.nodes.has(nodeKey(1, 1)), "right parent saved");
@@ -898,7 +910,7 @@ test("an unresolved early leaf stalls only its ancestors; the right subtree stil
   expect(store.nodes.has(nodeKey(2, 0))).toBe(false);
   expect(store.nodes.get(nodeKey(1, 1))?.text).toBe(summary("p2-3"));
 
-  early.resolve(summary("s0"));
+  early.resolve(leafReply("s0"));
   await until(() => model.labels().join() === "[s0]+[s1]", "left parent starts");
   model.take("[s0]", "[s1]").resolve(summary("p0-1"));
   await until(() => store.nodes.has(nodeKey(1, 0)), "left parent saved");
@@ -927,10 +939,10 @@ test("an unresolved early leaf stalls only its ancestors; the right subtree stil
     nodeKey(1, 1),
     nodeKey(2, 0),
   ]);
-  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(summary("s0"));
-  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe(summary("s1"));
-  expect(store.nodes.get(nodeKey(0, 2))?.text).toBe(summary("s2"));
-  expect(store.nodes.get(nodeKey(0, 3))?.text).toBe(summary("s3"));
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(leafLine("s0"));
+  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe(leafLine("s1"));
+  expect(store.nodes.get(nodeKey(0, 2))?.text).toBe(leafLine("s2"));
+  expect(store.nodes.get(nodeKey(0, 3))?.text).toBe(leafLine("s3"));
   expect(store.nodes.get(nodeKey(1, 0))?.text).toBe(summary("p0-1"));
   expect(store.nodes.get(nodeKey(1, 1))?.text).toBe(summary("p2-3"));
   expect(store.nodes.get(nodeKey(2, 0))?.text).toBe(summary("root"));
@@ -1001,7 +1013,8 @@ test("the shortest whole candidate survives later larger and oversized tries, un
   expect(await memory.settle()).toBe(true);
 
   expect(model.calls).toHaveLength(5);
-  expect(store.nodes.get(nodeKey(0, 0))).toEqual({ l: 0, i: 0, text: "B".repeat(30), size: 30 });
+  // Kept whole behind the leaf's kind: 6 + 30 bytes.
+  expect(store.nodes.get(nodeKey(0, 0))).toEqual({ l: 0, i: 0, text: `echo: ${"B".repeat(30)}`, size: 36 });
   // Feedback is always the latest try only, excerpted to the ceiling when oversized.
   expect(model.calls[1]!.request.feedback.map((turn) => turn.reply)).toEqual(["A".repeat(40)]);
   expect(model.calls[2]!.request.feedback.map((turn) => turn.reply)).toEqual(["é".repeat(32)]);
@@ -1022,7 +1035,7 @@ test("a failed branch stalls only its own subtree; independent branches keep bui
   await until(() => model.open().length === 4, "four leaves");
 
   model.take("[m0]").reject(new Error("provider down"));
-  for (const i of [1, 2, 3]) model.take(`[m${i}]`).resolve(summary(`s${i}`));
+  for (const i of [1, 2, 3]) model.take(`[m${i}]`).resolve(leafReply(`s${i}`));
   await until(() => model.labels().join() === "[s2]+[s3]", "right-branch pair");
   model.take("[s2]", "[s3]").resolve(summary("p2-3"));
   await until(() => store.nodes.has(nodeKey(1, 1)), "right branch parent");
@@ -1034,9 +1047,9 @@ test("a failed branch stalls only its own subtree; independent branches keep bui
   expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
   expect(store.nodes.has(nodeKey(1, 0))).toBe(false);
   expect(store.nodes.has(nodeKey(2, 0))).toBe(false);
-  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe(summary("s1"));
-  expect(store.nodes.get(nodeKey(0, 2))?.text).toBe(summary("s2"));
-  expect(store.nodes.get(nodeKey(0, 3))?.text).toBe(summary("s3"));
+  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe(leafLine("s1"));
+  expect(store.nodes.get(nodeKey(0, 2))?.text).toBe(leafLine("s2"));
+  expect(store.nodes.get(nodeKey(0, 3))?.text).toBe(leafLine("s3"));
   expect(store.nodes.get(nodeKey(1, 1))?.text).toBe(summary("p2-3"));
   const settled = track(memory.settle());
   await until(() => settled.done, "settle with a stalled left branch");
@@ -1074,7 +1087,7 @@ test("a failed call releases the only job slot to queued work without retrying u
   expect(model.calls.map(label)).toEqual(["[m0]", "[m1]"]);
   expect(model.labels()).toEqual(["[m1]"]);
   expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
-  model.take("[m1]").resolve(summary("s1"));
+  model.take("[m1]").resolve(leafReply("s1"));
   await until(() => store.nodes.has(nodeKey(0, 1)), "queued leaf saved");
   const stalled = track(memory.settle());
   await until(() => stalled.done, "failed branch settles without work");
@@ -1085,7 +1098,7 @@ test("a failed call releases the only job slot to queued work without retrying u
   expect(model.open()).toEqual([]);
   expect(memory.status().pending).toBe(0);
   expect([...store.nodes.keys()]).toEqual([nodeKey(0, 1)]);
-  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe(summary("s1"));
+  expect(store.nodes.get(nodeKey(0, 1))?.text).toBe(leafLine("s1", "talk"));
   expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
   expect(store.nodes.has(nodeKey(1, 0))).toBe(false);
   expect(reports).toHaveLength(1);
@@ -1096,11 +1109,11 @@ test("a failed call releases the only job slot to queued work without retrying u
   await until(() => model.calls.length === 3, "m0 retry on new append");
   expect(model.calls.map(label)).toEqual(["[m0]", "[m1]", "[m0]"]);
   expect(model.labels()).toEqual(["[m0]"]);
-  model.take("[m0]").resolve(summary("s0"));
+  model.take("[m0]").resolve(leafReply("s0"));
   await until(() => model.calls.length === 4, "m2 precedes newly ready parent");
   expect(model.calls.map(label)).toEqual(["[m0]", "[m1]", "[m0]", "[m2]"]);
-  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(summary("s0"));
-  model.take("[m2]").resolve(summary("s2"));
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(leafLine("s0"));
+  model.take("[m2]").resolve(leafReply("s2"));
   await until(() => model.calls.length === 5, "left parent starts after m2");
   expect(model.calls.map(label)).toEqual(["[m0]", "[m1]", "[m0]", "[m2]", "[s0]+[s1]"]);
   model.take("[s0]", "[s1]").resolve(summary("p0-1"));
@@ -1112,9 +1125,9 @@ test("a failed call releases the only job slot to queued work without retrying u
   await macrotasks(5);
   expect(model.calls.map(label)).toEqual(["[m0]", "[m1]", "[m0]", "[m2]", "[s0]+[s1]"]);
   expect([...store.nodes].map(([key, node]) => [key, node.text]).sort()).toEqual([
-    [nodeKey(0, 0), summary("s0")],
-    [nodeKey(0, 1), summary("s1")],
-    [nodeKey(0, 2), summary("s2")],
+    [nodeKey(0, 0), leafLine("s0")],
+    [nodeKey(0, 1), leafLine("s1", "talk")],
+    [nodeKey(0, 2), leafLine("s2")],
     [nodeKey(1, 0), summary("p0-1")],
   ].sort());
   expect(model.open()).toEqual([]);
@@ -1162,7 +1175,7 @@ test("repeated failures retry only on distinct appends, report once, and recover
     await until(() => model.calls.length === history.length, `unrelated m${i} starts after retry failure`);
     expect(model.calls.map(label)).toEqual(history);
     expect(model.labels()).toEqual([`[m${i}]`]);
-    model.take(`[m${i}]`).resolve(summary(`s${i}`));
+    model.take(`[m${i}]`).resolve(leafReply(`s${i}`));
     await until(() => store.nodes.has(nodeKey(0, i)), `unrelated leaf ${i} saved`);
     const stalled = track(memory.settle());
     await until(() => stalled.done, `retry failure ${i} settles`);
@@ -1176,7 +1189,7 @@ test("repeated failures retry only on distinct appends, report once, and recover
       (i === 1 ? [nodeKey(0, 1)] : [nodeKey(0, 1), nodeKey(0, 2)]).sort(),
     );
     for (let leaf = 1; leaf <= i; leaf++) {
-      expect(store.nodes.get(nodeKey(0, leaf))?.text).toBe(summary(`s${leaf}`));
+      expect(store.nodes.get(nodeKey(0, leaf))?.text).toBe(leafLine(`s${leaf}`));
     }
     expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
     expect(store.nodes.has(nodeKey(1, 0))).toBe(false);
@@ -1189,7 +1202,7 @@ test("repeated failures retry only on distinct appends, report once, and recover
   await until(() => model.calls.length === history.length, "successful m0 retry on fourth append");
   expect(model.calls.map(label)).toEqual(history);
   expect(model.labels()).toEqual(["[m0]"]);
-  model.take("[m0]").resolve(summary("s0"));
+  model.take("[m0]").resolve(leafReply("s0"));
 
   // Saving m0 queues the left parent behind m3; saving m3 queues the right
   // parent behind the left. Only saving both parents makes the root ready.
@@ -1203,9 +1216,9 @@ test("repeated failures retry only on distinct appends, report once, and recover
     await until(() => model.calls.length === history.length, `FIFO recovery call ${call}`);
     expect(model.calls.map(label)).toEqual(history);
     expect(model.labels()).toEqual([call]);
-    model.calls[history.length - 1]!.resolve(summary(reply));
+    model.calls[history.length - 1]!.resolve(l === 0 ? leafReply(reply) : summary(reply));
     await until(() => store.nodes.has(nodeKey(l, i)), `recovery node ${l}:${i} saved`);
-    expect(store.nodes.get(nodeKey(l, i))?.text).toBe(summary(reply));
+    expect(store.nodes.get(nodeKey(l, i))?.text).toBe(l === 0 ? leafLine(reply, "talk") : summary(reply));
     expect(reports).toHaveLength(1);
   }
   const recovered = track(memory.settle());
@@ -1218,10 +1231,10 @@ test("repeated failures retry only on distinct appends, report once, and recover
     "[s0]+[s1]", "[s2]+[s3]", "[p0-1]+[p2-3]",
   ]);
   expect([...store.nodes].map(([key, node]) => [key, node.text]).sort()).toEqual([
-    [nodeKey(0, 0), summary("s0")],
-    [nodeKey(0, 1), summary("s1")],
-    [nodeKey(0, 2), summary("s2")],
-    [nodeKey(0, 3), summary("s3")],
+    [nodeKey(0, 0), leafLine("s0")],
+    [nodeKey(0, 1), leafLine("s1")],
+    [nodeKey(0, 2), leafLine("s2")],
+    [nodeKey(0, 3), leafLine("s3", "talk")],
     [nodeKey(1, 0), summary("p0-1")],
     [nodeKey(1, 1), summary("p2-3")],
     [nodeKey(2, 0), summary("p0-3")],
@@ -1249,9 +1262,9 @@ test("an unprintable rejection is reported and retried on the next append", asyn
 
   memory.append("talk", "[m1] a second long message");
   await until(() => model.open().some((call) => label(call) === "[m0]"), "retry call");
-  model.take("[m0]").resolve(summary("s0"));
+  model.take("[m0]").resolve(leafReply("s0"));
   await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
-  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(summary("s0"));
+  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(leafLine("s0"));
 });
 
 test("an async reporter's rejection is contained and the retry proceeds", async () => {
@@ -1278,7 +1291,7 @@ test("an async reporter's rejection is contained and the retry proceeds", async 
 
     memory.append("talk", "[m1] a second long message");
     await until(() => model.open().some((call) => label(call) === "[m0]"), "retry call");
-    model.take("[m0]").resolve(summary("s0"));
+    model.take("[m0]").resolve(leafReply("s0"));
     await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
     await macrotasks(2);
     expect(unhandled).toEqual([]);
@@ -1340,14 +1353,14 @@ test("settle resolves per caller once every view line is a summary, without wait
 
   // A line appended while waiting must be summarized too.
   memory.append("talk", "[m1] second long reply message");
-  model.take("[m0]").resolve(summary("s0"));
+  model.take("[m0]").resolve(leafReply("s0"));
   await until(() => store.nodes.has(nodeKey(0, 0)), "leaf 0 saved");
   await flush();
   expect(second.done).toBe(false);
   expect(memory.render()).toContain(`1+1|${PLACEHOLDER}`);
 
   await until(() => model.open().some((call) => label(call) === "[m1]"), "leaf 1 call");
-  model.take("[m1]").resolve(summary("s1"));
+  model.take("[m1]").resolve(leafReply("s1"));
   await until(() => second.done, "settle after both leaves");
   expect(second.value).toBe(true);
   expect(memory.render()).not.toContain(PLACEHOLDER);
@@ -1404,7 +1417,7 @@ test("restart restores the persisted live tiling instead of replaying today's co
 
   memory.append("user", "[m4] next long message");
   await until(() => model.open().length === 1, "leaf 4");
-  model.take("[m4]").resolve(summary("s4"));
+  model.take("[m4]").resolve(leafReply("s4"));
   await until(() => store.nodes.has(nodeKey(0, 4)), "leaf 4 saved");
   expect(addresses(memory)).toEqual(["0+4", "4+1"]);
   expect(memory.status().viewBytes).toBe(24);
@@ -1440,11 +1453,11 @@ test("restart reproduces the compactor context of the next summary exactly", asy
   const memory = memoryFor(store, model, options);
   memory.append("user", "[m8] next long message");
   await until(() => model.open().length === 1, "leaf 8");
-  model.take("[m8]").resolve(summary("s8"));
+  model.take("[m8]").resolve(leafReply("s8"));
   await until(() => store.nodes.has(nodeKey(0, 8)), "leaf 8 saved");
   memory.append("talk", "[m9] another long message");
   await until(() => model.open().length === 1, "leaf 9");
-  model.take("[m9]").resolve(summary("s9"));
+  model.take("[m9]").resolve(leafReply("s9"));
   await until(() => store.nodes.has(nodeKey(0, 9)), "leaf 9 saved");
   await until(() => model.open().some((call) => label(call) === "[s8]+[s9]"), "pair 8+2");
   model.take("[s8]", "[s9]").resolve(summary("p8-9"));
@@ -1459,8 +1472,8 @@ test("restart reproduces the compactor context of the next summary exactly", asy
   expect(chatLines(before)).toEqual([
     `0+4|${summary("n2-0")}`,
     `4+4|${summary("n2-1")}`,
-    `8+1|${summary("s8")}`,
-    `9+1|${summary("s9")}`,
+    `8+1|${leafLine("s8")}`,
+    `9+1|${leafLine("s9", "talk")}`,
   ]);
   const beforeAddresses = chatLines(before).map((line) => line.slice(0, line.indexOf("|")));
   expect(beforeAddresses).toEqual(["0+4", "4+4", "8+1", "9+1"]);
@@ -1492,16 +1505,16 @@ test("restart reproduces the compactor context of the next summary exactly", asy
   expect(chatLines(retry.request.context)).toEqual([
     `0+4|${summary("n2-0")}`,
     `4+4|${summary("n2-1")}`,
-    `8+1|${summary("s8")}`,
-    `9+1|${summary("s9")}`,
+    `8+1|${leafLine("s8")}`,
+    `9+1|${leafLine("s9", "talk")}`,
   ]);
   const retryAddresses = chatLines(retry.request.context).map((line) => line.slice(0, line.indexOf("|")));
   expect(retryAddresses).toEqual(["0+4", "4+4", "8+1", "9+1"]);
   expect(retryAddresses).not.toEqual(["0+8", "8+2"]);
   expect(restored.render()).toBe(rendered);
-  retry.resolve(summary("s10"));
+  retry.resolve(leafReply("s10"));
   await until(() => restoredStore.nodes.has(nodeKey(0, 10)), "retried leaf 10 saved");
-  expect(restoredStore.nodes.get(nodeKey(0, 10))?.text).toBe(summary("s10"));
+  expect(restoredStore.nodes.get(nodeKey(0, 10))?.text).toBe(leafLine("s10"));
 });
 
 test("a stale snapshot preserves its coarse prefix and admits only the durable message suffix", async () => {
@@ -1523,7 +1536,7 @@ test("a stale snapshot preserves its coarse prefix and admits only the durable m
   const leaf = model.take("[m5]");
   expect(chatLines(leaf.request.context)).toEqual([`0+4|${summary("n2-0")}`, `4+1|${summary("s4")}`]);
   expect(leaf.request.context).not.toContain(PLACEHOLDER);
-  leaf.resolve(summary("s5"));
+  leaf.resolve(leafReply("s5"));
   await until(() => restoredStore.nodes.has(nodeKey(0, 5)), "suffix summarized");
   expect(addresses(memory)).toEqual(["0+4", "4+1", "5+1"]);
   expect(memory.status().viewBytes).toBe(36);
@@ -1666,7 +1679,8 @@ test("last-message age at T10 prefers 8+1|9+1 over 0+4|4+4", async () => {
 test("main bytes sawtooth from upper to half and available parents do not retile between batches", async () => {
   const store = await openStore();
   seedTree(store, 8, (l) => (l === 0 ? "l".repeat(10) : "p".repeat(6)));
-  const model = new Model({ auto: (request) => request.instruction.includes("<input>\nuser:") ? "l".repeat(10) : "p".repeat(6) });
+  // A leaf's stored line is "user: " + "llll", as long as the seeded "l" * 10.
+  const model = new Model({ auto: (request) => request.instruction.includes("<input>\nuser:") ? "l".repeat(4) : "p".repeat(6) });
   const memory = memoryFor(store, model, { nodeBytes: 8, tries: 1, viewBytes: 80 });
   expect(memory.status().viewBytes).toBe(80);
   expect(addresses(memory)).toEqual(Array.from({ length: 8 }, (_, i) => `${i}+1`));
@@ -1681,7 +1695,7 @@ test("main bytes sawtooth from upper to half and available parents do not retile
   };
 
   await appendAndFinish(8);
-  expect(store.nodes.get(nodeKey(0, 8))?.text).toBe("l".repeat(10));
+  expect(store.nodes.get(nodeKey(0, 8))?.text).toBe(`user: ${"l".repeat(4)}`);
   expect(addresses(memory)).toEqual(["0+8", "8+1"]);
   expect(memory.status().viewBytes).toBe(16);
   const growth: number[] = [];
@@ -1711,12 +1725,12 @@ test("compactor context has its own half-target batch and grows independently of
   const first = model.take("[m8]");
   expect(chatLines(first.request.context)).toEqual([`0+4|${summary("n2-0")}`, `4+4|${summary("n2-1")}`]);
   expect(contextBytes(first.request.context)).toBe(24);
-  first.resolve(summary("s8"));
+  first.resolve(leafReply("s8"));
   await until(() => store.nodes.has(nodeKey(0, 8)), "leaf 8 saved");
   memory.append("talk", "[m9] another long message");
   await until(() => model.open().length === 1, "leaf 9");
   const second = model.take("[m9]");
-  expect(chatLines(second.request.context)).toEqual([`0+4|${summary("n2-0")}`, `4+4|${summary("n2-1")}`, `8+1|${summary("s8")}`]);
+  expect(chatLines(second.request.context)).toEqual([`0+4|${summary("n2-0")}`, `4+4|${summary("n2-1")}`, `8+1|${leafLine("s8")}`]);
   expect(contextBytes(second.request.context)).toBe(36);
   expect(second.request.context).not.toContain(PLACEHOLDER);
   expect(addresses(memory)).toEqual([...original, "8+1", "9+1"]);
@@ -1794,13 +1808,13 @@ test("default compactor context grows through 32000 bytes before a batch returns
   append(2);
   await until(() => model.open().length === 1, "leaf 2");
   expect(chatLines(model.take("[m2]").request.context)).toEqual([`0+2|${"[n1-0]".padEnd(8_000, ".")}`]);
-  model.take("[m2]").resolve("[s2]".padEnd(16_000, "."));
+  model.take("[m2]").resolve("[s2]".padEnd(16_000 - "user: ".length, ".")); // stored behind "user: ": 16000 bytes
   await until(() => store.nodes.has(nodeKey(0, 2)), "leaf 2 saved");
   append(3);
   await until(() => model.open().length === 1, "leaf 3");
   const third = model.take("[m3]");
   expect(contextBytes(third.request.context)).toBe(24_000);
-  third.resolve("[s3]".padEnd(8_000, "."));
+  third.resolve("[s3]".padEnd(8_000 - "user: ".length, "."));
   await until(() => model.open().some((call) => label(call) === "[s2]+[s3]"), "pair 2+2");
   const pair = model.take("[s2]", "[s3]");
   expect(contextBytes(pair.request.context)).toBe(32_000);
@@ -1813,12 +1827,12 @@ test("default compactor context grows through 32000 bytes before a batch returns
   append(4);
   await until(() => model.open().length === 1, "leaf 4");
   expect(contextBytes(model.take("[m4]").request.context)).toBe(32_000);
-  model.take("[m4]").resolve(summary("s4"));
+  model.take("[m4]").resolve(leafReply("s4"));
   await until(() => store.nodes.has(nodeKey(0, 4)), "leaf 4 saved");
   append(5);
   await until(() => model.open().length === 1, "leaf 5");
   const after = model.take("[m5]");
-  expect(chatLines(after.request.context)).toEqual([`0+4|${"[p0-3]".padEnd(8_000, ".")}`, `4+1|${summary("s4")}`]);
+  expect(chatLines(after.request.context)).toEqual([`0+4|${"[p0-3]".padEnd(8_000, ".")}`, `4+1|${leafLine("s4")}`]);
   expect(contextBytes(after.request.context)).toBe(8_012);
   expect(memory.status().viewBytes).toBeGreaterThan(32_000);
 });
@@ -1986,8 +2000,11 @@ describe("terminal compressor refusal stand-ins", () => {
 
   test("merge refusal preserves fragments of both children and completes the tree", async () => {
     const store = await openStore();
-    const left = "LEFT-child:" + "a".repeat(21);
-    const right = "RIGHT-child:" + "b".repeat(20);
+    // Each leaf is stored behind "user: ", so each child is 32 bytes.
+    const left = "LEFT-child:" + "a".repeat(15);
+    const right = "RIGHT-child:" + "b".repeat(14);
+    const storedLeft = `user: ${left}`;
+    const storedRight = `user: ${right}`;
     const nodeBytes = 64;
     const model = new Model();
     const memory = memoryFor(store, model, { nodeBytes, pageBytes: 1_024 });
@@ -1998,20 +2015,21 @@ describe("terminal compressor refusal stand-ins", () => {
     model.take("[m1]").resolve(right);
     await until(() => model.open().length === 1, "merge request");
     const merge = model.take("merge lines 0+1 and 1+1");
-    expect(inputOf(merge)).toBe(`${left}\n${right}`);
+    expect(inputOf(merge)).toBe(`${storedLeft}\n${storedRight}`);
     merge.reject(new CompressorRefusedError());
 
     // Each child is 32 bytes, but their newline-joined parent is 65 > 64.
-    expect(Buffer.byteLength(`${left}\n${right}`, "utf8")).toBe(nodeBytes + 1);
+    expect(Buffer.byteLength(`${storedLeft}\n${storedRight}`, "utf8")).toBe(nodeBytes + 1);
     expect(await memory.settle()).toBe(true);
-    expect(store.nodes.get(nodeKey(0, 0))!.text).toBe(left);
-    expect(store.nodes.get(nodeKey(0, 1))!.text).toBe(right);
+    expect(store.nodes.get(nodeKey(0, 0))!.text).toBe(storedLeft);
+    expect(store.nodes.get(nodeKey(0, 1))!.text).toBe(storedRight);
     // settle() resolves once every leaf is built; the refused merge may still be in flight.
     await until(() => store.nodes.has(nodeKey(1, 0)), "refused merge stand-in");
     const parent = store.nodes.get(nodeKey(1, 0))!;
     expect(parent.text.startsWith(marker)).toBe(true);
-    expect(parent.text).toContain("LEFT-child:");
-    expect(parent.text).toContain("RIGHT-child:");
+    // Both children contribute a fragment of their stored line, kind prefix included.
+    expect(parent.text).toContain("user: LEFT");
+    expect(parent.text).toContain("user: RIGHT");
     expect(Buffer.byteLength(parent.text, "utf8")).toBeLessThanOrEqual(nodeBytes);
     expect(parent.size).toBe(Buffer.byteLength(parent.text, "utf8"));
     expect(store.nodes.size).toBe(3);
@@ -2048,9 +2066,9 @@ describe("terminal compressor refusal stand-ins", () => {
     model.take("[m0]").resolve("recovered leaf");
     model.take("[m1]").resolve("new leaf");
     expect(await memory.settle()).toBe(true);
-    expect(store.nodes.get(nodeKey(0, 0))!.text).toBe("recovered leaf");
-    expect(store.nodes.get(nodeKey(0, 1))!.text).toBe("new leaf");
-    expect(store.nodes.get(nodeKey(1, 0))!.text).toBe("recovered leaf\nnew leaf");
+    expect(store.nodes.get(nodeKey(0, 0))!.text).toBe("user: recovered leaf");
+    expect(store.nodes.get(nodeKey(0, 1))!.text).toBe("user: new leaf");
+    expect(store.nodes.get(nodeKey(1, 0))!.text).toBe("user: recovered leaf\nuser: new leaf");
     await until(() => memory.status().pending === 0, "recovered merge job drained");
     expect(memory.status()).toMatchObject({ messages: 2, nodes: 3, pending: 0, extractive: 0 });
     expect(model.calls).toHaveLength(3);
@@ -2089,5 +2107,231 @@ describe("terminal compressor refusal stand-ins", () => {
     expect(Buffer.byteLength(node.text, "utf8")).toBe(nodeBytes);
     expect(node.size).toBe(nodeBytes);
     expect(memory.status()).toMatchObject({ nodes: 1, pending: 0, extractive: 1 });
+  });
+});
+
+/** Like openMerge, over messages of the given kinds. */
+async function openMergeOf(
+  kinds: readonly [Kind, Kind],
+  options: MemoryOptions,
+): Promise<{ store: Store; model: Model; memory: Memory; merge: Call }> {
+  const store = await openStore();
+  const model = new Model();
+  const memory = memoryFor(store, model, { jobs: 2, ...options });
+  memory.append(kinds[0], "[m0] a message that needs a summary, long enough");
+  memory.append(kinds[1], "[m1] another message that needs a summary, too");
+  await until(() => model.open().length === 2, "two leaf calls");
+  model.take("[m0]").resolve(`[s0]${"a".repeat(26)}`);
+  model.take("[m1]").resolve(`[s1]${"b".repeat(26)}`);
+  await until(() => model.open().length === 1, "merge call");
+  return { store, model, memory, merge: model.take("[s0]", "[s1]") };
+}
+
+describe("what each compressor call says about itself", () => {
+  test("a leaf's tries carry a 1-based attempt and the reason the previous one was rejected", async () => {
+    const store = await openStore();
+    const model = new Model();
+    const memory = memoryFor(store, model, { nodeBytes: 40, tries: 5, jobs: 1 });
+    memory.append("echo", "[m0] a message that needs a summary, long enough");
+    const replies = ["0+1|found it", "z".repeat(60), "[unsummarized: compressor refused]", "user: asked for it", "found it"];
+    for (const [index, reply] of replies.entries()) {
+      await until(() => model.calls.length === index + 1, `try ${index + 1}`);
+      model.calls[index]!.resolve(reply);
+    }
+
+    await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+    expect(model.calls.map((call) => call.request.meta)).toEqual([
+      { node: "leaf", attempt: 1, retry: null },
+      { node: "leaf", attempt: 2, retry: "head" },
+      { node: "leaf", attempt: 3, retry: "length" },
+      { node: "leaf", attempt: 4, retry: "marker" },
+      { node: "leaf", attempt: 5, retry: "user" },
+    ]);
+    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("echo: found it");
+    expect(memory.status().compressorCalls).toBe(5);
+  });
+
+  test("a merge's first call is a merge at attempt 1, and each node counts its own attempts", async () => {
+    const { model, merge } = await openMerge({ nodeBytes: 40, tries: 3 });
+    expect(merge.request.meta).toEqual({ node: "merge", attempt: 1, retry: null });
+    expect(model.calls.slice(0, 2).map((call) => call.request.meta)).toEqual([
+      { node: "leaf", attempt: 1, retry: null },
+      { node: "leaf", attempt: 1, retry: null },
+    ]);
+    merge.resolve("0+1|Eric wants it kept");
+    await until(() => model.open().length === 1, "second merge try");
+    expect(model.open()[0]!.request.meta).toEqual({ node: "merge", attempt: 2, retry: "head" });
+  });
+
+  test("every page and reduction of a long leaf is a leaf call that starts again at attempt 1", async () => {
+    const store = await openStore();
+    const model = new Model();
+    const memory = memoryFor(store, model, { nodeBytes: 20, pageBytes: 16, jobs: 1 });
+    memory.append("echo", "y".repeat(40));
+    for (const reply of ["ab", "cd", "ef"]) {
+      await until(() => model.open().length === 1, `page for ${reply}`);
+      model.open()[0]!.resolve(reply);
+    }
+    await until(() => model.open().length === 1, "final call");
+    model.open()[0]!.resolve("all three");
+    await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+    expect(model.calls.map((call) => call.request.meta)).toEqual(
+      Array.from({ length: 4 }, () => ({ node: "leaf", attempt: 1, retry: null })),
+    );
+    expect(memory.status().compressorCalls).toBe(4);
+  });
+});
+
+describe("a user tag on a range with no user message", () => {
+  const long = "[m0] a message that needs a summary, long enough, and then some more words";
+
+  test("on a leaf of tool output it is retried, and a clean later reply is stored as is", async () => {
+    const store = await openStore();
+    const model = new Model();
+    const memory = memoryFor(store, model, { nodeBytes: 60, tries: 3, jobs: 1 });
+    memory.append("echo", long);
+
+    await until(() => model.calls.length === 1, "first try");
+    model.calls[0]!.resolve("user: asked for the file listing");
+    await until(() => model.calls.length === 2, "second try");
+    expect(model.calls[1]!.request.meta).toEqual({ node: "leaf", attempt: 2, retry: "user" });
+    expect(model.calls[1]!.request.feedback).toHaveLength(1);
+    model.calls[1]!.resolve("the file listing named three files");
+
+    await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("echo: the file listing named three files");
+    expect(memory.status()).toMatchObject({ compressorCalls: 2, userRetries: 1, headRetries: 0, lengthRetries: 0 });
+  });
+
+  test("when every try carries it, the first reply is stored with the tag cut, at the start or after a semicolon", async () => {
+    for (const [first, again, stored] of [
+      // At the start the leaf's own kind label replaces the false tag.
+      ["user: asked for the file listing", "user: asked again for it", "echo: asked for the file listing"],
+      ["echo: ran ls; user: asked for it", "user: asked again for it", "echo: ran ls; asked for it"],
+    ] as const) {
+      const store = await openStore();
+      const model = new Model();
+      const memory = memoryFor(store, model, { nodeBytes: 60, tries: 2, jobs: 1 });
+      memory.append("echo", long);
+
+      await until(() => model.calls.length === 1, "first try");
+      model.calls[0]!.resolve(first);
+      await until(() => model.calls.length === 2, "second try");
+      model.calls[1]!.resolve(again);
+
+      await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+      const node = store.nodes.get(nodeKey(0, 0))!;
+      expect(node.text).toBe(stored);
+      expect(node.size).toBe(utf8Bytes(stored));
+      expect(model.calls).toHaveLength(2);
+      expect(memory.status()).toMatchObject({ userRetries: 1, extractive: 0 });
+    }
+  });
+
+  test("on a merge of two non-user children it is retried, then the first reply is stored with the tag cut", async () => {
+    const { store, model, merge } = await openMergeOf(["echo", "tool"], { nodeBytes: 40, tries: 2 });
+    merge.resolve("user: Eric wants it kept");
+    await until(() => model.open().length === 1, "second merge try");
+    const second = model.open()[0]!;
+    expect(second.request.meta).toEqual({ node: "merge", attempt: 2, retry: "user" });
+    second.resolve("echo ok; user: Eric again");
+
+    await until(() => store.nodes.has(nodeKey(1, 0)), "merge saved");
+    expect(store.nodes.get(nodeKey(1, 0))?.text).toBe("Eric wants it kept");
+  });
+
+  test("a range that holds a user message keeps its tag and is never retried", async () => {
+    const { store, model, merge } = await openMergeOf(["echo", "user"], { nodeBytes: 40, tries: 3 });
+    merge.resolve("echo ok; user: wants it kept");
+
+    await until(() => store.nodes.has(nodeKey(1, 0)), "merge saved");
+    expect(store.nodes.get(nodeKey(1, 0))?.text).toBe("echo ok; user: wants it kept");
+    expect(model.calls).toHaveLength(3);
+  });
+
+  test("the word user inside a line, or at the start of a sentence, is content", async () => {
+    const store = await openStore();
+    const model = new Model();
+    const memory = memoryFor(store, model, { nodeBytes: 68, tries: 3, jobs: 1 });
+    memory.append("echo", long);
+    await until(() => model.calls.length === 1, "first try");
+    model.calls[0]!.resolve("Users table has a user_id: 7 rows; the user field is null");
+
+    await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("echo: Users table has a user_id: 7 rows; the user field is null");
+    expect(memory.status().userRetries).toBe(0);
+    expect(model.calls).toHaveLength(1);
+  });
+});
+
+describe("a leaf's kind prefix made by code", () => {
+  const long = "[m0] a message that needs a summary, long enough, and then some more words";
+
+  for (const [kind, reply, stored] of [
+    ["echo", "finding (high): the listing showed three rows", "echo: the listing showed three rows"],
+    ["echo", "decision: keep the plan", "echo: keep the plan"],
+    ["tool", "echo (finding, medium): ran the build", "tool: ran the build"],
+    ["echo", "the listing showed three rows", "echo: the listing showed three rows"],
+    ["talk", "Agent explained the plan", "talk: Agent explained the plan"],
+    ["echo", "echo: already tagged", "echo: already tagged"],
+    ["user", "user: wants the plan", "user: wants the plan"],
+  ] as const satisfies ReadonlyArray<readonly [Kind, string, string]>) {
+    test(`a ${kind} leaf replied "${reply}" is stored as "${stored}"`, async () => {
+      const store = await openStore();
+      const model = new Model({ auto: () => reply });
+      const memory = memoryFor(store, model, { nodeBytes: 60, tries: 3, jobs: 1 });
+      memory.append(kind, long);
+
+      await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+      const node = store.nodes.get(nodeKey(0, 0))!;
+      expect(node.text).toBe(stored);
+      expect(node.size).toBe(utf8Bytes(stored));
+      expect(model.calls).toHaveLength(1);
+    });
+  }
+
+  test("the prefix counts in the byte limit: a reply that fits only without it is retried", async () => {
+    const store = await openStore();
+    const model = new Model();
+    const memory = memoryFor(store, model, { nodeBytes: 20, tries: 3, jobs: 1 });
+    memory.append("echo", long);
+
+    await until(() => model.calls.length === 1, "first try");
+    model.calls[0]!.resolve("abcdefghijklmnopqr"); // 18 bytes alone, 24 with "echo: "
+    await until(() => model.calls.length === 2, "second try");
+    expect(model.calls[1]!.request.meta).toEqual({ node: "leaf", attempt: 2, retry: "length" });
+    model.calls[1]!.resolve("short line");
+
+    await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+    const node = store.nodes.get(nodeKey(0, 0))!;
+    expect(node.text).toBe("echo: short line");
+    expect(node.size).toBeLessThanOrEqual(20);
+  });
+
+  test("a merge line is left as the compressor wrote it", async () => {
+    const { store, merge } = await openMergeOf(["echo", "echo"], { nodeBytes: 40, tries: 2 });
+    merge.resolve("finding: both listed rows");
+
+    await until(() => store.nodes.has(nodeKey(1, 0)), "merge saved");
+    expect(store.nodes.get(nodeKey(1, 0))?.text).toBe("finding: both listed rows");
+  });
+
+  test("only the final line of a paged leaf takes the prefix, never a partial summary", async () => {
+    const store = await openStore();
+    const model = new Model();
+    const memory = memoryFor(store, model, { nodeBytes: 20, pageBytes: 16, jobs: 1 });
+    memory.append("echo", "y".repeat(40));
+    for (const reply of ["ab", "cd", "ef"]) {
+      await until(() => model.open().length === 1, `page for ${reply}`);
+      model.open()[0]!.resolve(reply);
+    }
+    await until(() => model.open().length === 1, "final call");
+    const final = model.take("Ordered partial summaries");
+    expect(inputOf(final)).toContain("ab\ncd\nef");
+    expect(inputOf(final)).not.toContain("echo: ab");
+    final.resolve("all three");
+
+    await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
+    expect(store.nodes.get(nodeKey(0, 0))?.text).toBe("echo: all three");
   });
 });

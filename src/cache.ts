@@ -213,8 +213,14 @@ function officialOpenAIEndpoint(baseUrl: string): boolean {
 
 /**
  * Anthropic Messages: one cache_control on the last whole four-line block,
- * plus the host's request-end breakpoint. Keep the latest tools and system
- * anchors within the four-marker budget. Every marker is a 5-minute ephemeral one.
+ * plus the host's request-end breakpoint. When the host anchored its system
+ * head, the last system block is anchored too: the host stops before its first
+ * volatile segment (`<project-context>`, `<memories>`), so everything after it,
+ * OptChat's SYSTEM_BLOCK included, was otherwise cached only inside a view
+ * prefix and rewritten whenever an early view line changed. Within the
+ * four-marker budget the order is: view block, request end, last system block,
+ * the host's latest system anchor, its latest tools anchor, then earlier host
+ * anchors newest first. Every marker is a 5-minute ephemeral one.
  */
 function cacheAnthropic(payload: WireObject): unknown {
 	const messages = payload.messages;
@@ -251,8 +257,18 @@ function cacheAnthropic(payload: WireObject): unknown {
 	const viewMark = view.marks.at(-1);
 	const endInView = end?.message === view.index && viewMark === end.block;
 	const allowedHead = MAX_BREAKPOINTS - (viewMark === undefined ? 0 : 1) - (end && !endInView ? 1 : 0);
-	// Keep each head family before spending any spare slots on earlier anchors.
 	const keep: typeof head = [];
+	// Only a non-empty text block takes cache_control; one the host already marked is in `head`.
+	const system = payload.system;
+	if (Array.isArray(system) && allowedHead > 0 && head.some((entry) => entry.field === "system")) {
+		const index = system.length - 1;
+		const last: unknown = system[index];
+		if (object(last) && last.type === "text" && typeof last.text === "string" && last.text !== "" &&
+			last.cache_control == null) {
+			keep.push({ field: "system", index });
+		}
+	}
+	// Keep each head family before spending any spare slots on earlier anchors.
 	for (const field of ["system", "tools"] as const) {
 		const last = head.findLast((entry) => entry.field === field);
 		if (last && keep.length < allowedHead) keep.push(last);

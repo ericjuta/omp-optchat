@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import * as zod from "@oh-my-pi/omptype/zod";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
 	adoptChildSource,
@@ -119,6 +120,21 @@ describe("paged memory tools", () => {
 		expect(later.content.some((part) => part.type === "image")).toBe(false);
 	});
 
+	test("a tool call's page ends with a pointer to its result, while the page bytes stay exact", async () => {
+		const call: MemoryReader = {
+			...reader,
+			zoom: (id, _n, offset) => ({ text: SOURCE.slice(offset, offset + 4), next: offset + 4 < SOURCE.length ? offset + 4 : null, totalBytes: SOURCE.length, offset, ...(id === 11 ? { result: 12 } : {}) }),
+		};
+		const { pi, tools } = harness();
+		registerMemoryTools(pi, call, UNGUARDED);
+		const result = await tools.get("zoom")!.execute("call", { id: 11, n: 1, offset: 8 });
+		expect(result.content[0]!.text).toBe("89");
+		expect(result.content.map((part) => part.text)).toContain("[result: message 12]");
+		expect((result.details as { result?: number }).result).toBe(12);
+		const plain = await tools.get("zoom")!.execute("call", { id: 0, n: 1, offset: 8 });
+		expect(plain.content.some((part) => part.text?.includes("[result:"))).toBe(false);
+	});
+
 	test("a summary zoom with n above 1 refuses any byte offset", async () => {
 		const { pi, tools } = harness();
 		registerMemoryTools(pi, reader, UNGUARDED);
@@ -169,6 +185,52 @@ describe("search tool", () => {
 			content: [{ type: "text", text: '[optchat search] 0 hits for "nothing" (newest first)\n[no older hits]' }],
 			details: { hits: [], next: null },
 		});
+	});
+
+	test("a zero-hit multi-word search lists how many messages hold each word, in the result and its details", async () => {
+		const termCounts = [
+			{ term: "staging", messages: 12 },
+			{ term: "vault", messages: 0 },
+		];
+		const { pi, tools } = harness();
+		registerMemoryTools(pi, searching({ hits: [], next: null, termCounts }, []), UNGUARDED);
+		const result = await tools.get("chat_search")!.execute("call", { text: "staging vault" });
+		const text = result.content[0]!.text!;
+		expect(text).toContain('"staging" 12');
+		expect(text).toContain('"vault" 0');
+		expect(text).not.toContain("chat_recall");
+		expect(result.details).toEqual({ hits: [], next: null, termCounts });
+	});
+
+	test("the zero-hit result suggests chat_recall only while the session has that tool", async () => {
+		const answer: SearchResult = { hits: [], next: null, termCounts: [{ term: "a", messages: 1 }, { term: "b", messages: 2 }] };
+		let registered = false;
+		const { pi, tools } = harness();
+		registerMemoryTools(pi, searching(answer, []), UNGUARDED, () => registered);
+		const search = tools.get("chat_search")!;
+		expect((await search.execute("call", { text: "a b" })).content[0]!.text).not.toContain("chat_recall");
+		registered = true;
+		expect((await search.execute("call", { text: "a b" })).content[0]!.text).toContain("chat_recall");
+	});
+
+	test("a result with hits carries no word counts", async () => {
+		const { pi, tools } = harness();
+		registerMemoryTools(pi, searching({ hits: [{ id: 3, kind: "talk", date: "d", snippet: "a b" }], next: null }, []), UNGUARDED, () => true);
+		const result = await tools.get("chat_search")!.execute("call", { text: "a b" });
+		expect(result.content[0]!.text).not.toContain("containing each word");
+		expect(result.details).toEqual({ hits: [3], next: null });
+	});
+
+	test("the schema refuses before = 0, which can never match, and accepts 1", () => {
+		const real = { zod, registerTool: (tool: Tool) => void realTools.set(tool.name, tool), on: () => {} };
+		const realTools = new Map<string, Tool>();
+		registerMemoryTools(real as unknown as ExtensionAPI, reader, UNGUARDED);
+		const parameters = (realTools.get("chat_search") as unknown as {
+			parameters: { safeParse(value: unknown): { success: boolean } };
+		}).parameters;
+		expect(parameters.safeParse({ text: "x", before: 0 }).success).toBe(false);
+		expect(parameters.safeParse({ text: "x", before: 1 }).success).toBe(true);
+		expect(parameters.safeParse({ text: "x" }).success).toBe(true);
 	});
 
 	test("an admission failure stops the search before it reads", async () => {

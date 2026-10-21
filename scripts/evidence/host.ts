@@ -3,6 +3,7 @@ import type { Dirent } from "node:fs";
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { isCompressorRow } from "../../src/metrics.ts";
 import type { UsageRecord } from "./artifact.ts";
 import type { RetrievedPage } from "./scoring.ts";
 
@@ -551,7 +552,7 @@ export interface MetricLine {
 	readonly cacheRead: number | null;
 	readonly cacheWrite: number | null;
 	readonly attempt: number | null;
-	readonly purpose: "leaf" | "shorten" | null;
+	readonly node: "leaf" | "merge" | null;
 	readonly latencyMs: number | null;
 	readonly costUsd: number | null;
 	readonly stopReason: string | null;
@@ -563,7 +564,7 @@ export async function initMetricsFile(file: string): Promise<void> {
 	await writeFile(file, "", { flag: "wx", mode: 0o600 });
 }
 
-/** Metric-only compressor sink; null when the host never wrote it (unavailable, not zero). */
+/** Metric-only compressor sink: the compressor rows only, since the sink also holds host-compaction and rules rows; null when the host never wrote it (unavailable, not zero). */
 export async function readMetricLines(file: string): Promise<MetricLine[] | null> {
 	let raw: string;
 	try {
@@ -571,8 +572,8 @@ export async function readMetricLines(file: string): Promise<MetricLine[] | null
 	} catch {
 		return null;
 	}
-	return raw.split("\n").filter((line) => line.trim()).map((line) => {
-		const value = asFrame(JSON.parse(line)) ?? {};
+	return raw.split("\n").filter((line) => line.trim()).map((line): unknown => JSON.parse(line)).filter(isCompressorRow).map((row) => {
+		const value = asFrame(row) ?? {};
 		return {
 			model: typeof value.model === "string" ? value.model : "",
 			input: numberOrNull(value.input),
@@ -580,7 +581,7 @@ export async function readMetricLines(file: string): Promise<MetricLine[] | null
 			cacheRead: numberOrNull(value.cacheRead),
 			cacheWrite: numberOrNull(value.cacheWrite),
 			attempt: numberOrNull(value.attempt),
-			purpose: value.purpose === "leaf" || value.purpose === "shorten" ? value.purpose : null,
+			node: value.node === "leaf" || value.node === "merge" ? value.node : null,
 			latencyMs: numberOrNull(value.latencyMs),
 			costUsd: numberOrNull(value.costUsd),
 			stopReason: typeof value.stopReason === "string" ? value.stopReason : null,

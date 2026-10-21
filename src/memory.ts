@@ -3,10 +3,19 @@ import { DEFAULT_PAGE_BYTES, MAX_PAGE_BYTES, readTextPage, type MessageMetadata 
 import { RULER } from "./prompts.js";
 import { nodeKey, type Kind, type Message, Store, type TreeNode, type ViewSnapshot } from "./store.js";
 
+/** Why an attempt is a retry: the previous attempt's first defect, `null` on the first attempt. */
+export type CompactionRetry = "head" | "length" | "marker" | "user";
+
 export interface CompactionRequest {
   context: string;
   instruction: string;
   feedback: ReadonlyArray<{ reply: string; instruction: string }>;
+  meta: {
+    node: "leaf" | "merge";
+    /** 1-based attempt within one compact() call. */
+    attempt: number;
+    retry: CompactionRetry | null;
+  };
 }
 
 export type Summarize = (
@@ -93,6 +102,11 @@ export interface SearchHit {
 export interface SearchResult {
   readonly hits: ReadonlyArray<SearchHit>;
   readonly next: number | null;
+  /**
+   * Only when a query of two or more distinct words has no hit: how many searchable messages, under the same
+   * kind and `before` bounds, contain each word alone, so a caller can see which word to drop.
+   */
+  readonly termCounts?: ReadonlyArray<{ readonly term: string; readonly messages: number }>;
 }
 
 /** Structured zoom result. `next` is the byte offset of the following page, or null. */
@@ -101,6 +115,8 @@ export interface ZoomPage {
   readonly next: number | null;
   readonly totalBytes: number;
   readonly offset: number;
+  /** For a single tool-call message: the id of the record that stores its result, when it is already logged. */
+  readonly result?: number;
 }
 
 interface Job {
@@ -157,6 +173,32 @@ const HEAD_FEEDBACK =
   "Your line began with a head or preamble. Write only the summary line for the same <input>, with no id+n| head, label, tag or commentary.";
 const MARK_FEEDBACK =
   `Your line began with "${MARK_TEXT}", a marker only the code writes. Write the summary line itself for the same <input>, without that marker.`;
+const USER_FEEDBACK =
+  'Your line tagged an item "user:", but no message in this task was written by the user. Write the line again for the same <input> without a "user:" tag.';
+
+/** An item tagged "user:", at the start of a line or after "; ". Only a range holding a user message may carry one. */
+const USER_TAG = /(?:^|;\s+)user:/i;
+const USER_TAGS = /(^|;\s+)user:\s*/gi;
+/**
+ * A leaf's own leading label: a message kind, or the "finding"/"decision" labels the compressor invents,
+ * with an optional parenthetical ("echo (finding, medium): …"). Code replaces it with the leaf's kind.
+ */
+const LEAF_LABEL = /^(?:user|talk|tool|echo|note|work|finding|decision)s?(?:\s*\([^)\n]{0,40}\))?\s*:\s*/i;
+
+/** What compact() needs to know about the node it summarizes. */
+interface NodeInfo {
+  node: "leaf" | "merge";
+  /** Set on a leaf's final line only: the line then opens with this kind, made by code. */
+  kind?: Kind;
+  /** Whether a user message is among the node's covered messages. */
+  user: boolean;
+}
+
+/** `text` as a line of a leaf of `kind`: its kind in front, any other leading label replaced. */
+function withKind(text: string, kind: Kind): string {
+  const rest = text.replace(LEAF_LABEL, "");
+  return rest ? `${kind}: ${rest}` : text;
+}
 
 /*
  * A colon-less opening that names the task's own message ids ("1197 Live …",
@@ -349,6 +391,7 @@ export class Memory {
   private compressorCalls = 0;
   private headRetries = 0;
   private lengthRetries = 0;
+  private userRetries = 0;
   private readonly ready: ViewPart[] = [];
   private readyHead = 0;
   private readonly queued = new Set<string>();
@@ -511,7 +554,41 @@ export class Memory {
       const at = originalIndex(message.text, lower, lower.indexOf(terms[0]!));
       hits.push({ id, kind: message.kind, date: message.date, snippet: snippet(message.text, at) });
     }
-    return { hits, next: null };
+    if (hits.length > 0) return { hits, next: null };
+    const distinct = [...new Set(terms)];
+    if (distinct.length < 2) return { hits, next: null };
+    const counts = new Array<number>(distinct.length).fill(0);
+    for (let id = Math.min(before ?? messages.length, messages.length) - 1; id >= 0; id--) {
+      const message = messages[id]!;
+      if ((kind !== undefined && message.kind !== kind) || memoryRecord(message)) continue;
+      const lower = message.text.toLowerCase();
+      distinct.forEach((term, k) => {
+        if (lower.includes(term)) counts[k]!++;
+      });
+    }
+    return { hits, next: null, termCounts: distinct.map((term, k) => ({ term, messages: counts[k]! })) };
+  }
+
+  /**
+   * The id of the record that stores the result of the tool call at `id`, or undefined when `id` is not a tool
+   * call or its result is not logged yet. A turn logs its calls, then their results in the same order, so the
+   * k-th call of a run of calls (talk may sit between them) pairs with the k-th result record after the run.
+   */
+  private resultOf(id: number): number | undefined {
+    const messages = this.store.messages;
+    if (messages[id]?.kind !== "tool") return undefined;
+    let before = 0;
+    for (let at = id - 1; at >= 0 && (messages[at]!.kind === "tool" || messages[at]!.kind === "talk"); at--) {
+      if (messages[at]!.kind === "tool") before++;
+    }
+    let end = id + 1;
+    while (end < messages.length && (messages[end]!.kind === "tool" || messages[end]!.kind === "talk")) end++;
+    const result = end + before;
+    for (let at = end; at <= result; at++) {
+      const kind = messages[at]?.kind;
+      if (kind !== "echo" && kind !== "work") return undefined;
+    }
+    return result;
   }
 
   /**
@@ -585,7 +662,14 @@ export class Memory {
     if (n === 1) {
       if (depth !== 1) throw new RangeError("depth applies only to zoom with n > 1");
       const page = this.store.readMessagePage(id, offset);
-      return { text: page.text, next: page.next, totalBytes: page.totalBytes, offset: page.offset };
+      const result = this.resultOf(id);
+      return {
+        text: page.text,
+        next: page.next,
+        totalBytes: page.totalBytes,
+        offset: page.offset,
+        ...(result === undefined ? {} : { result }),
+      };
     }
     if (offset !== 0) throw new RangeError("offset applies only to single-message zoom");
     if (depth > level) throw new RangeError(`depth ${depth} exceeds the ${level} levels under line ${id}+${n}`);
@@ -625,6 +709,7 @@ export class Memory {
     compressorCalls: number;
     headRetries: number;
     lengthRetries: number;
+    userRetries: number;
   } {
     return {
       messages: this.store.messages.length,
@@ -636,6 +721,7 @@ export class Memory {
       compressorCalls: this.compressorCalls,
       headRetries: this.headRetries,
       lengthRetries: this.lengthRetries,
+      userRetries: this.userRetries,
     };
   }
 
@@ -940,6 +1026,10 @@ export class Memory {
     const context = this.context(end);
     const half = width / 2;
     const own = { lo: start, hi: end - (part.l === 0 ? 0 : 1) };
+    const kind = part.l === 0 ? this.store.messages[part.i]!.kind : undefined;
+    // Partial summaries are never stored, so only the final line of a leaf takes its kind from code.
+    const partial: NodeInfo = { node: part.l === 0 ? "leaf" : "merge", user: this.hasUser(start, end - (part.l === 0 ? 0 : 1)) };
+    const final: NodeInfo = kind === undefined ? partial : { ...partial, kind };
     // Only a level-0 leaf that reaches this path is non-free: merges and verbatim nodes never ask for a hint.
     const hint = part.l === 0 ? await this.hintFor(part.i, signal) : undefined;
     if (this.stopped || signal.aborted) return undefined;
@@ -952,7 +1042,7 @@ export class Memory {
     const leaf = (body: string): string =>
       `Compaction: ${task} into one line of at most ${this.nodeBytes} bytes\n${this.ruler()}\n${RULER}\n${details}<input>\n${body}\n</input>`;
 
-    if (utf8Bytes(input) <= this.pageBytes) return this.compact(context, leaf(input), own, signal);
+    if (utf8Bytes(input) <= this.pageBytes) return this.compact(context, leaf(input), own, signal, final);
 
     // Pages are exact UTF-8 slices of the input; only bounded partial summaries
     // are retained, never the page strings themselves.
@@ -967,6 +1057,7 @@ export class Memory {
         `Compaction: ${task}, part ${++pageNumber}, source bytes ${page.offset} to ${page.next ?? page.totalBytes} of ${page.totalBytes}, into one line of at most ${this.nodeBytes} bytes. Other parts are summarized separately: keep only what this part states.\n${this.ruler()}\n${RULER}\n${details}<input>\n${page.text}\n</input>`,
         own,
         signal,
+        partial,
       );
       if (reply === undefined) return undefined;
       summaries.push(reply);
@@ -982,6 +1073,7 @@ export class Memory {
           leaf(`Ordered partial summaries of the complete input:\n${items.join("\n")}`),
           own,
           signal,
+          final,
         );
       }
       const next: string[] = [];
@@ -995,6 +1087,7 @@ export class Memory {
           `Compaction: ${task}; merge these ${group.length} ordered partial summaries of the complete input into one line of at most ${this.nodeBytes} bytes\n${this.ruler()}\n${RULER}\n<input>\n${group.join("\n")}\n</input>`,
           own,
           signal,
+          partial,
         );
         if (merged === undefined) return undefined;
         next.push(merged);
@@ -1003,6 +1096,14 @@ export class Memory {
       items = next;
     }
     return items[0];
+  }
+
+  /** Whether any message from `lo` to `hi`, inclusive, was written by the user. */
+  private hasUser(lo: number, hi: number): boolean {
+    for (let i = lo; i <= hi && i < this.store.messages.length; i++) {
+      if (this.store.messages[i]!.kind === "user") return true;
+    }
+    return false;
   }
 
   /**
@@ -1080,47 +1181,70 @@ export class Memory {
    * A reply opening with the reserved stand-in marker (after its heads) is never
    * a candidate: it is retried like a head, and when no other candidate is left
    * the compaction is refused, so the caller stores a marked source excerpt.
+   * A "user:" tag on a node whose messages include none from the user is retried
+   * the same way, and cut from the stored line when no clean reply comes. The
+   * final line of a leaf opens with its message kind, made by code: that prefix
+   * counts in the byte limit, and a different leading label is replaced by it.
    */
   private async compact(
     context: string,
     instruction: string,
     own: { lo: number; hi: number },
     signal: AbortSignal,
+    info: NodeInfo,
   ): Promise<string | undefined> {
     let feedback: CompactionRequest["feedback"] = [];
-    let headed: { text: string; head: number } | undefined;
+    let flawed: string | undefined;
     let shortest: { text: string; size: number } | undefined;
     let marked = false;
+    let retry: CompactionRetry | null = null;
     for (let attempt = 0; attempt < this.tries; attempt++) {
       if (this.stopped || signal.aborted) return undefined;
       this.compressorCalls++;
-      const reply = (await this.summarize({ context, instruction, feedback }, signal)).trim();
+      const meta: CompactionRequest["meta"] = { node: info.node, attempt: attempt + 1, retry };
+      const reply = (await this.summarize({ context, instruction, feedback, meta }, signal)).trim();
       if (this.stopped || signal.aborted) return undefined;
       if (!reply) throw new Error("Compactor returned an empty summary");
-      const size = utf8Bytes(reply);
       const head = replyHead(reply, own);
       const mark = reply.startsWith(MARK_TEXT, head);
+      const onlyHeads = head > 0 && reply.length === head;
+      const falseUser = !mark && !info.user && USER_TAG.test(reply.slice(head));
+      // The line as it would be stored: heads cut (kept whole when nothing else remains), kind prefix, false tags cut.
+      let text = reply;
+      if (!mark && !onlyHeads) {
+        text = reply.slice(head);
+        if (info.kind !== undefined) text = withKind(text, info.kind);
+        if (!info.user) text = text.replace(USER_TAGS, "$1").trim();
+        if (!text) throw new Error("Compactor returned an empty summary");
+      }
+      const size = mark || onlyHeads ? utf8Bytes(reply) : utf8Bytes(reply.slice(0, head)) + utf8Bytes(text);
       const fits = size <= this.nodeBytes;
+      // Bytes code adds in front of the model's own line (the kind label), which the model cannot see or spare.
+      const added = mark || onlyHeads ? 0 : Math.max(0, utf8Bytes(text) - utf8Bytes(reply.slice(head)));
       if (mark) marked = true;
-      else if (fits && head === 0) return reply;
-      else if (fits) headed ??= { text: reply, head };
-      else if (size <= this.summaryLimit && (!shortest || size < shortest.size)) shortest = { text: reply, size };
+      else if (fits && head === 0 && !falseUser) return text;
+      else if (fits) flawed ??= text;
+      else if (size <= this.summaryLimit && (!shortest || size < shortest.size)) shortest = { text, size };
       if (attempt + 1 === this.tries) break;
       if (head > 0 || mark) this.headRetries++;
+      else if (falseUser) this.userRetries++;
       if (!fits) this.lengthRetries++;
+      retry = mark ? "marker" : head > 0 ? "head" : falseUser ? "user" : "length";
       // The head and the marker are cut from the echoed reply so neither goes back into compressor input.
       const body = mark ? reply.slice(head + MARK_TEXT.length).trimStart() : reply.slice(head);
       const excerpt = utf8Prefix(body, this.summaryLimit);
       const notes = mark ? [MARK_FEEDBACK] : head > 0 ? [HEAD_FEEDBACK] : [];
+      if (falseUser) notes.push(USER_FEEDBACK);
       if (!fits) {
-        notes.push(`${utf8Bytes(body) > this.summaryLimit ? "Previous reply excerpt only; omitted bytes are not a complete summary. " : ""}Too long: your line is ${size} bytes, over the ${this.nodeBytes}-byte limit. Write\nthe whole line again for the same <input>, cutting just enough of the\nleast valuable items to fit before this cut:\n${utf8Prefix(excerpt, this.nodeBytes)}| ← LIMIT`);
+        const label = added > 0 ? ` (code puts a ${added}-byte kind label in front of it)` : "";
+        notes.push(`${utf8Bytes(body) > this.summaryLimit ? "Previous reply excerpt only; omitted bytes are not a complete summary. " : ""}Too long: your line is ${size} bytes${label}, over the ${this.nodeBytes}-byte limit. Write\nthe whole line again for the same <input>, cutting just enough of the\nleast valuable items to fit before this cut:\n${utf8Prefix(excerpt, Math.max(0, this.nodeBytes - added))}| ← LIMIT`);
       }
       // Keep one bounded feedback turn, not an ever-growing history of full
       // provider replies. The original input stays unchanged on every attempt.
       // A reply that was only heads is echoed as "…": a provider turn needs text.
       feedback = [{ reply: excerpt || "…", instruction: notes.join("\n") }];
     }
-    if (headed !== undefined) return headed.text.length > headed.head ? headed.text.slice(headed.head) : headed.text;
+    if (flawed !== undefined) return flawed;
     if (!shortest && marked) throw new CompressorRefusedError();
     if (!shortest) throw new Error(`Compactor returned no whole summary within the ${this.summaryLimit}-byte safety ceiling`);
     return shortest.text;

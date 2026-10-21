@@ -46,8 +46,17 @@ import {
 import { exportHtml, importHistory } from "./history.js";
 import { writeExportFile } from "./export-file.js";
 import { attachChildView, publishChildSource, registerMemoryTools, UNGUARDED, type ChildView, type PageEnvelope, type WorkEnvelope } from "./handoff.js";
-import { appendMetric, boundedProviderError, METRICS_FILE, readCompressorSpend, type CompressorUsage } from "./metrics.js";
-import { captureWorkReports, type ArtifactPathSource } from "./reports.js";
+import {
+	appendMetric,
+	boundedProviderError,
+	METRICS_FILE,
+	readCompressorSpend,
+	type CompressorUsage,
+	type HostCompactionCancelReason,
+	type HostCompactionRow,
+	type MetricRow,
+} from "./metrics.js";
+import { captureWaitReports, captureWorkReports, type ArtifactPathSource, type CapturedWorkReport } from "./reports.js";
 import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } from "./archive.js";
 import { CompressorRefusedError, Memory, type CompactionRequest, type Summarize } from "./memory.js";
 import { HOST_COMPACTION_SUMMARY, VIEW_DOC } from "./prompts.js";
@@ -57,7 +66,7 @@ import { counted, GATE_KEYS, GATE_LABEL, GATE_PURPOSE, GateCounts, INACTIVE_REAS
 import { RuleLedger, renderRules, type Rule } from "./system1/ledger.js";
 import { prefetchBlock, PREFETCH_MS } from "./system1/prefetch.js";
 import { recall, registerRecallTool, renderRecall } from "./system1/recall.js";
-import { decideTriage, offeredRules, ruleSentences, triageQuestions, triageState } from "./system1/rules.js";
+import { decideTriage, offeredRules, ruleSentences, triageProbabilities, triageQuestions, triageState } from "./system1/rules.js";
 import { valueHint } from "./system1/value.js";
 
 type AgentMessage = ContextEvent["messages"][number];
@@ -280,12 +289,34 @@ async function workEntries(
 	if (reports.length === 0) {
 		return [{ kind: "work", text, metadata: metadataOf(workOf(source, "pointer-only", undefined, undefined), images) }];
 	}
+	return reportEntries(reports, images);
+}
+
+/** One work entry per captured report; the first carries the message's images. */
+function reportEntries(reports: readonly CapturedWorkReport[], images: readonly ImageAttachment[]): Entry[] {
 	return reports.map((report, index) => ({
 		kind: "work",
 		text: report.reason === undefined ? report.body : `[incomplete: ${report.reason}] ${report.body}`,
 		at: report.timestamp,
 		metadata: metadataOf(report.work, index === 0 ? images : []),
 	}));
+}
+
+/**
+ * A `wait` result that recovered finished subagent reports: each report is work under its job id and agent name,
+ * as the async result the host would otherwise have delivered, and the result itself stays an echo only for what
+ * else it said, with those reports replaced by pointers. A result with no such report is an echo, as ever.
+ */
+async function waitEntries(
+	details: unknown,
+	text: string,
+	images: readonly ImageAttachment[],
+	at: number,
+	capture: Capture,
+): Promise<Entry[]> {
+	const { reports, rest } = await captureWaitReports({ details, text, timestamp: at, sessionManager: capture.artifacts });
+	const echo: Entry[] = rest === undefined ? [] : [{ kind: "echo", text: rest, metadata: metadataOf(undefined, images) }];
+	return [...echo, ...reportEntries(reports, echo.length === 0 ? images : [])];
 }
 
 /** Completed chat entries of one host message, in order; thoughts are never logged. */
@@ -320,6 +351,7 @@ async function entriesOf(
 			// The live result was capped after its full text was captured; the durable log keeps all of it.
 			const full = capture.full(message.toolCallId) ?? text;
 			const echo = message.isError ? `[error] ${full}` : full;
+			if (message.toolName === "wait") return waitEntries(message.details, echo, images, stamp(message), capture);
 			if (message.toolName !== "task") return [{ kind: "echo", text: echo, metadata: metadataOf(undefined, images) }];
 			// A subagent's report is work, with the provenance the capture records from its details.
 			return workEntries("task", message.details, echo, images, stamp(message), capture);
@@ -471,7 +503,17 @@ type State =
 	| { kind: "inactive"; reason: string }
 	| { kind: "closed" };
 
+/** The session entry type OptChat appends when it goes inactive; its data holds the `reason` and the store `directory`. */
+const INACTIVE_ENTRY = "optchat-inactive";
+
 type WireObject = Record<string, unknown>;
+
+/** The answer to one host compaction, with the outcome and cancel reason the metric sink records for it. */
+interface CompactionAnswer {
+	readonly result: SessionBeforeCompactResult;
+	readonly outcome: HostCompactionRow["outcome"];
+	readonly reason: HostCompactionCancelReason | null;
+}
 
 function wireObject(value: unknown): value is WireObject {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -543,6 +585,8 @@ class OptChat {
 	private memory: Memory | undefined;
 	/** Set once the tools are registered: the host rejects a second registration, so a reopened chat keeps them. */
 	private toolsRegistered = false;
+	/** Set once `chat_recall` is registered; a zero-hit `chat_search` suggests it only then. */
+	private recallRegistered = false;
 	/** Standing rules: present only when the rules gate is on and the session is ready. */
 	private rules: RuleLedger | undefined;
 	/** Triage jobs run one at a time in log order, each after its message is durable. */
@@ -581,8 +625,8 @@ class OptChat {
 	constructor(
 		private readonly pi: ExtensionAPI,
 		private readonly settleTimeoutMs: number,
-		private readonly observe: (usage: CompressorUsage, file: string | undefined) => void,
-		/** The compressor metric sink of a store directory. */
+		private readonly observe: (row: MetricRow, file: string | undefined) => void,
+		/** The metric sink of a store directory. */
 		private readonly metricsFile: (directory: string) => string,
 		private readonly policy: CompressorPolicy = {},
 		private readonly judges: JudgeFactory = hostJudge,
@@ -671,7 +715,7 @@ class OptChat {
 			date: (id) => this.openMemory().date(id),
 			work: (name, offset) => this.workEnvelope(name, offset, Number.POSITIVE_INFINITY),
 			search: (query, options) => this.openMemory().search(query, options),
-		}, UNGUARDED);
+		}, UNGUARDED, () => this.recallRegistered);
 	}
 
 	/** The recall gate's tool: a judge-guided scan of the best view lines that returns one stored message. Main sessions only. */
@@ -680,6 +724,7 @@ class OptChat {
 			throw new Error('tool name "chat_recall" is already registered');
 		}
 		registerRecallTool(this.pi, (question, current, signal) => this.recallFor(question, current, signal));
+		this.recallRegistered = true;
 	}
 
 	private async recallFor(question: string, current: ExtensionContext | undefined, signal: AbortSignal | undefined): Promise<string> {
@@ -748,7 +793,11 @@ class OptChat {
 			upperBound,
 			zoom: (id, n, offset, depth) => {
 				within(id, n);
-				return this.withImages(live().zoom(id, n, offset, depth), id, n, offset);
+				const page = this.withImages(live().zoom(id, n, offset, depth), id, n, offset);
+				// A result logged after the snapshot is not part of it.
+				if (page.result === undefined || page.result < upperBound) return page;
+				const { result: _later, ...visible } = page;
+				return visible;
 			},
 			date: (id) => {
 				within(id, 1);
@@ -818,23 +867,32 @@ class OptChat {
 	};
 
 	/** Metric-only: counts and timing of one completed compressor call; never its content. */
-	private observeUsage(model: Model, reply: AssistantMessage, feedback: number, latencyMs: number): void {
+	private observeUsage(model: Model, reply: AssistantMessage, request: CompactionRequest, totalMs: number, waitMs: number): void {
 		const total = reply.usage.cost.total;
+		this.record({
+			type: "compressor",
+			at: new Date().toISOString(),
+			model: `${model.provider}/${model.id}`,
+			input: reply.usage.input,
+			output: reply.usage.output,
+			cacheRead: reply.usage.cacheRead,
+			cacheWrite: reply.usage.cacheWrite,
+			node: request.meta.node,
+			attempt: request.meta.attempt,
+			retry: request.meta.retry,
+			waitMs: Math.round(waitMs),
+			latencyMs: Math.max(0, Math.round(totalMs - waitMs)),
+			costUsd: Number.isFinite(total) ? total : null,
+			stopReason: reply.stopReason,
+			error: reply.stopReason === "error" || reply.stopReason === "aborted" ? boundedProviderError(reply.errorMessage) : null,
+		});
+	}
+
+	/** Appends one row to the store's metric sink. Best effort: a failed write is a warning and never stops the chat. */
+	private record(row: MetricRow): void {
 		const directory = this.store?.directory;
 		try {
-			this.observe({
-				model: `${model.provider}/${model.id}`,
-				input: reply.usage.input,
-				output: reply.usage.output,
-				cacheRead: reply.usage.cacheRead,
-				cacheWrite: reply.usage.cacheWrite,
-				attempt: feedback + 1,
-				purpose: feedback > 0 ? "shorten" : "leaf",
-				latencyMs: Math.round(latencyMs),
-				costUsd: Number.isFinite(total) ? total : null,
-				stopReason: reply.stopReason,
-				error: reply.stopReason === "error" || reply.stopReason === "aborted" ? boundedProviderError(reply.errorMessage) : null,
-			}, directory === undefined ? undefined : this.metricsFile(directory));
+			this.observe(row, directory === undefined ? undefined : this.metricsFile(directory));
 		} catch (error) {
 			this.notify(`OptChat metrics: ${errorText(error)}`, "warning");
 		}
@@ -939,11 +997,22 @@ class OptChat {
 			release = undefined;
 		};
 		const started = performance.now();
+		// Time spent waiting before a send (admission, cache lease), over every provider attempt: reported apart from provider latency.
+		let waitMs = 0;
+		const waiting = async <T>(work: () => T | Promise<T>): Promise<T> => {
+			const from = performance.now();
+			try {
+				return await work();
+			} finally {
+				waitMs += performance.now() - from;
+			}
+		};
 		// Admission precedes every send. The first attempt is admitted here, before the request can be
 		// dispatched on any provider path; later payloads (SDK retries) are admitted by onPayload.
 		const selector = `${model.provider}/${model.id}`;
 		signal.throwIfAborted();
-		if (this.policy.admit && !(await this.policy.admit(selector))) throw new Error("compressor call was not admitted");
+		const admit = this.policy.admit?.bind(this.policy);
+		if (admit && !(await waiting(() => admit(selector)))) throw new Error("compressor call was not admitted");
 		// Admission may have outlived a cancellation or deadline: an abandoned call sends nothing.
 		signal.throwIfAborted();
 		let admitted = true;
@@ -971,16 +1040,16 @@ class OptChat {
 					// The first payload is the attempt admitted above; each retry is admitted before its send.
 					sends += 1;
 					if (sends > 1) {
-						admitted = this.policy.admit ? await this.policy.admit(selector) : true;
+						admitted = admit ? await waiting(() => admit(selector)) : true;
 						if (!admitted) throw new Error("compressor call was not admitted");
 					}
 					signal.throwIfAborted();
 					const actualModel = payloadModel ?? model;
 					const encoded = applyOptChatCache(this.alignPrefix(payload, actualModel, ctx), actualModel);
 					// This request's own onResponse/finally release the lease: the only correlated writer.
-					release = await this.cache.acquire(encoded, actualModel, {
+					release = await waiting(() => this.cache.acquire(encoded, actualModel, {
 						signal: attemptSignal ? AbortSignal.any([signal, attemptSignal]) : signal,
-					});
+					}));
 					// The lease wait may have outlived the attempt: give it back before any send.
 					if (signal.aborted) {
 						finish();
@@ -993,7 +1062,7 @@ class OptChat {
 		).finally(() => finish());
 		// A refused attempt was never sent: it is not a completed call and writes no metric line.
 		if (!admitted) throw new Error("compressor call was not admitted");
-		this.observeUsage(model, reply, request.feedback.length, performance.now() - started);
+		this.observeUsage(model, reply, request, performance.now() - started, waitMs);
 		return reply;
 	}
 
@@ -1123,6 +1192,12 @@ class OptChat {
 	private inactivate(reason: string): void {
 		this.state = { kind: "inactive", reason };
 		this.notify(`OptChat is inactive: ${reason}. Use --optchat-dir for a separate memory.`, "warning");
+		// The notice is UI-only: the session log keeps why this session ran without memory.
+		try {
+			this.pi.appendEntry(INACTIVE_ENTRY, { reason, directory: this.config?.directory ?? null });
+		} catch (error) {
+			this.notify(`OptChat could not record in the session log why it is inactive: ${errorText(error)}`, "warning");
+		}
 	}
 
 	/** The only supported way to stop a request from a context hook: abort the run, send nothing. */
@@ -1462,24 +1537,44 @@ class OptChat {
 	 */
 	beforeCompact(event: SessionBeforeCompactEvent): SessionBeforeCompactResult | undefined {
 		if (this.passive) return undefined;
-		if (this.state.kind !== "ready") return { cancel: true };
+		const answer = this.answerCompaction(event);
+		const tokens: unknown = event.preparation.tokensBefore;
+		// One row per answered compaction, counts and a closed reason only: the sink never sees message text.
+		this.record({
+			type: "host-compaction",
+			at: new Date().toISOString(),
+			outcome: answer.outcome,
+			reason: answer.reason,
+			tokensBefore: typeof tokens === "number" && Number.isFinite(tokens) ? tokens : null,
+		});
+		return answer.result;
+	}
+
+	/** The answer to one host compaction and what it is called in the metric sink. */
+	private answerCompaction(event: SessionBeforeCompactEvent): CompactionAnswer {
+		const cancel = (reason: HostCompactionCancelReason): CompactionAnswer => ({ result: { cancel: true }, outcome: "cancelled", reason });
+		if (this.state.kind !== "ready") return cancel("not-ready");
 		const { preparation } = event;
-		const marker = (firstKeptEntryId: string): SessionBeforeCompactResult => ({
-			compaction: { summary: HOST_COMPACTION_SUMMARY, firstKeptEntryId, tokensBefore: preparation.tokensBefore },
+		const marker = (firstKeptEntryId: string): CompactionAnswer => ({
+			result: { compaction: { summary: HOST_COMPACTION_SUMMARY, firstKeptEntryId, tokensBefore: preparation.tokensBefore } },
+			// The cut moved when it no longer sits where the host put it.
+			outcome: firstKeptEntryId === preparation.firstKeptEntryId ? "marker" : "cut-moved",
+			reason: null,
 		});
 		const anchor = this.turn?.first ?? this.turn?.after;
 		const dropped = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
 		const at = anchor ? this.find(dropped, anchor) : -1;
 		if (!anchor || at < 0) return marker(preparation.firstKeptEntryId);
 		// Nothing older than the open turn to drop, or a host stand-in for history that was dropped before.
-		if (at === 0 || dropped[at]!.role === "compactionSummary") return { cancel: true };
+		if (at === 0) return cancel("nothing-older");
+		if (dropped[at]!.role === "compactionSummary") return cancel("leftover-summary");
 		for (let index = event.branchEntries.length - 1; index >= 0; index--) {
 			const entry = event.branchEntries[index]!;
 			const message = branchEntryMessage(entry);
 			if (!message || stamp(message) !== anchor.stamp || keyOf(message) !== anchor.key) continue;
-			return isCutPoint(entry) ? marker(entry.id) : { cancel: true };
+			return isCutPoint(entry) ? marker(entry.id) : cancel("anchor-not-cut-point");
 		}
-		return { cancel: true };
+		return cancel("anchor-not-in-branch");
 	}
 
 	toolResult(event: ToolResultEvent): ToolResultEventResult | undefined {
@@ -1842,16 +1937,25 @@ class OptChat {
 		// Shutdown began while the judge answered: the ledger is closing, so nothing is written.
 		if (abort.aborted) return;
 		const decision = decideTriage(result.answers, offered, config.gates.ruleAdd, text, sentences);
-		if (decision.kind === "none") return;
+		// One row per triage: the judge's probabilities, the cutoff and whether a rule was written; never the message or a rule's text.
+		const { pRule, pSentenceMax } = triageProbabilities(result.answers, sentences);
+		const row = (added: boolean): void =>
+			this.record({ type: "rules", at: new Date().toISOString(), pRule, pSentenceMax, sentences: sentences.length, cutoff: config.gates.ruleAdd, added });
+		if (decision.kind === "none") {
+			row(false);
+			return;
+		}
 		let rule: Rule;
 		try {
 			rule = decision.kind === "add"
 				? ledger.add(source, decision.text, Date.now())
 				: ledger.replace(decision.replaces, source, decision.text, Date.now());
 		} catch (error) {
+			row(false);
 			this.gateFail("rules", error);
 			return;
 		}
+		row(true);
 		this.counts.add("rules", decision.kind === "add" ? "added" : "replaced");
 		const change = decision.kind === "add" ? "added" : `replaced ${decision.replaces}`;
 		this.notify(`OptChat rule ${rule.id} ${change} from message ${source}: ${rule.text}\nUndo with /optchat rules remove ${rule.id}.`, "info");
@@ -1960,11 +2064,12 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 		const override = process.env.OPTCHAT_METRICS_FILE;
 		// The default sink is the store's own `metrics.jsonl`; the evidence runner points each host at a file outside its store copy.
 		const metricsFile = (directory: string): string => override || join(directory, METRICS_FILE);
-		const observe = (usage: CompressorUsage, file: string | undefined): void => {
+		const observe = (row: MetricRow, file: string | undefined): void => {
 			try {
-				if (file) appendMetric(file, usage);
+				if (file) appendMetric(file, row);
 			} finally {
-				options.onCompressorUsage?.(usage);
+				// Only compressor calls reach the usage callback; the other row types are sink-only.
+				if (row.type === "compressor") options.onCompressorUsage?.(row);
 			}
 		};
 

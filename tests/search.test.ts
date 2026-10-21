@@ -337,3 +337,106 @@ describe("Memory.lineAt", () => {
     expect(memory.lineAt(0, 0)).toBeUndefined();
   });
 });
+
+describe("Memory.search zero-hit word counts", () => {
+  test("a multi-word query with no hit reports how many messages hold each word, under the same bounds", async () => {
+    const store = await openStore();
+    store.append("user", "deploy the staging box");
+    store.append("talk", "staging port is 8443");
+    store.append("talk", "the vault key rotates monthly");
+    store.append("tool", 'zoom {"id":0,"n":1} staging');
+    const memory = memoryOver(store);
+    const result = memory.search("staging vault");
+    expect(result.hits).toEqual([]);
+    expect(result.termCounts).toEqual([
+      { term: "staging", messages: 2 },
+      { term: "vault", messages: 1 },
+    ]);
+    expect(memory.search("staging vault", { kind: "talk" }).termCounts).toEqual([
+      { term: "staging", messages: 1 },
+      { term: "vault", messages: 1 },
+    ]);
+    expect(memory.search("staging vault", { before: 2 }).termCounts).toEqual([
+      { term: "staging", messages: 2 },
+      { term: "vault", messages: 0 },
+    ]);
+  });
+
+  test("words are counted once each, and a query with hits or a single distinct word carries no counts", async () => {
+    const store = await openStore();
+    store.append("talk", "alpha one");
+    store.append("talk", "beta two");
+    const memory = memoryOver(store);
+    expect(memory.search("alpha beta").termCounts).toEqual([
+      { term: "alpha", messages: 1 },
+      { term: "beta", messages: 1 },
+    ]);
+    expect(memory.search("Alpha ALPHA missing").termCounts).toEqual([
+      { term: "alpha", messages: 1 },
+      { term: "missing", messages: 0 },
+    ]);
+    expect(memory.search("alpha one").termCounts).toBeUndefined();
+    expect(memory.search("absent").termCounts).toBeUndefined();
+    expect(memory.search("absent absent").termCounts).toBeUndefined();
+  });
+});
+
+describe("Memory.zoom of a tool call", () => {
+  test("a page names the record that stores the call's result", async () => {
+    const store = await openStore();
+    store.append("user", "run it");
+    store.append("tool", 'bash {"command":"ls"}');
+    store.append("echo", "a.txt");
+    store.append("talk", "done");
+    const memory = memoryOver(store);
+    expect(memory.zoom(1, 1).result).toBe(2);
+    expect(memory.zoom(0, 1).result).toBeUndefined();
+    expect(memory.zoom(2, 1).result).toBeUndefined();
+    expect(memory.zoom(3, 1).result).toBeUndefined();
+  });
+
+  test("calls issued together pair with their results in order, even with talk between them", async () => {
+    const store = await openStore();
+    store.append("user", "two things");
+    store.append("talk", "first");
+    store.append("tool", 'read {"path":"a"}');
+    store.append("talk", "second");
+    store.append("tool", 'read {"path":"b"}');
+    store.append("tool", 'task {"id":"x"}');
+    store.append("echo", "contents of a");
+    store.append("echo", "contents of b");
+    store.append("work", "report x", new Date(), { work: { source: "task", completeness: "pointer-only" } });
+    store.append("talk", "later");
+    store.append("tool", 'read {"path":"c"}');
+    store.append("echo", "contents of c");
+    const memory = memoryOver(store);
+    expect(memory.zoom(2, 1).result).toBe(6);
+    expect(memory.zoom(4, 1).result).toBe(7);
+    expect(memory.zoom(5, 1).result).toBe(8);
+    expect(memory.zoom(10, 1).result).toBe(11);
+  });
+
+  test("a call whose result is not logged yet has no pointer, and a page of a longer call keeps it on every page", async () => {
+    const store = await openStore();
+    store.append("user", "go");
+    store.append("tool", `bash ${JSON.stringify({ command: "x".repeat(40_000) })}`);
+    const memory = memoryOver(store);
+    expect(memory.zoom(1, 1).result).toBeUndefined();
+    store.append("echo", "ok");
+    const first = memory.zoom(1, 1);
+    expect(first.next).not.toBeNull();
+    expect(first.result).toBe(2);
+    expect(memory.zoom(1, 1, first.next!).result).toBe(2);
+  });
+
+  test("a call followed only by another call's result does not claim it", async () => {
+    const store = await openStore();
+    store.append("user", "go");
+    store.append("tool", 'read {"path":"a"}');
+    store.append("tool", 'read {"path":"b"}');
+    store.append("echo", "contents of a");
+    const memory = memoryOver(store);
+    expect(memory.zoom(1, 1).result).toBe(3);
+    expect(memory.zoom(2, 1).result).toBeUndefined();
+  });
+});

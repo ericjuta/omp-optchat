@@ -59,7 +59,7 @@ export interface CapturedWorkReport {
   readonly work: WorkMetadata;
   readonly provenance: ReportProvenance;
   readonly timestamp: number;
-  /** The exact delivered text of the whole message, shared by every member of a batch. */
+  /** The exact delivered text of the whole message, shared by every member of a batch; a `wait` member's is its job section. */
   readonly envelope: string;
   /** The envelope, then this member's full structured data and public output. */
   readonly body: string;
@@ -87,6 +87,8 @@ interface Member {
   readonly reason?: string;
   /** Consulted only when the member is not already complete. */
   readonly hydrate?: Hydration;
+  /** Leads this member's body in place of the whole message: a `wait` result's job section. */
+  readonly envelope?: string;
 }
 
 type Structured =
@@ -268,6 +270,51 @@ function membersOf(source: WorkSource, details: unknown, text: string): readonly
   return daemons.map(daemonMember);
 }
 
+/** The finished task jobs a `wait` result delivered a report for, as batch members, with the text each report came as. */
+interface WaitReports {
+  readonly members: readonly Member[];
+  /** For the member at the same index: the exact result and error text the host rendered for it. */
+  readonly texts: readonly (readonly string[])[];
+  /** Whether the result also delivered something else: another job, a cancellation, or a running agent. */
+  readonly other: boolean;
+}
+
+/**
+ * A job the host already delivered carries no result text in a later `wait` snapshot, so its async-result capture
+ * stays its newest record; a running job, a non-task job and a job without text deliver no report here.
+ */
+function waitReports(details: unknown): WaitReports {
+  const record = isRecord(details) ? details : {};
+  const jobs: unknown[] = Array.isArray(record.jobs) ? record.jobs : [];
+  const members: Member[] = [];
+  const texts: string[][] = [];
+  let other = (Array.isArray(record.cancelled) && record.cancelled.length > 0) || (Array.isArray(record.agents) && record.agents.length > 0);
+  for (const job of jobs) {
+    const rendered = isRecord(job) && job.type === "task" && job.status !== "running" && typeof job.id === "string"
+      ? [job.resultText, job.errorText].filter((text): text is string => typeof text === "string" && text.length > 0)
+      : [];
+    if (!isRecord(job) || rendered.length === 0) {
+      other = true;
+      continue;
+    }
+    // Each job's own text is delivered, so a preview notice downgrades only the job it belongs to.
+    const previewed = rendered.some((text) => HOST_PREVIEW_MARKERS.some((marker) => text.includes(marker)));
+    const member = asyncJobMember(
+      { jobId: job.id, agentId: job.agentUrlId, label: job.label, type: job.type, status: job.status, durationMs: job.durationMs, schema: job.structured },
+      job.meta,
+      previewed,
+    );
+    const heading = [`### ${String(job.id)} [task] — ${String(job.status)}`, ...(typeof job.label === "string" ? [`Label: ${job.label}`] : [])];
+    const output = [
+      ...(typeof job.resultText === "string" && job.resultText.length > 0 ? [job.resultText] : []),
+      ...(typeof job.errorText === "string" && job.errorText.length > 0 ? [`Error: ${job.errorText}`] : []),
+    ].join("\n");
+    members.push({ ...member, envelope: heading.join("\n"), output });
+    texts.push(rendered);
+  }
+  return { members, texts, other };
+}
+
 /**
  * Derives the artifact to read from typed metadata only. Missing or unsafe references stay pointer-only.
  */
@@ -338,6 +385,7 @@ async function finish(
   envelope: string,
   reader: ArtifactPathSource | undefined,
 ): Promise<CapturedWorkReport> {
+  const lead = member.envelope ?? envelope;
   let complete = member.complete;
   let reason = member.reason;
   let output = member.output;
@@ -353,7 +401,7 @@ async function finish(
     }
   }
   if (!complete && reason === undefined) reason = "output is incomplete";
-  const parts = [envelope, member.structured, output];
+  const parts = [lead, member.structured, output];
   const body = parts.filter((part): part is string => part !== undefined && part.length > 0).join("\n\n");
   const work: { source: WorkSource; completeness: WorkCompleteness; id?: string; name?: string; agentId?: string } = {
     source,
@@ -364,7 +412,7 @@ async function finish(
     work: Object.freeze(work),
     provenance: member.provenance,
     timestamp,
-    envelope,
+    envelope: lead,
     body,
     ...(reason === undefined ? {} : { reason }),
   });
@@ -384,6 +432,10 @@ export async function captureWorkReports(input: WorkReportInput): Promise<WorkRe
   for (const member of membersOf(input.source, input.details, envelope)) {
     reports.push(await finish(member, input.source, input.timestamp, envelope, input.sessionManager));
   }
+  return aggregate(reports);
+}
+
+function aggregate(reports: readonly CapturedWorkReport[]): WorkReportCapture {
   const pointer = reports.find((report) => report.work.completeness !== "full");
   const capture: WorkReportCapture = {
     completeness: pointer === undefined ? "full" : "pointer-only",
@@ -391,4 +443,34 @@ export async function captureWorkReports(input: WorkReportInput): Promise<WorkRe
     reports,
   };
   return Object.freeze(capture);
+}
+
+export interface WaitReportCapture extends WorkReportCapture {
+  /**
+   * The `wait` text with each captured report replaced by a pointer to its work record, or `undefined` when the
+   * result delivered nothing else. Without captured reports it is the delivered text unchanged.
+   */
+  readonly rest: string | undefined;
+}
+
+/**
+ * Captures each finished subagent report a `wait` result recovered, as the async result the host would otherwise
+ * have delivered: one report per task job, recorded under its job id, agent id and name, led by that job's own
+ * section instead of the whole message. Only a job whose result text the host rendered qualifies; one it already
+ * delivered by itself, a running job and a non-task job do not.
+ */
+export async function captureWaitReports(input: Omit<WorkReportInput, "source">): Promise<WaitReportCapture> {
+  if (!Number.isFinite(input.timestamp)) throw new TypeError("Work timestamp must be finite milliseconds");
+  const envelope = typeof input.text === "string" ? input.text : "";
+  const { members, texts, other } = waitReports(input.details);
+  const reports: CapturedWorkReport[] = [];
+  for (const member of members) {
+    reports.push(await finish(member, "async-result", input.timestamp, envelope, input.sessionManager));
+  }
+  if (reports.length === 0) return Object.freeze({ ...aggregate(reports), rest: envelope });
+  let rest = envelope;
+  reports.forEach((report, index) => {
+    for (const text of texts[index]!) rest = rest.replace(text, () => `[report recorded as work ${report.work.id ?? "(unnamed job)"}]`);
+  });
+  return Object.freeze({ ...aggregate(reports), rest: other ? rest : undefined });
 }

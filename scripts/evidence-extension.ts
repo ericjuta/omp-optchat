@@ -17,6 +17,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { createOptChat } from "../src/index.ts";
+import { isCompressorRow } from "../src/metrics.ts";
 import { admitCompressorCall, committedUsd, parseAdmissionState, parseUsdDecimal } from "./evidence/admission.ts";
 import { findPrivateContextMarkers, parseParentSubstrings } from "./evidence/preflight.ts";
 
@@ -51,8 +52,8 @@ export default function evidenceExtension(pi: ExtensionAPI): void {
 	// Completed compressor calls at their reported cost; the metric sink is written by OptChat after every reply.
 	const completedCosts = (): (number | null)[] => {
 		if (!existsSync(metricsFile)) return [];
-		return readFileSync(metricsFile, "utf8").split("\n").filter((line) => line.trim()).map((line) => {
-			const value: unknown = JSON.parse(line);
+		// The sink also holds host-compaction and rules rows: only compressor rows are calls to charge.
+		return readFileSync(metricsFile, "utf8").split("\n").filter((line) => line.trim()).map((line): unknown => JSON.parse(line)).filter(isCompressorRow).map((value) => {
 			return value && typeof value === "object" && "costUsd" in value && typeof value.costUsd === "number" ? value.costUsd : null;
 		});
 	};

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { getBundledModels } from "@oh-my-pi/pi-catalog";
 import { applyOptChatCache, OptChatCacheCoordinator, viewBlocks, viewPartition } from "../src/cache.ts";
+import { SYSTEM_BLOCK } from "../src/index.ts";
 import {
   ALL_GATES_OFF,
   encodeMainRequest,
@@ -494,6 +495,32 @@ describe("native Anthropic Messages", () => {
     const input = nativePayload(labeledView(110), () => undefined);
     expect(markersAt(input, "cache_control")).toEqual({});
     expectPassthrough(input, anthropicModel());
+  });
+
+  test("a main request anchors OptChat's trailing system block behind the host's stable system anchor within four markers", () => {
+    const input = nativePayload(labeledView(9));
+    // The host anchors before its volatile project context; OptChat's block comes last and is unmarked.
+    input.system = [
+      { type: "text", text: "Host system prompt.", cache_control: hostMarker() },
+      { type: "text", text: "<project-context>\nworking directory</project-context>" },
+      { type: "text", text: SYSTEM_BLOCK },
+    ];
+    const result = apply(input, anthropicModel());
+    const markers = markersAt(result, "cache_control");
+    expect(markers).toEqual(expectedMarkers(FIVE_MINUTES, "$.system.0", "$.system.2", "$.messages.0.content.1", "$.messages.2.content.0"));
+    expect(Object.keys(markers)).toHaveLength(4);
+    expect(at(result, "system", 1)).toBe(input.system[1]);
+    expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
+  });
+
+  test("a trailing system block that is not text never receives a marker", () => {
+    const input = nativePayload(labeledView(9));
+    input.system = [
+      { type: "text", text: "Host system prompt.", cache_control: hostMarker() },
+      { type: "thinking", text: SYSTEM_BLOCK },
+    ];
+    const result = apply(input, anthropicModel());
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.0", "$.messages.0.content.1", "$.messages.2.content.0"));
   });
 
   test("the latest existing host breakpoint stays the request end when unmarked continuation messages follow", () => {
@@ -1034,6 +1061,29 @@ describe("compactor views", () => {
     const prefixes = cut === undefined ? [] : [context.slice(0, cut)];
     expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.system.0", ...viewPath, `$.messages.0.content.${viewCount}`));
     expect(markedPrefixes(at(result, "messages", 0, "content"), "cache_control")).toEqual([...prefixes, context + COMPACTOR_INSTRUCTION]);
+    expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
+  });
+
+  test("native: a compressor request anchors OptChat's trailing system block independently of the view", () => {
+    const input: NativePayload = {
+      model: "claude-fixture",
+      max_tokens: 8_192,
+      stream: true,
+      tools: [],
+      system: [
+        { type: "text", text: "Compressor prompt.", cache_control: hostMarker() },
+        { type: "text", text: "<project-context>\nworking directory</project-context>" },
+        { type: "text", text: SYSTEM_BLOCK },
+      ],
+      messages: [{
+        role: "user",
+        content: [...nativeViewBlocks(COMPACTOR_CONTEXT), { type: "text", text: COMPACTOR_INSTRUCTION, cache_control: hostMarker() }],
+      }],
+    };
+    const result = apply(input, anthropicModel());
+    const markers = markersAt(result, "cache_control");
+    expect(markers).toEqual(expectedMarkers(FIVE_MINUTES, "$.system.0", "$.system.2", "$.messages.0.content.26", "$.messages.0.content.28"));
+    expect(Object.keys(markers)).toHaveLength(4);
     expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
   });
 

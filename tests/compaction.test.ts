@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent";
 import { HOST_COMPACTION_SUMMARY } from "../src/prompts.ts";
 import type { FakeHost, HostMessage } from "./helpers/fake-host.ts";
+import { branchOf, compact, messageEntry, stampOf } from "./helpers/host-compaction.ts";
 import { ALL_GATES_OFF, Harness, messagesOf, SMALL_NODES, talk, viewContent } from "./helpers/system1-chat.ts";
 
 const FLAGS = { ...SMALL_NODES, ...ALL_GATES_OFF };
@@ -19,46 +20,6 @@ afterEach(async () => {
 
 async function open(): Promise<FakeHost> {
   return (await harness.open({ flags: FLAGS })).host;
-}
-
-function stampOf(message: HostMessage): number {
-  if (!("timestamp" in message) || typeof message.timestamp !== "number") throw new Error(`a ${message.role} message has no numeric timestamp`);
-  return message.timestamp;
-}
-
-function messageEntry(id: string, message: HostMessage): SessionEntry {
-  return { type: "message", id, parentId: null, timestamp: new Date(stampOf(message)).toISOString(), message };
-}
-
-/** Entries `e1..eN` for `messages`, the way the host's branch holds them. */
-function branchOf(messages: readonly HostMessage[]): SessionEntry[] {
-  return messages.map((message, index) => messageEntry(`e${index + 1}`, message));
-}
-
-interface Preparation {
-  /** Messages the host would summarize and drop, then the dropped prefix of a split turn. */
-  dropped: readonly HostMessage[];
-  prefix?: readonly HostMessage[];
-  firstKeptEntryId: string;
-  tokensBefore?: number;
-}
-
-/** Fires `session_before_compact` with the host's event shape and returns the one handler's result. */
-async function compact(host: FakeHost, preparation: Preparation, branchEntries: SessionEntry[]): Promise<unknown> {
-  const results = await host.fire("session_before_compact", {
-    preparation: {
-      firstKeptEntryId: preparation.firstKeptEntryId,
-      messagesToSummarize: [...preparation.dropped],
-      turnPrefixMessages: [...(preparation.prefix ?? [])],
-      recentMessages: [],
-      isSplitTurn: (preparation.prefix ?? []).length > 0,
-      tokensBefore: preparation.tokensBefore ?? 1000,
-    },
-    branchEntries,
-    signal: new AbortController().signal,
-  });
-  if (results.length !== 1) throw new Error(`expected one session_before_compact handler, got ${results.length}`);
-  return results[0];
 }
 
 function marker(firstKeptEntryId: string, tokensBefore = 1000): unknown {

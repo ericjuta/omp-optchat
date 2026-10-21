@@ -81,6 +81,29 @@ export function triageQuestions(offered: readonly Rule[], sentences: readonly st
   return questions;
 }
 
+/** P(rule) of one answer; null when it is missing, mistyped or not a finite number. */
+function ruleProbability(answer: Answer | undefined): number | null {
+  return answer?.type === "noul" && Number.isFinite(answer.noul) ? answer.noul : null;
+}
+
+/**
+ * The probabilities behind one triage, for the metric sink: P(rule) of the whole message, and the highest P(rule) over its
+ * sentences (null unless the message was judged sentence by sentence and some sentence answer is usable). Counts only.
+ */
+export function triageProbabilities(
+  answers: TriageAnswers,
+  sentences: readonly string[] = [],
+): { readonly pRule: number | null; readonly pSentenceMax: number | null } {
+  let pSentenceMax: number | null = null;
+  if (sentences.length > 1) {
+    for (let index = 0; index < sentences.length; index++) {
+      const value = ruleProbability(answers[`s${index}`]);
+      if (value !== null && (pSentenceMax === null || value > pSentenceMax)) pSentenceMax = value;
+    }
+  }
+  return { pRule: ruleProbability(answers.rule), pSentenceMax };
+}
+
 /**
  * Add when P(rule) reaches `ruleAdd`. Replace instead when `supersedes` names a listed rule at 0.5 or more.
  * A message that fails the rule threshold never changes the ledger, whatever `supersedes` says.

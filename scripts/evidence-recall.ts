@@ -775,7 +775,7 @@ async function collectCompressor(context: Context, slot: HostSlot): Promise<void
 		}
 		const base = {
 			role: "compressor" as const,
-			purpose: line.purpose ?? "unknown",
+			purpose: line.node ?? "unknown",
 			input: line.input,
 			output: line.output,
 			cacheRead: line.cacheRead,

@@ -46,8 +46,16 @@ export interface RegisteredTool {
   execute(id: string, input: Record<string, unknown>, signal: AbortSignal | undefined, update: undefined, ctx: ExtensionContext): Promise<{ content: { type: string; text?: string }[] }>;
 }
 
+/** One `pi.appendEntry` call: a custom session entry the extension asked the host to persist. */
+export interface AppendedEntry {
+  customType: string;
+  data: unknown;
+}
+
 export interface FakeHost {
   directory: string;
+  /** Every custom session entry the extension appended, in order. */
+  entries: AppendedEntry[];
   /** Every tool OptChat registered, by name. */
   tools: Map<string, RegisteredTool>;
   notices: Notice[];
@@ -100,6 +108,7 @@ export async function openFakeHost(
   const tools: FakeHost["tools"] = new Map();
   const notices: Notice[] = [];
   const confirms: Confirm[] = [];
+  const entries: AppendedEntry[] = [];
   let lastTimestamp = Date.now();
   const timestamp = (): number => (lastTimestamp = Math.max(Date.now(), lastTimestamp + 1));
   const pi = {
@@ -118,11 +127,15 @@ export async function openFakeHost(
     registerTool(tool: RegisteredTool) {
       tools.set(tool.name, tool);
     },
+    appendEntry(customType: string, data?: unknown) {
+      entries.push({ customType, data });
+    },
     zod: zodStub(),
     pi: { getAgentDir: () => directory },
   } as unknown as ExtensionAPI;
   const host: FakeHost = {
     directory,
+    entries,
     tools,
     notices,
     confirms,

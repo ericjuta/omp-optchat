@@ -17,14 +17,14 @@ export interface CompressorServer {
 
 const SSE_HEADERS = { "content-type": "text/event-stream" };
 
-function reply(model: string): Response {
+function reply(model: string, text: string): Response {
   const id = "chatcmpl-optchat-compressor";
   const chunk = (delta: Record<string, unknown>, finish: string | null = null) =>
     `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: 1, model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
   const usage = { prompt_tokens: 8, completion_tokens: 2, total_tokens: 10 };
   const body = [
     chunk({ role: "assistant" }),
-    chunk({ content: SUMMARY }),
+    chunk({ content: text }),
     chunk({}, "stop"),
     `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: 1, model, choices: [], usage })}\n\n`,
     "data: [DONE]\n\n",
@@ -32,7 +32,8 @@ function reply(model: string): Response {
   return new Response(body, { headers: SSE_HEADERS });
 }
 
-export async function startCompressorServer(): Promise<CompressorServer> {
+/** `replies` answers the first requests in arrival order, one text each; every later request gets `SUMMARY`. */
+export async function startCompressorServer(replies: readonly string[] = []): Promise<CompressorServer> {
   const bodies: Array<Record<string, unknown>> = [];
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -45,7 +46,7 @@ export async function startCompressorServer(): Promise<CompressorServer> {
       }
       const body = (await request.json()) as Record<string, unknown>;
       bodies.push(body);
-      return reply(String(body.model));
+      return reply(String(body.model), replies[bodies.length - 1] ?? SUMMARY);
     },
   });
   const model: Model<"openai-completions"> = {
