@@ -17,6 +17,7 @@ import {
 import { Settings } from "@oh-my-pi/pi-coding-agent";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { roleCandidatePool } from "@oh-my-pi/pi-coding-agent/config/model-roles";
 import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
 import { BUDGET_USD, ROOT } from "./lib.ts";
 
@@ -89,10 +90,30 @@ export interface Models {
 	close(): void;
 }
 
-/** `selector` is `provider/id` or `@role`; the host's own resolver turns it into a model. */
-function resolveOne(registry: ModelRegistry, settings: Settings, selector: string): Model {
-	const model = resolveModelRoleValue(selector, registry.getAvailable(), { settings }).model;
-	if (!model) throw new Error(`model "${selector}" is not available in this OMP configuration`);
+/** Judge selectors admit native runners; compressor/main retain the host's chat-only resolution. */
+function resolveOne(registry: ModelRegistry, settings: Settings, selector: string, judge = false): Model {
+	const standingJudge = judge && selector === "@judge";
+	// An unset standing role must block rather than expand the host's built-in chat fallbacks.
+	const value = (standingJudge ? settings.getModelRole("judge") : selector)?.trim();
+	if (!value) {
+		const error = new Error(`model "${selector}" is not available in this OMP configuration`);
+		error.name = "ModelUnavailableError";
+		throw error;
+	}
+	const available = standingJudge
+		? roleCandidatePool("judge", settings, registry)
+		: judge ? registry.getAvailable("all") : registry.getAvailable();
+	// Guard clear canonical identities; leave lists, thinking suffixes, routing, and roles to the host grammar.
+	// API validation is the runner's job.
+	const exactJudge = judge && /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._~/-]+$/.test(value);
+	const model = exactJudge
+		? available.find((candidate) => `${candidate.provider}/${candidate.id}` === value)
+		: resolveModelRoleValue(value, available, { settings }).model;
+	if (!model) {
+		const error = new Error(`model "${selector}" is not available in this OMP configuration`);
+		error.name = "ModelUnavailableError";
+		throw error;
+	}
 	return model;
 }
 
@@ -107,7 +128,7 @@ export async function openModels(options: { judge: string; main: string }): Prom
 			// The plugin's default compressor selector (src/config.ts `model`).
 			compressor: resolveOne(registry, settings, "@smol"),
 			main: resolveOne(registry, settings, options.main),
-			judge: resolveOne(registry, settings, options.judge),
+			judge: resolveOne(registry, settings, options.judge, true),
 			sessionId: "optchat-compressor-ab",
 			close: () => auth.close(),
 		};

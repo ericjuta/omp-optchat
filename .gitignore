@@ -5,6 +5,7 @@ coverage/
 .verify/
 evals/recall/cases/real.jsonl
 evals/recall/real-spec.json
+evals/recall/runs/
 evals/rules/cases/real.jsonl
 evals/rules/real-spec.json
 .omp/ratchet/
