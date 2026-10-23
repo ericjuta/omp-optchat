@@ -27,6 +27,12 @@ describe("rules grader", () => {
     expect(grade(REPLACE("r1", "x"), { rule: false }, []).pass).toBe(false);
   });
 
+  test("a withdrawal cannot pass as a no-op or an add in the existing corpus", () => {
+    const withdrawal: TriageDecision = { kind: "remove", removes: "r1" };
+    expect(grade(withdrawal, { rule: false }, []).pass).toBe(false);
+    expect(grade(withdrawal, { rule: true }, []).pass).toBe(false);
+  });
+
   test("a rule passes on add, and fails on none or a replacement with no supersedes", () => {
     expect(grade(ADD("Always test."), { rule: true }, ["Always test."]).pass).toBe(true);
     expect(grade(NONE, { rule: true }, []).pass).toBe(false);
@@ -76,7 +82,7 @@ describe("rules eval cases", () => {
     for (const c of cases) {
       const sentences = ruleSentences(c.message);
       const offered = offeredRules(c.rules.map((rule) => ({ ...rule, source: 0, at: 0 })));
-      const decision = decideTriage(oracleAnswers(c, sentences), offered, RULE_ADD, c.message, sentences);
+      const decision = decideTriage("human", oracleAnswers(c, sentences), offered, RULE_ADD, c.message, sentences);
       expect(grade(decision, c.gold, sentences).pass).toBe(true);
     }
   });

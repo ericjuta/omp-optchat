@@ -2203,11 +2203,10 @@ describe("a user tag on a range with no user message", () => {
     expect(memory.status()).toMatchObject({ compressorCalls: 2, userRetries: 1, headRetries: 0, lengthRetries: 0 });
   });
 
-  test("when every try carries it, the first reply is stored with the tag cut, at the start or after a semicolon", async () => {
-    for (const [first, again, stored] of [
-      // At the start the leaf's own kind label replaces the false tag.
-      ["user: asked for the file listing", "user: asked again for it", "echo: asked for the file listing"],
-      ["echo: ran ls; user: asked for it", "user: asked again for it", "echo: ran ls; asked for it"],
+  test("when every try carries it, a marked source excerpt replaces the false attribution", async () => {
+    for (const [first, again] of [
+      ["user: asked for the file listing", "user: asked again for it"],
+      ["echo: ran ls; user: asked for it", "user: asked again for it"],
     ] as const) {
       const store = await openStore();
       const model = new Model();
@@ -2221,15 +2220,16 @@ describe("a user tag on a range with no user message", () => {
 
       await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
       const node = store.nodes.get(nodeKey(0, 0))!;
+      const stored = utf8Prefix(`[unsummarized: compressor refused] ${long}`, 60);
       expect(node.text).toBe(stored);
       expect(node.size).toBe(utf8Bytes(stored));
       expect(model.calls).toHaveLength(2);
-      expect(memory.status()).toMatchObject({ userRetries: 1, extractive: 0 });
+      expect(memory.status()).toMatchObject({ userRetries: 1, extractive: 1 });
     }
   });
 
-  test("on a merge of two non-user children it is retried, then the first reply is stored with the tag cut", async () => {
-    const { store, model, merge } = await openMergeOf(["echo", "tool"], { nodeBytes: 40, tries: 2 });
+  test("on a merge of two non-user children it is retried, then a marked excerpt keeps both sources", async () => {
+    const { store, model, memory, merge } = await openMergeOf(["echo", "tool"], { nodeBytes: 40, tries: 2 });
     merge.resolve("user: Eric wants it kept");
     await until(() => model.open().length === 1, "second merge try");
     const second = model.open()[0]!;
@@ -2237,7 +2237,8 @@ describe("a user tag on a range with no user message", () => {
     second.resolve("echo ok; user: Eric again");
 
     await until(() => store.nodes.has(nodeKey(1, 0)), "merge saved");
-    expect(store.nodes.get(nodeKey(1, 0))?.text).toBe("Eric wants it kept");
+    expect(store.nodes.get(nodeKey(1, 0))?.text).toBe("[unsummarized: compressor refused] e | t");
+    expect(memory.status()).toMatchObject({ userRetries: 1, extractive: 1 });
   });
 
   test("a range that holds a user message keeps its tag and is never retried", async () => {

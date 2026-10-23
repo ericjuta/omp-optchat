@@ -198,7 +198,7 @@ export async function loadSnapshot(run: string, rev: string) {
 		COMPACT: prompts.COMPACT,
 		compressorReasoning: index.compressorReasoning,
 		viewBlocks: cache.viewBlocks,
-		applyOptChatCache: cache.applyOptChatCache,
+		...snapshotCache(cache),
 		sharedToolsAllowed: dialect.sharedToolsAllowed,
 	};
 	return snapshot;
@@ -214,8 +214,37 @@ export interface Snapshot {
 	readonly COMPACT: string;
 	readonly compressorReasoning: typeof compressorReasoning;
 	readonly viewBlocks: typeof viewBlocks;
-	readonly applyOptChatCache: typeof applyOptChatCache;
+	/** Source module's result contract; independent of provider payload fields. */
+	readonly cacheReturnShape: "payload" | "outcome";
+	/** Always returns the encoded provider payload, never diagnostic metadata. */
+	readonly encodeCachePayload: (...args: Parameters<typeof applyOptChatCache>) => unknown;
 	readonly sharedToolsAllowed: typeof sharedToolsAllowed;
+}
+
+/**
+ * Normalize at import time, without changing frozen source. Modules predating
+ * cache diagnostics have no discriminator and return the provider payload itself.
+ * Current modules explicitly declare their result envelope; provider fields are
+ * never inspected to infer a version, even if a payload contains `payload`/`mode`.
+ */
+export function snapshotCache(cache: {
+	readonly OPTCHAT_CACHE_RESULT_CONTRACT?: unknown;
+	readonly applyOptChatCache: (...args: Parameters<typeof applyOptChatCache>) => unknown;
+}): Pick<Snapshot, "encodeCachePayload" | "cacheReturnShape"> {
+	if (!Object.hasOwn(cache, "OPTCHAT_CACHE_RESULT_CONTRACT")) {
+		return { cacheReturnShape: "payload", encodeCachePayload: cache.applyOptChatCache };
+	}
+	if (cache.OPTCHAT_CACHE_RESULT_CONTRACT === "payload-mode-v1") {
+		return {
+			cacheReturnShape: "outcome",
+			encodeCachePayload: (payload, model) => {
+				// The module declaration, not the provider payload's shape, selects this result type.
+				const applied = cache.applyOptChatCache(payload, model) as { payload: unknown };
+				return applied.payload;
+			},
+		};
+	}
+	throw new Error(`Unsupported snapshot cache result contract: ${String(cache.OPTCHAT_CACHE_RESULT_CONTRACT)}`);
 }
 
 /** The minimal store surface `Memory` reads, filled from a real store's prefix. Nothing is ever written. */

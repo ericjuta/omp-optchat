@@ -127,9 +127,27 @@ export interface ValidatedImage {
   readonly bytes: Buffer;
 }
 
+export interface CoordinationIdentity {
+  readonly instanceId: string;
+  readonly generation: number;
+  readonly sessionId: string;
+}
+
+/** Host-authored provenance for an agent coordination note, never human authority. */
+export interface CoordinationMetadata {
+  readonly version: 1;
+  readonly requestId: string;
+  readonly sender: CoordinationIdentity;
+  readonly recipient: CoordinationIdentity;
+  readonly admission: "idle" | "busy";
+  readonly admittedAt: number;
+}
+
 export interface MessageMetadata {
   readonly work?: WorkMetadata;
   readonly images?: readonly ImageAttachment[];
+  readonly resultFor?: number;
+  readonly coordination?: CoordinationMetadata;
 }
 
 const workSources: Record<WorkSource, true> = { task: true, "async-result": true, "launch-completion": true };
@@ -182,6 +200,41 @@ function parseWork(value: unknown): WorkMetadata {
   return Object.freeze(work);
 }
 
+function coordinationIdentity(value: unknown, where: string): CoordinationIdentity {
+  const row = plainRecord(value, ["instanceId", "generation", "sessionId"], [], where);
+  if (typeof row.instanceId !== "string" || !/^[a-z0-9-]{8,64}$/.test(row.instanceId)) {
+    fail(where, "invalid instanceId");
+  }
+  if (!isIndex(row.generation) || row.generation === 0) fail(where, "generation must be a positive safe integer");
+  // Match the host registry's character bound, not the work-metadata byte bound.
+  if (typeof row.sessionId !== "string" || row.sessionId.length === 0 || row.sessionId.length > 1024) {
+    fail(where, "sessionId must contain 1 to 1024 characters");
+  }
+  return Object.freeze({ instanceId: row.instanceId, generation: row.generation, sessionId: row.sessionId });
+}
+
+function decodeCoordination(value: unknown): CoordinationMetadata {
+  const row = plainRecord(value, ["version", "requestId", "sender", "recipient", "admission", "admittedAt"], [], "coordination metadata");
+  if (row.version !== 1) fail("coordination metadata", "unsupported version");
+  if (typeof row.requestId !== "string" || !/^[A-Za-z0-9._:-]{8,128}$/.test(row.requestId)) {
+    fail("coordination metadata", "invalid requestId");
+  }
+  if (row.admission !== "idle" && row.admission !== "busy") fail("coordination metadata", "invalid admission");
+  if (!isIndex(row.admittedAt) || row.admittedAt === 0) fail("coordination metadata", "admittedAt must be a positive safe integer");
+  const sender = coordinationIdentity(row.sender, "coordination sender");
+  const recipient = coordinationIdentity(row.recipient, "coordination recipient");
+  return Object.freeze({ version: 1, requestId: row.requestId, sender, recipient, admission: row.admission, admittedAt: row.admittedAt });
+}
+
+/** Live capture rejects malformed host details without assigning agent provenance. */
+export function parseCoordination(value: unknown): CoordinationMetadata | undefined {
+  try {
+    return decodeCoordination(value);
+  } catch {
+    return undefined;
+  }
+}
+
 export function parseImageDescriptor(value: unknown): ImageDescriptor {
   const row = plainRecord(value, ["sha256", "mimeType", "bytes", "width", "height"], [], "image descriptor");
   if (typeof row.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(row.sha256)) fail("image descriptor", "sha256 must be lowercase hex");
@@ -212,15 +265,24 @@ function parseAttachments(value: unknown): readonly ImageAttachment[] {
 }
 
 /**
- * Strict metadata admission: exact keys, bounded text and images, and fresh
- * frozen copies. Callers must still check kind coupling and image storage.
+ * Strict metadata admission: exact enumerable data keys, bounded text and images,
+ * and fresh frozen copies. resultFor is a nonnegative safe-integer message index;
+ * coordination preserves host-authored agent identities. Callers must still check
+ * link target existence and semantics, kind coupling, and image storage.
  */
 export function parseMetadata(value: unknown): MessageMetadata {
-  const row = plainRecord(value, [], ["work", "images"], "message metadata");
-  const result: { work?: WorkMetadata; images?: readonly ImageAttachment[] } = {};
+  const row = plainRecord(value, [], ["work", "images", "resultFor", "coordination"], "message metadata");
+  const result: { work?: WorkMetadata; images?: readonly ImageAttachment[]; resultFor?: number; coordination?: CoordinationMetadata } = {};
   if (hasOwn(row, "work")) result.work = parseWork(row.work);
   if (hasOwn(row, "images")) result.images = parseAttachments(row.images);
-  if (result.work === undefined && result.images === undefined) fail("message metadata", "must not be empty");
+  if (hasOwn(row, "resultFor")) {
+    if (!isIndex(row.resultFor)) fail("message metadata", "resultFor must be a nonnegative safe integer");
+    result.resultFor = row.resultFor;
+  }
+  if (hasOwn(row, "coordination")) result.coordination = decodeCoordination(row.coordination);
+  if (result.work === undefined && result.images === undefined && result.resultFor === undefined && result.coordination === undefined) {
+    fail("message metadata", "must not be empty");
+  }
   return Object.freeze(result);
 }
 

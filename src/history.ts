@@ -18,8 +18,8 @@ interface ImportRecord {
   readonly text: string;
   readonly date?: Date;
   readonly i?: number;
-  // Exactly what Store.append persists: work plus the ordered image refs.
-  readonly metadata?: MessageMetadata;
+  // Stored work/resultFor/images metadata; resultFor is rebased during preflight.
+  metadata?: MessageMetadata;
   readonly inline: readonly InlineImage[];
 }
 
@@ -117,7 +117,7 @@ function parseRecord(text: string, line: number): ImportRecord {
     if (refs === undefined) {
       // Legacy exports carried payloads without metadata refs; the payloads are the refs.
       metadata = admitMetadata({
-        ...(metadata?.work === undefined ? {} : { work: metadata.work }),
+        ...metadata,
         images: inline.map((image) => image.attachment),
       }, line);
     } else if (refs.length !== inline.length || inline.some((image, k) =>
@@ -127,6 +127,12 @@ function parseRecord(text: string, line: number): ImportRecord {
   }
   if ((kind === 'work') !== (metadata?.work !== undefined)) {
     return invalid(line, 'work kind and work metadata must accompany each other');
+  }
+  if (metadata?.resultFor !== undefined && kind !== 'echo' && kind !== 'work') {
+    return invalid(line, 'resultFor is only allowed on echo or work records');
+  }
+  if (metadata?.coordination !== undefined && kind !== 'note') {
+    return invalid(line, 'coordination is only allowed on note records');
   }
   return {
     line,
@@ -172,10 +178,12 @@ function checkReferences(memory: Memory, records: readonly ImportRecord[]): void
  * beginning with `{` or `[` must therefore be wrapped as a JSONL note record.
  *
  * A JSONL record accepts kind/text/date/i/size, `metadata` exactly as stored
- * (`work` and/or `images` refs, with `work` required for kind `work`), and optional
- * inline `images` [{sha256,mimeType,bytes,width,height,order,data}] with canonical
- * base64 data. Inline images must match the record's metadata refs one-to-one,
- * in order. Legacy payloads without metadata refs are admitted as the refs.
+ * (`work`, `resultFor`, and/or `images` refs, with `work` required for kind
+ * `work`), and optional inline `images`
+ * [{sha256,mimeType,bytes,width,height,order,data}] with canonical base64 data.
+ * Inline images must match the record's metadata refs one-to-one, in order.
+ * Legacy payloads without metadata refs are admitted as the refs without
+ * discarding work provenance or result links.
  * A metadata ref without inline bytes must name an image already durable in the
  * store, or the same image supplied by this import with an identical descriptor.
  * Zero-length `images` arrays are invalid; omit the key instead.
@@ -186,12 +194,19 @@ function checkReferences(memory: Memory, records: readonly ImportRecord[]): void
  * session/transcript schemas are rejected; this helper never extracts reasoning
  * or messages from nested transcript data.
  *
- * Every record and reference is validated before the first image write or
- * append. Explicit IDs are accepted only when all records have consecutive IDs
- * 0..N-1 and memory is empty. Append allocates those same IDs; existing history
- * is never overwritten or renumbered. Validation failures write nothing. An
- * underlying storage failure can leave a successfully written prefix: this is
- * not a durable batch transaction.
+ * Explicit source IDs require consecutive IDs 0..N-1 on every record. A
+ * `resultFor` link is allowed only on echo/work records, requires these explicit
+ * IDs, and must name an earlier source tool record; existing destination
+ * records never satisfy source links.
+ * Imports append at the destination's current message count, offsetting source
+ * IDs and result links together. Empty-memory imports retain the source IDs;
+ * repeated imports append separate copies, without deduplication. Existing
+ * history is never overwritten or renumbered.
+ *
+ * Every record, reference, and destination index is validated before the first
+ * image write or append. Validation failures write nothing. An underlying
+ * storage failure can leave a successfully written prefix: this is not a
+ * durable batch transaction.
  */
 export function importHistory(memory: Memory, input: string): number {
   const trimmed = input.trim();
@@ -206,14 +221,22 @@ export function importHistory(memory: Memory, input: string): number {
     const text = line.trim();
     if (text.length !== 0) records.push(parseRecord(text, index + 1));
   }
+  const base = memory.store.messages.length;
+  if (!Number.isSafeInteger(base) || base < 0 || base > Number.MAX_SAFE_INTEGER - (records.length - 1)) {
+    invalid(records[0]!.line, 'destination IDs must be nonnegative safe integers');
+  }
   const indexed = records.some((record) => record.i !== undefined);
-  if (indexed) {
-    if (memory.store.messages.length !== 0) {
-      throw new Error('Indexed history imports require empty memory');
+  for (const [index, record] of records.entries()) {
+    if (indexed && record.i !== index) {
+      invalid(record.line, 'indexed imports require consecutive IDs 0..N-1 on every record');
     }
-    if (records.some((record, index) => record.i !== index)) {
-      throw new Error('Indexed history imports require consecutive IDs 0..N-1 on every record');
+    const resultFor = record.metadata?.resultFor;
+    if (resultFor === undefined) continue;
+    if (!indexed) invalid(record.line, 'resultFor requires explicit source IDs on every record');
+    if (resultFor >= index || records[resultFor]?.kind !== 'tool') {
+      invalid(record.line, 'resultFor must name an earlier source tool record');
     }
+    if (base !== 0) record.metadata = { ...record.metadata, resultFor: base + resultFor };
   }
   checkReferences(memory, records);
   for (const record of records) {
@@ -225,9 +248,11 @@ export function importHistory(memory: Memory, input: string): number {
 
 /**
  * Lossless JSONL archive: one record per message in ID order with its original
- * date, size, and exact stored metadata (work provenance plus ordered image refs).
- * Every referenced image is verified and emitted once as inline base64 data.
- * Feeding the output to importHistory into empty memory reproduces the same IDs.
+ * date, size, and exact stored metadata (work provenance, resultFor links, and
+ * ordered image refs). Every referenced image is verified and emitted once as
+ * inline base64 data. Feeding the output to importHistory into empty memory
+ * reproduces the same IDs and links; nonempty memory offsets both by its current
+ * message count. Each import appends a separate copy.
  */
 export function exportJsonl(memory: Memory): string {
   const { store } = memory;

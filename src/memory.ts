@@ -24,8 +24,8 @@ export type Summarize = (
 ) => Promise<string>;
 
 /**
- * The compressor refused every model eligible for one compaction, or every try
- * opened with the reserved stand-in marker. The message carries no provider text.
+ * The compressor refused every model eligible for one compaction, or no safe
+ * candidate survived reserved-marker / false-speaker validation. The message carries no provider text.
  */
 export class CompressorRefusedError extends Error {
   constructor() {
@@ -115,7 +115,7 @@ export interface ZoomPage {
   readonly next: number | null;
   readonly totalBytes: number;
   readonly offset: number;
-  /** For a single tool-call message: the id of the record that stores its result, when it is already logged. */
+  /** For a single tool-call message: the first explicit durable result row's id; absent means no proven association. */
   readonly result?: number;
 }
 
@@ -174,11 +174,92 @@ const HEAD_FEEDBACK =
 const MARK_FEEDBACK =
   `Your line began with "${MARK_TEXT}", a marker only the code writes. Write the summary line itself for the same <input>, without that marker.`;
 const USER_FEEDBACK =
-  'Your line tagged an item "user:", but no message in this task was written by the user. Write the line again for the same <input> without a "user:" tag.';
+  'Your line attributed an item to the user, but no message in this task was written by the user. Write the line again for the same <input> without a user speaker header (including nested or wrapped headers). Preserve genuine quoted text exactly.';
 
-/** An item tagged "user:", at the start of a line or after "; ". Only a range holding a user message may carry one. */
-const USER_TAG = /(?:^|;\s+)user:/i;
-const USER_TAGS = /(^|;\s+)user:\s*/gi;
+/** Speaker headers can nest behind kinds, metadata and presentational wrappers. */
+const SPEAKER_LABEL = /(user|talk|tool|echo|note|work|finding|decision)s?(?:\s*(?:\([^\n)]*\)|\[[^\n\]]*\]))?\s*(?:\*{1,2}|_{1,2}|[\])}])?\s*:\s*/iy;
+const SPEAKER_WRAPPER = /<([a-z][\w-]*)(?:\s[^>\n]*)?>\s*/iy;
+const ITEM_PREFIX = /(?:[-*+•]|\d+[.)])\s+/y;
+
+/**
+ * Recognize attribution, not every occurrence of "user:". Only item starts and
+ * chains of speaker headers/wrappers are structural; ordinary prose and quoted
+ * strings (including their semicolons) are content. Inspect before cutting heads
+ * too, since a head such as <user> would otherwise erase the false attribution.
+ * Pass the production head offset to reuse its source-range-aware scan; the
+ * default recognizes presentational heads without assuming any source ids.
+ */
+export function hasUserSpeaker(reply: string, head = replyHead(reply)): boolean {
+  let header = true;
+  for (let i = 0; i < reply.length;) {
+    if (i === head) header = true;
+    const char = reply[i]!;
+    if (/\s/.test(char)) {
+      if (char === "\n" || char === "\r") header = true;
+      i++;
+      continue;
+    }
+    if (char === ";" || char === "|") {
+      header = true;
+      i++;
+      continue;
+    }
+    // Apostrophes in words are not opening quotes. Escaped delimiters do not
+    // close a quote; backtick runs keep inline code and fenced text opaque.
+    if (char === '"' || char === "“" || char === "‘" || char === "`" ||
+      (char === "'" && (i === 0 || !/[\p{L}\p{N}_]/u.test(reply[i - 1]!)))) {
+      let width = 1;
+      if (char === "`") while (reply[i + width] === "`") width++;
+      const close = char === "“" ? "”" : char === "‘" ? "’" : reply.slice(i, i + width);
+      let end = i + width;
+      for (; end < reply.length; end++) {
+        if (reply[end] === "\\") {
+          end++;
+          continue;
+        }
+        if (reply.startsWith(close, end)) break;
+      }
+      if (end < reply.length) {
+        i = end + close.length;
+        header = false;
+        continue;
+      }
+      // An unmatched opening quote at an item start is only a wrapper, not
+      // evidence that the following speaker header is genuinely quoted text.
+      i += width;
+      continue;
+    }
+    if (header) {
+      SPEAKER_LABEL.lastIndex = i;
+      const label = SPEAKER_LABEL.exec(reply);
+      if (label) {
+        if (label[1]!.toLowerCase() === "user") return true;
+        i = SPEAKER_LABEL.lastIndex;
+        continue;
+      }
+      SPEAKER_WRAPPER.lastIndex = i;
+      const wrapper = SPEAKER_WRAPPER.exec(reply);
+      if (wrapper) {
+        if (/^users?$/i.test(wrapper[1]!)) return true;
+        i = SPEAKER_WRAPPER.lastIndex;
+        continue;
+      }
+      ITEM_PREFIX.lastIndex = i;
+      if (ITEM_PREFIX.test(reply)) {
+        i = ITEM_PREFIX.lastIndex;
+        continue;
+      }
+      if (char === "(" || char === "[" || char === "{" || char === ">" || char === "*" || char === "_") {
+        i++;
+        continue;
+      }
+    }
+    header = false;
+    i++;
+  }
+  return false;
+}
+
 /**
  * A leaf's own leading label: a message kind, or the "finding"/"decision" labels the compressor invents,
  * with an optional parenthetical ("echo (finding, medium): …"). Code replaces it with the leaf's kind.
@@ -215,7 +296,7 @@ const OWN_HEAD = /^(?:(?:message|msg|echo|line|node)s?\s+)?(\d+)(?:[+\-–]\d*)?
 const OWN_MERGED = /^merged?\s+(?:lines?\s+)?(\d+)(?:[+\-–]\d*)?(?:\s*(?:,|and|&)\s*\d+(?:[+\-–]\d*)?)*\s*\.\s+/iu;
 
 /** Length of the forbidden heads that open `reply`, 0 when it opens with the summary itself. */
-function replyHead(reply: string, own: { lo: number; hi: number }): number {
+function replyHead(reply: string, own?: { lo: number; hi: number }): number {
   let length = 0;
   for (;;) {
     const rest = reply.slice(length);
@@ -224,10 +305,12 @@ function replyHead(reply: string, own: { lo: number; hi: number }): number {
       length += match[0].length;
       continue;
     }
-    const id = OWN_HEAD.exec(rest) ?? OWN_MERGED.exec(rest);
-    if (id?.[0] && Number(id[1]) >= own.lo && Number(id[1]) <= own.hi) {
-      length += id[0].length;
-      continue;
+    if (own !== undefined) {
+      const id = OWN_HEAD.exec(rest) ?? OWN_MERGED.exec(rest);
+      if (id?.[0] && Number(id[1]) >= own.lo && Number(id[1]) <= own.hi) {
+        length += id[0].length;
+        continue;
+      }
     }
     return length;
   }
@@ -569,26 +652,14 @@ export class Memory {
     return { hits, next: null, termCounts: distinct.map((term, k) => ({ term, messages: counts[k]! })) };
   }
 
-  /**
-   * The id of the record that stores the result of the tool call at `id`, or undefined when `id` is not a tool
-   * call or its result is not logged yet. A turn logs its calls, then their results in the same order, so the
-   * k-th call of a run of calls (talk may sit between them) pairs with the k-th result record after the run.
-   */
+  /** The lowest stored row id explicitly linked to this tool call, or undefined without a proven association. */
   private resultOf(id: number): number | undefined {
     const messages = this.store.messages;
     if (messages[id]?.kind !== "tool") return undefined;
-    let before = 0;
-    for (let at = id - 1; at >= 0 && (messages[at]!.kind === "tool" || messages[at]!.kind === "talk"); at--) {
-      if (messages[at]!.kind === "tool") before++;
+    for (const message of messages) {
+      if (message.metadata?.resultFor === id) return message.i;
     }
-    let end = id + 1;
-    while (end < messages.length && (messages[end]!.kind === "tool" || messages[end]!.kind === "talk")) end++;
-    const result = end + before;
-    for (let at = end; at <= result; at++) {
-      const kind = messages[at]?.kind;
-      if (kind !== "echo" && kind !== "work") return undefined;
-    }
-    return result;
+    return undefined;
   }
 
   /**
@@ -740,10 +811,9 @@ export class Memory {
     return bytes;
   }
 
-  /** Merge oldest equal-due siblings. Age is measured from the pair's LAST
-   * message, not its first: at T=10, 8+1|9+1 precedes 0+4|4+4. */
-  private coarsen(parts: ViewPart[], bytes: number, target: number): number {
-    const length = this.store.messages.length;
+  /** Merge oldest equal-due siblings. Age is measured at exclusive `end` from
+   * the pair's LAST message, not its first: at T=10, 8+1|9+1 precedes 0+4|4+4. */
+  private coarsen(parts: ViewPart[], bytes: number, target: number, end: number): number {
     while (bytes > target) {
       let best = -1;
       let due = -1;
@@ -755,7 +825,7 @@ export class Memory {
         const candidate = this.store.nodes.get(nodeKey(a.l + 1, a.i / 2));
         if (!candidate) continue;
         const width = 2 ** a.l;
-        const age = (length - ((a.i + 2) * width - 1)) / width;
+        const age = (end - ((a.i + 2) * width - 1)) / width;
         if (age > due) {
           best = j;
           due = age;
@@ -786,7 +856,7 @@ export class Memory {
     if (compacting && !preserveMain) {
       view = proposed.slice();
       const count = view.length;
-      bytes = this.coarsen(view, bytes, this.target);
+      bytes = this.coarsen(view, bytes, this.target, length);
       merged = view.length !== count;
       compacting = bytes > this.target;
     }
@@ -831,7 +901,7 @@ export class Memory {
     }
     if (next.bytes > this.compactionBudget) next.pending = true;
     if (next.pending) {
-      next.bytes = this.coarsen(next.parts, next.bytes, this.compactionTarget);
+      next.bytes = this.coarsen(next.parts, next.bytes, this.compactionTarget, next.length);
       next.pending = next.bytes > this.compactionTarget;
     }
     return next;
@@ -1181,8 +1251,8 @@ export class Memory {
    * A reply opening with the reserved stand-in marker (after its heads) is never
    * a candidate: it is retried like a head, and when no other candidate is left
    * the compaction is refused, so the caller stores a marked source excerpt.
-   * A "user:" tag on a node whose messages include none from the user is retried
-   * the same way, and cut from the stored line when no clean reply comes. The
+   * A user speaker header on a node whose messages include none from the user is
+   * also excluded from candidates, never stripped or rewritten into a claim. The
    * final line of a leaf opens with its message kind, made by code: that prefix
    * counts in the byte limit, and a different leading label is replaced by it.
    */
@@ -1196,7 +1266,7 @@ export class Memory {
     let feedback: CompactionRequest["feedback"] = [];
     let flawed: string | undefined;
     let shortest: { text: string; size: number } | undefined;
-    let marked = false;
+    let refused = false;
     let retry: CompactionRetry | null = null;
     for (let attempt = 0; attempt < this.tries; attempt++) {
       if (this.stopped || signal.aborted) return undefined;
@@ -1208,21 +1278,20 @@ export class Memory {
       const head = replyHead(reply, own);
       const mark = reply.startsWith(MARK_TEXT, head);
       const onlyHeads = head > 0 && reply.length === head;
-      const falseUser = !mark && !info.user && USER_TAG.test(reply.slice(head));
-      // The line as it would be stored: heads cut (kept whole when nothing else remains), kind prefix, false tags cut.
+      const falseUser = !mark && !info.user && hasUserSpeaker(reply, head);
+      // Only safe candidates may have their presentational heads cut and leaf kind applied.
       let text = reply;
-      if (!mark && !onlyHeads) {
+      if (!mark && !falseUser && !onlyHeads) {
         text = reply.slice(head);
         if (info.kind !== undefined) text = withKind(text, info.kind);
-        if (!info.user) text = text.replace(USER_TAGS, "$1").trim();
         if (!text) throw new Error("Compactor returned an empty summary");
       }
-      const size = mark || onlyHeads ? utf8Bytes(reply) : utf8Bytes(reply.slice(0, head)) + utf8Bytes(text);
+      const size = mark || falseUser || onlyHeads ? utf8Bytes(reply) : utf8Bytes(reply.slice(0, head)) + utf8Bytes(text);
       const fits = size <= this.nodeBytes;
       // Bytes code adds in front of the model's own line (the kind label), which the model cannot see or spare.
-      const added = mark || onlyHeads ? 0 : Math.max(0, utf8Bytes(text) - utf8Bytes(reply.slice(head)));
-      if (mark) marked = true;
-      else if (fits && head === 0 && !falseUser) return text;
+      const added = mark || falseUser || onlyHeads ? 0 : Math.max(0, utf8Bytes(text) - utf8Bytes(reply.slice(head)));
+      if (mark || falseUser) refused = true;
+      else if (fits && head === 0) return text;
       else if (fits) flawed ??= text;
       else if (size <= this.summaryLimit && (!shortest || size < shortest.size)) shortest = { text, size };
       if (attempt + 1 === this.tries) break;
@@ -1245,7 +1314,7 @@ export class Memory {
       feedback = [{ reply: excerpt || "…", instruction: notes.join("\n") }];
     }
     if (flawed !== undefined) return flawed;
-    if (!shortest && marked) throw new CompressorRefusedError();
+    if (!shortest && refused) throw new CompressorRefusedError();
     if (!shortest) throw new Error(`Compactor returned no whole summary within the ${this.summaryLimit}-byte safety ceiling`);
     return shortest.text;
   }

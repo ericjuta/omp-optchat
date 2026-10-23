@@ -351,7 +351,7 @@ describe("rules rows", () => {
   });
 
   test("a message judged sentence by sentence records its highest sentence probability and count", async () => {
-    const judge = fakeJudge(() => ({ rule: noul(0.95), s0: noul(0.9), s1: noul(0.1) }));
+    const judge = fakeJudge(() => ({ rule: noul(0.95), withdraw: noul(0), s0: noul(0.9), s1: noul(0.1) }));
     const { host } = await harness.open({ flags: FLAGS, judge });
     const metrics = join(host.directory, METRICS_FILE);
     await host.context([host.user("From now on always reply in French. Also run the tests.")]);
@@ -360,7 +360,7 @@ describe("rules rows", () => {
   });
 
   test("a near miss below the cutoff is recorded with its probability and adds no rule", async () => {
-    const judge = fakeJudge(() => ({ rule: noul(0.75) }));
+    const judge = fakeJudge(() => ({ rule: noul(0.75), withdraw: noul(0) }));
     const { host } = await harness.open({ flags: FLAGS, judge });
     const metrics = join(host.directory, METRICS_FILE);
     await host.context([host.user(RULE_TEXT)]);

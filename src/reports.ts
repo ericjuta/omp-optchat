@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import type { WorkCompleteness, WorkMetadata, WorkSource } from "./archive.js";
 import { isRecord } from "./type-guards.js";
@@ -10,7 +11,14 @@ export const MAX_ARTIFACT_READ_BYTES = 8 * 1024 * 1024;
 const MAX_IDENTIFIER_BYTES = 256;
 const SOURCES: Record<WorkSource, true> = { task: true, "async-result": true, "launch-completion": true };
 const NUMERIC_ARTIFACT_ID = /^\d+$/;
-/** The nested task preview tag: the only marker that makes hydrated text unusable as a full report. */
+/** Version-one task snapshots are separately bounded by the host report protocol. */
+const MAX_REPORT_BYTES = 4 * 1024 * 1024;
+const REPORT_FIELDS = ["version", "runId", "status", "artifact", "reason"];
+const REPORT_ARTIFACT_FIELDS = ["id", "uri", "sha256", "bytes"];
+const PARTIAL_REPORT_REASONS = [
+  "failed", "aborted", "schema-invalid", "too-large", "storage-unavailable", "storage-failed", "empty", "history-unavailable",
+];
+/** A legacy artifact containing this preview cannot prove a full report without the typed protocol. */
 const NESTED_TASK_PREVIEW = '<preview full-output="agent://';
 /**
  * The host renders job output inline when it fits (12,000 characters in OMP 18.9.0) and otherwise
@@ -76,6 +84,19 @@ export interface WorkReportCapture {
 /** Typed `OutputMeta` may recover a preview through an admitted numeric artifact reference only. */
 type Hydration = { readonly meta: unknown; readonly absent: string };
 
+interface ReportArtifact {
+  readonly id: string;
+  readonly sha256: string;
+  readonly bytes: number;
+}
+
+/** Admitted version-one snapshot facts, copied before any asynchronous artifact lookup. */
+interface ImmutableReport {
+  readonly artifact?: ReportArtifact;
+  /** A partial or malformed reference cannot become complete after reading bytes. */
+  readonly reason?: string;
+}
+
 interface Member {
   readonly work: { readonly id?: string; readonly name?: string; readonly agentId?: string };
   readonly provenance: ReportProvenance;
@@ -87,6 +108,8 @@ interface Member {
   readonly reason?: string;
   /** Consulted only when the member is not already complete. */
   readonly hydrate?: Hydration;
+  /** When present, takes precedence over every inline or legacy hydration path. */
+  readonly report?: ImmutableReport;
   /** Leads this member's body in place of the whole message: a `wait` result's job section. */
   readonly envelope?: string;
 }
@@ -169,6 +192,48 @@ function unitMember(reason: string, hydrate?: Hydration): Member {
     : { work: {}, provenance: EMPTY_PROVENANCE, complete: false, hydrate };
 }
 
+/** Parse only the host's closed report DTO, never references found in public output text. */
+function immutableReport(value: unknown): ImmutableReport {
+  if (!isRecord(value) || Object.keys(value).some((key) => !REPORT_FIELDS.includes(key))) {
+    return { reason: "report reference is malformed" };
+  }
+  if (!Object.hasOwn(value, "version") || value.version !== 1) return { reason: "report version is not supported" };
+  if (!Object.hasOwn(value, "runId") || typeof value.runId !== "string" || value.runId.length === 0) {
+    return { reason: "report run identifier is malformed" };
+  }
+  if (!Object.hasOwn(value, "status") || (value.status !== "complete" && value.status !== "partial")) {
+    return { reason: "report status is not recognized" };
+  }
+  if (value.status === "complete" && value.reason !== undefined) return { reason: "complete report carries a partial reason" };
+  if (value.status === "partial" && (!Object.hasOwn(value, "reason") || typeof value.reason !== "string" || !PARTIAL_REPORT_REASONS.includes(value.reason))) {
+    return { reason: "partial report reason is not recognized" };
+  }
+  let artifact: ReportArtifact | undefined;
+  if (Object.hasOwn(value, "artifact") && value.artifact !== undefined) {
+    const candidate = value.artifact;
+    if (!isRecord(candidate) || Object.keys(candidate).some((key) => !REPORT_ARTIFACT_FIELDS.includes(key)) ||
+      REPORT_ARTIFACT_FIELDS.some((key) => !Object.hasOwn(candidate, key))) {
+      return { reason: "report artifact reference is malformed" };
+    }
+    if (typeof candidate.id !== "string" || !/^(0|[1-9]\d*)$/.test(candidate.id) ||
+      !Number.isSafeInteger(Number(candidate.id)) || candidate.uri !== `artifact://${candidate.id}`) {
+      return { reason: "report artifact id and URI are not admitted" };
+    }
+    if (typeof candidate.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(candidate.sha256)) {
+      return { reason: "report artifact SHA256 is malformed" };
+    }
+    if (typeof candidate.bytes !== "number" || !Number.isSafeInteger(candidate.bytes) || candidate.bytes <= 0 || candidate.bytes > MAX_REPORT_BYTES) {
+      return { reason: "report artifact byte count exceeds the limit or is malformed" };
+    }
+    artifact = { id: candidate.id, sha256: candidate.sha256, bytes: candidate.bytes };
+  }
+  if (value.status === "complete" && artifact === undefined) return { reason: "complete report carries no artifact" };
+  return {
+    ...(artifact === undefined ? {} : { artifact }),
+    ...(value.status === "partial" ? { reason: `report is partial: ${String(value.reason)}` } : {}),
+  };
+}
+
 /**
  * A task result's public text is its finalized `output`, which the executor builds from assistant
  * text blocks only. Only the admitted fields are read; native thinking and other keys are never copied.
@@ -183,6 +248,13 @@ function taskMember(result: unknown): Member {
     structured: structured.json,
     output,
   };
+  if (Object.hasOwn(result, "report")) {
+    const reason = structured.outcome === "incomplete" ? structured.reason
+      : result.aborted === true ? "run was aborted; output is partial"
+      : result.exitCode !== 0 ? "task did not exit successfully"
+      : typeof result.error === "string" ? "task reported an error" : undefined;
+    return { ...base, complete: false, report: immutableReport(result.report), ...(reason === undefined ? {} : { reason }) };
+  }
   if (structured.outcome === "complete") return { ...base, complete: true };
   if (structured.outcome === "incomplete") return { ...base, complete: false, reason: structured.reason };
   if (result.aborted === true) return { ...base, complete: false, reason: "run was aborted; output is partial" };
@@ -211,9 +283,19 @@ function asyncJobMember(job: unknown, meta: unknown, previewed: boolean): Member
     work: workIds({ id: job.jobId, agentId: job.agentId, name: job.label }),
     provenance: provenance({ type: job.type, status: job.status, durationMs: job.durationMs }),
   };
+  const structured = structuredOf(job.schema);
+  if (Object.hasOwn(job, "report")) {
+    const reason = structured.outcome === "incomplete" ? structured.reason
+      : job.status === "running" ? "job is still running"
+      : job.status === "cancelled" ? "job was cancelled; output may be partial"
+      : job.status === "failed" ? "job failed; output may be partial" : undefined;
+    return {
+      ...base, structured: structured.json, complete: false, report: immutableReport(job.report),
+      ...(reason === undefined ? {} : { reason }),
+    };
+  }
   if (job.status === "running") return { ...base, complete: false, reason: "job is still running" };
   if (job.status === "cancelled") return { ...base, complete: false, reason: "job was cancelled; output may be partial" };
-  const structured = structuredOf(job.schema);
   if (structured.outcome === "complete") return { ...base, structured: structured.json, complete: true };
   if (structured.outcome === "incomplete") {
     return { ...base, structured: structured.json, complete: false, reason: structured.reason };
@@ -249,7 +331,7 @@ function membersOf(source: WorkSource, details: unknown, text: string): readonly
     const running = isRecord(record.async) && record.async.state === "running";
     return results.map((result) => {
       const member = taskMember(result);
-      return running && member.complete ? { ...member, complete: false, reason: "task is still running" } : member;
+      return running && (member.complete || member.report !== undefined) ? { ...member, complete: false, reason: "task is still running" } : member;
     });
   }
   if (source === "async-result") {
@@ -300,7 +382,10 @@ function waitReports(details: unknown): WaitReports {
     // Each job's own text is delivered, so a preview notice downgrades only the job it belongs to.
     const previewed = rendered.some((text) => HOST_PREVIEW_MARKERS.some((marker) => text.includes(marker)));
     const member = asyncJobMember(
-      { jobId: job.id, agentId: job.agentUrlId, label: job.label, type: job.type, status: job.status, durationMs: job.durationMs, schema: job.structured },
+      {
+        jobId: job.id, agentId: job.agentUrlId, label: job.label, type: job.type, status: job.status, durationMs: job.durationMs, schema: job.structured,
+        ...(Object.hasOwn(job, "report") ? { report: job.report } : {}),
+      },
       job.meta,
       previewed,
     );
@@ -350,26 +435,38 @@ async function resolveArtifact(meta: unknown, absent: string, reader: ArtifactPa
   const reference = artifactReference(meta, absent);
   if (!("id" in reference)) return failed(reference.reason);
   if (!NUMERIC_ARTIFACT_ID.test(reference.id)) return failed("artifact reference is not admitted");
+  return resolveArtifactId(reference.id, reader);
+}
+
+async function resolveArtifactId(id: string, reader: ArtifactPathSource | undefined, expected?: ReportArtifact): Promise<Resolved> {
   if (reader === undefined) return failed("no artifact source is available");
   let path: string | null;
   try {
-    path = await reader.getArtifactPath(reference.id);
+    path = await reader.getArtifactPath(id);
   } catch {
     return failed("artifact lookup failed");
   }
   if (typeof path !== "string") return failed("artifact is unavailable");
-  return readRegularArtifact(path);
+  return readRegularArtifact(path, expected);
 }
 
 /** Reads one file only when it is a regular, bounded, strictly UTF-8 file: a symlink never qualifies. */
-async function readRegularArtifact(path: string): Promise<Resolved> {
+async function readRegularArtifact(path: string, expected?: ReportArtifact): Promise<Resolved> {
   try {
+    const limit = expected === undefined ? MAX_ARTIFACT_READ_BYTES : MAX_REPORT_BYTES;
     const info = await lstat(path);
     if (!info.isFile()) return failed("artifact is not a regular file");
-    if (info.size > MAX_ARTIFACT_READ_BYTES) return failed("artifact exceeds the read limit");
-    const text = strictUtf8.decode(await readFile(path));
-    // A numeric artifact can itself contain a nested preview. Do not traverse its URIs or replace the delivered preview.
-    if (text.includes(NESTED_TASK_PREVIEW)) {
+    if (info.size > limit) return failed("artifact exceeds the read limit");
+    if (expected !== undefined && info.size !== expected.bytes) return failed("report artifact byte count does not match");
+    const bytes = await readFile(path);
+    if (bytes.byteLength > limit) return failed("artifact exceeds the read limit");
+    if (expected !== undefined) {
+      if (bytes.byteLength !== expected.bytes) return failed("report artifact byte count does not match");
+      if (createHash("sha256").update(bytes).digest("hex") !== expected.sha256) return failed("report artifact SHA256 does not match");
+    }
+    const text = strictUtf8.decode(bytes);
+    // Legacy output metadata may point to a nested preview. Typed snapshots are literal public history, not text to interpret.
+    if (expected === undefined && text.includes(NESTED_TASK_PREVIEW)) {
       return failed("artifact contains a nested preview, not the full output");
     }
     return { ok: true, text };
@@ -389,7 +486,20 @@ async function finish(
   let complete = member.complete;
   let reason = member.reason;
   let output = member.output;
-  if (member.hydrate !== undefined) {
+  if (member.report !== undefined) {
+    const report = member.report;
+    complete = false;
+    reason ??= report.reason;
+    if (report.artifact !== undefined) {
+      const resolved = await resolveArtifactId(report.artifact.id, reader, report.artifact);
+      if (resolved.ok) {
+        output = resolved.text;
+        complete = reason === undefined;
+      } else {
+        reason = reason === undefined ? resolved.reason : `${reason}; ${resolved.reason}`;
+      }
+    }
+  } else if (member.hydrate !== undefined) {
     const hydrate = member.hydrate;
     const resolved = await resolveArtifact(hydrate.meta, hydrate.absent, reader);
     if (resolved.ok) {

@@ -136,7 +136,7 @@ describe("readTextPage exact UTF-8 paging", () => {
 
 describe("parseMetadata strict admission", () => {
   const image = {
-    sha256: "a".repeat(64), mimeType: "image/png", bytes: 10, width: 1, height: 1,
+    sha256: "a".repeat(64), mimeType: "image/png" as const, bytes: 10, width: 1, height: 1,
   };
 
   test("accepts a bounded work and image record and returns a detached frozen copy", () => {
@@ -146,6 +146,97 @@ describe("parseMetadata strict admission", () => {
     expect(parsed.work?.id).toBe("w1");
     expect(Object.isFrozen(parsed)).toBe(true);
     expect(Object.isFrozen(parsed.images![0])).toBe(true);
+  });
+
+  const work = { source: "task" as const, completeness: "full" as const, id: "w1" };
+  const shapes = [
+    ["only", {}],
+    ["with work", { work }],
+    ["with images", { images: [{ ...image, order: 0 }] }],
+    ["with work and images", { work, images: [{ ...image, order: 0 }] }],
+  ] as const;
+
+  test.each(shapes.flatMap(([name, fields]) =>
+    [0, Number.MAX_SAFE_INTEGER].map((resultFor) => [name, resultFor, fields] as const),
+  ))("accepts resultFor %s at %s", (_name, resultFor, fields) => {
+    expect(parseMetadata({ ...fields, resultFor })).toEqual({ ...fields, resultFor });
+  });
+
+  test("resultFor, work, and images form a detached deeply frozen snapshot", () => {
+    const input = { resultFor: 0, work: { ...work }, images: [{ ...image, order: 0 }] };
+    const expected = { resultFor: 0, work: { ...work }, images: [{ ...image, order: 0 }] };
+    const parsed = parseMetadata(input);
+    expect(parsed).not.toBe(input);
+    expect(parsed.work).not.toBe(input.work);
+    expect(parsed.images).not.toBe(input.images);
+    expect(parsed.images![0]).not.toBe(input.images[0]);
+    for (const value of [parsed, parsed.work, parsed.images, parsed.images![0]]) {
+      expect(Object.isFrozen(value)).toBe(true);
+    }
+    input.resultFor = 7;
+    input.work.id = "changed";
+    input.images[0]!.width = 9;
+    input.images[0]!.sha256 = "b".repeat(64);
+    input.images.push({ ...image, order: 1 });
+    input.images[0] = { ...image, order: 0, height: 8 };
+    expect(parsed).toEqual(expected);
+    expect(Reflect.set(parsed, "resultFor", 1)).toBe(false);
+    expect(Reflect.deleteProperty(parsed, "resultFor")).toBe(false);
+    expect(Reflect.set(parsed.work!, "id", "changed")).toBe(false);
+    expect(Reflect.deleteProperty(parsed.work!, "id")).toBe(false);
+    for (const field of ["sha256", "mimeType", "bytes", "width", "height", "order"]) {
+      expect(Reflect.set(parsed.images![0]!, field, "changed")).toBe(false);
+      expect(Reflect.deleteProperty(parsed.images![0]!, field)).toBe(false);
+    }
+    expect(Reflect.set(parsed.images!, "0", { ...image, order: 0 })).toBe(false);
+    expect(Reflect.set(parsed.images!, "1", { ...image, order: 1 })).toBe(false);
+    expect(Reflect.set(parsed.images!, "length", 0)).toBe(false);
+    expect(Reflect.deleteProperty(parsed.images!, "0")).toBe(false);
+    expect(() => Object.defineProperty(parsed, "resultFor", { value: 2 })).toThrow();
+    expect(parsed).toEqual(expected);
+  });
+
+  test.each([
+    ["negative", -1],
+    ["fractional", 0.5],
+    ["unsafe", Number.MAX_SAFE_INTEGER + 1],
+    ["NaN", NaN],
+    ["positive infinity", Infinity],
+    ["negative infinity", -Infinity],
+    ["string", "0"],
+    ["null", null],
+    ["boolean", false],
+    ["undefined", undefined],
+  ])("rejects malformed resultFor %s in every shape", (_name, resultFor) => {
+    for (const [, fields] of shapes) {
+      expect(() => parseMetadata({ ...fields, resultFor })).toThrow();
+    }
+  });
+
+  test.each(["getter", "setter", "non-enumerable"] as const)(
+    "rejects resultFor %s descriptors without invoking accessors in every shape",
+    (kind) => {
+      for (const [, fields] of shapes) {
+        let gets = 0;
+        let sets = 0;
+        const descriptor: PropertyDescriptor = kind === "getter"
+          ? { enumerable: true, get: () => { gets++; return 0; } }
+          : kind === "setter"
+            ? { enumerable: true, set: () => { sets++; } }
+            : { enumerable: false, value: 0 };
+        const input = Object.defineProperty({ ...fields }, "resultFor", descriptor);
+        expect(() => parseMetadata(input)).toThrow();
+        expect(gets).toBe(0);
+        expect(sets).toBe(0);
+      }
+    },
+  );
+
+  test.each([
+    ["string", "unknown"],
+    ["symbol", Symbol("unknown")],
+  ])("rejects unknown root %s keys alongside resultFor", (_name, key) => {
+    expect(() => parseMetadata({ resultFor: 0, [key]: true })).toThrow();
   });
 
   test.each([
@@ -159,6 +250,9 @@ describe("parseMetadata strict admission", () => {
     ["too many images", { images: Array.from({ length: 33 }, (_, order) => ({ ...image, order })) }],
   ])("rejects %s", (_name, value) => {
     expect(() => parseMetadata(value)).toThrow();
+    if (Object.keys(value).length > 0) {
+      expect(() => parseMetadata({ ...value, resultFor: 0 })).toThrow();
+    }
   });
 });
 

@@ -30,6 +30,7 @@ import type {
 import {
 	applyOptChatCache,
 	OptChatCacheCoordinator,
+	type OptChatCacheMode,
 	type OptChatCacheRelease,
 	viewBlocks,
 	viewPartition,
@@ -59,7 +60,7 @@ import {
 	type MetricRow,
 } from "./metrics.js";
 import { captureWaitReports, captureWorkReports, type ArtifactPathSource, type CapturedWorkReport } from "./reports.js";
-import type { ImageAttachment, ImageMimeType, MessageMetadata, WorkMetadata } from "./archive.js";
+import { parseCoordination, type ImageAttachment, type ImageMimeType, type MessageMetadata, type WorkMetadata } from "./archive.js";
 import { CompressorRefusedError, Memory, type CompactionRequest, type Summarize } from "./memory.js";
 import { HOST_COMPACTION_SUMMARY, hostCompactionSummaryInTurn, VIEW_DOC } from "./prompts.js";
 import { nextArchivePath, Store, StoreLeaseConflictError, type Kind, type Message } from "./store.js";
@@ -72,6 +73,46 @@ import { decideTriage, offeredRules, ruleSentences, triageProbabilities, triageQ
 import { valueHint } from "./system1/value.js";
 
 type AgentMessage = ContextEvent["messages"][number];
+
+/** Read once from this plugin's package, never from the host or a session directory. */
+const PLUGIN_VERSION = (() => {
+	try {
+		const metadata: unknown = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+		if (metadata === null || typeof metadata !== "object" || !("version" in metadata)) return "unknown";
+		const version = metadata.version;
+		return typeof version === "string" && version.length <= 128
+			&& !/[^0-9A-Za-z.+-]/.test(version)
+			&& /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)
+			? version : "unknown";
+	} catch {
+		return "unknown";
+	}
+})();
+
+/** A command reads the current identity; neither a stale context nor a path is an identity fallback. */
+function statusSessionId(ctx: ExtensionCommandContext): string {
+	try {
+		const id: unknown = ctx.sessionManager?.getSessionId?.();
+		return typeof id === "string" && id.length > 0 && id.length <= 128 && !/[^A-Za-z0-9._-]/.test(id) ? id : "unknown";
+	} catch {
+		return "unknown";
+	}
+}
+
+/** Available even when no main-session OptChat instance was created. */
+function diagnosticStatusLines(
+	ctx: ExtensionCommandContext,
+	mainMode?: OptChatCacheMode,
+	compressorMode?: OptChatCacheMode,
+): string[] {
+	return [
+		`version: ${PLUGIN_VERSION}`,
+		`session: ${statusSessionId(ctx)}`,
+		`cache mutation (last encoded main-hook request, including side requests): ${mainMode ?? "unknown"}`,
+		`cache mutation (last encoded compressor request): ${compressorMode ?? "unknown"}`,
+		"cache mutation reports local payload changes, not sends, provider acceptance or cache hits; unchanged does not mean caching is disabled; last requests may use a different model",
+	];
+}
 
 /** Appended to the host system prompt; byte-identical on every request so it stays cached. */
 export const SYSTEM_BLOCK = `# OptChat memory\n\n${VIEW_DOC}`;
@@ -200,12 +241,19 @@ interface Capture {
 	readonly artifacts?: ArtifactPathSource;
 }
 
+/** Session-local host call identity; only its durable message ID is stored. */
+interface PendingCall {
+	readonly messageId: number;
+	readonly toolName: string;
+}
+
 interface Entry {
 	readonly kind: Kind;
 	readonly text: string;
 	/** Own recorded time, for work reports; otherwise the message's. */
 	readonly at?: number;
 	readonly metadata?: MessageMetadata;
+	readonly call?: { readonly id: string; readonly name: string };
 }
 
 /** Matches the store's per-message image bound. */
@@ -333,6 +381,17 @@ async function entriesOf(
 			return text.length > 0 ? [{ kind: "user", text, metadata: metadataOf(undefined, images) }] : [];
 		}
 		case "custom": {
+			if (message.customType === "collab:agent-message") {
+				if (message.attribution !== "agent" || typeof message.content !== "string" ||
+					message.content.trim().length === 0 || utf8Length(message.content) > 16_384) return [];
+				const coordination = parseCoordination(message.details);
+				if (!coordination) return [];
+				return [{
+					kind: "note",
+					text: `Agent ${coordination.sender.instanceId}:\n${message.content}`,
+					metadata: { coordination },
+				}];
+			}
 			// Admission precedes extraction: a message nothing admits never reaches capture.image, so it stores no image.
 			const skill = message.customType === SKILL_PROMPT_MESSAGE_TYPE && message.attribution === "user";
 			const background = Object.hasOwn(BACKGROUND_RESULT_TYPES, message.customType);
@@ -392,7 +451,10 @@ function assistantEntries(message: AssistantMessage, capture: Capture): Entry[] 
 			}
 		} else if (part.type === "toolCall" && !Object.hasOwn(PRIVATE_TOOLS, part.name)) {
 			flushTalk();
-			entries.push({ kind: "tool", text: `${part.name} ${JSON.stringify(part.arguments ?? {})}` });
+			entries.push({
+				kind: "tool", text: `${part.name} ${JSON.stringify(part.arguments ?? {})}`,
+				call: { id: part.id, name: part.name },
+			});
 		}
 	});
 	flushTalk();
@@ -481,7 +543,9 @@ interface Turn {
 	blocks: TextContent[];
 	partition: ViewPartition;
 	timestamp: number;
-	/** System One messages (rules, then prefetch), frozen at the turn's start; empty when every gate is off. */
+	/** Human rules present when the turn opened. Additions stay frozen; retired identities are filtered on emission. */
+	readonly rules: readonly Rule[];
+	/** Prefetch messages, frozen at the turn's start; empty when prefetch is off or has no result. */
 	extra: UserMessage[];
 	/** First host message of the turn. */
 	first?: Mark;
@@ -610,7 +674,9 @@ class OptChat {
 	private cutoff = Date.now();
 	private readonly logged = new Set<string>();
 	/** Full ordinary tool output captured before the live cap; consumed by its durable log entry. */
-	private readonly captured = new Map<string, string>();
+	private captured = new Map<string, string>();
+	/** Null retains a consumed or ambiguous ID so it can never bind a later call. */
+	private capturedCalls = new Map<string, PendingCall | null>();
 	/** Keys queued for logging but not yet appended: each message is appended once, in queue order. */
 	private readonly queued = new Set<string>();
 	private logChain: Promise<void> = Promise.resolve();
@@ -622,6 +688,9 @@ class OptChat {
 	private ctx: ExtensionContext | undefined;
 	private sharedPrefix: SharedPrefix | undefined;
 	private readonly cache = new OptChatCacheCoordinator();
+	/** Local payload mutations only: these observations do not attest provider cache acceptance or hits. */
+	private lastMainCacheMode: OptChatCacheMode | undefined;
+	private lastCompressorCacheMode: OptChatCacheMode | undefined;
 	private cacheFence = new AbortController();
 	/** Cancels main requests still waiting on compressor writers once their run moves on. */
 	private mainWaits = new AbortController();
@@ -1069,7 +1138,8 @@ class OptChat {
 					}
 					signal.throwIfAborted();
 					const actualModel = payloadModel ?? model;
-					const encoded = applyOptChatCache(this.alignPrefix(payload, actualModel, ctx), actualModel);
+					const { payload: encoded, mode } = applyOptChatCache(this.alignPrefix(payload, actualModel, ctx), actualModel);
+					this.lastCompressorCacheMode = mode;
 					// This request's own onResponse/finally release the lease: the only correlated writer.
 					release = await waiting(() => this.cache.acquire(encoded, actualModel, {
 						signal: attemptSignal ? AbortSignal.any([signal, attemptSignal]) : signal,
@@ -1234,9 +1304,13 @@ class OptChat {
 	// --- host events -----------------------------------------------------------------
 
 	async beforeProviderRequest(payload: unknown, ctx: ExtensionContext): Promise<unknown> {
-		if (!ctx.model) return undefined;
+		if (!ctx.model) {
+			this.lastMainCacheMode = undefined;
+			return undefined;
+		}
 		this.capturePrefix(payload, ctx.model, ctx);
-		const encoded = applyOptChatCache(payload, ctx.model);
+		const { payload: encoded, mode } = applyOptChatCache(payload, ctx.model);
+		this.lastMainCacheMode = mode;
 		if (!this.turn || ctx.isIdle()) return encoded;
 		// Public host hooks carry no request identity: side requests share them, and
 		// retries or advisors report responses without a matching request event. A
@@ -1262,6 +1336,8 @@ class OptChat {
 		this.cache.clear();
 		this.cacheFence = new AbortController();
 		this.sharedPrefix = undefined;
+		this.lastMainCacheMode = undefined;
+		this.lastCompressorCacheMode = undefined;
 	}
 
 	beforeAgentStart(systemPrompt: string[]): { systemPrompt: string[] } {
@@ -1310,7 +1386,13 @@ class OptChat {
 					: [{ type: "text", text: `${SYSTEM_BLOCK}\n\n` }, ...turn.blocks],
 				timestamp: turn.timestamp,
 			};
-			return { messages: [view, ...turn.extra, ...messages.slice(start)] };
+			// Filter after openTurn's awaits: a withdrawal can settle while prefetch is pending.
+			// Keep only the original snapshot's identities, never rules added during this turn.
+			const rules = turn.rules.filter((rule) => this.rules?.has(rule.id));
+			const extra: UserMessage[] = rules.length > 0
+				? [{ role: "user", content: [{ type: "text", text: renderRules(rules) }], timestamp: turn.timestamp }]
+				: [];
+			return { messages: [view, ...extra, ...turn.extra, ...messages.slice(start)] };
 		} catch (error) {
 			const reason = error instanceof Refusal ? error.message : `OptChat refused the request: ${errorText(error)}`;
 			if (!(error instanceof Refusal) && this.state.kind === "ready") this.fail(reason);
@@ -1449,11 +1531,12 @@ class OptChat {
 		const timestamp = first ? stamp(first) : Date.now();
 		this.logNew(tail);
 		const partition = viewPartition(ctx.model);
+		const rules = this.rules?.active() ?? [];
 		const turn: Turn = first
-			? { blocks, partition, timestamp, extra: [], first: mark(first) }
-			: { blocks, partition, timestamp, extra: [], after: start > 0 ? mark(messages[start - 1]!) : undefined };
+			? { blocks, partition, timestamp, rules, extra: [], first: mark(first) }
+			: { blocks, partition, timestamp, rules, extra: [], after: start > 0 ? mark(messages[start - 1]!) : undefined };
 		this.turn = turn;
-		// Frozen with the view: every request of this turn carries the same System One messages.
+		// Freeze additions and prefetch with the view; context drops any rules retired during this await.
 		turn.extra = await this.extraFor(tail, memory, ctx, deadline, timestamp);
 		return turn;
 	}
@@ -1478,7 +1561,10 @@ class OptChat {
 		if (this.logged.has(key) || this.queued.has(key)) return;
 		this.queued.add(key);
 		const at = stamp(message);
-		const full = message.role === "toolResult" ? this.captured.get(message.toolCallId) : undefined;
+		const captured = this.captured;
+		const full = message.role === "toolResult" ? captured.get(message.toolCallId) : undefined;
+		// Retain this epoch across async artifact reads; session switches replace the map.
+		const calls = this.capturedCalls;
 		const capture: Capture = {
 			full: () => full,
 			image: (part, index) => this.storeImage(part, index),
@@ -1489,13 +1575,23 @@ class OptChat {
 			let typed: { source: number; text: string } | undefined;
 			const turn = this.turn;
 			const opens = turn?.first?.key === key;
+			const pending = message.role === "toolResult" ? calls.get(message.toolCallId) : undefined;
+			const resultFor = message.role === "toolResult" && pending?.toolName === message.toolName
+				? pending.messageId : undefined;
 			for (const entry of await entriesOf(message, capture)) {
-				const stored = memory.append(entry.kind, entry.text, entry.at === undefined ? date : new Date(entry.at), entry.metadata);
+				const metadata = resultFor === undefined ? entry.metadata : { ...entry.metadata, resultFor };
+				const stored = memory.append(entry.kind, entry.text, entry.at === undefined ? date : new Date(entry.at), metadata);
+				if (entry.call && entry.call.id.length > 0) {
+					calls.set(entry.call.id, calls.has(entry.call.id) ? null : { messageId: stored.i, toolName: entry.call.name });
+				}
 				if (opens && turn.firstId === undefined) turn.firstId = stored.i;
 				// Only a user's own text can state a rule. Skill prompts, reports and agent-authored messages never reach here as role user.
 				if (message.role === "user" && entry.kind === "user") typed = { source: stored.i, text: entry.text };
 			}
-			if (message.role === "toolResult") this.captured.delete(message.toolCallId);
+			if (message.role === "toolResult") {
+				captured.delete(message.toolCallId);
+				if (calls.has(message.toolCallId)) calls.set(message.toolCallId, null);
+			}
 			this.queued.delete(key);
 			this.logged.add(key);
 			// Triage starts only now: the message is durable, and the chain keeps log order.
@@ -1646,7 +1742,8 @@ class OptChat {
 		this.saveUnanswered();
 		this.turn = undefined;
 		this.cutoff = Date.now();
-		this.captured.clear();
+		this.captured = new Map();
+		this.capturedCalls = new Map();
 		this.resetCacheFence();
 		// The child view belongs to the session it was published from: revoke it, then publish the new session's.
 		this.unpublish?.();
@@ -1673,7 +1770,8 @@ class OptChat {
 		this.state = { kind: "closed" };
 		this.unpublish?.();
 		this.unpublish = undefined;
-		this.captured.clear();
+		this.captured = new Map();
+		this.capturedCalls = new Map();
 		this.resetCacheFence();
 		const memory = this.memory;
 		const store = this.store;
@@ -1791,7 +1889,7 @@ class OptChat {
 			switch (action) {
 				case "":
 				case "status":
-					ctx.ui.notify(this.statusText(), "info");
+					ctx.ui.notify(this.statusText(ctx), "info");
 					return;
 				case "view":
 					ctx.ui.notify(this.openMemory().render(), "info");
@@ -1836,9 +1934,12 @@ class OptChat {
 		}
 	}
 
-	private statusText(): string {
+	private statusText(ctx: ExtensionCommandContext): string {
 		const state = this.state;
-		const lines = [`OptChat: ${state.kind === "failed" || state.kind === "inactive" ? `${state.kind}: ${state.reason}` : state.kind}`];
+		const lines = [
+			`OptChat: ${state.kind === "failed" || state.kind === "inactive" ? `${state.kind}: ${state.reason}` : state.kind}`,
+			...diagnosticStatusLines(ctx, this.lastMainCacheMode, this.lastCompressorCacheMode),
+		];
 		if (this.config) {
 			lines.push(`directory: ${this.store?.directory ?? this.config.directory}`);
 			lines.push(`compressor: ${this.compressor ? `${this.compressor.provider}/${this.compressor.id}` : this.config.model}`);
@@ -1863,7 +1964,7 @@ class OptChat {
 		lines.push(
 			`stateless OpenAI: ${process.env.PI_OPENAI_STATEFUL === "0" ? "requested (PI_OPENAI_STATEFUL=0)" : "not set; official OpenAI main requests may chain responses"}`,
 			`settlement deadline: ${this.settleTimeoutMs} ms (host handler limit ${HOST_HANDLER_LIMIT_MS} ms)`,
-			"host maintenance: OptChat answers host compaction with a marker summary, never a model call, and keeps the open turn; automatic shake pruning bypasses that hook",
+			"host maintenance: OptChat answers host compaction with a marker summary, never a model call; it may cut the open turn with a recovery pointer; automatic shake pruning bypasses that hook",
 			"correlation: main provider responses carry no request identity; cache writers are compressor-only",
 			`child view: ${this.childStatus}`,
 			"side turns (/btw, recaps): the host gives no typed purpose; see issue #1",
@@ -1900,7 +2001,7 @@ class OptChat {
 		this.counts.add(gate, "failures");
 	}
 
-	/** The System One messages of one turn, frozen at its start: the rules block, then the prefetch block. */
+	/** The prefetch messages of one turn, frozen at its start; rules retain a separate typed snapshot. */
 	private async extraFor(
 		tail: AgentMessage[],
 		memory: Memory,
@@ -1909,8 +2010,6 @@ class OptChat {
 		timestamp: number,
 	): Promise<UserMessage[]> {
 		const extra: UserMessage[] = [];
-		const rules = this.rules?.active() ?? [];
-		if (rules.length > 0) extra.push({ role: "user", content: [{ type: "text", text: renderRules(rules) }], timestamp });
 		const block = await this.prefetch(tail, memory, ctx, deadline);
 		if (block !== undefined) extra.push({ role: "user", content: [{ type: "text", text: block }], timestamp });
 		return extra;
@@ -1966,7 +2065,7 @@ class OptChat {
 			.catch((error: unknown) => this.gateFail("rules", error));
 	}
 
-	/** One triage: one judge request, then add, replace, or nothing. Fails open: a failure changes no rule. */
+	/** One admitted human message: judge, then add, replace, remove, or nothing. A failure changes no rule. */
 	private async triage(source: number, text: string, ctx: ExtensionContext, abort: AbortSignal): Promise<void> {
 		const ledger = this.rules;
 		const config = this.config;
@@ -1993,13 +2092,27 @@ class OptChat {
 		}
 		// Shutdown began while the judge answered: the ledger is closing, so nothing is written.
 		if (abort.aborted) return;
-		const decision = decideTriage(result.answers, offered, config.gates.ruleAdd, text, sentences);
+		// queueTriage is reached only from a durably admitted human user message.
+		const decision = decideTriage("human", result.answers, offered, config.gates.ruleAdd, text, sentences);
 		// One row per triage: the judge's probabilities, the cutoff and whether a rule was written; never the message or a rule's text.
 		const { pRule, pSentenceMax } = triageProbabilities(result.answers, sentences);
 		const row = (added: boolean): void =>
 			this.record({ type: "rules", at: new Date().toISOString(), pRule, pSentenceMax, sentences: sentences.length, cutoff: config.gates.ruleAdd, added });
 		if (decision.kind === "none") {
 			row(false);
+			return;
+		}
+		if (decision.kind === "remove") {
+			row(false);
+			try {
+				// remove checks current activity, not the snapshot offered before the judge wait.
+				if (ledger.remove(decision.removes, Date.now())) {
+					this.counts.add("rules", "removed");
+					this.notify(`OptChat rule ${decision.removes} withdrawn by message ${source}.`, "info");
+				}
+			} catch (error) {
+				this.gateFail("rules", error);
+			}
 			return;
 		}
 		let rule: Rule;
@@ -2134,7 +2247,10 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 			description: "OptChat memory: status | view | export PATH | import PATH | rules [remove ID] | new",
 			handler: async (args, ctx) => {
 				if (!chat) {
-					ctx.ui.notify("OptChat is not active in this session (main sessions are active unless opted out with --no-optchat).", "info");
+					const inactive = "OptChat is not active in this session (main sessions are active unless opted out with --no-optchat).";
+					const trimmed = args.trim();
+					const status = trimmed === "" || /^status(?:\s|$)/.test(trimmed);
+					ctx.ui.notify(status ? [inactive, ...diagnosticStatusLines(ctx)].join("\n") : inactive, "info");
 					return;
 				}
 				await chat.command(args, ctx);
@@ -2163,7 +2279,7 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 			pi.on("tool_result", (event) => active.toolResult(event));
 			pi.on("message_end", (event) => active.messageEnd(event.message));
 			pi.on("agent_end", (event) => active.agentEnd(event.messages, event.willContinue === true));
-			// Host compaction gets OptChat's marker summary and never cuts the open turn: see beforeCompact.
+			// Host compaction gets a marker, no model call; an open-turn cut carries a recovery pointer: see beforeCompact.
 			pi.on("session_before_compact", (event) => active.beforeCompact(event));
 			pi.on("session_switch", (_event, switchCtx) => active.sessionChanged(switchCtx));
 			pi.on("session_branch", (_event, branchCtx) => active.sessionChanged(branchCtx));

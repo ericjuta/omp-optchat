@@ -3,7 +3,7 @@ import { deflateSync } from "node:zlib";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { validateImage, type ImageAttachment } from "../src/archive.js";
+import { parseMetadata, validateImage, type ImageAttachment, type MessageMetadata } from "../src/archive.js";
 import { exportHtml, exportJsonl, importHistory } from "../src/history.js";
 import { Memory } from "../src/memory.js";
 import { Store, type Kind, type Message, type TreeNode } from "../src/store.js";
@@ -219,10 +219,23 @@ describe("importHistory", () => {
     ]);
   });
 
-  test("refuses indexed import into nonempty history even when the next ID would match", () => {
-    for (const i of [0, 1]) {
-      expectRejectedWithoutAppend(jsonl([{ i, kind: "note", text: "must not renumber" }]), [message(0, "user", "Already stored")]);
-    }
+  test("offsets indexed imports after existing history without changing the seed", async () => {
+    await withRealMemory(async (memory) => {
+      const seed = memory.append("user", "Already stored", new Date(DEFAULT_DATE));
+      const source = [message(0, "note", "first"), message(1, "talk", "second")];
+      expect(importHistory(memory, jsonl(source))).toBe(2);
+      expect(memory.store.messages).toEqual([
+        seed,
+        { ...source[0]!, i: 1 },
+        { ...source[1]!, i: 2 },
+      ]);
+    });
+  });
+
+  test("rejects source IDs starting at one even when the next destination ID matches", async () => {
+    await expectRejectedWithoutWrites(jsonl([{
+      i: 1, kind: "note", text: "must start at zero", images: [inlineOf(PNG_A, 0)],
+    }]), 1, /indexed imports require consecutive IDs 0\.\.N-1/);
   });
 
   test.each([
@@ -539,43 +552,329 @@ function inlineOf(data: string, order: number): Record<string, unknown> {
   return { ...refOf(data, order), data };
 }
 
-// Rejections must leave no message, no main-log byte, and no image file behind.
-async function expectRejectedWithoutWrites(input: string): Promise<void> {
+async function imageState(store: Store) {
+  const directory = join(store.directory, "images");
+  const names = (await readdir(directory)).sort();
+  return Promise.all(names.map(async (name) => ({ name, contents: await readFile(join(directory, name)) })));
+}
+
+// The seeded image differs from the valid PNG_A import prefix, making premature writes observable.
+// Four seeds put an unrelated tool at ID 3, which missing-source-target tests deliberately name.
+async function expectRejectedWithoutWrites(
+  input: string,
+  seedCount = 0,
+  reason = /Invalid history import on line/,
+): Promise<void> {
   await withRealMemory(async (memory) => {
+    for (let i = 0; i < seedCount; i++) {
+      memory.append(i === seedCount - 1 ? "tool" : "user", `seed ${i}`, new Date(DEFAULT_DATE),
+        i === 0 ? { images: [{ ...memory.store.saveImage(PNG_B, "image/png"), order: 0 }] } : undefined);
+    }
+    const messagesBefore = structuredClone(memory.store.messages);
     const mainBefore = await mainState(memory.store);
-    expect(() => importHistory(memory, input)).toThrow();
-    expect(memory.store.messages).toEqual([]);
+    const imagesBefore = await imageState(memory.store);
+    expect(messagesBefore).toHaveLength(seedCount);
+    if (seedCount > 0) {
+      expect(mainBefore.length).toBeGreaterThan(0);
+      expect(imagesBefore).toHaveLength(1);
+      expect(memory.store.messages[seedCount - 1]!.kind).toBe("tool");
+    } else {
+      expect(mainBefore).toEqual([]);
+      expect(imagesBefore).toEqual([]);
+    }
+    expect(() => importHistory(memory, input)).toThrow(reason);
+    expect(memory.store.messages).toEqual(messagesBefore);
     expect(await mainState(memory.store)).toEqual(mainBefore);
-    expect(await readdir(join(memory.store.directory, "images"))).toEqual([]);
+    expect(await imageState(memory.store)).toEqual(imagesBefore);
   });
 }
 
+function appendLinkedWait(memory: Memory): void {
+  memory.append("tool", 'wait({"jobs":["job-1","job-2"]})', new Date(DEFAULT_DATE));
+  memory.append("echo", "Both jobs settled", new Date(DEFAULT_DATE), { resultFor: 0 });
+  memory.append("work", "report <b>body</b>", new Date(DEFAULT_DATE), {
+    resultFor: 0,
+    work: { source: "task", completeness: "pointer-only", id: "job-1", name: "scout", agentId: "a<1>" },
+    images: [
+      { ...memory.store.saveImage(PNG_A, "image/png"), order: 0 },
+      { ...memory.store.saveImage(PNG_B, "image/png"), order: 3 },
+    ],
+  });
+  memory.append("work", "second report", new Date(DEFAULT_DATE), {
+    resultFor: 0,
+    work: { source: "task", completeness: "full", id: "job-2", name: "reviewer", agentId: "a2" },
+  });
+}
+
+// Arrays cannot represent near-MAX_SAFE_INTEGER history lengths. Model only the length and
+// append boundary, keeping real image storage so a premature image write remains observable.
+function boundedDestination(store: Store, base: number) {
+  const appends: Message[] = [];
+  const memory = {
+    store: {
+      messages: { length: base },
+      saveImage: store.saveImage.bind(store),
+      readImage: store.readImage.bind(store),
+    },
+    append(kind: Kind, text: string, date?: Date, metadata?: MessageMetadata): Message {
+      const entry: Message = {
+        ...message(base + appends.length, kind, text, date?.toISOString()),
+        ...(metadata === undefined ? {} : { metadata: parseMetadata(metadata) }),
+      };
+      appends.push(entry);
+      return entry;
+    },
+  };
+  return { memory: memory as unknown as Memory, appends };
+}
+
 describe("archive JSONL and provenance with a real Store", () => {
-  test("export then import reproduces metadata, IDs, dates, and image bytes exactly", async () => {
+  test("export then import roundtrips resultFor, wait members, provenance, images, and export bytes exactly", async () => {
     let exported = "";
     let sourceMessages: Message[] = [];
     await withRealMemory(async (memory) => {
-      memory.append("work", "report <b>body</b>", new Date(DEFAULT_DATE), {
-        work: { source: "task", completeness: "pointer-only", id: "job-1", name: "scout", agentId: "a<1>" },
-        images: [
-          { ...memory.store.saveImage(PNG_A, "image/png"), order: 0 },
-          { ...memory.store.saveImage(PNG_B, "image/png"), order: 3 },
-        ],
-      });
-      memory.append("user", "plain");
+      appendLinkedWait(memory);
+      memory.append("user", "plain", new Date(DEFAULT_DATE));
       exported = exportJsonl(memory);
-      sourceMessages = memory.store.messages.map((entry) => ({ ...entry }));
+      sourceMessages = structuredClone(memory.store.messages);
     });
     await withRealMemory(async (memory) => {
-      expect(importHistory(memory, exported)).toBe(2);
+      expect(importHistory(memory, exported)).toBe(5);
       expect(memory.store.messages).toEqual(sourceMessages);
-      expect(memory.store.messages[1]!.metadata).toBeUndefined();
-      expect(memory.store.readMessageImages(0).map(({ attachment, data }) => ({ sha256: attachment.sha256, order: attachment.order, data })))
+      expect(memory.store.messages.map((entry) => entry.metadata?.resultFor)).toEqual([undefined, 0, 0, 0, undefined]);
+      expect(memory.store.messages[4]!.metadata).toBeUndefined();
+      expect(memory.store.readMessageImages(2).map(({ attachment, data }) => ({ sha256: attachment.sha256, order: attachment.order, data })))
         .toEqual([
           { sha256: validateImage(PNG_A, "image/png").descriptor.sha256, order: 0, data: PNG_A },
           { sha256: validateImage(PNG_B, "image/png").descriptor.sha256, order: 3, data: PNG_B },
         ]);
       expect(exportJsonl(memory)).toBe(exported);
+    });
+  });
+
+  test("repeated indexed imports remap wait results to each imported tool and preserve colliding seed and prior copies", async () => {
+    let exported = "";
+    let sourceMessages: Message[] = [];
+    await withRealMemory(async (memory) => {
+      appendLinkedWait(memory);
+      exported = exportJsonl(memory);
+      sourceMessages = structuredClone(memory.store.messages);
+    });
+    const remapped = (base: number): Message[] => sourceMessages.map((entry) => ({
+      ...entry,
+      i: base + entry.i,
+      ...(entry.metadata?.resultFor === undefined ? {} : {
+        metadata: { ...entry.metadata, resultFor: base + entry.metadata.resultFor },
+      }),
+    }));
+    await withRealMemory(async (memory) => {
+      memory.append("tool", "unrelated seeded tool", new Date(DEFAULT_DATE), {
+        images: [{ ...memory.store.saveImage(PNG_B, "image/png"), order: 0 }],
+      });
+      memory.append("echo", "seeded result", new Date(DEFAULT_DATE), { resultFor: 0 });
+      const seed = structuredClone(memory.store.messages);
+      expect(seed[0]!.i).toBe(sourceMessages[0]!.i);
+      expect(seed[0]!.text).not.toBe(sourceMessages[0]!.text);
+
+      expect(importHistory(memory, exported)).toBe(4);
+      expect(memory.store.messages).toEqual([...seed, ...remapped(2)]);
+      const firstCopy = structuredClone(memory.store.messages);
+      const firstExport = exportJsonl(memory);
+      expect(importHistory(memory, exported)).toBe(4);
+      expect(memory.store.messages).toEqual([...firstCopy, ...remapped(6)]);
+      expect(exportJsonl(memory).startsWith(firstExport)).toBe(true);
+      expect(memory.store.messages.slice(0, seed.length)).toEqual(seed);
+
+      for (const base of [2, 6]) {
+        const importedTool = memory.store.messages[base]!;
+        expect(importedTool).toMatchObject({ i: base, kind: "tool", text: sourceMessages[0]!.text });
+        const results = memory.store.messages.slice(base + 1, base + 4);
+        expect(results.map((entry) => entry.kind)).toEqual(["echo", "work", "work"]);
+        expect(results.map((entry) => entry.metadata?.resultFor)).toEqual([base, base, base]);
+        for (const result of results) {
+          expect(memory.store.messages[result.metadata!.resultFor!]).toBe(importedTool);
+          expect(result.metadata!.resultFor).not.toBe(seed[0]!.i);
+        }
+        expect(results.slice(1).map((entry) => entry.metadata!.work))
+          .toEqual(sourceMessages.slice(2).map((entry) => entry.metadata!.work));
+        expect(memory.store.readMessageImages(base + 2).map(({ data }) => data)).toEqual([PNG_A, PNG_B]);
+      }
+    });
+  });
+
+  test.each(["echo", "work"] as const)(
+    "legacy inline-image reconstruction retains and remaps resultFor, provenance, and refs after a seed: %s",
+    async (kind) => {
+      await withRealMemory(async (memory) => {
+        memory.append("tool", "unrelated seeded tool", new Date(DEFAULT_DATE));
+        memory.append("user", "seed", new Date(DEFAULT_DATE));
+        const seed = structuredClone(memory.store.messages);
+        const metadata = parseMetadata({
+          resultFor: 0,
+          ...(kind === "work" ? {
+            work: { source: "task", completeness: "full", id: "legacy-job", name: "scout", agentId: "legacy-agent" },
+          } : {}),
+        });
+        const refs = [refOf(PNG_A, 2), refOf(PNG_B, 5)];
+        const payloads = [inlineOf(PNG_A, 2), inlineOf(PNG_B, 5)];
+        const input = jsonl([
+          message(0, "tool", "legacy wait"),
+          { ...message(1, kind, "legacy linked result"), metadata, images: payloads },
+        ]);
+        expect(metadata.images).toBeUndefined();
+        expect(importHistory(memory, input)).toBe(2);
+        const expectedMetadata = { ...metadata, resultFor: 2, images: refs };
+        expect(memory.store.messages).toEqual([
+          ...seed,
+          message(2, "tool", "legacy wait"),
+          { ...message(3, kind, "legacy linked result"), metadata: expectedMetadata },
+        ]);
+        expect(memory.store.readMessageImages(3)).toEqual([
+          { attachment: refs[0], data: PNG_A },
+          { attachment: refs[1], data: PNG_B },
+        ]);
+        const exported = exportJsonl(memory).trimEnd().split("\n").map((line) => JSON.parse(line));
+        expect(exported[3]).toEqual({
+          ...message(3, kind, "legacy linked result"), metadata: expectedMetadata, images: payloads,
+        });
+      });
+    },
+  );
+
+  const imagePrefix = {
+    i: 0, kind: "tool", text: "valid image prefix", date: DEFAULT_DATE, images: [inlineOf(PNG_A, 0)],
+  };
+  test.each([
+    ["unindexed linked records", [
+      { ...imagePrefix, i: undefined },
+      { kind: "echo", text: "linked", metadata: { resultFor: 0 } },
+    ], /resultFor requires explicit source IDs/],
+    ["indexed tool before unindexed result", [
+      imagePrefix,
+      { kind: "echo", text: "linked", metadata: { resultFor: 0 } },
+    ], /indexed imports require consecutive IDs/],
+    ["unindexed tool before indexed result", [
+      { ...imagePrefix, i: undefined },
+      { i: 1, kind: "echo", text: "linked", metadata: { resultFor: 0 } },
+    ], /indexed imports require consecutive IDs/],
+    ["missing source target despite seeded tool ID 3", [
+      imagePrefix,
+      { i: 1, kind: "echo", text: "linked", metadata: { resultFor: 3 } },
+    ], /resultFor must name an earlier source tool record/],
+    ["self reference", [
+      imagePrefix,
+      { i: 1, kind: "echo", text: "linked", metadata: { resultFor: 1 } },
+    ], /resultFor must name an earlier source tool record/],
+    ["forward tool reference", [
+      imagePrefix,
+      { i: 1, kind: "echo", text: "linked", metadata: { resultFor: 2 } },
+      { i: 2, kind: "tool", text: "later tool" },
+    ], /resultFor must name an earlier source tool record/],
+    ["non-tool target", [
+      { ...imagePrefix, kind: "note" },
+      { i: 1, kind: "echo", text: "linked", metadata: { resultFor: 0 } },
+    ], /resultFor must name an earlier source tool record/],
+    ["ambiguous duplicate tool IDs", [
+      imagePrefix,
+      { i: 0, kind: "tool", text: "duplicate tool" },
+      { i: 2, kind: "echo", text: "linked", metadata: { resultFor: 0 } },
+    ], /indexed imports require consecutive IDs/],
+  ] as const)("rejects invalid resultFor relationships atomically in empty and seeded stores: %s", async (_label, records, reason) => {
+    // Each metadata value is schema-valid: import must reject the source relationship instead.
+    for (const record of records) {
+      if ("metadata" in record) expect(parseMetadata(record.metadata)).toEqual(record.metadata);
+    }
+    for (const seedCount of [0, 4]) await expectRejectedWithoutWrites(jsonl(records), seedCount, reason);
+  });
+
+  test.each([
+    ["negative", "-1"],
+    ["fractional", "0.5"],
+    ["unsafe integer", "9007199254740992"],
+    ["nonfinite JSON exponent 1e309", "1e309"],
+    ["numeric string", '"0"'],
+    ["null", "null"],
+    ["boolean", "false"],
+    ["object", "{}"],
+    ["array", "[]"],
+  ] as const)("rejects malformed resultFor metadata atomically for echo/work in empty and seeded stores: %s", async (_label, literal) => {
+    for (const kind of ["echo", "work"] as const) {
+      const work = kind === "work" ? '"work":{"source":"task","completeness":"full"},' : "";
+      // Preserve 1e309 as a JSON numeric literal; JSON.stringify(Infinity) would test null instead.
+      const metadata = `{${work}"resultFor":${literal}}`;
+      expect(() => parseMetadata(JSON.parse(metadata))).toThrow(/resultFor must be a nonnegative safe integer/);
+      const input = `${jsonl([imagePrefix])}\n{"i":1,"kind":"${kind}","text":"invalid metadata","metadata":${metadata}}`;
+      for (const seedCount of [0, 4]) {
+        await expectRejectedWithoutWrites(input, seedCount, /resultFor must be a nonnegative safe integer/);
+      }
+    }
+  });
+
+  test.each(["user", "talk", "tool", "note"] as const)(
+    "rejects resultFor on a non-result carrier atomically in empty and seeded stores: %s",
+    async (kind) => {
+      const metadata = { resultFor: 0 };
+      expect(parseMetadata(metadata)).toEqual(metadata);
+      const input = jsonl([imagePrefix, { i: 1, kind, text: "not a result carrier", metadata }]);
+      for (const seedCount of [0, 4]) {
+        await expectRejectedWithoutWrites(input, seedCount, /resultFor is only allowed on echo or work records/);
+      }
+    },
+  );
+
+  const boundaryRecords: Message[] = [
+    message(0, "tool", "boundary wait"),
+    { ...message(1, "echo", "boundary echo"), metadata: { resultFor: 0 } },
+    {
+      ...message(2, "work", "boundary work"),
+      metadata: { resultFor: 0, work: { source: "task", completeness: "full", id: "boundary-job" } },
+    },
+  ];
+  const boundaryInput = jsonl(boundaryRecords.map((record) =>
+    record.i === 0 ? { ...record, images: [inlineOf(PNG_A, 0)] } : record));
+
+  test.each([
+    ["last below MAX_SAFE_INTEGER", Number.MAX_SAFE_INTEGER - 3],
+    ["last equals MAX_SAFE_INTEGER", Number.MAX_SAFE_INTEGER - 2],
+  ] as const)("accepts safe destination indices and remaps references without a huge array: %s", async (_label, base) => {
+    await withRealMemory(async (memory) => {
+      const destination = boundedDestination(memory.store, base);
+      expect(importHistory(destination.memory, boundaryInput)).toBe(3);
+      expect(destination.appends).toEqual([
+        { ...boundaryRecords[0]!, i: base, metadata: { images: [refOf(PNG_A, 0)] } },
+        { ...boundaryRecords[1]!, i: base + 1, metadata: { resultFor: base } },
+        { ...boundaryRecords[2]!, i: base + 2, metadata: { ...boundaryRecords[2]!.metadata, resultFor: base } },
+      ]);
+      expect(destination.appends.every((entry) => Number.isSafeInteger(entry.i))).toBe(true);
+      expect(destination.appends.slice(1).map((entry) => entry.metadata!.resultFor)).toEqual([base, base]);
+      // The contract guards actual assigned IDs, not the unused last + 1 value.
+      expect(memory.store.readImage(PNG_A_DESCRIPTOR).data).toBe(PNG_A);
+      expect(await imageState(memory.store)).toHaveLength(1);
+      expect(memory.store.messages).toEqual([]);
+      expect(await mainState(memory.store)).toEqual([]);
+    });
+  });
+
+  test.each([
+    ["unsafe base", Number.MAX_SAFE_INTEGER + 1],
+    ["unsafe batch last index", Number.MAX_SAFE_INTEGER - 1],
+  ] as const)("rejects unsafe destination arithmetic before image writes or appends: %s", async (_label, base) => {
+    await withRealMemory(async (memory) => {
+      memory.append("tool", "seed", new Date(DEFAULT_DATE), {
+        images: [{ ...memory.store.saveImage(PNG_B, "image/png"), order: 0 }],
+      });
+      const messagesBefore = structuredClone(memory.store.messages);
+      const mainBefore = await mainState(memory.store);
+      const imagesBefore = await imageState(memory.store);
+      expect(mainBefore.length).toBeGreaterThan(0);
+      expect(imagesBefore).toHaveLength(1);
+      const destination = boundedDestination(memory.store, base);
+      expect(() => importHistory(destination.memory, boundaryInput))
+        .toThrow(/destination IDs must be nonnegative safe integers/);
+      expect(destination.appends).toEqual([]);
+      expect(memory.store.messages).toEqual(messagesBefore);
+      expect(await mainState(memory.store)).toEqual(mainBefore);
+      expect(await imageState(memory.store)).toEqual(imagesBefore);
     });
   });
 

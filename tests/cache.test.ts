@@ -231,7 +231,7 @@ function blockTexts(content: unknown): string[] {
 }
 
 function apply(payload: WireObject, model: Model): WireObject {
-  const result = applyOptChatCache(payload, model);
+  const { payload: result } = applyOptChatCache(payload, model);
   if (!isWireObject(result)) throw new Error("applyOptChatCache returned a non-object payload");
   return result;
 }
@@ -298,7 +298,9 @@ function freezeDeep<T>(value: T): T {
 function expectPassthrough(payload: WireObject, model: Model): void {
   const before = structuredClone(payload);
   freezeDeep(payload);
-  expect(applyOptChatCache(payload, model)).toBe(payload);
+  const result = applyOptChatCache(payload, model);
+  expect(result.payload).toBe(payload);
+  expect(result.mode).toBe("unchanged");
   expect(payload).toEqual(before);
 }
 
@@ -327,6 +329,37 @@ interface ModelCase {
   name: string;
   model: () => Model;
 }
+
+// ---- local mutation modes ----------------------------------------------------
+
+describe("local cache mutation modes", () => {
+  test.each(ADAPTERS)("$name: unsupported models, shapes and missing views report unchanged", ({ model, payload }) => {
+    expectPassthrough(payload(), { ...model(), provider: "unsupported" });
+    expectPassthrough({}, model());
+    expectPassthrough(payload("ordinary user text"), model());
+    for (const input of [null, undefined, "not a payload", 42, freezeDeep([])]) {
+      const result = applyOptChatCache(input, model());
+      expect(result.payload).toBe(input);
+      expect(result.mode).toBe("unchanged");
+    }
+  });
+
+  test("retention none leaves marker-free Anthropic and Responses requests unchanged", () => {
+    process.env.PI_CACHE_RETENTION = "none";
+    expectPassthrough(nativePayload(labeledView(110), () => undefined), anthropicModel());
+    expectPassthrough(responsesPayload(), openaiModel());
+  });
+
+  test("Anthropic host markers still select breakpoint mutation with retention none", () => {
+    process.env.PI_CACHE_RETENTION = "none";
+    const input = freezeDeep(nativePayload());
+    const before = structuredClone(input);
+    const result = applyOptChatCache(input, anthropicModel());
+    expect(result.mode).toBe("anthropic-breakpoints");
+    expect(result.payload).not.toBe(input);
+    expect(input).toEqual(before);
+  });
+});
 
 // ---- native Anthropic --------------------------------------------------------
 
@@ -696,8 +729,11 @@ describe("Codex Responses", () => {
 
   test("PI_CACHE_RETENTION=none does not disable the reasoning-context request", () => {
     process.env.PI_CACHE_RETENTION = "none";
-    const result = expectChanged(codexPayload(), codexModel());
-    expect(result.reasoning).toEqual({ effort: "high", summary: "auto", context: "all_turns" });
+    const input = codexPayload();
+    const { payload: result, mode } = applyOptChatCache(input, codexModel());
+    expect(mode).toBe("codex-all-turns");
+    expect(result).not.toBe(input);
+    expect(at(result, "reasoning")).toEqual({ effort: "high", summary: "auto", context: "all_turns" });
   });
 });
 
@@ -1314,7 +1350,9 @@ describe("frozen inputs", () => {
   test("native: a deep-frozen active payload is copied on write and untouched objects stay shared", () => {
     const input = freezeDeep(nativePayload());
     const before = structuredClone(input);
-    const result = apply(input, anthropicModel());
+    const { payload: result, mode } = applyOptChatCache(input, anthropicModel());
+    expect(mode).toBe("anthropic-breakpoints");
+    if (!isWireObject(result)) throw new Error("Expected an object payload");
     expect(input).toEqual(before);
     expect(result).not.toBe(input);
     expect(markersAt(input, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.0", "$.system.1", "$.messages.2.content.0"));
@@ -1334,7 +1372,9 @@ describe("frozen inputs", () => {
   test("Responses: a deep-frozen active payload is copied on write and reasoning stays shared", () => {
     const input = freezeDeep(responsesPayload());
     const before = structuredClone(input);
-    const result = apply(input, openaiModel());
+    const { payload: result, mode } = applyOptChatCache(input, openaiModel());
+    expect(mode).toBe("responses-breakpoints");
+    if (!isWireObject(result)) throw new Error("Expected an object payload");
     expect(input).toEqual(before);
     expect(result).not.toBe(input);
     expect(input).not.toHaveProperty("prompt_cache_options");
@@ -1350,7 +1390,9 @@ describe("frozen inputs", () => {
   test("Codex: a deep-frozen active payload gets a new reasoning container and keeps its input", () => {
     const input = freezeDeep(codexPayload());
     const before = structuredClone(input);
-    const result = apply(input, codexModel());
+    const { payload: result, mode } = applyOptChatCache(input, codexModel());
+    expect(mode).toBe("codex-all-turns");
+    if (!isWireObject(result)) throw new Error("Expected an object payload");
     expect(input).toEqual(before);
     expect(result).not.toBe(input);
     expect(input.reasoning).toEqual({ effort: "high", summary: "auto" });

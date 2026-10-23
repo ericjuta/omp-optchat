@@ -42,7 +42,7 @@ Message kinds in omp-optchat are `user`, `talk`, `tool`, `echo`, `note` and `wor
           merge the pair whose last message is oldest (age rule, 2.4)
         if no pair qualifies, stop and wait for the compactor
 
-Once merged, a part never splits. Because merges happen mostly near the end, the start of the view stays byte-identical across turns, which is what makes it cacheable. The view is not saved; at startup it is rebuilt from the durable log and tree.
+Once merged, a part never splits. The age calculation uses the endpoint of the view being fitted: the main history length for the main view, and the built context endpoint for the compactor view. Queued messages beyond that endpoint cannot change its merge choice. Built parents may publish partial progress between turns; each open turn keeps its frozen view. Stable prefixes are cache opportunities, not evidence of provider savings.
 
 **Settle.** A part whose node is not built yet would render as a placeholder. No model call is allowed to see one: an agent turn waits until every view line is a summary (usually seconds; `SETTLE_TIMEOUT_MS` is 25 s at `src/index.ts:53`).
 
@@ -118,7 +118,9 @@ How the plugin reaches it. The host's `judge` role maps to Jev on this user's ho
 
 ### 3.3 The four gates (the tool gate was removed in 0.8.0)
 
-**Rules ledger** (per user message, in the background, after the message is durable). Only human-typed user messages are triaged: work reports, skill prompts and side turns are skipped. One Jev request asks two things: is this a standing instruction or correction (`noul`), and if rules exist, which current rule does it replace, if any (`choice` over the 64 most recent rule ids plus `none`). A rule is added when P(rule) is at least 0.8 (`--optchat-rule-add`). It replaces a rule only when P(rule) clears that threshold and the supersede pick has probability at least 0.5. There is no ask band: every add and replace is announced, appears in `/optchat rules`, and can be removed with `/optchat rules remove <id>`. A wrong rule is cheap to see and cheap to remove, so a visible announcement replaces the blocking question the first design had. The ledger is a durable file in omp-optchat's store directory. It is rendered as a message after the view, so changing it never changes the view's cache marks. The original messages stay in the log and remain the source of truth.
+**Rules ledger** (per user message, in the background, after the message is durable). Only human-typed user messages are triaged: work reports, skill prompts and side turns are skipped. Jev separately judges a new standing instruction/correction and an explicit withdrawal or ended scope. Target choices are restricted to the newest 32 offered active rule IDs plus `none`; code rejects unknown or stale IDs. Withdrawal does not depend on the probability of adding a rule, and no time-based expiry is inferred. A rule is added when P(rule) is at least 0.8 (`--optchat-rule-add`). It replaces a rule only when P(rule) clears that threshold and the supersede pick has probability at least 0.5. There is no ask band: every accepted add, replacement or withdrawal is announced. `/optchat rules` lists active rules, and `/optchat rules remove <id>` can also remove older rules outside the automatic target window. A wrong rule is cheap to see and cheap to remove, so a visible announcement replaces the blocking question the first design had. The ledger is a durable file in omp-optchat's store directory. It is rendered as a message after the view, so changing it never changes the view's cache marks. The original messages stay in the log and remain the source of truth.
+
+Rule additions and prefetch remain frozen per turn. Retired IDs are filtered from subsequent context assemblies, including an assembly awaiting prefetch; already assembled or transmitted requests are not rewritten. Typed host coordination is stored as agent-provenanced notes, never admitted to human triage. Unmarked terminal keystrokes cannot provide that authority boundary.
 
 **Standing instructions have three scopes.** The rules ledger holds instructions you state in this chat, per store (per worktree by default). OMP TTSR rule files hold enforced guardrails that apply to every session. Sharpshooter holds cross-session project decisions learned from friction. An item in one scope is not copied into another.
 
@@ -227,9 +229,9 @@ So a subagent's report is the only part of its work that enters the parent's cha
 
 ### 4.2 Rules, with their status
 
-1. **Freeze the fork at spawn.** Implemented as an option: child views are bounded to the spawn point. Off by default.
-2. **The report is the only thing that survives.** Implemented: reports are logged as `work`. Requiring a report that states what changed, what failed and what was learned is a prompt change, not yet made.
-3. **Reports are not the user's words.** Planned in plan Milestone 2: triage runs only on human-typed user messages (kind `user`, attribution `user`), so a report can never create or replace a rule.
+1. **Freeze the fork at spawn.** Child views are bounded to the spawn point and on by default, with `--no-optchat-child-view` as the opt-out.
+2. **Retain published reports, not acknowledgements alone.** Reports are logged as `work`. The matching source-only host patch journals cumulative explicit public publications and delivers an immutable digest/byte/run-bound artifact independently of final structured output. OptChat verifies and archives that body; unknown or partial bodies stay incomplete. This does not infer semantic completeness or recover text never published.
+3. **Reports and peer messages are not the user's words.** Triage admits only human user messages. Typed host coordination retains authenticated sender/recipient metadata as a note; report and coordination bodies cannot add, replace or withdraw human rules. The host patch is not installed automatically, and terminal paste is not a substitute.
 4. **Tool approval applies to the `task` call only.** Individual subagent calls run in yolo and are not approved again. The tool gate that would have screened them was removed in 0.8.0; whether subagent calls need any approval is open (map, "Not yet specified").
 5. **Keep subagent tasks short.** A subagent's own session gets none of omp-optchat's view protection, so a long one can still degrade as its context grows.
 

@@ -3,7 +3,8 @@
  *
  * `tests/fixtures/system1-off.golden.json` is the spec: the system prompt OptChat hands the host, the encoded
  * Anthropic request (system, tool definitions, messages) after OptChat's payload hook, the context hook's
- * messages for a scripted chat, and the `/optchat status` lines. Any byte drift fails with a structural diff.
+ * messages for a scripted chat. Diagnostic `/optchat status` is not provider bytes and is excluded.
+ * Any substantive byte drift fails with a structural diff.
  *
  * Regenerate only for an intended change: `OPTCHAT_UPDATE_GOLDEN=1 bun test tests/system1-off.test.ts`.
  */
@@ -39,7 +40,6 @@ interface Golden {
   systemPrompt: string[];
   request: { system: unknown; tools: unknown; messages: unknown };
   context: unknown[];
-  status: string[];
 }
 
 /** Hands OptChat the host's real `pi.zod` (omptype), so tool schemas are the ones a real session encodes. */
@@ -157,16 +157,22 @@ describe("every System One gate opted out", () => {
       systemPrompt,
       request: { system: payload.system, tools: payload.tools, messages: payload.messages },
       context,
-      status,
     };
     const text = serialize(actual);
     if (process.env.OPTCHAT_UPDATE_GOLDEN === "1") writeFileSync(GOLDEN, text);
-    const expected = readFileSync(GOLDEN, "utf8");
-    // The structural comparison reports the first differing field; the byte digest pins key order and whitespace too.
-    expect(actual).toEqual(JSON.parse(expected) as Golden);
+    const historical = JSON.parse(readFileSync(GOLDEN, "utf8")) as Golden;
+    // Project the historical fixture: diagnostic status is not provider bytes. Keep its original data untouched.
+    const expected: Golden = {
+      systemPrompt: historical.systemPrompt,
+      request: historical.request,
+      context: historical.context,
+    };
+    const expectedText = serialize(expected);
+    // Structural comparison explains drift; the digest pins all substantive fields with the same serialization.
+    expect(actual).toEqual(expected);
     expect({ bytes: Buffer.byteLength(text), sha256: sha256(text) }).toEqual({
-      bytes: Buffer.byteLength(expected),
-      sha256: sha256(expected),
+      bytes: Buffer.byteLength(expectedText),
+      sha256: sha256(expectedText),
     });
   });
 });

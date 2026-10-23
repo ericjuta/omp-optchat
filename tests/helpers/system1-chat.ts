@@ -39,7 +39,7 @@ export function routedJudge(routes: Routes = {}): FakeJudge {
     }
     if (keys.includes("rule")) {
       const states = routes.ruleWhen !== undefined && JSON.stringify(request.state).includes(routes.ruleWhen);
-      const answers: Record<string, Answer> = { rule: noul(states ? 0.95 : 0) };
+      const answers: Record<string, Answer> = { rule: noul(states ? 0.95 : 0), withdraw: noul(0) };
       if (keys.includes("supersedes")) answers.supersedes = choice("none", { none: 1 });
       return answers;
     }

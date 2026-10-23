@@ -1,4 +1,5 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -618,6 +619,8 @@ interface WaitJob {
   /** Absent once the host already delivered the job by itself. */
   resultText?: string;
   errorText?: string;
+  report?: unknown;
+  structured?: unknown;
 }
 
 /** A `wait` result as the host renders it: the text the model reads and the job snapshots in its details. */
@@ -644,6 +647,424 @@ function waitResult(jobs: readonly WaitJob[]): { text: string; details: Record<s
     details: { op: "wait", meta: { source: { type: "report", value: "background jobs snapshot" } }, jobs },
   };
 }
+
+const REPORT_BYTE_LIMIT = 4 * 1024 * 1024;
+const PREVIOUS_MESSAGE = "The full findings are in my previous message.";
+const SUBSTANTIVE_TABLE = "| Finding | Evidence |\n| --- | --- |\n| EARLIER-TABLE | café: retained public evidence |";
+const REPORT_RUN = "8e20bcd8-030d-4ba7-8410-932fd754207d";
+const REPORT_AGENT = "0-TableReviewer";
+const REPORT_PATHS = ["task", "wait", "async-result"] as const;
+type ReportPath = typeof REPORT_PATHS[number];
+
+interface TypedReportFixture {
+  version: 1;
+  runId: string;
+  status: "complete";
+  artifact: { id: string; uri: string; sha256: string; bytes: number };
+}
+
+/** Exact version-1 host reference; the digest and size bind the raw UTF-8 snapshot, not its preview. */
+function typedReport(body: string | Uint8Array, id = "41", runId = REPORT_RUN): TypedReportFixture {
+  const bytes = typeof body === "string" ? Buffer.from(body, "utf8") : body;
+  return {
+    version: 1,
+    runId,
+    status: "complete",
+    artifact: { id, uri: `artifact://${id}`, sha256: createHash("sha256").update(bytes).digest("hex"), bytes: bytes.byteLength },
+  };
+}
+
+/** Uses each host delivery's actual field names; own `report: undefined` is intentionally preserved. */
+async function captureTypedReport(
+  source: ReportPath,
+  report: unknown,
+  reader: ArtifactPathSource,
+  { text = PREVIOUS_MESSAGE, structured }: { text?: string; structured?: unknown } = {},
+) {
+  if (source === "wait") {
+    return captureWaitReports({
+      ...waitResult([{ id: "bg_table", type: "task", status: "completed", label: "TableReviewer", agentUrlId: REPORT_AGENT,
+        durationMs: 42, resultText: text, report, structured }]),
+      timestamp: TIMESTAMP,
+      sessionManager: reader,
+    });
+  }
+  return captureWorkReports({
+    source,
+    timestamp: TIMESTAMP,
+    text,
+    sessionManager: reader,
+    details: source === "task"
+      ? { results: [{ id: REPORT_AGENT, agent: "TableReviewer", output: text, exitCode: 0, durationMs: 42, truncated: false,
+        report, structuredOutput: structured }] }
+      : { jobs: [{ jobId: "bg_table", type: "task", status: "completed", agentId: REPORT_AGENT, label: "TableReviewer", durationMs: 42,
+        report, schema: structured }] },
+  });
+}
+
+// References in these tests come from typed host metadata, never from model-controlled body text.
+describe("typed task report snapshots", () => {
+  for (const source of REPORT_PATHS) {
+    test(`${source}: a short previous-message reply recovers its earlier substantive table`, async () => {
+      await withArtifactDirectory(async (directory) => {
+        const full = `${SUBSTANTIVE_TABLE}\n\n${PREVIOUS_MESSAGE}`;
+        const path = join(directory, "41.txt");
+        await writeFile(path, full);
+        const reader = artifactReader({ "41": path });
+        const capture = await captureTypedReport(source, typedReport(full), reader);
+        expect(capture.completeness).toBe("full");
+        expect(capture.reason).toBeUndefined();
+        expect(capture.reports).toHaveLength(1);
+        const report = capture.reports[0]!;
+        expect(report.body).toContain(full);
+        expect(report.envelope).toContain(source === "wait" ? "### bg_table [task] — completed" : PREVIOUS_MESSAGE);
+        expect(report.work.source).toBe(source === "task" ? "task" : "async-result");
+        expect(report.work.agentId).toBe(REPORT_AGENT);
+        expect(report.work.name).toBe("TableReviewer");
+        if (source !== "task") expect(report.work.id).toBe("bg_table");
+        expect(report.work.completeness).toBe("full");
+        expect(report.provenance.durationMs).toBe(42);
+        expect(report.timestamp).toBe(TIMESTAMP);
+        expect(report.reason).toBeUndefined();
+        expect(reader.calls).toEqual(["41"]);
+      });
+    });
+
+    test(`${source}: valid structured data still reads the authoritative public report`, async () => {
+      await withArtifactDirectory(async (directory) => {
+        const path = join(directory, "41.txt");
+        await writeFile(path, SUBSTANTIVE_TABLE);
+        const reader = artifactReader({ "41": path });
+        const capture = await captureTypedReport(source, typedReport(SUBSTANTIVE_TABLE), reader, {
+          text: '{"summary":"STRUCTURED-ONLY"}',
+          structured: { source: "task", mode: "strict", status: "valid", data: { summary: "STRUCTURED-ONLY" } },
+        });
+        expect(capture.completeness).toBe("full");
+        expect(capture.reports[0]!.body).toContain(SUBSTANTIVE_TABLE);
+        expect(capture.reports[0]!.body).toContain("STRUCTURED-ONLY");
+        expect(reader.calls).toEqual(["41"]);
+      });
+    });
+
+    test(`${source}: unavailable typed artifact cannot fall back to valid structure or full-looking inline text`, async () => {
+      const reader = artifactReader({});
+      const capture = await captureTypedReport(source, typedReport(SUBSTANTIVE_TABLE), reader, {
+        text: "This looks like a complete final answer.",
+        structured: { source: "task", mode: "strict", status: "valid", data: { answer: "VALID-INLINE" } },
+      });
+      expect(capture.completeness).toBe("pointer-only");
+      expect(capture.reports[0]!.work.completeness).toBe("pointer-only");
+      expect(capture.reports[0]!.reason).toContain("unavailable");
+      expect(capture.reason).toBe(capture.reports[0]!.reason);
+      expect(capture.reports[0]!.body).toContain("This looks like a complete final answer.");
+      expect(capture.reports[0]!.body).not.toContain(SUBSTANTIVE_TABLE);
+      expect(reader.calls).toEqual(["41"]);
+    });
+  }
+
+  const malformed: readonly { name: string; reason?: RegExp; reference: (valid: TypedReportFixture) => unknown }[] = [
+    { name: "null", reference: () => null },
+    { name: "own undefined", reference: () => undefined },
+    { name: "string", reference: () => "artifact://41" },
+    { name: "array", reference: (valid) => [valid] },
+    { name: "unknown report field", reference: (valid) => ({ ...valid, output: "UNADMITTED" }) },
+    { name: "unknown artifact field", reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, path: "/etc/passwd" } }) },
+    { name: "partial missing reason", reason: /partial report reason/, reference: (valid) => ({ ...valid, status: "partial" }) },
+    { name: "partial unknown reason", reason: /partial report reason/, reference: (valid) => ({ ...valid, status: "partial", reason: "finished" }) },
+    { name: "unsupported version", reason: /version/, reference: (valid) => ({ ...valid, version: 2 }) },
+    { name: "string version", reason: /version/, reference: (valid) => ({ ...valid, version: "1" }) },
+    { name: "missing run", reason: /run identifier/, reference: (valid) => ({ ...valid, runId: undefined }) },
+    { name: "empty run", reason: /run identifier/, reference: (valid) => ({ ...valid, runId: "" }) },
+    { name: "nonstring run", reason: /run identifier/, reference: (valid) => ({ ...valid, runId: 42 }) },
+    { name: "unknown status", reason: /status/, reference: (valid) => ({ ...valid, status: "completed" }) },
+    { name: "complete with partial reason", reason: /partial reason/, reference: (valid) => ({ ...valid, reason: "failed" }) },
+    { name: "missing artifact", reason: /no artifact/, reference: (valid) => ({ ...valid, artifact: undefined }) },
+    { name: "artifact array", reference: (valid) => ({ ...valid, artifact: [valid.artifact] }) },
+    { name: "numeric id value", reason: /id and URI/, reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, id: 41 } }) },
+    { name: "path id", reason: /id and URI/, reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, id: "../secret", uri: "artifact://../secret" } }) },
+    { name: "agent id", reason: /id and URI/, reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, id: REPORT_AGENT, uri: `agent://${REPORT_AGENT}` } }) },
+    { name: "noncanonical id", reason: /id and URI/, reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, id: "041", uri: "artifact://041" } }) },
+    { name: "unsafe integer id", reason: /id and URI/, reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, id: "9007199254740992", uri: "artifact://9007199254740992" } }) },
+    { name: "mismatched URI", reason: /id and URI/, reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, uri: "artifact://42" } }) },
+    { name: "body selector URI", reason: /id and URI/, reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, uri: "artifact://41:raw" } }) },
+    { name: "file URI", reason: /id and URI/, reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, uri: "file:///etc/passwd" } }) },
+    { name: "uppercase digest", reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, sha256: "A".repeat(64) } }) },
+    { name: "short digest", reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, sha256: "a".repeat(63) } }) },
+    { name: "nonhex digest", reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, sha256: "g".repeat(64) } }) },
+    { name: "zero bytes", reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, bytes: 0 } }) },
+    { name: "negative bytes", reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, bytes: -1 } }) },
+    { name: "fractional bytes", reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, bytes: 1.5 } }) },
+    { name: "string bytes", reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, bytes: String(valid.artifact.bytes) } }) },
+    { name: "nonfinite bytes", reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, bytes: Number.POSITIVE_INFINITY } }) },
+    { name: "oversized declared bytes", reference: (valid) => ({ ...valid, artifact: { ...valid.artifact, bytes: REPORT_BYTE_LIMIT + 1 } }) },
+  ];
+
+  for (const source of REPORT_PATHS) {
+    for (const { name, reason = /malformed/, reference } of malformed) {
+      test(`${source}: ${name} report metadata fails closed before artifact lookup`, async () => {
+        await withArtifactDirectory(async (directory) => {
+          const path = join(directory, "41.txt");
+          await writeFile(path, SUBSTANTIVE_TABLE);
+          const reader = artifactReader({ "41": path });
+          const capture = await captureTypedReport(source, reference(typedReport(SUBSTANTIVE_TABLE)), reader, {
+            text: "UNTRUNCATED-INLINE-ANSWER",
+            structured: { source: "task", mode: "strict", status: "valid", data: { answer: "STRUCTURED-FALLBACK" } },
+          });
+          expect(capture.completeness).toBe("pointer-only");
+          expect(capture.reports).toHaveLength(1);
+          expect(capture.reports[0]!.work.completeness).toBe("pointer-only");
+          expect(capture.reports[0]!.reason).toMatch(reason);
+          expect(capture.reason).toBe(capture.reports[0]!.reason);
+          expect(capture.reports[0]!.body).toContain("UNTRUNCATED-INLINE-ANSWER");
+          expect(capture.reports[0]!.body).not.toContain(SUBSTANTIVE_TABLE);
+          expect(reader.calls).toEqual([]);
+        });
+      });
+    }
+  }
+
+  for (const [name, change, reason] of [
+    ["wrong digest", (valid: TypedReportFixture) => ({ ...valid.artifact, sha256: "0".repeat(64) }), /hash|digest|sha256/i],
+    ["understated bytes", (valid: TypedReportFixture) => ({ ...valid.artifact, bytes: valid.artifact.bytes - 1 }), /byte|size/],
+    ["overstated bytes", (valid: TypedReportFixture) => ({ ...valid.artifact, bytes: valid.artifact.bytes + 1 }), /byte|size/],
+    ["character count instead of UTF-8 bytes", (valid: TypedReportFixture) => ({ ...valid.artifact, bytes: SUBSTANTIVE_TABLE.length }), /byte|size/],
+  ] as const) {
+    test(`${name} rejects a real artifact instead of accepting full-looking inline output`, async () => {
+      await withArtifactDirectory(async (directory) => {
+        const path = join(directory, "41.txt");
+        await writeFile(path, SUBSTANTIVE_TABLE);
+        const reader = artifactReader({ "41": path });
+        const valid = typedReport(SUBSTANTIVE_TABLE);
+        const capture = await captureTypedReport("async-result", { ...valid, artifact: change(valid) }, reader);
+        expect(capture.completeness).toBe("pointer-only");
+        expect(capture.reports[0]!.reason).toMatch(reason);
+        expect(capture.reason).toBe(capture.reports[0]!.reason);
+        expect(capture.reports[0]!.body).toBe(PREVIOUS_MESSAGE);
+        expect(reader.calls).toEqual(["41"]);
+      });
+    });
+  }
+
+  test("replacement at the same numeric artifact path cannot swap a previously bound report", async () => {
+    await withArtifactDirectory(async (directory) => {
+      const path = join(directory, "41.txt");
+      const original = "RUN-A-TABLE";
+      const replacement = "RUN-B-TABLE";
+      expect(Buffer.byteLength(original)).toBe(Buffer.byteLength(replacement));
+      await writeFile(path, original);
+      const reference = typedReport(original);
+      const reader = artifactReader({ "41": path });
+      const before = await captureTypedReport("task", reference, reader);
+      await writeFile(path, replacement);
+      const after = await captureTypedReport("task", reference, reader);
+      expect(before.completeness).toBe("full");
+      expect(before.reports[0]!.body).toContain(original);
+      expect(after.completeness).toBe("pointer-only");
+      expect(after.reports[0]!.reason).toMatch(/hash|digest|sha256/i);
+      expect(after.reports[0]!.body).not.toContain(replacement);
+      expect(reader.calls).toEqual(["41", "41"]);
+    });
+  });
+
+  test("reusing an agent name retains each run's numeric artifact rather than a stale agent file", async () => {
+    await withArtifactDirectory(async (directory) => {
+      const firstPath = join(directory, "41.txt");
+      const secondPath = join(directory, "42.txt");
+      const stalePath = join(directory, `${REPORT_AGENT}.md`);
+      await writeFile(firstPath, "FIRST-RUN-TABLE");
+      await writeFile(secondPath, "SECOND-RUN-TABLE");
+      await writeFile(stalePath, "STALE-AGENT-REPORT");
+      const reader = hostileArtifactReader({ "41": firstPath, "42": secondPath, [REPORT_AGENT]: stalePath }, directory);
+      const first = await captureTypedReport("async-result", typedReport("FIRST-RUN-TABLE"), reader);
+      const second = await captureTypedReport("async-result", typedReport("SECOND-RUN-TABLE", "42", "another-run"), reader);
+      const replay = await captureTypedReport("async-result", typedReport("FIRST-RUN-TABLE"), reader);
+      for (const capture of [first, second, replay]) {
+        expect(capture.completeness).toBe("full");
+        expect(capture.reports[0]!.work.agentId).toBe(REPORT_AGENT);
+        expect(capture.reports[0]!.body).not.toContain("STALE-AGENT-REPORT");
+      }
+      expect(first.reports[0]!.body).toContain("FIRST-RUN-TABLE");
+      expect(second.reports[0]!.body).toContain("SECOND-RUN-TABLE");
+      expect(second.reports[0]!.body).not.toContain("FIRST-RUN-TABLE");
+      expect(replay.reports[0]!.body).toContain("FIRST-RUN-TABLE");
+      expect(replay.reports[0]!.body).not.toContain("SECOND-RUN-TABLE");
+      expect(reader.calls).toEqual(["41", "42", "41"]);
+      expect(reader.directoryAccesses()).toBe(0);
+    });
+  });
+});
+
+describe("typed task report isolation and incomplete evidence", () => {
+  for (const source of REPORT_PATHS) {
+    test(`${source}: mixed members resolve only their own snapshots and retain individual completeness`, async () => {
+      await withArtifactDirectory(async (directory) => {
+        const firstPath = join(directory, "41.txt");
+        const secondPath = join(directory, "42.txt");
+        await writeFile(firstPath, "ALPHA-TABLE");
+        await writeFile(secondPath, "BETA-TABLE");
+        const reader = artifactReader({ "41": firstPath, "42": secondPath });
+        const members = [
+          { name: "Alpha", report: typedReport("ALPHA-TABLE") },
+          { name: "Beta", report: typedReport("BETA-TABLE", "42", "beta-run") },
+          { name: "Missing", report: typedReport("MISSING-TABLE", "43", "missing-run") },
+        ];
+        const capture = source === "wait"
+          ? await captureWaitReports({
+            ...waitResult(members.map(({ name, report }) => ({ id: `bg_${name}`, type: "task", status: "completed", label: name,
+              agentUrlId: `0-${name}`, resultText: `${name}: ${PREVIOUS_MESSAGE}`, report }))),
+            timestamp: TIMESTAMP, sessionManager: reader,
+          })
+          : await captureWorkReports({
+            source, timestamp: TIMESTAMP, text: "Three task reports", sessionManager: reader,
+            details: source === "task"
+              ? { results: members.map(({ name, report }) => ({ id: `0-${name}`, agent: name, report,
+                output: `${name}: ${PREVIOUS_MESSAGE}`, exitCode: 0, truncated: false })) }
+              : { jobs: members.map(({ name, report }) => ({ jobId: `bg_${name}`, type: "task", status: "completed",
+                label: name, agentId: `0-${name}`, report })) },
+          });
+        expect(capture.completeness).toBe("pointer-only");
+        expect(capture.reports.map((report) => report.work.name)).toEqual(["Alpha", "Beta", "Missing"]);
+        expect(capture.reports.map((report) => report.work.agentId)).toEqual(["0-Alpha", "0-Beta", "0-Missing"]);
+        expect(capture.reports.map((report) => report.work.completeness)).toEqual(["full", "full", "pointer-only"]);
+        expect(capture.reports[0]!.body).toContain("ALPHA-TABLE");
+        expect(capture.reports[0]!.body).not.toContain("BETA-TABLE");
+        expect(capture.reports[1]!.body).toContain("BETA-TABLE");
+        expect(capture.reports[1]!.body).not.toContain("ALPHA-TABLE");
+        expect(capture.reports[2]!.body).not.toContain("ALPHA-TABLE");
+        expect(capture.reports[2]!.body).not.toContain("BETA-TABLE");
+        expect(capture.reports[2]!.body).not.toContain("MISSING-TABLE");
+        expect(capture.reason).toBe(capture.reports[2]!.reason);
+        expect(capture.reason).toContain("unavailable");
+        expect(reader.calls).toEqual(["41", "42", "43"]);
+      });
+    });
+
+    test(`${source}: a readable partial snapshot remains pointer-only`, async () => {
+      await withArtifactDirectory(async (directory) => {
+        const path = join(directory, "41.txt");
+        await writeFile(path, SUBSTANTIVE_TABLE);
+        const reader = artifactReader({ "41": path });
+        const capture = await captureTypedReport(source, { ...typedReport(SUBSTANTIVE_TABLE), status: "partial", reason: "failed" }, reader);
+        expect(capture.completeness).toBe("pointer-only");
+        expect(capture.reports[0]!.work.completeness).toBe("pointer-only");
+        expect(capture.reports[0]!.body).toContain(SUBSTANTIVE_TABLE);
+        expect(capture.reports[0]!.reason).toMatch(/partial|failed/);
+        expect(capture.reason).toBe(capture.reports[0]!.reason);
+        expect(reader.calls).toEqual(["41"]);
+      });
+    });
+
+    test(`${source}: an otherwise complete artifact cannot promote schema-invalid output`, async () => {
+      await withArtifactDirectory(async (directory) => {
+        const path = join(directory, "41.txt");
+        await writeFile(path, SUBSTANTIVE_TABLE);
+        const reader = artifactReader({ "41": path });
+        const capture = await captureTypedReport(source, typedReport(SUBSTANTIVE_TABLE), reader, {
+          structured: { source: "task", mode: "strict", status: "invalid", data: { partial: "INVALID-SCHEMA-EVIDENCE" }, error: "missing required field" },
+        });
+        expect(capture.completeness).toBe("pointer-only");
+        expect(capture.reports[0]!.work.completeness).toBe("pointer-only");
+        expect(capture.reports[0]!.reason).toMatch(/validation|schema/);
+        expect(capture.reports[0]!.body).toContain(SUBSTANTIVE_TABLE);
+        expect(capture.reports[0]!.body).toContain("INVALID-SCHEMA-EVIDENCE");
+        expect(reader.calls).toEqual(["41"]);
+      });
+    });
+  }
+
+  for (const reason of ["failed", "aborted", "schema-invalid", "too-large", "storage-unavailable", "storage-failed", "empty", "history-unavailable"]) {
+    test(`partial without an artifact preserves the host's ${reason} reason`, async () => {
+      const reader = artifactReader({});
+      const capture = await captureTypedReport("task", { version: 1, runId: REPORT_RUN, status: "partial", reason }, reader);
+      expect(capture.completeness).toBe("pointer-only");
+      expect(capture.reports[0]!.work.completeness).toBe("pointer-only");
+      expect(capture.reports[0]!.reason).toContain(reason);
+      expect(capture.reports[0]!.body).toBe(`${PREVIOUS_MESSAGE}\n\n${PREVIOUS_MESSAGE}`);
+      expect(reader.calls).toEqual([]);
+    });
+  }
+
+  test("body URLs in a typed snapshot never trigger recursive artifact or agent hydration", async () => {
+    await withArtifactDirectory(async (directory) => {
+      const path = join(directory, "41.txt");
+      const forbidden = join(directory, "42.txt");
+      const body = `${SUBSTANTIVE_TABLE}\n[other](artifact://42) agent://${REPORT_AGENT} https://example.invalid/report file:///etc/passwd\n<preview full-output="agent://${REPORT_AGENT}">literal quoted syntax</preview>\nFull output: artifact://42`;
+      await writeFile(path, body);
+      await writeFile(forbidden, "UNADMITTED-BODY-REPORT");
+      const reader = hostileArtifactReader({ "41": path, "42": forbidden, [REPORT_AGENT]: forbidden }, directory);
+      const capture = await captureTypedReport("task", typedReport(body), reader);
+      expect(capture.completeness).toBe("full");
+      expect(capture.reports[0]!.body).toContain(body);
+      expect(capture.reports[0]!.body).not.toContain("UNADMITTED-BODY-REPORT");
+      expect(reader.calls).toEqual(["41"]);
+      expect(reader.directoryAccesses()).toBe(0);
+    });
+  });
+});
+
+describe("typed report bounded regular UTF-8 files", () => {
+  test("an exactly 4 MiB UTF-8 snapshot is recovered through its last byte", async () => {
+    await withArtifactDirectory(async (directory) => {
+      const path = join(directory, "41.txt");
+      const body = `${"é".repeat((REPORT_BYTE_LIMIT - 4) / 2)}LAST`;
+      const reference = typedReport(body);
+      expect(reference.artifact.bytes).toBe(REPORT_BYTE_LIMIT);
+      await writeFile(path, body);
+      const reader = artifactReader({ "41": path });
+      const capture = await captureTypedReport("task", reference, reader);
+      expect(capture.completeness).toBe("full");
+      expect(capture.reports[0]!.body.endsWith(body)).toBe(true);
+      expect(capture.reports[0]!.reason).toBeUndefined();
+      expect(reader.calls).toEqual(["41"]);
+    });
+  });
+
+  test("a real 4 MiB-plus-one file is rejected even when its reference understates its size", async () => {
+    await withArtifactDirectory(async (directory) => {
+      const path = join(directory, "41.txt");
+      const body = "x".repeat(REPORT_BYTE_LIMIT + 1);
+      await writeFile(path, body);
+      const reference = typedReport(body);
+      const reader = artifactReader({ "41": path });
+      const capture = await captureTypedReport("task", { ...reference, artifact: { ...reference.artifact, bytes: REPORT_BYTE_LIMIT } }, reader);
+      expect(capture.completeness).toBe("pointer-only");
+      expect(capture.reports[0]!.reason).toMatch(/large|limit|byte|size/);
+      expect(capture.reports[0]!.body).toBe(`${PREVIOUS_MESSAGE}\n\n${PREVIOUS_MESSAGE}`);
+      expect(reader.calls).toEqual(["41"]);
+    });
+  });
+
+  for (const kind of ["directory", "symlink", "invalid UTF-8", "missing file", "empty file"] as const) {
+    test(`${kind} cannot become a full report even with admitted metadata`, async () => {
+      await withArtifactDirectory(async (directory) => {
+        const path = join(directory, "41.txt");
+        let reference = typedReport(SUBSTANTIVE_TABLE);
+        if (kind === "directory") await mkdir(path);
+        if (kind === "symlink") {
+          const target = join(directory, "target.txt");
+          await writeFile(target, SUBSTANTIVE_TABLE);
+          await symlink(target, path);
+        }
+        if (kind === "invalid UTF-8") {
+          const invalid = new Uint8Array([0x63, 0xc3, 0x28]);
+          await writeFile(path, invalid);
+          reference = typedReport(invalid);
+        }
+        if (kind === "empty file") await writeFile(path, "");
+        const reader = artifactReader({ "41": path });
+        const capture = await captureTypedReport("task", reference, reader);
+        expect(capture.completeness).toBe("pointer-only");
+        expect(capture.reports[0]!.work.completeness).toBe("pointer-only");
+        expect(capture.reports[0]!.reason).toMatch(kind === "directory" || kind === "symlink"
+          ? /regular|file/ : kind === "empty file" ? /byte|size|empty/ : /unreadable|UTF-8/);
+        expect(capture.reason).toBe(capture.reports[0]!.reason);
+        expect(capture.reports[0]!.body).toBe(`${PREVIOUS_MESSAGE}\n\n${PREVIOUS_MESSAGE}`);
+        expect(capture.reports[0]!.reason).not.toContain(directory);
+        expect(reader.calls).toEqual(["41"]);
+      });
+    });
+  }
+});
 
 const taskReport = (agent: string, finding: string): string => `<task-result agent="${agent}">\n<output>\n${finding}\n</output>\n</task-result>`;
 

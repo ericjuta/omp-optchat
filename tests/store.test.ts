@@ -1904,6 +1904,180 @@ function pngFixture(seed: number): { readonly png: Buffer; readonly base64: stri
   };
 }
 
+describe("Store result associations", () => {
+  const work = { source: "task" as const, completeness: "full" as const, id: "task-1" };
+  const invalidLinks: { name: string; kind?: Kind; targetKind?: Kind; resultFor: unknown }[] = [
+    { name: "negative link", resultFor: -1 },
+    { name: "fractional link", resultFor: 0.5 },
+    { name: "unsafe integer link", resultFor: Number.MAX_SAFE_INTEGER + 1 },
+    { name: "numeric string link", resultFor: "0" },
+    { name: "null link", resultFor: null },
+    { name: "boolean link", resultFor: true },
+    { name: "object link", resultFor: { i: 0 } },
+    { name: "array link", resultFor: [0] },
+    { name: "user carrier", kind: "user", resultFor: 0 },
+    { name: "talk carrier", kind: "talk", resultFor: 0 },
+    { name: "tool carrier", kind: "tool", resultFor: 0 },
+    { name: "note carrier", kind: "note", resultFor: 0 },
+    { name: "self link", resultFor: 2 },
+    { name: "forward link", resultFor: 3 },
+    { name: "dangling link", resultFor: 99 },
+    { name: "user target", targetKind: "user", resultFor: 1 },
+    { name: "talk target", targetKind: "talk", resultFor: 1 },
+    { name: "note target", targetKind: "note", resultFor: 1 },
+    { name: "echo target", targetKind: "echo", resultFor: 1 },
+    { name: "work target", targetKind: "work", resultFor: 1 },
+    { name: "work self link", kind: "work", resultFor: 2 },
+    { name: "work forward link", kind: "work", resultFor: 3 },
+    { name: "work dangling link", kind: "work", resultFor: 99 },
+    { name: "work echo target", kind: "work", targetKind: "echo", resultFor: 1 },
+    { name: "work work target", kind: "work", targetKind: "work", resultFor: 1 },
+  ];
+  const invalidAppendLinks: typeof invalidLinks = [
+    ...invalidLinks,
+    { name: "undefined link", resultFor: undefined },
+    { name: "NaN link", resultFor: NaN },
+    { name: "positive infinite link", resultFor: Infinity },
+    { name: "negative infinite link", resultFor: -Infinity },
+  ];
+
+  test.each(invalidAppendLinks)("append rejects $name without changing bytes or IDs, then accepts a valid link", async ({ kind = "echo", targetKind = "tool", resultFor }) => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const prefix = [
+        store.append("tool", "tool zero"),
+        store.append(targetKind, "target", undefined, targetKind === "work" ? { work } : undefined),
+      ];
+      const main = join(fixture.directory, "main");
+      const files = (await readdir(main)).sort();
+      const before = await Promise.all(files.map((name) => readFile(join(main, name))));
+      const metadata = { resultFor, ...(kind === "work" ? { work } : {}) };
+      expect(() => store.append(kind, "rejected result", undefined, metadata as Parameters<Store["append"]>[3])).toThrow();
+      expect(store.messages).toEqual(prefix);
+      expect((await readdir(main)).sort()).toEqual(files);
+      expect(await Promise.all(files.map((name) => readFile(join(main, name))))).toEqual(before);
+      const valid = store.append("echo", "valid result", undefined, { resultFor: 0 });
+      expect(valid.i).toBe(2);
+      expect(store.messages).toEqual([...prefix, valid]);
+      expect(await streamContents(fixture.directory, "main"))
+        .toBe([...prefix, valid].map((record) => `${JSON.stringify(record)}\n`).join(""));
+    });
+  });
+
+  test.each(invalidLinks)("replay rejects $name before repairing any earlier file", async ({ kind = "echo", targetKind = "tool", resultFor }) => {
+    await withFixture(async (fixture) => {
+      const first = message(0, "tool zero", "tool");
+      const target = { ...message(1, "target", targetKind), ...(targetKind === "work" ? { metadata: { work } } : {}) };
+      const invalid = { ...message(2, "rejected result", kind), metadata: { resultFor, ...(kind === "work" ? { work } : {}) } };
+      const future = message(3, "future tool", "tool");
+      // The first two files are read before the invalid record. Neither their
+      // missing newline nor the later file's missing newline may be repaired.
+      const earlier = await seed(fixture.directory, "main", "2026-01-01.jsonl", [], JSON.stringify(first));
+      const torn = await seed(fixture.directory, "main", "2026-01-02.jsonl", [], '{"i":');
+      const later = await seed(fixture.directory, "main", "2026-01-03.jsonl", [target, invalid], JSON.stringify(future));
+      const tree = await seed(fixture.directory, "tree", "2026-01-01.jsonl", [], JSON.stringify(node(0, 0)));
+      const files = [earlier, torn, later, tree];
+      const before = await Promise.all(files.map((path) => readFile(path)));
+      const reports: string[] = [];
+      await expect(fixture.open((report) => reports.push(report))).rejects.toThrow();
+      expect(reports.some((report) => report.includes(torn))).toBe(true);
+      expect(await Promise.all(files.map((path) => readFile(path)))).toEqual(before);
+
+      const repaired = { ...message(2, "valid result", "echo"), metadata: { resultFor: 0 } };
+      await writeFile(later, [target, repaired, future].map((record) => JSON.stringify(record)).join("\n"));
+      const reopened = await fixture.open();
+      expect(reopened.messages).toEqual([first, target, repaired, future]);
+      expect(await readFile(earlier)).toEqual(Buffer.concat([before[0]!, Buffer.from("\n")]));
+      expect(await readFile(torn)).toEqual(Buffer.concat([before[1]!, Buffer.from("\n")]));
+    });
+  });
+
+  test("tool zero accepts multiple echo and work reports with independent frozen metadata snapshots", async () => {
+    await withFixture(async (fixture) => {
+      const store = await fixture.open();
+      const tool = store.append("tool", "tool zero");
+      const echoInput = { resultFor: 0 };
+      const workInput = { resultFor: 0, work: { ...work } };
+      const echo = store.append("echo", "first echo", undefined, echoInput);
+      const report = store.append("work", "first report", undefined, workInput);
+      expect(echo.metadata).not.toBe(echoInput);
+      expect(report.metadata).not.toBe(workInput);
+      expect(report.metadata!.work).not.toBe(workInput.work);
+      expect(Object.isFrozen(echoInput)).toBe(false);
+      expect(Object.isFrozen(workInput)).toBe(false);
+      expect(Object.isFrozen(workInput.work)).toBe(false);
+      echoInput.resultFor = 99;
+      workInput.resultFor = 99;
+      workInput.work.id = "caller mutation";
+      expect(echo.metadata).toEqual({ resultFor: 0 });
+      expect(report.metadata).toEqual({ resultFor: 0, work });
+      const repeated = [
+        store.append("echo", "second echo", undefined, { resultFor: 0 }),
+        store.append("work", "second report", undefined, { resultFor: 0, work }),
+      ];
+      const expected = [tool, echo, report, ...repeated];
+      for (const record of expected.slice(1)) {
+        expect(Object.isFrozen(record)).toBe(true);
+        expect(Object.isFrozen(record.metadata)).toBe(true);
+        expect(record.metadata!.resultFor).toBe(0);
+        expect(store.readMessagePage(record.i).metadata).toEqual(record.metadata);
+      }
+      expect(Object.isFrozen(report.metadata!.work)).toBe(true);
+      expect(() => { (echo.metadata as { resultFor: number }).resultFor = 99; }).toThrow();
+      expect(() => { (report.metadata!.work as { id: string }).id = "rewrite"; }).toThrow();
+      expect(await streamContents(fixture.directory, "main"))
+        .toBe(expected.map((record) => `${JSON.stringify(record)}\n`).join(""));
+      await store.close();
+      const reopened = await fixture.open();
+      expect(reopened.messages).toEqual(expected);
+      for (const record of reopened.messages.slice(1)) {
+        expect(Object.isFrozen(record.metadata)).toBe(true);
+        expect(record.metadata!.resultFor).toBe(0);
+      }
+      expect(Object.isFrozen(reopened.messages[2]!.metadata!.work)).toBe(true);
+    });
+  });
+
+  test("reopened linked prefixes retain legacy echo and work records and accept more reports for the original tool", async () => {
+    await withFixture(async (fixture) => {
+      const prefix = [
+        message(0, "original tool", "tool"),
+        { ...message(1, "linked echo", "echo"), metadata: { resultFor: 0 } },
+        { ...message(2, "linked work", "work"), metadata: { resultFor: 0, work } },
+        message(3, "legacy echo", "echo"),
+        { ...message(4, "legacy work", "work"), metadata: { work } },
+      ];
+      await seed(fixture.directory, "main", "2026-01-01.jsonl", prefix);
+      const reopened = await fixture.open();
+      expect(reopened.messages).toEqual(prefix);
+      expect(Object.keys(reopened.messages[3]!).sort()).toEqual(["date", "i", "kind", "size", "text"]);
+      expect(reopened.messages[4]!.metadata).toEqual({ work });
+      const echo = reopened.append("echo", "later echo", undefined, { resultFor: 0 });
+      const report = reopened.append("work", "later report", undefined, { resultFor: 0, work });
+      expect([echo.i, report.i]).toEqual([5, 6]);
+      await reopened.close();
+      expect((await fixture.open()).messages).toEqual([...prefix, echo, report]);
+    });
+  });
+
+  test("replay sorts permanent IDs before resolving links from earlier filenames to later tool files", async () => {
+    await withFixture(async (fixture) => {
+      const firstTool = message(0, "first tool", "tool");
+      const echo = { ...message(1, "echo", "echo"), metadata: { resultFor: 0 } };
+      const secondTool = message(2, "second tool", "tool");
+      const report = { ...message(3, "report", "work"), metadata: { resultFor: 2, work } };
+      await seed(fixture.directory, "main", "2026-01-01.jsonl", [echo, report]);
+      await seed(fixture.directory, "main", "2026-01-03.jsonl", [firstTool, secondTool]);
+      const store = await fixture.open();
+      expect(store.messages).toEqual([firstTool, echo, secondTool, report]);
+      const next = store.append("echo", "another report", undefined, { resultFor: 2 });
+      expect(next.i).toBe(4);
+      await store.close();
+      expect((await fixture.open()).messages).toEqual([firstTool, echo, secondTool, report, next]);
+    });
+  });
+});
+
 describe("Store image storage and message attachments", () => {
   const imagesOf = (store: Store) => join(store.directory, "images");
 

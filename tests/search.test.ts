@@ -382,38 +382,74 @@ describe("Memory.search zero-hit word counts", () => {
 });
 
 describe("Memory.zoom of a tool call", () => {
-  test("a page names the record that stores the call's result", async () => {
+  test("a page names its explicitly linked result, but non-tool and summary pages do not", async () => {
     const store = await openStore();
     store.append("user", "run it");
     store.append("tool", 'bash {"command":"ls"}');
-    store.append("echo", "a.txt");
+    store.append("echo", "a.txt", new Date(), { resultFor: 1 });
     store.append("talk", "done");
     const memory = memoryOver(store);
     expect(memory.zoom(1, 1).result).toBe(2);
     expect(memory.zoom(0, 1).result).toBeUndefined();
     expect(memory.zoom(2, 1).result).toBeUndefined();
     expect(memory.zoom(3, 1).result).toBeUndefined();
+    saveText(store, 0, 0, "run it");
+    saveText(store, 0, 1, "list files");
+    expect(memory.zoom(0, 2).result).toBeUndefined();
   });
 
-  test("calls issued together pair with their results in order, even with talk between them", async () => {
+  test("multiple wait reports do not shift the following call result", async () => {
     const store = await openStore();
-    store.append("user", "two things");
-    store.append("talk", "first");
+    store.append("tool", "wait {}");
     store.append("tool", 'read {"path":"a"}');
-    store.append("talk", "second");
-    store.append("tool", 'read {"path":"b"}');
-    store.append("tool", 'task {"id":"x"}');
-    store.append("echo", "contents of a");
-    store.append("echo", "contents of b");
-    store.append("work", "report x", new Date(), { work: { source: "task", completeness: "pointer-only" } });
-    store.append("talk", "later");
-    store.append("tool", 'read {"path":"c"}');
-    store.append("echo", "contents of c");
+    store.append("work", "first report", new Date(), {
+      resultFor: 0,
+      work: { source: "task", completeness: "pointer-only" },
+    });
+    store.append("work", "second report", new Date(), {
+      resultFor: 0,
+      work: { source: "task", completeness: "pointer-only" },
+    });
+    store.append("echo", "contents of a", new Date(), { resultFor: 1 });
     const memory = memoryOver(store);
-    expect(memory.zoom(2, 1).result).toBe(6);
-    expect(memory.zoom(4, 1).result).toBe(7);
-    expect(memory.zoom(5, 1).result).toBe(8);
-    expect(memory.zoom(10, 1).result).toBe(11);
+    expect(memory.zoom(0, 1).result).toBe(2);
+    expect(memory.zoom(1, 1).result).toBe(4);
+    saveText(store, 0, 0, "wait for reports");
+    saveText(store, 0, 1, "read a");
+    expect(memory.zoom(0, 2).result).toBeUndefined();
+  });
+
+  test("a wait echo remains the first linked row before multiple work reports", async () => {
+    const store = await openStore();
+    store.append("tool", "wait {}");
+    store.append("tool", 'read {"path":"a"}');
+    store.append("echo", "reports ready", new Date(), { resultFor: 0 });
+    store.append("work", "first report", new Date(), {
+      resultFor: 0,
+      work: { source: "task", completeness: "pointer-only" },
+    });
+    store.append("work", "second report", new Date(), {
+      resultFor: 0,
+      work: { source: "task", completeness: "pointer-only" },
+    });
+    store.append("echo", "contents of a", new Date(), { resultFor: 1 });
+    const memory = memoryOver(store);
+    expect(memory.zoom(0, 1).result).toBe(2);
+    expect(memory.zoom(1, 1).result).toBe(5);
+  });
+
+  test("out-of-order results and intervening messages retain explicit call identity", async () => {
+    const store = await openStore();
+    store.append("tool", 'read {"path":"a"}');
+    store.append("tool", 'read {"path":"b"}');
+    store.append("echo", "contents of b", new Date(), { resultFor: 1 });
+    store.append("user", "continue");
+    store.append("talk", "waiting for a");
+    store.append("note", "a is pending");
+    store.append("echo", "contents of a", new Date(), { resultFor: 0 });
+    const memory = memoryOver(store);
+    expect(memory.zoom(0, 1).result).toBe(6);
+    expect(memory.zoom(1, 1).result).toBe(2);
   });
 
   test("a call whose result is not logged yet has no pointer, and a page of a longer call keeps it on every page", async () => {
@@ -422,11 +458,14 @@ describe("Memory.zoom of a tool call", () => {
     store.append("tool", `bash ${JSON.stringify({ command: "x".repeat(40_000) })}`);
     const memory = memoryOver(store);
     expect(memory.zoom(1, 1).result).toBeUndefined();
-    store.append("echo", "ok");
-    const first = memory.zoom(1, 1);
-    expect(first.next).not.toBeNull();
-    expect(first.result).toBe(2);
-    expect(memory.zoom(1, 1, first.next!).result).toBe(2);
+    store.append("echo", "ok", new Date(), { resultFor: 1 });
+    let page = memory.zoom(1, 1);
+    expect(page.next).not.toBeNull();
+    while (true) {
+      expect(page.result).toBe(2);
+      if (page.next === null) break;
+      page = memory.zoom(1, 1, page.next);
+    }
   });
 
   test("a call followed only by another call's result does not claim it", async () => {
@@ -434,9 +473,49 @@ describe("Memory.zoom of a tool call", () => {
     store.append("user", "go");
     store.append("tool", 'read {"path":"a"}');
     store.append("tool", 'read {"path":"b"}');
-    store.append("echo", "contents of a");
+    store.append("echo", "contents of b", new Date(), { resultFor: 2 });
     const memory = memoryOver(store);
-    expect(memory.zoom(1, 1).result).toBe(3);
+    expect(memory.zoom(1, 1).result).toBeUndefined();
+    expect(memory.zoom(2, 1).result).toBe(3);
+  });
+
+  test("unbound legacy echoes and native work reports never imply a result", async () => {
+    const store = await openStore();
+    store.append("tool", 'read {"path":"a"}');
+    store.append("echo", 'read {"path":"a"}');
+    store.append("tool", "wait {}");
+    store.append("work", "wait {}", new Date(), {
+      work: { source: "async-result", completeness: "pointer-only", id: "job-1", name: "read a" },
+    });
+    const memory = memoryOver(store);
+    expect(memory.zoom(0, 1).result).toBeUndefined();
     expect(memory.zoom(2, 1).result).toBeUndefined();
+    expect(memory.zoom(1, 1).result).toBeUndefined();
+    expect(memory.zoom(3, 1).result).toBeUndefined();
+  });
+
+  test("explicit result links survive closing and reopening the store", async () => {
+    const store = await openStore();
+    store.append("tool", "wait {}");
+    store.append("tool", 'read {"path":"a"}');
+    store.append("work", "first report", new Date(), {
+      resultFor: 0,
+      work: { source: "task", completeness: "pointer-only" },
+    });
+    store.append("work", "second report", new Date(), {
+      resultFor: 0,
+      work: { source: "task", completeness: "pointer-only" },
+    });
+    store.append("echo", "contents of a", new Date(), { resultFor: 1 });
+    const memory = memoryOver(store);
+    expect(memory.zoom(0, 1).result).toBe(2);
+    expect(memory.zoom(1, 1).result).toBe(4);
+    await memory.close();
+    await store.close();
+    const reopened = await Store.open(store.directory);
+    cleanups.push(() => reopened.close());
+    const reopenedMemory = memoryOver(reopened);
+    expect(reopenedMemory.zoom(0, 1).result).toBe(2);
+    expect(reopenedMemory.zoom(1, 1).result).toBe(4);
   });
 });

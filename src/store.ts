@@ -129,10 +129,24 @@ function isKind(value: unknown): value is Kind {
     value === "echo" || value === "note" || value === "work";
 }
 
-// Work kind and work metadata must describe each other exactly.
+// Work kind and work metadata must describe each other exactly; only results may carry links.
 function checkCoupling(kind: Kind, metadata: MessageMetadata | undefined, where: string): void {
   if ((kind === "work") !== (metadata?.work !== undefined)) {
     throw new Error(`Work kind and work metadata must accompany each other at ${where}`);
+  }
+  if (metadata?.resultFor !== undefined && kind !== "echo" && kind !== "work") {
+    throw new Error(`resultFor requires echo or work kind at ${where}`);
+  }
+  if (metadata?.coordination !== undefined && kind !== "note") {
+    throw new Error(`coordination requires note kind at ${where}`);
+  }
+}
+
+// Contiguous permanent IDs make association lookup allocation-free; legacy unlinked rows remain valid.
+function checkAssociation(message: Message, messages: readonly Message[]): void {
+  const target = message.metadata?.resultFor;
+  if (target !== undefined && (target >= message.i || messages[target]?.kind !== "tool")) {
+    throw new Error(`resultFor must name an earlier tool record at message ${message.i}`);
   }
 }
 
@@ -893,6 +907,9 @@ export class Store {
           throw new Error(`Message ID gap or duplicate: expected ${i}, found ${actual}; refusing to reindex history`);
         }
       }
+      for (let i = 0; i < this.messages.length; i++) {
+        checkAssociation(this.messages[i]!, this.messages);
+      }
       readStream(this.tree, (value, where) => {
         const node = parseNode(value, where);
         const key = nodeKey(node.l, node.i);
@@ -961,6 +978,7 @@ export class Store {
       date: new Date(time).toISOString(),
       ...(stored === undefined ? {} : { metadata: stored }),
     });
+    checkAssociation(message, this.messages);
     this.appendRecord(this.main, message);
     this.messages.push(message);
     return message;

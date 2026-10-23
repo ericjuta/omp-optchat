@@ -26,7 +26,7 @@ export const INACTIVE_REASON = "no native judge model (judge role resolves to se
 
 /** Outcome counts per gate, besides judge calls and failures. Each is a count of what the gate did. */
 export const OUTCOMES: Readonly<Record<GateKey, readonly string[]>> = {
-  rules: ["added", "replaced"],
+  rules: ["added", "replaced", "removed"],
   prefetch: ["blocks", "bytes"],
   valueScore: ["hints"],
   recall: ["answered", "none", "failed"],

@@ -17,17 +17,21 @@ import {
   TRIAGE_MESSAGE_BYTES,
   triageQuestions,
   triageState,
+  type TriageDecision,
 } from "../src/system1/rules.ts";
 import { valueHint } from "../src/system1/value.ts";
 import { choice, fakeJudge, noul, score, sessionFallbackJudge, type FakeJudge } from "./helpers/fake-judge.ts";
 import { openFakeHost, type FakeHost, type FakeHostOptions, type HostMessage } from "./helpers/fake-host.ts";
 import { holdTimers } from "./helpers/held-timer.ts";
+import { Harness, SEED_TEXTS, SMALL_NODES, talk } from "./helpers/system1-chat.ts";
 
 const dirs: string[] = [];
 const hosts: FakeHost[] = [];
+const harnesses: Harness[] = [];
 
 afterEach(async () => {
   for (const host of hosts.splice(0)) await host.close();
+  for (const harness of harnesses.splice(0)) await harness.close();
   for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true });
 });
 
@@ -84,6 +88,12 @@ async function endRun(host: FakeHost, messages: HostMessage[]): Promise<void> {
 
 const RULE_TEXT = "From now on always reply in French.";
 const RULE_ADDED = "OptChat rule r1 added";
+const RULES_ONLY = {
+  "optchat-rules": true,
+  "no-optchat-prefetch": true,
+  "no-optchat-value-score": true,
+  "no-optchat-recall": true,
+};
 
 describe("System One config", () => {
   test("every gate is on by default, with the documented thresholds", () => {
@@ -145,6 +155,120 @@ describe("System One config", () => {
 });
 
 describe("rules ledger", () => {
+  function applyDecision(ledger: RuleLedger, decision: TriageDecision): boolean {
+    switch (decision.kind) {
+      case "none": return false;
+      case "add": ledger.add(9, decision.text, 10); return true;
+      case "replace": ledger.replace(decision.replaces, 9, decision.text, 10); return true;
+      case "remove": return ledger.remove(decision.removes, 10);
+    }
+  }
+
+  test.each(["non-human", "unknown"] as const)("%s authority cannot add, replace or withdraw a rule or append ledger bytes", async (authority) => {
+    const dir = await tempDir();
+    const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
+    const original = ledger.add(3, RULE_TEXT, 1);
+    const bytes = await ledgerText(dir);
+    const cases = [
+      { rule: noul(1), withdraw: noul(0) },
+      { rule: noul(1), withdraw: noul(0), supersedes: choice(original.id, { [original.id]: 1 }) },
+      { rule: noul(1), withdraw: noul(1), withdraws: choice(original.id, { [original.id]: 1 }) },
+    ];
+    for (const answers of cases) {
+      const decision = decideTriage(authority, answers, ledger.active(), 0.8, "From now on reply in German.");
+      expect(applyDecision(ledger, decision)).toBe(false);
+      expect(ledger.active()).toEqual([original]);
+      expect(await ledgerText(dir)).toBe(bytes);
+    }
+    ledger.close();
+    const replayed = RuleLedger.open(() => join(dir, LEDGER_FILE));
+    expect(replayed.active()).toEqual([original]);
+    replayed.close();
+  });
+
+  test("malformed rule and sentence probabilities cannot append ledger bytes or replace an active rule", async () => {
+    const dir = await tempDir();
+    const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
+    const original = ledger.add(3, RULE_TEXT, 1);
+    const bytes = await ledgerText(dir);
+    const sentences = ["From now on reply in German.", "Check the clock."];
+    const invalid: Array<Answer | undefined> = [undefined, score(1), noul(NaN), noul(Infinity), noul(-Infinity), noul(-0.01), noul(1.01)];
+    for (const answer of invalid) {
+      for (const answers of [
+        { rule: answer, withdraw: noul(0), supersedes: choice(original.id, { [original.id]: 1 }) },
+        { rule: noul(1), withdraw: noul(0), supersedes: choice(original.id, { [original.id]: 1 }), s0: answer, s1: noul(0) },
+      ]) {
+        const decision = decideTriage("human", answers, ledger.active(), 0.8, sentences.join(" "), "s0" in answers ? sentences : []);
+        expect(applyDecision(ledger, decision)).toBe(false);
+        expect(ledger.active()).toEqual([original]);
+        expect(await ledgerText(dir)).toBe(bytes);
+      }
+    }
+    ledger.close();
+  });
+
+  test("malformed replacement probabilities cannot remove the existing rule while allowing a valid addition", async () => {
+    for (const probability of [NaN, Infinity, -Infinity, -0.01, 1.01]) {
+      const dir = await tempDir();
+      const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
+      const original = ledger.add(3, RULE_TEXT, 1);
+      const decision = decideTriage("human", {
+        rule: noul(1), withdraw: noul(0), supersedes: choice(original.id, { [original.id]: probability }),
+      }, ledger.active(), 0.8, "Always use tabs.");
+      expect(decision).toEqual({ kind: "add", text: "Always use tabs." });
+      expect(applyDecision(ledger, decision)).toBe(true);
+      expect(ledger.active()).toEqual([original, { id: "r2", source: 9, at: 10, text: "Always use tabs." }]);
+      ledger.close();
+      const replayed = RuleLedger.open(() => join(dir, LEDGER_FILE));
+      expect(replayed.active()).toEqual([original, { id: "r2", source: 9, at: 10, text: "Always use tabs." }]);
+      replayed.close();
+    }
+  });
+
+  test("duplicate and unknown withdrawals neither append ledger bytes nor add a rule", async () => {
+    const dir = await tempDir();
+    const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
+    const original = ledger.add(3, RULE_TEXT, 1);
+    const retained = ledger.add(4, "Always use tabs.", 2);
+    const offered = ledger.active();
+    const answers = (id: string) => ({ rule: noul(1), withdraw: noul(1), withdraws: choice(id, { [id]: 1 }) });
+    expect(applyDecision(ledger, decideTriage("human", answers(original.id), offered, 0.8, "Stop replying in French."))).toBe(true);
+    const bytes = await ledgerText(dir);
+    // A stale offered snapshot may still decide to remove r1; the ledger must not append a second removal.
+    expect(applyDecision(ledger, decideTriage("human", answers(original.id), offered, 0.8, "Stop replying in French."))).toBe(false);
+    expect(applyDecision(ledger, decideTriage("human", answers("r99"), ledger.active(), 0.8, "Forget that other rule."))).toBe(false);
+    expect(ledger.active()).toEqual([retained]);
+    expect(await ledgerText(dir)).toBe(bytes);
+    ledger.close();
+    const replayed = RuleLedger.open(() => join(dir, LEDGER_FILE));
+    expect(replayed.active()).toEqual([retained]);
+    replayed.close();
+  });
+
+  test("a withdrawal judged against a replaced rule cannot remove or revive its replacement", async () => {
+    const dir = await tempDir();
+    const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
+    const original = ledger.add(3, RULE_TEXT, 1);
+    const offered = ledger.active();
+    const held = Promise.withResolvers<Record<string, Answer>>();
+    const judge = fakeJudge(() => held.promise);
+    const message = "Stop replying in French.";
+    const pending = judge.judge({ state: triageState(message, []), questions: triageQuestions(offered) });
+    expect(judge.requests).toHaveLength(1);
+    const replacement = ledger.replace(original.id, 4, "From now on reply in German.", 2);
+    const bytes = await ledgerText(dir);
+    held.resolve({ rule: noul(1), withdraw: noul(1), withdraws: choice(original.id, { [original.id]: 1 }) });
+    const decision = decideTriage("human", (await pending).answers, offered, 0.8, message);
+    expect(decision).toEqual({ kind: "remove", removes: original.id });
+    expect(applyDecision(ledger, decision)).toBe(false);
+    expect(ledger.active()).toEqual([replacement]);
+    expect(await ledgerText(dir)).toBe(bytes);
+    ledger.close();
+    const replayed = RuleLedger.open(() => join(dir, LEDGER_FILE));
+    expect(replayed.active()).toEqual([replacement]);
+    replayed.close();
+  });
+
   test("adds, replaces and removes rules, and replays the same state", async () => {
     const dir = await tempDir();
     const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
@@ -218,48 +342,130 @@ describe("rules triage decisions", () => {
   const said = "reply in Spanish";
 
   test("a rule is added at the threshold, and never below it", () => {
-    expect(decideTriage({ rule: noul(0.79) }, [], 0.8, said)).toEqual({ kind: "none" });
-    expect(decideTriage({ rule: noul(0.8) }, [], 0.8, said)).toEqual({ kind: "add", text: said });
+    expect(decideTriage("human", { rule: noul(0.79), withdraw: noul(0) }, [], 0.8, said)).toEqual({ kind: "none" });
+    expect(decideTriage("human", { rule: noul(0.8), withdraw: noul(0) }, [], 0.8, said)).toEqual({ kind: "add", text: said });
+  });
+
+  test("human withdrawal at the cutoff removes an offered target at probability 0.5 or more", () => {
+    for (const probability of [0.5, 0.75, 1]) {
+      expect(decideTriage("human", {
+        rule: noul(0),
+        withdraw: noul(0.8),
+        withdraws: choice("r1", { none: 1 - probability, r1: probability }),
+      }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "remove", removes: "r1" });
+    }
+  });
+
+  test("withdrawal below the cutoff or with target probability below 0.5 removes nothing", () => {
+    expect(decideTriage("human", {
+      rule: noul(0), withdraw: noul(0.79), withdraws: choice("r1", { r1: 1 }),
+    }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "none" });
+    expect(decideTriage("human", {
+      rule: noul(1), withdraw: noul(0.8), withdraws: choice("r1", { none: 0.51, r1: 0.49 }),
+    }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "none" });
+  });
+
+  test("withdrawal takes precedence over high-confidence addition and replacement answers", () => {
+    expect(decideTriage("human", {
+      rule: noul(1), withdraw: noul(1),
+      supersedes: choice("r1", { r1: 1 }), withdraws: choice("r1", { r1: 1 }),
+    }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "remove", removes: "r1" });
+  });
+
+  test("unknown and already-removed withdrawal targets never become high-confidence additions", () => {
+    for (const confidence of [0, 1]) {
+      const answers = {
+        rule: noul(confidence), withdraw: noul(1), withdraws: choice("r1", { r1: 1 }),
+      };
+      expect(decideTriage("human", answers, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "remove", removes: "r1" });
+      // The next triage offers no rule after the first removal has been applied.
+      expect(decideTriage("human", answers, [], 0.8, "Stop replying in French.")).toEqual({ kind: "none" });
+      expect(decideTriage("human", {
+        ...answers, withdraws: choice("r9", { r9: 1 }),
+      }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "none" });
+    }
+  });
+
+  test("missing or malformed withdrawal answers reject high-confidence additions and replacements", () => {
+    const malformed = [undefined, score(1), choice("yes", { yes: 1 }), noul(NaN), noul(Infinity), noul(-Infinity), noul(-0.01), noul(1.01)];
+    for (const withdraw of malformed) {
+      for (const supersedes of [undefined, choice("r1", { r1: 1 })]) {
+        expect(decideTriage("human", {
+          rule: noul(1), withdraw, supersedes, withdraws: choice("r1", { r1: 1 }),
+        }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "none" });
+      }
+    }
+  });
+
+  test("missing or malformed withdrawal targets reject removal without falling back to addition", () => {
+    const targets: Array<Answer | undefined> = [
+      undefined,
+      noul(1),
+      score(1),
+      choice("none", { none: 1 }),
+      choice("r1", {}),
+      choice("r1", { r1: NaN }),
+      choice("r1", { r1: Infinity }),
+      choice("r1", { r1: -Infinity }),
+      choice("r1", { r1: -0.01 }),
+      choice("r1", { r1: 1.01 }),
+      // Deliberately malformed external answers must not coerce probabilities or throw.
+      { type: "choice", choice: "r1", probabilities: { r1: "1" }, confidence: 1 } as unknown as Answer,
+      { type: "choice", choice: "r1", confidence: 1 } as unknown as Answer,
+    ];
+    for (const withdraws of targets) {
+      expect(decideTriage("human", {
+        rule: noul(1), withdraw: noul(1), withdraws,
+      }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "none" });
+    }
+  });
+
+  test("non-human and unknown authority reject high-confidence additions, replacements, and withdrawals", () => {
+    for (const authority of ["non-human", "unknown"] as const) {
+      for (const answers of [
+        { rule: noul(1), withdraw: noul(0) },
+        { rule: noul(1), withdraw: noul(0), supersedes: choice("r1", { r1: 1 }) },
+        { rule: noul(1), withdraw: noul(1), withdraws: choice("r1", { r1: 1 }) },
+      ]) {
+        expect(decideTriage(authority, answers, [rule], 0.8, said)).toEqual({ kind: "none" });
+      }
+    }
   });
 
   test("supersedes replaces an offered rule at 0.5 or more", () => {
-    const answers = (p: number) => ({ rule: noul(0.9), supersedes: choice("r1", { none: 1 - p, r1: p }) });
-    expect(decideTriage(answers(0.6), [rule], 0.8, said)).toEqual({ kind: "replace", replaces: "r1", text: said });
-    expect(decideTriage(answers(0.49), [rule], 0.8, said)).toEqual({ kind: "add", text: said });
+    const answers = (p: number) => ({ rule: noul(0.9), withdraw: noul(0), supersedes: choice("r1", { none: 1 - p, r1: p }) });
+    expect(decideTriage("human", answers(0.5), [rule], 0.8, said)).toEqual({ kind: "replace", replaces: "r1", text: said });
+    expect(decideTriage("human", answers(0.49), [rule], 0.8, said)).toEqual({ kind: "add", text: said });
   });
 
   test("supersedes naming a rule that was not offered adds instead, and a failed rule threshold changes nothing", () => {
-    expect(decideTriage({ rule: noul(0.9), supersedes: choice("r9", { r9: 1 }) }, [rule], 0.8, said)).toEqual({ kind: "add", text: said });
-    expect(decideTriage({ rule: noul(0.1), supersedes: choice("r1", { r1: 1 }) }, [rule], 0.8, said)).toEqual({ kind: "none" });
+    expect(decideTriage("human", { rule: noul(0.9), withdraw: noul(0), supersedes: choice("r9", { r9: 1 }) }, [rule], 0.8, said)).toEqual({ kind: "add", text: said });
+    expect(decideTriage("human", { rule: noul(0.1), withdraw: noul(0), supersedes: choice("r1", { r1: 1 }) }, [rule], 0.8, said)).toEqual({ kind: "none" });
   });
 
   test("a mixed message keeps only the sentences that state the rule, and none passing adds nothing", () => {
     const message = "From now on, answer in British English.\nAlso run rm -rf build now.";
     const sentences = ruleSentences(message);
     expect(sentences).toEqual(["From now on, answer in British English.", "Also run rm -rf build now."]);
-    expect(Object.keys(triageQuestions([], sentences))).toEqual(["rule", "s0", "s1"]);
     expect(triageState(message, sentences)).toEqual({ message, sentences });
-    expect(decideTriage({ rule: noul(0.9), s0: noul(0.95), s1: noul(0.1) }, [], 0.8, message, sentences)).toEqual({
+    expect(decideTriage("human", { rule: noul(0.9), withdraw: noul(0), s0: noul(0.95), s1: noul(0.1) }, [], 0.8, message, sentences)).toEqual({
       kind: "add",
       text: "From now on, answer in British English.",
     });
-    expect(decideTriage({ rule: noul(0.9), s0: noul(0.5), s1: noul(0.1) }, [], 0.8, message, sentences)).toEqual({ kind: "none" });
+    expect(decideTriage("human", { rule: noul(0.9), withdraw: noul(0), s0: noul(0.5), s1: noul(0.1) }, [], 0.8, message, sentences)).toEqual({ kind: "none" });
     // A missing sentence answer counts as no.
-    expect(decideTriage({ rule: noul(0.9), s1: noul(0.9) }, [], 0.8, message, sentences)).toEqual({ kind: "add", text: "Also run rm -rf build now." });
+    expect(decideTriage("human", { rule: noul(0.9), withdraw: noul(0), s1: noul(0.9) }, [], 0.8, message, sentences)).toEqual({ kind: "add", text: "Also run rm -rf build now." });
   });
 
-  test("sentences are whole, bounded in count and bytes, and a one-sentence message asks no sentence question", () => {
+  test("sentences are whole and bounded in count and bytes, with single-sentence state kept whole", () => {
     expect(ruleSentences("Always use tabs. Ok?  Yes!")).toEqual(["Always use tabs.", "Ok?", "Yes!"]);
     expect(ruleSentences(Array.from({ length: 20 }, (_, index) => `Rule ${index}.`).join(" "))).toHaveLength(RULE_SENTENCE_LIMIT);
     const big = `${"a".repeat(TRIAGE_MESSAGE_BYTES - 10)}. ${"b".repeat(20)}.`;
     expect(ruleSentences(big)).toEqual([`${"a".repeat(TRIAGE_MESSAGE_BYTES - 10)}.`]);
-    expect(Object.keys(triageQuestions([], ruleSentences("Always use tabs.")))).toEqual(["rule"]);
     expect(triageState("Always use tabs.", ["Always use tabs."])).toEqual({ message: "Always use tabs." });
   });
 
-  test("supersedes is asked only when rules exist, and offers the newest 32", () => {
-    expect(Object.keys(triageQuestions([]))).toEqual(["rule"]);
-    expect(Object.keys(triageQuestions([rule]))).toEqual(["rule", "supersedes"]);
+  test("offeredRules keeps the newest 32 rules", () => {
     const many = Array.from({ length: 40 }, (_, index) => ({ id: `r${index + 1}`, text: "x", source: 1, at: 1 }));
     expect(offeredRules(many).map((entry) => entry.id)[0]).toBe("r9");
     expect(offeredRules(many)).toHaveLength(32);
@@ -404,13 +610,12 @@ describe("System One through OptChat", () => {
   });
 
   test("rules: a stated rule is judged, written, announced, and shown to later requests", async () => {
-    const judge = fakeJudge(() => ({ rule: noul(0.95) }));
+    const judge = fakeJudge(() => ({ rule: noul(0.95), withdraw: noul(0) }));
     const host = await start({ "optchat-rules": true }, judge);
     const first = host.user(RULE_TEXT);
     await contextTexts(host, [first]);
     await waitFor(() => host.notices.some((notice) => notice.message.startsWith(RULE_ADDED)), "rule r1");
     expect(await ledgerText(host.directory)).toContain(RULE_TEXT);
-    expect(judge.requests[0]!.questions).toHaveProperty("rule");
 
     // The first turn froze its System One messages before the rule existed; the next turn must carry it.
     const reply = host.assistant("Understood.");
@@ -419,21 +624,270 @@ describe("System One through OptChat", () => {
     expect(texts.some((text) => text.includes("<rules>") && text.includes(RULE_TEXT))).toBe(true);
   });
 
-  test("a rule written mid-turn does not change the System One messages of that turn's tool loop", async () => {
-    const judge = fakeJudge(() => ({ rule: noul(0.95) }));
-    const host = await start({ "optchat-rules": true }, judge);
+  test("an accepted human withdrawal removes the frozen rule from the next tool-loop context and a reopened host", async () => {
+    const dir = await tempDir();
+    const held = Promise.withResolvers<Record<string, Answer>>();
+    let calls = 0;
+    const judge = fakeJudge(() => ++calls === 1 ? { rule: noul(1), withdraw: noul(0) } : held.promise);
+    const host = await start(RULES_ONLY, judge, { directory: dir });
     const first = host.user(RULE_TEXT);
     await contextTexts(host, [first]);
+    await waitFor(() => host.notices.some((notice) => notice.message.startsWith(RULE_ADDED)), "the human rule addition");
+    const reply = host.assistant("Understood.");
+    await endRun(host, [first, reply]);
+
+    const withdrawal = host.user("Stop replying in French.");
+    const messages = [first, reply, withdrawal];
+    const before = await contextTexts(host, messages);
+    await waitFor(() => judge.requests.length === 2, "the human withdrawal judgment");
+    expect(before.some((text) => text.includes("<rules>") && text.includes(RULE_TEXT))).toBe(true);
+
+    const firstCall = host.assistant("checking", { id: "before-withdrawal", name: "bash", arguments: { command: "pwd" } });
+    messages.push(firstCall, host.toolResult("before-withdrawal", "bash", "/tmp"));
+    const beforeAccepted = await contextTexts(host, messages);
+    expect(beforeAccepted.some((text) => text.includes("<rules>") && text.includes(RULE_TEXT))).toBe(true);
+
+    held.resolve({ rule: noul(1), withdraw: noul(1), withdraws: choice("r1", { r1: 1 }) });
+    await waitFor(() => host.notices.some((notice) => notice.message.startsWith("OptChat rule r1 withdrawn")), "the accepted human withdrawal");
+    // Already-returned assemblies retain their contents; the next tool-loop request must omit the withdrawn rule.
+    expect((await host.command("rules")).at(-1)?.message).toBe("OptChat has no standing rules.");
+    const status = (await host.command("status")).map((notice) => notice.message).join("\n");
+    expect(status).toContain("rules counts: 2 judge calls, 0 failures, 1 added, 0 replaced, 1 removed");
+
+    const call = host.assistant("checking", { id: "withdrawal-tool", name: "bash", arguments: { command: "pwd" } });
+    const loop = await contextTexts(host, [...messages, call, host.toolResult("withdrawal-tool", "bash", "/tmp")]);
+    expect(loop.some((text) => text.includes("<rules>"))).toBe(false);
+    await host.shutdown();
+    const bytes = await ledgerText(dir);
+    const replayed = RuleLedger.open(() => join(dir, LEDGER_FILE));
+    expect(replayed.active()).toEqual([]);
+    replayed.close();
+
+    const reopened = await start(RULES_ONLY, fakeJudge(() => ({ rule: noul(0), withdraw: noul(0) })), { directory: dir });
+    expect((await reopened.command("rules")).at(-1)?.message).toBe("OptChat has no standing rules.");
+    const later = await contextTexts(reopened, [reopened.user("What language should this answer use?")]);
+    expect(later.some((text) => text.includes("<rules>"))).toBe(false);
+    await reopened.shutdown();
+    expect(await ledgerText(dir)).toBe(bytes);
+  });
+
+  test.each(["What time is it?", "Thanks, that was helpful."])("unrelated or no-op text preserves exact ledger bytes and the active rule: %s", async (message) => {
+    let calls = 0;
+    const judge = fakeJudge(() => ({ rule: noul(++calls === 1 ? 1 : 0), withdraw: noul(0) }));
+    const host = await start(RULES_ONLY, judge);
+    const first = host.user(RULE_TEXT);
+    await contextTexts(host, [first]);
+    await waitFor(() => host.notices.some((notice) => notice.message.startsWith(RULE_ADDED)), "the human rule addition");
+    const bytes = await ledgerText(host.directory);
+    const before = RuleLedger.open(() => join(host.directory, LEDGER_FILE));
+    const active = before.active();
+    before.close();
+    const reply = host.assistant("Understood.");
+    await endRun(host, [first, reply]);
+    const texts = await contextTexts(host, [first, reply, host.user(message)]);
+    expect(texts.some((text) => text.includes("<rules>") && text.includes(RULE_TEXT))).toBe(true);
+    // Shutdown settles triage before comparing bytes, so a late no-op cannot escape this assertion.
+    await host.shutdown();
+    expect(judge.requests).toHaveLength(2);
+    expect(await ledgerText(host.directory)).toBe(bytes);
+    const replayed = RuleLedger.open(() => join(host.directory, LEDGER_FILE));
+    expect(replayed.active()).toEqual(active);
+    replayed.close();
+  });
+
+  test("a tool-loop withdrawal preserves unrelated frozen rules and the exact frozen prefetch", async () => {
+    const retained = "Always use tabs.";
+    const withdrawal = "Stop replying in French.";
+    const held = Promise.withResolvers<Record<string, Answer>>();
+    let prefetchCalls = 0;
+    let withdrawalStarted = false;
+    const judge = fakeJudge((request) => {
+      const keys = Object.keys(request.questions);
+      if (keys.some((key) => /^\d+\+\d+$/.test(key))) {
+        prefetchCalls++;
+        return Object.fromEntries(keys.map((key) => [key, noul(0.9)]));
+      }
+      if (keys.includes("rule")) {
+        const state = JSON.stringify(request.state);
+        if (state.includes(withdrawal)) {
+          withdrawalStarted = true;
+          return held.promise;
+        }
+        return { rule: noul(state.includes(RULE_TEXT) || state.includes(retained) ? 1 : 0), withdraw: noul(0) };
+      }
+      throw new Error(`unrouted judgment: ${keys.join(", ")}`);
+    });
+    const harness = new Harness();
+    harnesses.push(harness);
+    const { host } = await harness.open({
+      flags: { ...SMALL_NODES, "no-optchat-value-score": true, "no-optchat-recall": true },
+      judge,
+    });
+    let transcript: HostMessage[] = [];
+    for (const text of [RULE_TEXT, retained, ...SEED_TEXTS]) transcript = await talk(host, transcript, text);
+    await waitFor(() => host.notices.some((notice) => notice.message.startsWith("OptChat rule r2 added")), "both standing rules");
+
+    const messages = [...transcript, host.user(withdrawal)];
+    const before = await contextTexts(host, messages);
+    await waitFor(() => withdrawalStarted, "the held withdrawal judgment");
+    const beforeRules = before.filter((text) => text.includes("<rules>"));
+    expect(beforeRules).toHaveLength(1);
+    expect(beforeRules[0]).toContain(RULE_TEXT);
+    expect(beforeRules[0]).toContain(retained);
+    const frozenPrefetch = before.filter((text) => text.includes("<prefetch>"));
+    expect(frozenPrefetch).toHaveLength(1);
+    expect(frozenPrefetch[0]).toMatch(/\d+\+\d+\|/);
+    const frozenCalls = prefetchCalls;
+    expect(frozenCalls).toBeGreaterThan(0);
+
+    held.resolve({ rule: noul(0), withdraw: noul(1), withdraws: choice("r1", { r1: 1 }) });
+    await waitFor(() => host.notices.some((notice) => notice.message.startsWith("OptChat rule r1 withdrawn")), "the accepted withdrawal");
+    const call = host.assistant("checking", { id: "frozen-prefetch", name: "bash", arguments: { command: "pwd" } });
+    const after = await contextTexts(host, [...messages, call, host.toolResult("frozen-prefetch", "bash", "/tmp")]);
+    const afterRules = after.filter((text) => text.includes("<rules>"));
+    expect(afterRules).toHaveLength(1);
+    expect(afterRules[0]).toContain(retained);
+    expect(afterRules[0]).toContain("r2 [");
+    expect(afterRules[0]).not.toContain(RULE_TEXT);
+    expect(afterRules[0]).not.toContain("r1 [");
+    expect(after.filter((text) => text.includes("<prefetch>"))).toEqual(frozenPrefetch);
+    expect(prefetchCalls).toBe(frozenCalls);
+  });
+
+  test("removal during pending prefetch affects its first returned context while a mid-turn addition stays deferred", async () => {
+    const retained = "Always use tabs.";
+    const added = "From now on use metric units.";
+    const prefetch = Promise.withResolvers<Record<string, Answer>>();
+    const addition = Promise.withResolvers<Record<string, Answer>>();
+    let prefetchAnswers: Record<string, Answer> = {};
+    let additionStarted = false;
+    const judge = fakeJudge((request) => {
+      const keys = Object.keys(request.questions);
+      const state = JSON.stringify(request.state);
+      if (keys.some((key) => /^\d+\+\d+$/.test(key))) {
+        const answers = Object.fromEntries(keys.map((key) => [key, noul(0.9)]));
+        if (state.includes(added)) {
+          prefetchAnswers = answers;
+          return prefetch.promise;
+        }
+        return answers;
+      }
+      if (keys.includes("rule")) {
+        if (state.includes(added)) {
+          additionStarted = true;
+          return addition.promise;
+        }
+        return { rule: noul(state.includes(RULE_TEXT) || state.includes(retained) ? 1 : 0), withdraw: noul(0) };
+      }
+      throw new Error(`unrouted judgment: ${keys.join(", ")}`);
+    });
+    const harness = new Harness();
+    harnesses.push(harness);
+    const { host } = await harness.open({
+      flags: { ...SMALL_NODES, "no-optchat-value-score": true, "no-optchat-recall": true },
+      judge,
+    });
+    let transcript: HostMessage[] = [];
+    for (const text of [RULE_TEXT, retained, ...SEED_TEXTS]) transcript = await talk(host, transcript, text);
+    await waitFor(() => host.notices.some((notice) => notice.message.startsWith("OptChat rule r2 added")), "both standing rules");
+
+    const messages = [...transcript, host.user(added)];
+    let assembled = false;
+    const pending = contextTexts(host, messages).then((texts) => {
+      assembled = true;
+      return texts;
+    });
+    await waitFor(() => Object.keys(prefetchAnswers).length > 0 && additionStarted, "pending prefetch and rule addition");
+    expect((await host.command("rules remove r1")).at(-1)?.message).toBe("OptChat rule r1 removed.");
+    addition.resolve({ rule: noul(1), withdraw: noul(0) });
+    await waitFor(() => host.notices.some((notice) => notice.message.startsWith("OptChat rule r3 added")), "the accepted mid-turn addition");
+    expect(assembled).toBe(false);
+
+    prefetch.resolve(prefetchAnswers);
+    // This is the first assembly returned after the prefetch wait, not a corrective second request.
+    const first = await pending;
+    const frozenRules = first.filter((text) => text.includes("<rules>"));
+    expect(frozenRules).toHaveLength(1);
+    expect(frozenRules[0]).toContain(retained);
+    expect(frozenRules[0]).toContain("r2 [");
+    expect(frozenRules[0]).not.toContain(RULE_TEXT);
+    expect(frozenRules[0]).not.toContain("r1 [");
+    expect(frozenRules[0]).not.toContain(added);
+    expect(frozenRules[0]).not.toContain("r3 [");
+    const frozenPrefetch = first.filter((text) => text.includes("<prefetch>"));
+    expect(frozenPrefetch).toHaveLength(1);
+    expect(frozenPrefetch[0]).toMatch(/\d+\+\d+\|/);
+
+    const call = host.assistant("checking", { id: "after-prefetch", name: "bash", arguments: { command: "pwd" } });
+    messages.push(call, host.toolResult("after-prefetch", "bash", "/tmp"));
+    const loop = await contextTexts(host, messages);
+    expect(loop.filter((text) => text.includes("<rules>"))).toEqual(frozenRules);
+    expect(loop.filter((text) => text.includes("<prefetch>"))).toEqual(frozenPrefetch);
+    messages.push(host.assistant("Understood."));
+    await endRun(host, messages);
+    const later = await contextTexts(host, [...messages, host.user("What time is it?")]);
+    const laterRules = later.filter((text) => text.includes("<rules>"));
+    expect(laterRules).toHaveLength(1);
+    expect(laterRules[0]).toContain(retained);
+    expect(laterRules[0]).toContain(added);
+    expect(laterRules[0]).not.toContain(RULE_TEXT);
+  });
+
+  test("a withdrawal target removed while the judge is pending cannot be revived by its late answer", async () => {
+    const dir = await tempDir();
+    const seed = RuleLedger.open(() => join(dir, LEDGER_FILE));
+    seed.add(3, RULE_TEXT, 1);
+    seed.close();
+    const held = Promise.withResolvers<Record<string, Answer>>();
+    const judge = fakeJudge(() => held.promise);
+    const host = await start(RULES_ONLY, judge, { directory: dir });
+    const messages = [host.user("Stop replying in French.")];
+    const before = await contextTexts(host, messages);
+    await waitFor(() => judge.requests.length === 1, "the pending withdrawal judgment");
+    expect(before.some((text) => text.includes("<rules>") && text.includes(RULE_TEXT))).toBe(true);
+    expect((await host.command("rules remove r1")).at(-1)?.message).toBe("OptChat rule r1 removed.");
+    const bytes = await ledgerText(dir);
+    held.resolve({
+      rule: noul(1), withdraw: noul(1),
+      withdraws: choice("r1", { r1: 1 }), supersedes: choice("r1", { r1: 1 }),
+    });
+    const call = host.assistant("checking", { id: "stale-withdrawal", name: "bash", arguments: { command: "pwd" } });
+    const texts = await contextTexts(host, [...messages, call, host.toolResult("stale-withdrawal", "bash", "/tmp")]);
+    expect(texts.some((text) => text.includes("<rules>"))).toBe(false);
+    await host.shutdown();
+    expect(await ledgerText(dir)).toBe(bytes);
+    expect(host.notices.some((notice) => notice.message.startsWith(RULE_ADDED))).toBe(false);
+    const replayed = RuleLedger.open(() => join(dir, LEDGER_FILE));
+    expect(replayed.active()).toEqual([]);
+    replayed.close();
+  });
+
+  test("a rule accepted mid-turn stays absent from the tool loop until the next turn", async () => {
+    const held = Promise.withResolvers<Record<string, Answer>>();
+    let calls = 0;
+    const judge = fakeJudge(() => ++calls === 1 ? held.promise : { rule: noul(0), withdraw: noul(0) });
+    const host = await start(RULES_ONLY, judge);
+    const first = host.user(RULE_TEXT);
+    const before = await contextTexts(host, [first]);
+    await waitFor(() => judge.requests.length === 1, "the pending rule addition");
+    expect(before.some((text) => text.includes("<rules>"))).toBe(false);
+    held.resolve({ rule: noul(0.95), withdraw: noul(0) });
     await waitFor(() => host.notices.some((notice) => notice.message.startsWith(RULE_ADDED)), "rule r1");
 
     // A tool call and its result inside the same turn: the request carries the frozen view, not the new rule.
     const call = host.assistant("checking", { id: "t1", name: "bash", arguments: { command: "pwd" } });
-    const texts = await contextTexts(host, [first, call, host.toolResult("t1", "bash", "/tmp")]);
+    const messages = [first, call, host.toolResult("t1", "bash", "/tmp")];
+    const texts = await contextTexts(host, messages);
     expect(texts.some((text) => text.includes("<rules>"))).toBe(false);
+    const reply = host.assistant("Understood.");
+    messages.push(reply);
+    await endRun(host, messages);
+    const later = await contextTexts(host, [...messages, host.user("What time is it?")]);
+    expect(later.some((text) => text.includes("<rules>") && text.includes(RULE_TEXT))).toBe(true);
   });
 
   test("rules remove ID removes the rule, and the list is empty afterwards", async () => {
-    const judge = fakeJudge(() => ({ rule: noul(0.95) }));
+    const judge = fakeJudge(() => ({ rule: noul(0.95), withdraw: noul(0) }));
     const host = await start({ "optchat-rules": true }, judge);
     await contextTexts(host, [host.user(RULE_TEXT)]);
     await waitFor(() => host.notices.some((notice) => notice.message.startsWith(RULE_ADDED)), "rule r1");
@@ -484,7 +938,7 @@ describe("System One through OptChat", () => {
     const closing = host.shutdown();
     await macrotask();
     // Shutdown is now waiting on the triage: the judge answers after the close began, and the write must still land.
-    held.resolve({ rule: noul(0.95) });
+    held.resolve({ rule: noul(0.95), withdraw: noul(0) });
     await closing;
     expect(await ledgerText(host.directory)).toContain(RULE_TEXT);
     expect(host.notices.some((notice) => notice.message.startsWith(RULE_ADDED))).toBe(true);
@@ -515,7 +969,7 @@ describe("System One through OptChat", () => {
       timers.restore();
     }
 
-    never.resolve({ rule: noul(0.95) });
+    never.resolve({ rule: noul(0.95), withdraw: noul(0) });
     await macrotask();
     expect(await ledgerText(host.directory)).not.toContain(RULE_TEXT);
     expect(host.notices.some((notice) => notice.message.startsWith("OptChat rule"))).toBe(false);
@@ -571,13 +1025,13 @@ describe("System One through OptChat", () => {
   });
 
   test("gate counters: judge calls and outcomes per gate, in status, when a gate is on", async () => {
-    const judge = fakeJudge(() => ({ rule: noul(0.95) }));
+    const judge = fakeJudge(() => ({ rule: noul(0.95), withdraw: noul(0) }));
     const host = await start({ "optchat-rules": true }, judge);
     await contextTexts(host, [host.user(RULE_TEXT)]);
     await waitFor(() => host.notices.some((notice) => notice.message.startsWith(RULE_ADDED)), "rule r1");
 
     const status = (await host.command("status")).map((notice) => notice.message).join("\n");
-    expect(status).toContain("rules counts: 1 judge calls, 0 failures, 1 added, 0 replaced");
+    expect(status).toContain("rules counts: 1 judge calls, 0 failures, 1 added, 0 replaced, 0 removed");
     expect(status).toContain("prefetch counts:");
     expect(status).not.toContain("tool gate");
   });

@@ -174,7 +174,10 @@ function offeredOf(c: RuleCase): Rule[] {
 
 /** The oracle answers the gold label: a rule at 0.95, a non-rule at 0.05, a named replacement at 0.9. */
 export function oracleAnswers(c: RuleCase, sentences: readonly string[]): TriageAnswers {
-  const answers: Record<string, Answer> = { rule: { type: "noul", noul: c.gold.rule ? 0.95 : 0.05 } };
+  const answers: Record<string, Answer> = {
+    rule: { type: "noul", noul: c.gold.rule ? 0.95 : 0.05 },
+    withdraw: { type: "noul", noul: 0 },
+  };
   if (c.rules.length > 0) {
     const target = c.gold.supersedes ?? "none";
     answers.supersedes = { type: "choice", choice: target, probabilities: { [target]: 0.9 }, confidence: 1 };
@@ -199,7 +202,7 @@ async function attempt(c: RuleCase, ctx: Context, induced: boolean): Promise<Att
   const judge = metered(ctx.judge!.judge, meter, ctx.budget, induced);
   try {
     const result = await judgeWithin(judge, { state: triageState(c.message, sentences), questions: triageQuestions(offered, sentences) }, TRIAGE_MS);
-    const decision = decideTriage(result.answers, offered, ctx.options.ruleAdd, c.message, sentences);
+    const decision = decideTriage("human", result.answers, offered, ctx.options.ruleAdd, c.message, sentences);
     return { sentences, decision, answers: result.answers, meter, latency: latency() };
   } catch (error) {
     const text = errorText(error);
@@ -298,7 +301,7 @@ async function runTrial(c: RuleCase, rep: number, ctx: Context): Promise<"result
   if (ctx.options.mode !== "live") {
     const sentences = ruleSentences(c.message);
     const answers = ctx.options.mode === "oracle" ? oracleAnswers(c, sentences) : {};
-    const decision = decideTriage(answers, offeredOf(c), ctx.options.ruleAdd, c.message, sentences);
+    const decision = decideTriage("human", answers, offeredOf(c), ctx.options.ruleAdd, c.message, sentences);
     await writeResult(c, rep, ctx, { decision, answers, sentences, meter: newMeter(), latency: 0 }, 0);
     return "result";
   }

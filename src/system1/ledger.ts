@@ -7,7 +7,7 @@ export const LEDGER_FILE = "ledger.jsonl";
 /** Rule text kept verbatim up to this many UTF-8 bytes; longer text is cut and points at its source message. */
 export const RULE_TEXT_BYTES = 512;
 
-/** One standing rule. `id` is never reused; `source` is the message that stated it. */
+/** One human standing rule. `id` is never reused; `source` is the message that stated it. */
 export interface Rule {
   readonly id: string;
   readonly text: string;
@@ -45,7 +45,8 @@ function eventOf(value: unknown): Event | undefined {
 }
 
 /**
- * The rules ledger: append-only JSON lines, one fsynced write per event. Replay keeps every well-formed line and
+ * The human-only rules ledger. Callers admit human authority before mutation; foreign messages never create rules here.
+ * Append-only JSON lines, one fsynced write per event. Replay keeps every well-formed line and
  * skips a torn or malformed one; the next append starts on a fresh line. The file is named by a resolver that is
  * called at open and again at every write, so a caller can resolve it relative to a held store descriptor
  * (`Store.sidecarPath`): a write then lands in the directory the writer holds the lease of, wherever that directory's
@@ -74,6 +75,11 @@ export class RuleLedger {
     return [...this.rules.values()];
   }
 
+  /** Whether this exact rule identity is still active, without copying the active rules. */
+  has(id: string): boolean {
+    return this.rules.has(id);
+  }
+
   add(source: number, text: string, at: number): Rule {
     const id = this.nextId();
     const clipped = clipRule(text, source);
@@ -89,7 +95,7 @@ export class RuleLedger {
     return this.rules.get(id)!;
   }
 
-  /** Removes an active rule; false when no active rule has this id. */
+  /** Removes an active rule; false for duplicates, unknown ids or a target replaced while triage was pending. */
   remove(id: string, at: number): boolean {
     if (!this.rules.has(id)) return false;
     this.write({ op: "remove", id, at });

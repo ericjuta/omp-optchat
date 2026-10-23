@@ -340,31 +340,39 @@ function cacheCodex(payload: WireObject): unknown {
 	return { ...payload, reasoning: { ...reasoning, context: "all_turns" } };
 }
 
+/** The mutation applied locally, not provider cache acceptance or a cache hit. */
+export type OptChatCacheMode = "unchanged" | "anthropic-breakpoints" | "responses-breakpoints" | "codex-all-turns";
+
+/** Snapshot loaders use this declaration to distinguish the result envelope from historical payload-only returns. */
+export const OPTCHAT_CACHE_RESULT_CONTRACT = "payload-mode-v1" as const;
+
 /**
  * Add cache metadata to an encoded provider request that starts with the
  * OptChat view (the main chat's or the compressor's context, both rendered
  * `id+n|` rows). Use from `before_provider_request` or the compressor's
  * `onPayload`. Supported: official Anthropic Messages, official OpenAI
  * Responses models whose host compat enables explicit breakpoints, and
- * official Codex `reasoning.context`.
+ * official Codex `reasoning.context`. The result preserves payload identity on
+ * pass-through and reports a mode only when the adapter changed that identity.
  */
-export function applyOptChatCache(payload: unknown, model: Model): unknown {
+export function applyOptChatCache(payload: unknown, model: Model): { payload: unknown; mode: OptChatCacheMode } {
 	const compat: unknown = model.compat;
-	if (!object(payload) || !object(compat) || model.transport === "pi-native") return payload;
-	if (model.api === "anthropic-messages") return officialAnthropic(model) ? cacheAnthropic(payload) : payload;
-	if (model.api === "openai-responses") {
-		return model.provider === "openai" && compat.supportsPromptCacheBreakpoints === true &&
-			officialOpenAIEndpoint(model.baseUrl)
-			? cacheResponses(payload, compat)
-			: payload;
+	if (!object(payload) || !object(compat) || model.transport === "pi-native") return { payload, mode: "unchanged" };
+	let encoded: unknown = payload;
+	let mode: OptChatCacheMode = "unchanged";
+	if (model.api === "anthropic-messages" && officialAnthropic(model)) {
+		encoded = cacheAnthropic(payload);
+		mode = "anthropic-breakpoints";
+	} else if (model.api === "openai-responses" && model.provider === "openai" &&
+		compat.supportsPromptCacheBreakpoints === true && officialOpenAIEndpoint(model.baseUrl)) {
+		encoded = cacheResponses(payload, compat);
+		mode = "responses-breakpoints";
+	} else if (model.api === "openai-codex-responses" && model.provider === "openai-codex" &&
+		compat.supportsAllTurnsReasoningContext === true && isOfficialCodexApiUrl(model.baseUrl)) {
+		encoded = cacheCodex(payload);
+		mode = "codex-all-turns";
 	}
-	if (model.api === "openai-codex-responses") {
-		return model.provider === "openai-codex" && compat.supportsAllTurnsReasoningContext === true &&
-			isOfficialCodexApiUrl(model.baseUrl)
-			? cacheCodex(payload)
-			: payload;
-	}
-	return payload;
+	return { payload: encoded, mode: encoded === payload ? "unchanged" : mode };
 }
 
 /** Release at the first provider response (`true`), or error/cancel/finally (`false`). */

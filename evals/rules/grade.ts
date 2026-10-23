@@ -47,6 +47,11 @@ export function grade(decision: TriageDecision, gold: RuleGold, sentences: reado
   const tn = !gold.rule && !predicted ? 1 : 0;
   const counts = { tp, fp, fn, tn };
 
+  // This corpus labels add/replace/none only. A withdrawal must not silently pass as an ordinary no-op.
+  if (decision.kind === "remove") {
+    return { ...counts, pass: false, explanation: "fail: withdrawal is outside this add/replace case's contract" };
+  }
+
   if (!gold.rule) {
     return predicted
       ? { ...counts, pass: false, explanation: `fail: not a rule, but the gate ${decision.kind === "replace" ? "replaced a rule" : "added a rule"}` }

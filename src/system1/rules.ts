@@ -1,20 +1,23 @@
 import type { Answer, Questions } from "@oh-my-pi/pi-ai";
 import { utf8Prefix } from "../memory.js";
 import type { Rule } from "./ledger.js";
-import { RULE_PROMPT, SENTENCE_PROMPT, SUPERSEDES_PROMPT } from "./rules-prompt.js";
+import { RULE_PROMPT, SENTENCE_PROMPT, SUPERSEDES_PROMPT, WITHDRAW_PROMPT, WITHDRAWS_PROMPT } from "./rules-prompt.js";
 
 /** The user message as judged: bounded so one request stays within the judge's state limit. */
 export const TRIAGE_MESSAGE_BYTES = 4_000;
-/** Only the newest active rules are offered to `supersedes`; older ones still hold, but cannot be replaced. */
+/** Only the newest active rules are offered for replacement or withdrawal; older ones still hold. */
 export const SUPERSEDE_RULE_LIMIT = 32;
-/** A `supersedes` choice must reach this probability to replace a rule. */
-const REPLACE_PROBABILITY = 0.5;
+/** A replacement or withdrawal target must reach this probability. */
+const TARGET_PROBABILITY = 0.5;
 /** At most this many sentences are judged one by one; a longer message offers only its first ones. */
 export const RULE_SENTENCE_LIMIT = 12;
 
+/** Authority comes from host attribution, never the message text. Only human messages may change this human-only ledger. */
+export type RuleAuthority = "human" | "non-human" | "unknown";
+
 /**
- * The judge's answers for one user message: `rule` always, `supersedes` when rules exist, `s<k>` per sentence when there are several.
- * A missing or mistyped answer counts as probability 0.
+ * The judge's answers for one human message: `rule` and `withdraw` always, `supersedes` and `withdraws` when rules exist,
+ * and `s<k>` per sentence when there are several. A missing or mistyped answer cannot authorize a mutation.
  */
 export type TriageAnswers = Readonly<Record<string, Answer | undefined>>;
 
@@ -22,7 +25,8 @@ export type TriageAnswers = Readonly<Record<string, Answer | undefined>>;
 export type TriageDecision =
   | { readonly kind: "none" }
   | { readonly kind: "add"; readonly text: string }
-  | { readonly kind: "replace"; readonly replaces: string; readonly text: string };
+  | { readonly kind: "replace"; readonly replaces: string; readonly text: string }
+  | { readonly kind: "remove"; readonly removes: string };
 
 /**
  * The message's sentences, split after `.`, `!` or `?` and at line breaks, whole and in order.
@@ -41,7 +45,7 @@ export function ruleSentences(message: string): string[] {
   return sentences;
 }
 
-/** The rules offered to `supersedes`: the newest `SUPERSEDE_RULE_LIMIT`. */
+/** The rules offered for replacement and withdrawal: the newest `SUPERSEDE_RULE_LIMIT`. */
 export function offeredRules(active: readonly Rule[]): Rule[] {
   return active.slice(-SUPERSEDE_RULE_LIMIT);
 }
@@ -53,12 +57,13 @@ export function triageState(message: string, sentences: readonly string[]): { me
 }
 
 /**
- * One noul `rule` question, plus a choice `supersedes` over `none` and the offered rule ids when rules exist,
- * plus one noul `s<k>` per sentence when the message has several, so the rule keeps only the sentences that state it.
+ * Noul `rule` and `withdraw` questions, plus `supersedes` and `withdraws` choices over the offered rule ids when rules exist,
+ * plus one noul `s<k>` per sentence when the message has several, so an added rule keeps only the sentences that state it.
  */
 export function triageQuestions(offered: readonly Rule[], sentences: readonly string[] = []): Questions {
   const questions: Questions = {
     rule: { type: "noul", instructions: RULE_PROMPT.instructions, criteria: { ...RULE_PROMPT.criteria } },
+    withdraw: { type: "noul", instructions: WITHDRAW_PROMPT.instructions, criteria: { ...WITHDRAW_PROMPT.criteria } },
   };
   if (offered.length > 0) {
     const criteria: Record<string, string | null> = { none: SUPERSEDES_PROMPT.none };
@@ -67,6 +72,11 @@ export function triageQuestions(offered: readonly Rule[], sentences: readonly st
       type: "choice",
       instructions: SUPERSEDES_PROMPT.instructions,
       criteria,
+    };
+    questions.withdraws = {
+      type: "choice",
+      instructions: WITHDRAWS_PROMPT.instructions,
+      criteria: { ...criteria, none: WITHDRAWS_PROMPT.none },
     };
   }
   if (sentences.length > 1) {
@@ -81,9 +91,9 @@ export function triageQuestions(offered: readonly Rule[], sentences: readonly st
   return questions;
 }
 
-/** P(rule) of one answer; null when it is missing, mistyped or not a finite number. */
+/** P(rule) of one answer; null when it is missing, mistyped or outside the finite probability range. */
 function ruleProbability(answer: Answer | undefined): number | null {
-  return answer?.type === "noul" && Number.isFinite(answer.noul) ? answer.noul : null;
+  return answer?.type === "noul" && Number.isFinite(answer.noul) && answer.noul >= 0 && answer.noul <= 1 ? answer.noul : null;
 }
 
 /**
@@ -105,34 +115,53 @@ export function triageProbabilities(
 }
 
 /**
- * Add when P(rule) reaches `ruleAdd`. Replace instead when `supersedes` names a listed rule at 0.5 or more.
- * A message that fails the rule threshold never changes the ledger, whatever `supersedes` says.
+ * Only host-attributed humans can act. An explicit withdrawal reaching `ruleAdd` removes its listed `withdraws` target
+ * at 0.5 or more; an unknown or missing withdrawal target does nothing and never becomes an added rule.
+ * Otherwise add when P(rule) reaches `ruleAdd`, or replace when `supersedes` names a listed rule at 0.5 or more.
+ * The caller must still require the target to be active when applying the decision after a judge wait.
  * With several sentences, the rule's text is the sentences whose own `s<k>` reaches `ruleAdd`, in order;
  * when none does, or an answer is missing, nothing changes. A single sentence keeps the whole message.
  */
 export function decideTriage(
+  authority: RuleAuthority,
   answers: TriageAnswers,
   offered: readonly Rule[],
   ruleAdd: number,
   message: string,
   sentences: readonly string[] = [],
 ): TriageDecision {
-  const whole = answers.rule;
-  if (!(whole?.type === "noul" && whole.noul >= ruleAdd)) return { kind: "none" };
+  if (authority !== "human") return { kind: "none" };
+  const withdrawal = ruleProbability(answers.withdraw);
+  if (withdrawal === null) return { kind: "none" };
+  if (withdrawal >= ruleAdd) {
+    const withdraws = answers.withdraws?.type === "choice" ? answers.withdraws : undefined;
+    const target = withdraws?.choice;
+    const probability = target === undefined ? undefined : withdraws?.probabilities?.[target];
+    if (
+      target !== undefined && target !== "none" && offered.some((rule) => rule.id === target) &&
+      typeof probability === "number" && probability >= TARGET_PROBABILITY && probability <= 1
+    ) {
+      return { kind: "remove", removes: target };
+    }
+    return { kind: "none" };
+  }
+  const whole = ruleProbability(answers.rule);
+  if (whole === null || whole < ruleAdd) return { kind: "none" };
   let text = message;
   if (sentences.length > 1) {
     const kept = sentences.filter((_, index) => {
-      const answer = answers[`s${index}`];
-      return answer?.type === "noul" && answer.noul >= ruleAdd;
+      const probability = ruleProbability(answers[`s${index}`]);
+      return probability !== null && probability >= ruleAdd;
     });
     if (kept.length === 0) return { kind: "none" };
     text = kept.join(" ");
   }
   const supersedes = answers.supersedes?.type === "choice" ? answers.supersedes : undefined;
   const target = supersedes?.choice;
+  const probability = target === undefined ? undefined : supersedes?.probabilities?.[target];
   if (
     target !== undefined && target !== "none" && offered.some((rule) => rule.id === target) &&
-    (supersedes?.probabilities[target] ?? 0) >= REPLACE_PROBABILITY
+    typeof probability === "number" && probability >= TARGET_PROBABILITY && probability <= 1
   ) {
     return { kind: "replace", replaces: target, text };
   }

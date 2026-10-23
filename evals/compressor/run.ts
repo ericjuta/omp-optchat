@@ -219,7 +219,7 @@ async function main(args: string[]): Promise<void> {
 			const encoded = tools && typeof payload === "object" && payload !== null
 				? { ...(payload as Record<string, unknown>), tools: structuredClone(tools) }
 				: payload;
-			return snapshot.applyOptChatCache(encoded, actual);
+			return snapshot.encodeCachePayload(encoded, actual);
 		};
 
 		if (check) {
