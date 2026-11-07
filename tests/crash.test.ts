@@ -81,9 +81,10 @@ const cases: readonly Case[] = [
   // A real level-1 summary commit: leaves 0:0 and 0:1 are saved first, then 1:0.
   { ...summaryBase, name: "summary: first leaf tree write", stage: "tree node write", nth: 1, treeNodes: 0 },
   { ...summaryBase, name: "summary: parent node tree write", stage: "tree node write", nth: 3, treeNodes: 2 },
-  { ...summaryBase, name: "summary: view temp write after parent", stage: "view temp write", nth: 1, after: "1:0", treeNodes: 3, viewTemps: 1 },
-  { ...summaryBase, name: "summary: view rename after parent", stage: "view rename", nth: 1, after: "1:0", treeNodes: 3, viewTemps: 1 },
-  { ...summaryBase, name: "summary: root directory fsync after parent", stage: "root directory fsync", nth: 1, after: "1:0", treeNodes: 3, viewTemps: 0 },
+  // The built parent is published by the next append's view commit; that record is durable before the view.
+  { ...summaryBase, name: "summary: view temp write after parent", stage: "view temp write", nth: 1, after: "1:0", treeNodes: 3, viewTemps: 1, recovered: 3 },
+  { ...summaryBase, name: "summary: view rename after parent", stage: "view rename", nth: 1, after: "1:0", treeNodes: 3, viewTemps: 1, recovered: 3 },
+  { ...summaryBase, name: "summary: root directory fsync after parent", stage: "root directory fsync", nth: 1, after: "1:0", treeNodes: 3, viewTemps: 0, recovered: 3, viewLength: 3 },
 
   // history.importHistory: blobs A and C are saved first, then one actual Memory.append per record.
   { ...importBase, name: "import: image temp write of A", stage: "image temp write", nth: 1, acked: 2, recovered: 2, imageFiles: 2, imageTemps: 1, viewTemps: 0, viewLength: 2 },
@@ -241,7 +242,8 @@ async function runCrash(c: Case): Promise<void> {
     memory = new Memory(store, async () => "summary", { report: (message) => reports.push(message) });
     expect(await memory.settle()).toBe(true);
     if (c.scenario === "summary") {
-      expect([...store.nodes.keys()].sort()).toEqual(["0:0", "0:1", "1:0"]);
+      const leaves = store.messages.map((message) => `0:${message.i}`);
+      expect([...store.nodes.keys()].sort()).toEqual([...leaves, "1:0"].sort());
     }
     const parts = memory.viewParts();
     let covered = 0;

@@ -854,9 +854,11 @@ export class Memory {
 
   /**
    * Publishes a main tiling and the compactor derived from it. Both are durable
-   * in one snapshot before any of them becomes the live state.
+   * in one snapshot before any of them becomes the live state. A `background` commit (a node completed, no new
+   * message) publishes merges only when they bring the view down to its target in one go; otherwise the tiling
+   * stays as it is until the next append, so the lines before the tail stay byte-identical between turns.
    */
-  private commit(proposed: ViewPart[], preserveMain = false, preserveCompactor = false): void {
+  private commit(proposed: ViewPart[], preserveMain = false, preserveCompactor = false, background = false): void {
     const length = this.store.messages.length;
     let bytes = this.size(proposed);
     let view = proposed;
@@ -868,6 +870,11 @@ export class Memory {
       bytes = this.coarsen(view, bytes, this.target, length);
       merged = view.length !== count;
       compacting = bytes > this.target;
+      if (background && merged && compacting) {
+        view = proposed;
+        bytes = this.size(proposed);
+        merged = false;
+      }
     }
     // Restore an unchanged compactor exactly, including its pending latch. A
     // merely available parent is not an event that may rewrite a saved prefix.
@@ -1090,7 +1097,7 @@ export class Memory {
     if (part.l === 0) this.unbuilt--;
     this.advanceFirst();
     this.enqueueParent(part);
-    this.commit(this.view);
+    this.commit(this.view, false, false, true);
   }
 
   /**

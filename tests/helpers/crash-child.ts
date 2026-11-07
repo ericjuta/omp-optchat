@@ -126,7 +126,8 @@ export async function runChild(plan: Plan): Promise<void> {
     await gate.promise;
     return "summary";
   };
-  // Summary coarsening needs view bytes over budget: a built parent merges [0,0]+[0,1] into [1,0] only then.
+  // Summary coarsening needs view bytes over budget: a built parent merges [0,0]+[0,1] into [1,0] only then. A
+  // background merge short of the target waits for the next append, so the scenario appends one text record.
   const memory = new Memory(store, summarize, {
     report: () => {},
     ...(plan.scenario === "summary" ? { viewBytes: 8 } : {}),
@@ -205,6 +206,7 @@ export async function runChild(plan: Plan): Promise<void> {
     case "summary": {
       gate.resolve();
       if (!(await memory.settle())) throw new Error("summary settle failed");
+      ack(memory.append("user", "after summary"));
       break;
     }
     case "import": {

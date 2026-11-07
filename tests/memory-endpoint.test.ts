@@ -183,7 +183,7 @@ test("pending main view uses GLOBAL mixed-width ordering, not the compactor fron
   }
 });
 
-test("background merges publish partial main-view progress without appends while the compaction latch stays set", async () => {
+test("background merges short of the target wait for the next append; reaching it publishes in one go", async () => {
   const store = await openStore();
   const leaves = Array.from({ length: 8 }, (_, i) => `user: leaf-${i}`.padEnd(20, "."));
   for (const [i, text] of leaves.entries()) {
@@ -217,21 +217,32 @@ test("background merges publish partial main-view progress without appends while
     leaves.map((_, i) => [0, i]), leaves.map((_, i) => leafLine(i)), 160, 214,
   );
 
+  // Two merges land, but the view would still be above its 60-byte target: the tiling must not change.
   model.take("merge lines 2+1 and 3+1").resolve("middle one");
-  await until(() => memory.status().viewBytes === 130, "first partial publication");
-  const afterOne = expectProgress(
-    [[0, 0], [0, 1], [1, 1], [0, 4], [0, 5], [0, 6], [0, 7]],
-    [leafLine(0), leafLine(1), "2+2|middle one", leafLine(4), leafLine(5), leafLine(6), leafLine(7)],
-    130, 179,
-  );
-  expect(afterOne).not.toBe(before);
-
   model.take("merge lines 4+1 and 5+1").resolve("middle two");
-  await until(() => memory.status().viewBytes === 100, "second partial publication");
-  const afterTwo = expectProgress(
-    [[0, 0], [0, 1], [1, 1], [1, 2], [0, 6], [0, 7]],
-    [leafLine(0), leafLine(1), "2+2|middle one", "4+2|middle two", leafLine(6), leafLine(7)],
-    100, 144,
-  );
-  expect(afterTwo).not.toBe(afterOne);
+  await until(() => memory.lineAt(2, 2) !== undefined && memory.lineAt(4, 2) !== undefined, "two built parents");
+  expect(expectProgress(leaves.map((_, i) => [0, i]), leaves.map((_, i) => leafLine(i)), 160, 214)).toBe(before);
+
+  // The other two reach the target, so the whole batch is published at once.
+  model.take("merge lines 0+1 and 1+1").resolve("left");
+  model.take("merge lines 6+1 and 7+1").resolve("right");
+  await until(() => memory.status().viewBytes < 160, "one-step publication");
+  expect(parts(memory)).toEqual([[1, 0], [1, 1], [1, 2], [1, 3]]);
+});
+
+test("an append publishes held background merges even short of the target", async () => {
+  const store = await openStore();
+  const leaves = Array.from({ length: 8 }, (_, i) => `user: leaf-${i}`.padEnd(20, "."));
+  for (const [i, text] of leaves.entries()) {
+    store.append("user", source(i));
+    saveText(store, 0, i, text);
+  }
+  const model = new Model();
+  const memory = memoryFor(store, model, { nodeBytes: 24, viewBytes: 120, jobs: 4 });
+  await until(() => model.calls.length === 4, "four held sibling merges");
+  model.take("merge lines 2+1 and 3+1").resolve("middle one");
+  await until(() => memory.lineAt(2, 2) !== undefined, "built parent");
+  expect(parts(memory)).toEqual(leaves.map((_, i) => [0, i]));
+  memory.append("user", "next");
+  expect(parts(memory).slice(0, 3)).toEqual([[0, 0], [0, 1], [1, 1]]);
 });
