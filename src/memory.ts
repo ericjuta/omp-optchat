@@ -58,10 +58,10 @@ export interface ViewPart {
   readonly i: number;
 }
 
-/** Every memory tool's name. Their call records are skipped by search; recall is registered on its own. */
-export const MEMORY_TOOL_NAMES = ["zoom", "date", "work", "chat_search", "chat_recall"] as const;
-/** Each search or recall result's text begins with its mark; search skips those results. */
-export const MEMORY_RESULT_MARKS = ["[optchat search]", "[optchat recall]"] as const;
+/** Every memory tool's name. Their call records are skipped by search; recall and evidence are registered on their own. */
+export const MEMORY_TOOL_NAMES = ["zoom", "date", "work", "chat_search", "chat_recall", "chat_evidence"] as const;
+/** Each search, recall or evidence result's text begins with its mark; search skips those results. */
+export const MEMORY_RESULT_MARKS = ["[optchat search]", "[optchat recall]", "[optchat evidence]"] as const;
 /** Every stored message kind, in the store's order. */
 export const MESSAGE_KINDS = ["user", "talk", "tool", "echo", "note", "work"] as const satisfies readonly Kind[];
 /** Deepest zoom that opens several levels at once: 2^4 = 16 lines. */

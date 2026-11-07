@@ -3138,7 +3138,7 @@ async function fakeChildView(ctx: CaseContext): Promise<Evidence> {
     await durableRows(parent.ctx, 2, "fake child parent durable rows");
 
     const child = await withFakeHost(ctx, childPrompt, { agentKind: "task", artifactManager: artifacts });
-    assert.deepEqual(child.registeredTools, ["zoom", "date", "chat_search", "work"], "a child with the view registers exactly the read-only tools");
+    assert.deepEqual(child.registeredTools, ["zoom", "date", "chat_search", "work", "chat_evidence"], "a child with the view registers exactly the read-only tools");
 
     await parent.switchSession(other, [user, talk]);
     const stale = await withFakeHost(
@@ -3151,7 +3151,7 @@ async function fakeChildView(ctx: CaseContext): Promise<Evidence> {
       { agentKind: "task", artifactManager: artifacts },
     );
     const fresh = await withFakeHost(ctx, childPrompt, { agentKind: "task", artifactManager: other });
-    assert.deepEqual(fresh.registeredTools, ["zoom", "date", "chat_search", "work"], "the republished view is adopted by the new manager");
+    assert.deepEqual(fresh.registeredTools, ["zoom", "date", "chat_search", "work", "chat_evidence"], "the republished view is adopted by the new manager");
     return { child: child.registeredTools, stale, fresh: fresh.registeredTools };
   }, { childView: true, artifactManager: artifacts });
 }

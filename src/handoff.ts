@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { MESSAGE_KINDS, type SearchOptions, type SearchResult } from "./memory.js";
+import { registerEvidenceTool } from "./system1/evidence.js";
 
 /** Stored image bytes and their MIME type; never a path. */
 export interface PageImage {
@@ -40,6 +41,8 @@ export interface ChildView extends MemoryReader {
 	readonly render: string;
 	/** Messages with id below this bound existed when the snapshot was taken. */
 	readonly upperBound: number;
+	/** `chat_evidence` over the messages below `upperBound`, present while the parent's evidence gate is on. */
+	readonly evidence?: (question: string, signal: AbortSignal | undefined) => Promise<string>;
 }
 
 /** A parent's published view, bound to the session that owns it. */
@@ -108,6 +111,7 @@ function guarded(view: ChildView, token: { live: boolean }): ChildView {
 	const check = (): void => {
 		if (!token.live) throw new Error("the parent chat view was revoked");
 	};
+	const evidence = view.evidence;
 	return {
 		render: view.render,
 		upperBound: view.upperBound,
@@ -127,6 +131,14 @@ function guarded(view: ChildView, token: { live: boolean }): ChildView {
 			check();
 			return view.search(query, options);
 		},
+		...(evidence === undefined
+			? {}
+			: {
+					evidence: (question: string, signal: AbortSignal | undefined) => {
+						check();
+						return evidence(question, signal);
+					},
+				}),
 	};
 }
 
@@ -282,10 +294,19 @@ export function attachChildView(pi: ExtensionAPI, ctx: ExtensionContext, guide: 
 		current !== undefined &&
 		current.sessionManager.getArtifactManager() === manager &&
 		current.sessionManager.getSessionId() === sessionId;
-	registerMemoryTools(pi, view, (current) => {
+	const admit: Admission = (current) => {
 		if (!attached(current)) throw new Error("the parent chat view is not attached to this session");
-	});
-	const block = `${guide}\n\n# Parent chat snapshot (read-only; zoom, date, work and chat_search only)\n\n${view.render}`;
+	};
+	registerMemoryTools(pi, view, admit);
+	const evidence = view.evidence;
+	if (evidence !== undefined) {
+		registerEvidenceTool(pi, async (question, current, signal) => {
+			admit(current);
+			return evidence(question, signal);
+		});
+	}
+	const tools = evidence === undefined ? "zoom, date, work and chat_search" : "zoom, date, work, chat_search and chat_evidence";
+	const block = `${guide}\n\n# Parent chat snapshot (read-only; ${tools} only)\n\n${view.render}`;
 	pi.on("before_agent_start", (event, current) =>
 		attached(current) ? { systemPrompt: [...event.systemPrompt, block] } : undefined,
 	);

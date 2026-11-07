@@ -142,6 +142,24 @@
           ],
           "additionalProperties": false
         },
+        "eager_input_streaming": true
+      },
+      {
+        "name": "chat_evidence",
+        "description": "Gather exact passages from the stored chat's original messages that bear on a question, without a model: the messages whose words best match it are read whole in windows of up to 2,048 bytes, and the windows holding the rarest question words win (at most 8 passages, 16,384 bytes in all). Each passage gives its message id and UTF-8 byte range; zoom(id, 1, start) reopens it. A trailer lists the messages searched, question words found in none of them, and partial reports.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "question": {
+              "type": "string",
+              "description": "What the stored chat should show evidence for, in plain words\n\n{minLength: 1, maxLength: 1000}"
+            }
+          },
+          "required": [
+            "question"
+          ],
+          "additionalProperties": false
+        },
         "eager_input_streaming": true,
         "cache_control": {
           "type": "ephemeral"

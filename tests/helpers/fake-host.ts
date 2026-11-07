@@ -38,6 +38,8 @@ export interface FakeHostOptions {
   apiKey?: string;
   /** The session's main model (`ctx.model`); default undefined, which makes the cache hook a pass-through. */
   mainModel?: object;
+  /** `sessionManager.getArtifactManager()`; default undefined, so no child view is published. */
+  artifactManager?: object;
 }
 
 /** A registered tool as the host holds it: only the members a test reads or calls. */
@@ -210,7 +212,7 @@ export async function openFakeHost(
     agent: { kind: options.agentKind ?? "main" },
     sessionManager: {
       getSessionId: () => "optchat-system1-session",
-      getArtifactManager: () => undefined,
+      getArtifactManager: () => options.artifactManager,
       getBranch: () => [],
     },
     modelRegistry: options.apiKey === undefined ? {} : { resolver: () => options.apiKey },

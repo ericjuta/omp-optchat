@@ -12,6 +12,7 @@ export const DEFAULTS = Object.freeze({
   tries: 5,
   toolCap: 30_000,
   childView: true,
+  evidence: true,
   rules: true,
   prefetch: true,
   valueScore: true,
@@ -34,6 +35,8 @@ export interface OptChatConfig {
   tries: number;
   toolCap: number;
   childView: boolean;
+  /** Whether `chat_evidence` is registered, in the chat and in its child views. It never resolves a judge. */
+  evidence: boolean;
   gates: GateConfig;
 }
 
@@ -110,12 +113,22 @@ export function registerFlags(api: FlagRegistrar): void {
   api.registerFlag("optchat-child-view", {
     type: "boolean",
     default: DEFAULTS.childView,
-    description: "Give subagents a read-only frozen snapshot of this chat: zoom, date, work and chat_search only (default: on; --no-optchat-child-view takes precedence)",
+    description: "Give subagents a read-only frozen snapshot of this chat: zoom, date, work and chat_search, plus chat_evidence while it is on (default: on; --no-optchat-child-view takes precedence)",
   });
   api.registerFlag("no-optchat-child-view", {
     type: "boolean",
     default: false,
     description: "Give subagents no snapshot of this chat, even when --optchat-child-view is present",
+  });
+  api.registerFlag("optchat-evidence", {
+    type: "boolean",
+    default: DEFAULTS.evidence,
+    description: "Register chat_evidence: exact passages of the stored chat that bear on a question, found by word overlap without a model (default: on; --no-optchat-evidence takes precedence)",
+  });
+  api.registerFlag("no-optchat-evidence", {
+    type: "boolean",
+    default: false,
+    description: "Register no chat_evidence tool, even when --optchat-evidence is present",
   });
   for (const gate of GATE_FLAGS) {
     api.registerFlag(gate.flag, {
@@ -169,8 +182,12 @@ const GATE_FLAGS = [
   { key: "recall", flag: "optchat-recall", name: "recall gate", what: "answer questions from stored history by scanning the best view lines for one message (chat_recall tool)" },
 ] as const;
 
-/** One gate: its opt-out wins over its flag; a malformed value of either fails closed. */
-function gate(api: FlagReader, flag: (typeof GATE_FLAGS)[number]["flag"], fallback: boolean): boolean {
+/** One gate, System One or not: its opt-out wins over its flag; a malformed value of either fails closed. */
+function gate(
+  api: FlagReader,
+  flag: (typeof GATE_FLAGS)[number]["flag"] | "optchat-child-view" | "optchat-evidence",
+  fallback: boolean,
+): boolean {
   if (boolean(api.getFlag(`no-${flag}`), `no-${flag}`, false)) return false;
   return boolean(api.getFlag(flag), flag, fallback);
 }
@@ -267,9 +284,8 @@ export function readConfig(api: FlagReader, defaultDirectory: string): OptChatCo
     jobs: integer(api, "optchat-jobs", DEFAULTS.jobs, 1, 64),
     tries: integer(api, "optchat-tries", DEFAULTS.tries, 1, 100),
     toolCap: integer(api, "optchat-tool-cap", DEFAULTS.toolCap, 128),
-    childView: boolean(api.getFlag("no-optchat-child-view"), "no-optchat-child-view", false)
-      ? false
-      : boolean(api.getFlag("optchat-child-view"), "optchat-child-view", DEFAULTS.childView),
+    childView: gate(api, "optchat-child-view", DEFAULTS.childView),
+    evidence: gate(api, "optchat-evidence", DEFAULTS.evidence),
     gates: gates(api),
   };
 }

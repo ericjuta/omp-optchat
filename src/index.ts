@@ -69,7 +69,8 @@ import { counted, GATE_KEYS, GATE_LABEL, GATE_PURPOSE, GateCounts, INACTIVE_REAS
 import { LEDGER_FILE, RuleLedger, renderRules, type Rule } from "./system1/ledger.js";
 import { prefetchBlock, PREFETCH_MS } from "./system1/prefetch.js";
 import { recall, registerRecallTool, renderRecall } from "./system1/recall.js";
-import { decideTriage, offeredRules, ruleSentences, triageProbabilities, triageQuestions, triageState } from "./system1/rules.js";
+import { gatherEvidence, registerEvidenceTool, renderEvidence, type EvidenceMemory } from "./system1/evidence.js";
+import { decideTriage, ruleSentences, triageProbabilities, triageQuestions, triageState, triageTargets } from "./system1/rules.js";
 import { valueHint } from "./system1/value.js";
 
 type AgentMessage = ContextEvent["messages"][number];
@@ -765,6 +766,7 @@ class OptChat {
 			if (!this.toolsRegistered) {
 				this.registerTools();
 				if (config.gates.recall) this.registerRecall();
+				if (config.evidence) this.registerEvidence();
 				this.toolsRegistered = true;
 			}
 		} catch (error) {
@@ -812,6 +814,33 @@ class OptChat {
 		}
 		registerRecallTool(this.pi, (question, current, signal) => this.recallFor(question, current, signal));
 		this.recallRegistered = true;
+	}
+
+	/** The evidence gate's tool: passages of the raw log read by word overlap, no model call. Child views get their own. */
+	private registerEvidence(): void {
+		if (this.pi.getAllTools().some((tool) => tool.name === "chat_evidence")) {
+			throw new Error('tool name "chat_evidence" is already registered');
+		}
+		registerEvidenceTool(this.pi, (question, _current, signal) => {
+			const memory = this.openMemory();
+			const live = (): Memory => {
+				if (this.state.kind !== "ready" || this.memory !== memory) throw new Error("OptChat memory is not open");
+				return memory;
+			};
+			return this.evidenceText(live, question, memory.status().messages, signal);
+		});
+	}
+
+	/** `chat_evidence` over messages below `upperBound`; every read first proves, through `live`, that the chat is still open. */
+	private async evidenceText(live: () => Memory, question: string, upperBound: number, signal: AbortSignal | undefined): Promise<string> {
+		const reader: EvidenceMemory = {
+			rank: (text, limit, before) => live().rankMessages(text, { limit, before }),
+			page: (id, offset, maxBytes) => {
+				live();
+				return this.openStore().readMessagePage(id, offset, maxBytes);
+			},
+		};
+		return renderEvidence(question, await gatherEvidence(reader, question, { upperBound, signal }));
 	}
 
 	private async recallFor(question: string, current: ExtensionContext | undefined, signal: AbortSignal | undefined): Promise<string> {
@@ -898,6 +927,8 @@ class OptChat {
 				// Hits come only from messages the snapshot already holds.
 				return live().search(query, { ...options, before: Math.min(options.before ?? upperBound, upperBound) });
 			},
+			// Passages come only from messages the snapshot already holds.
+			...(this.config?.evidence ? { evidence: (question: string, signal: AbortSignal | undefined) => this.evidenceText(live, question, upperBound, signal) } : {}),
 		};
 	}
 
@@ -2065,12 +2096,14 @@ class OptChat {
 			.catch((error: unknown) => this.gateFail("rules", error));
 	}
 
-	/** One admitted human message: judge, then add, replace, remove, or nothing. A failure changes no rule. */
+	/**
+	 * One admitted human message: judge, then apply its changes in source order, each sentence's add, replace or remove
+	 * on its own, with its own rule id. A failed judgment changes no rule; a failed change does not stop the next one.
+	 */
 	private async triage(source: number, text: string, ctx: ExtensionContext, abort: AbortSignal): Promise<void> {
 		const ledger = this.rules;
 		const config = this.config;
 		if (!ledger || !config || abort.aborted) return;
-		const offered = offeredRules(ledger.active());
 		const judging = this.judgingFor(ctx, "rules");
 		if (judging.kind === "inactive") return;
 		if (judging.kind === "none") {
@@ -2078,6 +2111,7 @@ class OptChat {
 			return;
 		}
 		const sentences = ruleSentences(text);
+		const offered = triageTargets(ledger.active(), text, sentences);
 		let result: JudgmentResult<Questions>;
 		try {
 			result = await judgeWithin(
@@ -2093,42 +2127,38 @@ class OptChat {
 		// Shutdown began while the judge answered: the ledger is closing, so nothing is written.
 		if (abort.aborted) return;
 		// queueTriage is reached only from a durably admitted human user message.
-		const decision = decideTriage("human", result.answers, offered, config.gates.ruleAdd, text, sentences);
-		// One row per triage: the judge's probabilities, the cutoff and whether a rule was written; never the message or a rule's text.
-		const { pRule, pSentenceMax } = triageProbabilities(result.answers, sentences);
-		const row = (added: boolean): void =>
-			this.record({ type: "rules", at: new Date().toISOString(), pRule, pSentenceMax, sentences: sentences.length, cutoff: config.gates.ruleAdd, added });
-		if (decision.kind === "none") {
-			row(false);
-			return;
-		}
-		if (decision.kind === "remove") {
-			row(false);
-			try {
-				// remove checks current activity, not the snapshot offered before the judge wait.
-				if (ledger.remove(decision.removes, Date.now())) {
-					this.counts.add("rules", "removed");
-					this.notify(`OptChat rule ${decision.removes} withdrawn by message ${source}.`, "info");
+		const changes = decideTriage("human", result.answers, offered, config.gates.ruleAdd, text, sentences);
+		let added = false;
+		for (const change of changes) {
+			if (change.kind === "remove") {
+				try {
+					// remove checks current activity, not the snapshot offered before the judge wait.
+					if (ledger.remove(change.removes, Date.now())) {
+						this.counts.add("rules", "removed");
+						this.notify(`OptChat rule ${change.removes} withdrawn by message ${source}.`, "info");
+					}
+				} catch (error) {
+					this.gateFail("rules", error);
 				}
+				continue;
+			}
+			let rule: Rule;
+			try {
+				rule = change.kind === "add"
+					? ledger.add(source, change.text, Date.now())
+					: ledger.replace(change.replaces, source, change.text, Date.now());
 			} catch (error) {
 				this.gateFail("rules", error);
+				continue;
 			}
-			return;
+			added = true;
+			this.counts.add("rules", change.kind === "add" ? "added" : "replaced");
+			const outcome = change.kind === "add" ? "added" : `replaced ${change.replaces}`;
+			this.notify(`OptChat rule ${rule.id} ${outcome} from message ${source}: ${rule.text}\nUndo with /optchat rules remove ${rule.id}.`, "info");
 		}
-		let rule: Rule;
-		try {
-			rule = decision.kind === "add"
-				? ledger.add(source, decision.text, Date.now())
-				: ledger.replace(decision.replaces, source, decision.text, Date.now());
-		} catch (error) {
-			row(false);
-			this.gateFail("rules", error);
-			return;
-		}
-		row(true);
-		this.counts.add("rules", decision.kind === "add" ? "added" : "replaced");
-		const change = decision.kind === "add" ? "added" : `replaced ${decision.replaces}`;
-		this.notify(`OptChat rule ${rule.id} ${change} from message ${source}: ${rule.text}\nUndo with /optchat rules remove ${rule.id}.`, "info");
+		// One row per triage: the judge's probabilities, the cutoff and whether any rule was written; never the message or a rule's text.
+		const { pRule, pSentenceMax } = triageProbabilities(result.answers, sentences);
+		this.record({ type: "rules", at: new Date().toISOString(), pRule, pSentenceMax, sentences: sentences.length, cutoff: config.gates.ruleAdd, added });
 	}
 
 	/** Waits for queued triage at most SHUTDOWN_TRIAGE_MS. The caller then aborts whatever still runs. */

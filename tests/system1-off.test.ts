@@ -33,8 +33,11 @@ const HOST_TOOL = {
   description: "Read a file.",
   parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
 };
-/** OptChat's tools in the order it registers them. `chat_recall` is absent: its gate is off. */
-const OPTCHAT_TOOLS = ["zoom", "date", "work", "chat_search"] as const;
+/**
+ * OptChat's tools. `chat_recall` is absent: its gate is off. `chat_evidence` is present: it is not a System One gate,
+ * resolves no judge, and has its own opt-out, `--no-optchat-evidence`.
+ */
+const OPTCHAT_TOOLS = ["zoom", "date", "work", "chat_search", "chat_evidence"] as const;
 
 interface Golden {
   systemPrompt: string[];
