@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "id": "evidence-20261108",
+  "status": "pre-registered before any paid call; not run",
+  "registered": "2026-11-07, agent, under Eric's delegation (\"CTO delegation\", up to $50 total). Replaces evidence-20261107, whose span criterion did not define null-value answers; that run is not re-scored.",
+  "approval": "No paid call (judge or extractor) runs until Eric approves the SHA-256 of this exact file. A change to any bound file requires a new manifest and a new approval.",
+  "question": "Does adding the OpenRouter cloudflare/clairic extractor line to chat_evidence (arm C) give located, correct answers often enough, and mislead rarely enough, to turn --optchat-extract on by default?",
+  "cases": {
+    "path": "evals/evidence/cases/synthetic-20261108.jsonl",
+    "sha256": "1745b3311fae337ba05aa5528bf9ca2106d42ac6f42792b2ac8cee300eaa52c8",
+    "bytes": 223091,
+    "count": 40,
+    "generator": "evals/evidence/build-cases.ts --seed 20261108 (fresh seed, never run)",
+    "categories": {
+      "deep": 8,
+      "unicode": 8,
+      "superseded": 8,
+      "absent": 8,
+      "ambiguous": 4,
+      "incomplete": 4
+    },
+    "answerable": 24,
+    "abstain": 16,
+    "provenance": "Synthetic chats authored by the seeded generator; no real chat text, no traces. Unicode cases put emoji and accented letters before the answer, so they double as the live span-unit probe."
+  },
+  "bound": {
+    "evals/evidence/build-cases.ts": "6fc648e483bbdde877ac0f76aa0121d4d492f6c81dbfc6e52fc07e64f2df3aea",
+    "evals/evidence/run.ts": "887ef8ea0443417626accc6217e97b66c264ab3fcd2acdafef8eb61d77261191",
+    "evals/evidence/grade.ts": "5ffc431921239d158b91692b37fcac96f173c3631b76e219bcd72792d6e3a7c2",
+    "src/system1/extract.ts": "0ade358aad23a224556871580e741676aa8be345a41f5ab63c1ed0e162a7c00d",
+    "src/system1/evidence.ts": "c6edf5645186c3e3df1e11c457a7c3ed1159cfca33815ebe27b1f56b4812eb00",
+    "src/system1/recall.ts": "318a5b1b3cbe0b4e4d20f06f0046caee94829e1c9522983cfc7a75397dd6c758",
+    "src/system1/recall-prompt.ts": "1c1e6ce7f57c3a78c7f689ff9088187dc150940d4b5750d30fb5c89bbddf6e7a",
+    "src/memory.ts": "02f1ede9bb762d1e2a5ddaa02ef15a6cee640260df3c289a52b02b5bdfbd7675"
+  },
+  "arms": {
+    "A": "chat_recall: production recall() with shipped defaults (recall-min 0.5, k 1, seeds 8), host judge role; report only, not in the adoption rule.",
+    "B": "chat_evidence: production gatherEvidence(), no model.",
+    "C": "B plus the production openRouterExtractor (cloudflare/clairic, return_state_text), shown below p_null 0.5 (the shipped --optchat-extract-null default)."
+  },
+  "run": {
+    "command": "bun run evals:evidence --out evals/evidence/runs/evidence-20261108 --arms A,B,C --reps 2 --concurrency 4 --max-judge-calls 1500 --max-extract-calls 120 --max-usd-a 1 --max-usd-c 1 --cases evals/evidence/cases/synthetic-20261108.jsonl",
+    "preflight": "--mode oracle (no provider call) must score C 1.0 grounded and abstain success with 0 errors before the live run.",
+    "budget": "$2 ceiling across both paid arms (A $1, C $1), inside Eric's $5 cap; concurrency can overshoot a cap by up to 4 calls.",
+    "reruns": "Only rows in errors.jsonl may be rerun, once."
+  },
+  "metrics": [
+    "groundedSuccess (answerable)",
+    "abstainSuccess",
+    "misleading (all rows)",
+    "omission (answerable)",
+    "latency p50/p90",
+    "cost and cost per success",
+    "span probe: echo matches and span text equals value"
+  ],
+  "adoption": {
+    "rule": "Turn --optchat-extract on by default only if all hold for C: misleading <= 0.05; groundedSuccess >= 0.70; abstainSuccess >= 0.80; every span-bearing answer has echo === state; among answers with a non-null value, span text equals value in >= 0.95 (answers with a null value are not counted: they assert nothing); cost known on every row and mean <= $0.0005 per row; latency p90 <= 5000 ms. Otherwise keep C off by default and record the rejection.",
+    "inconclusive": "More than 5% error rows, unknown cost on any C row, or a cap exhausted before every row ran: inconclusive, C stays off.",
+    "limits": "Synthetic chats with a deterministic head summariser measure the extractor on known passages, not real-summary navigation; A's numbers are context, not a verdict on chat_recall."
+  }
+}
