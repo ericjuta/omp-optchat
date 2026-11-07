@@ -1,4 +1,14 @@
 # Changelog
+## 0.15.2 — 2026-11-08
+
+- **Fixed: the extractor's response-size bound.** The body used to be read in full before its size was checked, so a response without a content-length header could be of any size. It is now read as a stream and cancelled once it passes 262,144 bytes.
+- **Fixed: a reported extraction cost of 0 is shown as `cost unknown`.** The route reported $0 on every eval row, although Clairic is listed at $0.10/M input tokens. The 0.15.0 entry's "cost reported $0" is therefore unverified, not a measurement.
+- **Fixed: docs said `chat_evidence` sends nothing to any model.** Since 0.15.0 it sends its passages to Clairic whenever a key resolves. The 0.15.0 entry's "(no model call)" covers only the passage search.
+- **Changed: the extractor key can come from the environment.** OMP's credential cascade may return `OPENROUTER_API_KEY` instead of a stored key. Eric accepted this; AGENTS.md and README now say so.
+- **Changed (#16): background merges no longer rewrite the main view piece by piece.** When a node finishes between messages, its merges are published only if they bring the view to its target in one go. Otherwise the tiling waits for the next append, so the lines before the tail stay byte-identical between turns, as in UniiChat's `Memory.fit`. Part 2 of #16 (the compactor ageing pairs against the chat length) was already fixed: `coarsen` takes each view's own end.
+- **Known issue, from a real-chat check (n = 3, on this repo's own store):** one exact answer, one abstention and one misleading answer. In the misleading case, ranking missed the gold message and Clairic returned a wrong value with p_null 0.078. Details are in `plans/evidence-layer.md` Outcomes. Turn it off with `--no-optchat-extract`.
+- **Judges:** the 0.15.0 rules and evidence comparisons stand as `cloudflare/clef` results, as served; Eric accepted them without a Jev rerun.
+
 
 ## 0.15.1 — 2026-11-07
 

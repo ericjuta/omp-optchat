@@ -77,9 +77,20 @@ You can see it working by running the new evidence eval (Milestone 4) and by cal
   Rationale: the installed compiled host serves plugin imports from its own bundled packages, so a source-only patch never runs, and the 18.12.6 checkout is five minors behind (#19 findings).
   Date/Author: 2026-11-06, agent, from ticket #19.
 
-## Outcomes & Retrospective
+- Decision: the Milestone 1 rules eval and the Milestone 4/5 arm A stand as Clef results. The manifests named `~typesafe/jev-latest`, but the host `judge` role served `cloudflare/clef` on every row. No Jev rerun.
+  Rationale: Eric accepted Clef (HITL 2026-11-08). Both arms of each comparison used the same served model, so the comparisons hold, but they say nothing about Jev.
+  Date/Author: 2026-11-08, Eric.
 
-None yet.
+- Decision: the extractor key may come from the host's whole cascade, including an `OPENROUTER_API_KEY` environment variable, and not only from the credential store. AGENTS.md and README now say so.
+  Rationale: Eric (HITL 2026-11-08).
+  Date/Author: 2026-11-08, Eric.
+
+- Decision: a reported extraction cost of 0 is recorded as unknown. The response body is read in a stream and cancelled once it passes 262,144 bytes, whether or not a content-length header is sent.
+  Rationale: the route reported $0 on every eval row although Clairic is listed at $0.10/M input tokens. The old size check read the whole body before measuring it.
+  Date/Author: 2026-11-08, agent.
+
+## Outcomes & Retrospective
+- (2026-11-08) Real-chat check, n = 3, in-repo plugin with the real OpenRouter key, on a copy of this repo's own store (about 5,950 messages). (1) "what manifest SHA-256 did Eric approve for the M4 evidence eval": exact SHA returned at message 5685 bytes 5992–6056, p_null 0.000. (2) "which compressor model had a p90 latency of 120.4s in the Perps store": abstained, p_null 0.662. (3) "which minimum Bun runtime version does omp 18.18.0 require": MISLEADING. The gold record (message 5770, "Bun runtime must be >= 1.4.4") was not among the 50 ranked candidates, and Clairic answered "1.4.0" from an unrelated Bun note (message 4268) with p_null 0.078. Extraction cost was reported as unknown on every call. Three questions measure nothing reliably; they show two open defects: on natural questions in a large chat, ranking can miss the gold, and a confident wrong span gets past the 0.5 null threshold.
 
 ## Context and Orientation
 
