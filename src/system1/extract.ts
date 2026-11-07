@@ -33,7 +33,8 @@ export type Extraction =
 export type Extractor = (state: string, question: string, signal: AbortSignal) => Promise<Extraction>;
 
 /**
- * The OpenRouter extractor. `key` reads the `openrouter` credential through the host at call time; undefined turns
+ * The OpenRouter extractor. `key` resolves the `openrouter` key through the host at call time (OMP's credential
+ * store or, by its own cascade, an environment variable; Eric, 2026-11-08); undefined turns
  * the extractor off. Errors are reduced to a status line so neither the key nor response bodies reach the tool text.
  */
 export function openRouterExtractor(key: () => Promise<string | undefined>, request: typeof fetch = fetch): Extractor {
@@ -42,10 +43,10 @@ export function openRouterExtractor(key: () => Promise<string | undefined>, requ
     try {
       apiKey = await key();
     } catch {
-      return { kind: "off", reason: "the OMP credential store could not resolve an openrouter key" };
+      return { kind: "off", reason: "OMP could not resolve an openrouter key" };
     }
     signal.throwIfAborted();
-    if (!apiKey) return { kind: "off", reason: "no openrouter key in the OMP credential store" };
+    if (!apiKey) return { kind: "off", reason: "no openrouter key resolved" };
     const body = JSON.stringify({
       model: EXTRACT_MODEL,
       state,
@@ -74,8 +75,8 @@ export function openRouterExtractor(key: () => Promise<string | undefined>, requ
     if (length > RESPONSE_BYTES) return { kind: "failed", reason: "response too large" };
     let parsed: unknown;
     try {
-      const text = await response.text();
-      if (Buffer.byteLength(text) > RESPONSE_BYTES) return { kind: "failed", reason: "response too large" };
+      const text = await boundedText(response, RESPONSE_BYTES);
+      if (text === null) return { kind: "failed", reason: "response too large" };
       parsed = JSON.parse(text);
     } catch {
       signal.throwIfAborted();
@@ -85,10 +86,30 @@ export function openRouterExtractor(key: () => Promise<string | undefined>, requ
   };
 }
 
+/** The body as text, read chunk by chunk; null (and the stream cancelled) once it passes `limit` bytes. */
+async function boundedText(response: Response, limit: number): Promise<string | null> {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > limit) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 const record = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 const text = (value: unknown): string | null => (typeof value === "string" ? value : null);
 const finite = (value: unknown): number | null => (typeof value === "number" && Number.isFinite(value) ? value : null);
+const positive = (value: number | null): number | null => (value !== null && value > 0 ? value : null);
 
 /** The response body as an Extraction; anything off-shape fails closed. */
 export function parseExtraction(body: unknown): Extraction {
@@ -108,7 +129,8 @@ export function parseExtraction(body: unknown): Extraction {
     span,
     stateText: text(root.state_text),
     truncated: root.truncated === true,
-    cost: finite(record(root.usage)?.cost),
+    // Clairic is listed at $0.10/M input, yet the route reports 0: a zero is not evidence of no cost, so it is unknown.
+    cost: positive(finite(record(root.usage)?.cost)),
     provider: text(root.provider),
   };
 }

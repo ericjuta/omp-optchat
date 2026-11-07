@@ -79,6 +79,11 @@ describe("extraction span mapping", () => {
 });
 
 describe("parseExtraction", () => {
+  test("a reported zero cost is unknown: the route reports 0 for a priced model", () => {
+    const parsed = parseExtraction({ answers: { answer: { value: "a" } }, usage: { cost: 0 } });
+    expect(parsed.kind === "answer" && parsed.cost).toBe(null);
+  });
+
   test("off-shape bodies and spans fail closed", () => {
     expect(parseExtraction({ answers: {} }).kind).toBe("failed");
     expect(parseExtraction(null).kind).toBe("failed");
@@ -116,6 +121,18 @@ describe("openRouterExtractor", () => {
     expect((seen[0]!.init.headers as Record<string, string>).authorization).toBe("Bearer sk-or-secret");
   });
 
+  test("an endless body without content-length is refused once it passes the byte bound, and its stream cancelled", async () => {
+    let cancelled = false;
+    const chunk = new Uint8Array(65_536).fill(0x20);
+    const endless = new ReadableStream<Uint8Array>({
+      pull: (controller) => controller.enqueue(chunk),
+      cancel: () => { cancelled = true; },
+    });
+    const extractor = openRouterExtractor(async () => "k", (async () => new Response(endless)) as unknown as typeof fetch);
+    expect(await extractor("s", "q", new AbortController().signal)).toEqual({ kind: "failed", reason: "response too large" });
+    expect(cancelled).toBe(true);
+  });
+
   test("no key makes no request; HTTP errors report the status without the body or key", async () => {
     let calls = 0;
     const fetcher = (async () => {
@@ -124,7 +141,7 @@ describe("openRouterExtractor", () => {
     }) as unknown as typeof fetch;
     expect(await openRouterExtractor(async () => undefined, fetcher)("s", "q", new AbortController().signal)).toEqual({
       kind: "off",
-      reason: "no openrouter key in the OMP credential store",
+      reason: "no openrouter key resolved",
     });
     expect(calls).toBe(0);
     const failed = await openRouterExtractor(async () => "sk-or-secret", fetcher)("s", "q", new AbortController().signal);

@@ -382,7 +382,7 @@ describe("chat_evidence through OptChat", () => {
     const compressor = await startCompressorServer();
     cleanups.push(() => compressor.stop());
     const host: FakeHost = await openFakeHost(
-      createOptChat({ judge: () => fakeJudge(() => ({})), extractor: () => async () => ({ kind: "off", reason: "no openrouter key in the OMP credential store" }) }),
+      createOptChat({ judge: () => fakeJudge(() => ({})), extractor: () => async () => ({ kind: "off", reason: "no openrouter key resolved" }) }),
       { flags: gatesOff, model: compressor.model, mainModel: anthropicModel(), apiKey: "fixture-key" },
     );
     cleanups.push(() => host.close());
