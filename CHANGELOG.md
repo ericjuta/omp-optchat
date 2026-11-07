@@ -3,7 +3,8 @@
 ## Unreleased
 
 - **Added: `chat_evidence`.** A deterministic memory tool (no model call) that returns up to 8 exact passages (≤2,048 bytes each, ≤16,384 bytes total, 10 s limit) with message id, kind and zoom-valid UTF-8 byte offsets, and always ends with a trailer listing searched messages, words not found and partial reports. On by default; `--no-optchat-evidence` removes it. It is not a System One gate: with every gate opted out it stays available and still resolves no judge. Child views get it bounded to their snapshot.
-- **Changed (pending pre-registered eval): one standing rule per sentence.** "Use British English. Always ask before deploying." now stores two rules, so withdrawing one leaves the other. Whole sentences are kept, so "unless…" clauses stay attached. Replace and withdraw targets are the newest 16 rules plus the 16 most relevant, instead of the newest 32, so old rules stay reachable.
+- **Changed: one standing rule per sentence.** Adopted by a pre-registered eval: 51 synthetic cases × 3, rule-add F1 0.985 for both old and new, no new false positives; the new version also handles the two old-rule replacements the old one missed. Cost $0.046, judge served as `cloudflare/clef`. "Use British English. Always ask before deploying." now stores two rules, so withdrawing one leaves the other. Whole sentences are kept, so "unless…" clauses stay attached. Replace and withdraw targets are the newest 16 rules plus the 16 most relevant, instead of the newest 32, so old rules stay reachable.
+- **Fixed: `chat_evidence` in short chats.** With only a few stored messages, every word the question shared with a report weighed 0 under BM25, so only the question itself was searched. Evidence ranking now uses a smoothed, always-positive weight; `chat_recall` ranking is unchanged.
 - **Fixed: README install pin** now names the current tag.
 
 ## 0.14.0 — 2026-10-23
