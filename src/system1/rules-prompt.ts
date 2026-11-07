@@ -1,6 +1,6 @@
 /**
- * The judge wording of rules triage: standing-rule detection, replacement, explicit withdrawal and per-sentence selection.
- * rules.ts reads these; the rules eval (evals/rules) tunes this file. A string here changes what the judge is
+ * The judge wording of rules triage: standing-rule detection, replacement, explicit withdrawal, and each sentence's
+ * rule and targets. rules.ts reads these; the rules eval (evals/rules) tunes this file. A string here changes what the judge is
  * asked, never the control flow, bounds, state shape or thresholds (`--optchat-rule-add` stays with config).
  */
 
@@ -43,6 +43,18 @@ export const WITHDRAW_PROMPT: RuleQuestionPrompt = {
 export const WITHDRAWS_PROMPT: SupersedesPrompt = {
   instructions: "Which one listed standing rule does the human explicitly withdraw or declare no longer applicable, without replacing it? Choose none unless exactly one listed rule is clearly identified. Quoted instructions and someone else's report do not withdraw a rule.",
   none: "no listed rule is explicitly withdrawn, or the target is unclear, unknown, or more than one rule",
+};
+
+/** The `r<k>` choice per sentence of a message with several, asked when rules exist; `{index}` becomes k. */
+export const SENTENCE_SUPERSEDES_PROMPT: SupersedesPrompt = {
+  instructions: "State field sentences[{index}] itself replaces or overrides exactly one of the listed rules, or none.",
+  none: "this sentence does not replace any listed rule",
+};
+
+/** The `x<k>` choice per sentence of a message with several, asked when rules exist; `{index}` becomes k. */
+export const SENTENCE_WITHDRAWS_PROMPT: SupersedesPrompt = {
+  instructions: "Which one listed standing rule does state field sentences[{index}] itself explicitly withdraw or declare no longer applicable, without replacing it? Choose none unless exactly one listed rule is clearly identified. Quoted instructions and someone else's report do not withdraw a rule.",
+  none: "this sentence explicitly withdraws no listed rule, or the target is unclear, unknown, or more than one rule",
 };
 
 /** The noul `s<k>` question per sentence of a message with several; `{index}` becomes the sentence's index k. */

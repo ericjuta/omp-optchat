@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "id": "rules-atomic-20261106",
+  "status": "pre-registered before any paid call; not run",
+  "registered": "2026-11-06, agent (Milestone 1 of plans/evidence-layer.md, Eric's #21 decision)",
+  "approval": "No paid judge call runs until Eric approves the SHA-256 of this exact file. A change to any bound file below requires a new manifest and a new approval.",
+  "question": "Does splitting a multi-sentence human message into one rule per kept sentence, with per-sentence replace/withdraw targets drawn from the newest 16 active rules plus the 16 most word-relevant older ones, keep rule-add accuracy at the 0.8 cutoff?",
+  "cases": {
+    "path": "evals/rules/cases/atomic-20261106.jsonl",
+    "sha256": "741625f2bee5f99e373a9850464bf2876035f4737efac7fa47ffb1289bdc8bec",
+    "bytes": 20528,
+    "count": 51,
+    "labels": { "rule": 33, "none": 18 },
+    "categories": {
+      "multi-rule": 10,
+      "mixed-rule": 8,
+      "exception-inline": 6,
+      "exception-sentence": 4,
+      "multi-none": 12,
+      "ruled-none": 3,
+      "unless-none": 3,
+      "supersede-multi": 3,
+      "supersede-old": 2
+    },
+    "provenance": "Fresh synthetic messages authored by the agent for this run; no real chat text; none repeats an earlier rules case (checked against evals/rules/cases/synthetic.jsonl); no secret-like text (evals/recall SECRET_LIKE). Every case is split test, so the runner writes no traces.",
+    "labelling": "Eric's 2026-10-19 boundary: a rule is a standing instruction meant to hold beyond the current task; task-scoped instructions, recurring in-task instructions and one-off authorizations are not rules. A message with several sentences lists in gold.keep the sentences that state the rule, including an exception stated in its own sentence; gold.supersedes names the offered rule a message replaces."
+  },
+  "scorer": {
+    "path": "evals/rules/grade.ts",
+    "sha256": "4030e0f9573b0f9c94ee10d84b0d68cc25a712ac87cf95d4c4a913e7c5d33632",
+    "note": "Frozen and unchanged from c3efa48. It grades one decision per message. The candidate runner grades its per-sentence changes through messageDecision (evals/rules/run.ts): kept sentences joined in source order, a replacement if any sentence replaced, so both arms are scored by the same function on the same message-level outcome."
+  },
+  "arms": {
+    "baseline": {
+      "label": "B",
+      "revision": "c3efa482e76951e96a5118d3d7eac9f4b0de8ffc",
+      "description": "Joined rule text, newest-32 targets (rules.ts identical to v0.14.0).",
+      "files": {
+        "src/system1/rules.ts": "d7cbdf074dd10aa221c851630e9b23d795705eb868ca7780e3f04292c5da3d75",
+        "src/system1/rules-prompt.ts": "9382cb4008202a5a399113c41c37b2afd3056ac0877989f5f5ea341287d852bf",
+        "evals/rules/run.ts": "9f3da76f61766861f98d1f004a90e9942cfeefa1f5f74c6ec0baf41fb193df02",
+        "evals/rules/grade.ts": "4030e0f9573b0f9c94ee10d84b0d68cc25a712ac87cf95d4c4a913e7c5d33632"
+      }
+    },
+    "candidate": {
+      "label": "C",
+      "revision": "the Milestone 1 commit, recorded in the run report; its bound files must hash exactly as listed",
+      "description": "One rule per kept sentence; per-sentence r<k>/x<k> targets over the newest 16 plus 16 most relevant active rules.",
+      "files": {
+        "src/system1/rules.ts": "d0122e9bb5c205767a5e3f2fcfda75e265c2eebd4dfbafe9d25731cb84d01b74",
+        "src/system1/rules-prompt.ts": "bdfa68bc3a3c86832c959e0209d21b4ef4222cb9afbc516fa868e5db3383b8db",
+        "evals/rules/run.ts": "28c17dcb3f8a57d1a12935f37b424c0261b1cf69435fdfb8d1302183968eaedd",
+        "evals/rules/grade.ts": "4030e0f9573b0f9c94ee10d84b0d68cc25a712ac87cf95d4c4a913e7c5d33632"
+      }
+    }
+  },
+  "judge": {
+    "role": "the host judge role (openrouter/~typesafe/jev-latest), through evals/recall/judge.ts openHostJudge",
+    "ruleAdd": 0.8,
+    "repetitions": 3,
+    "concurrency": 4,
+    "sameModel": "Every result row of both arms must name the same served judge model; otherwise the run is INCONCLUSIVE."
+  },
+  "budget": {
+    "capUsd": 0.5,
+    "perArm": { "maxCostUsd": 0.25, "maxJudgeCalls": 200 },
+    "note": "Judge spend only, from the host's reported usage. A row with unknown cost makes the run INCONCLUSIVE. The runner checks the ceiling before each attempt, so concurrent attempts can overshoot a per-arm ceiling by a few calls; the two per-arm ceilings together stay at the $0.50 cap."
+  },
+  "procedure": [
+    "Verify the sha256 of the case file and of every bound file of both arms (baseline from an ovnfs checkout at the baseline revision, candidate from the Milestone 1 commit). Any mismatch stops the run before a call.",
+    "B, from the baseline checkout: bun evals/rules/run.ts --variant baseline --cases <repo>/evals/rules/cases/atomic-20261106.jsonl --reps 3 --concurrency 4 --max-judge-calls 200 --max-cost-usd 0.25 --rule-add 0.8 --out <repo>/evals/rules/runs/atomic-20261106/baseline",
+    "C, from the candidate commit: bun evals/rules/run.ts --variant v1 --cases evals/rules/cases/atomic-20261106.jsonl --reps 3 --concurrency 4 --max-judge-calls 200 --max-cost-usd 0.25 --rule-add 0.8 --out evals/rules/runs/atomic-20261106/v1",
+    "Run B then C in the same session. A rerun only fills errored slots of the same out directory; no case, arm or setting changes after data."
+  ],
+  "metrics": {
+    "primary": "Rule-add F1 per arm over all result rows (51 cases x 3 repetitions), from grade.ts summarize: a row is a predicted add when the message's outcome adds or replaces any rule.",
+    "falsePositives": "Per gold-none case, the number of repetitions with a predicted add."
+  },
+  "adoptionRule": "Adopt C (ship Milestone 1) iff both hold: (1) F1(C) >= F1(B) - 0.06, where 0.06 is the rules eval's measured baseline noise (test score 0.918 +/- 0.060, .omp/ratchet/rules-triage/narrative.md, used here as the F1 tolerance); and (2) no new false positives: for every gold-none case, C's false-positive repetitions are at most B's. Otherwise C is not adopted and Milestone 1 does not ship.",
+  "inconclusive": "Not adopted, and reported as inconclusive rather than as a failure, if: either arm has error rows for more than 5% of its 153 slots after the runner's retries; any row has unknown cost; the served judge model differs between rows; or spend reaches the $0.50 cap before both arms finish. No relaxation after data.",
+  "secondaryReadouts": "Reported, decide nothing: pass rate (score) per arm and per category; on gold-rule cases with several kept sentences, how often C wrote one change per kept sentence (results.jsonl changes); the two supersede-old cases, whose target (r3, r5) lies outside B's newest-32 offer. The message-level grader cannot tell whether a split-off exception sentence still reads correctly on its own; that is not measured here.",
+  "preflight": {
+    "cost": "$0, no judge calls (oracle and null modes, 1 repetition)",
+    "candidateOracle": "51/51 pass, F1 1.000",
+    "candidateNull": "score 0.353 (the 18 non-rules), F1 0.000",
+    "baselineOracle": "49/51 pass, F1 1.000; fails only atomic-supersede-old-01 and -02 (target not among the newest 32 offered)",
+    "baselineNull": "score 0.353, F1 0.000"
+  }
+}

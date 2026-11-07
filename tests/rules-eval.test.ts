@@ -3,8 +3,8 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CASES_DIR, type RuleCase } from "../evals/rules/build-cases.ts";
 import { expectedText, grade, summarize } from "../evals/rules/grade.ts";
-import { oracleAnswers } from "../evals/rules/run.ts";
-import { decideTriage, offeredRules, ruleSentences, type TriageDecision } from "../src/system1/rules.ts";
+import { messageDecision, offeredOf, oracleAnswers } from "../evals/rules/run.ts";
+import { decideTriage, ruleSentences, type TriageDecision } from "../src/system1/rules.ts";
 
 const RULE_ADD = 0.8;
 const NONE: TriageDecision = { kind: "none" };
@@ -73,6 +73,14 @@ describe("rules grader", () => {
     expect(summarize([{ pass: false, tp: 0, fp: 0, fn: 1, tn: 0 }]).precision).toBe(0);
     expect(summarize([]).score).toBe(0);
   });
+
+  test("a message's per-sentence changes are graded as one outcome with the kept sentences in order", () => {
+    expect(messageDecision([])).toEqual(NONE);
+    const tabs = { kind: "add", text: "Use tabs." } as const;
+    expect(messageDecision([tabs, { kind: "add", text: "Cite paths." }])).toEqual(ADD("Use tabs. Cite paths."));
+    expect(messageDecision([tabs, { kind: "replace", replaces: "r2", text: "Cite paths." }])).toEqual(REPLACE("r2", "Use tabs. Cite paths."));
+    expect(messageDecision([{ kind: "remove", removes: "r1" }, { kind: "remove", removes: "r2" }])).toEqual({ kind: "remove", removes: "r1" });
+  });
 });
 
 describe("rules eval cases", () => {
@@ -81,9 +89,8 @@ describe("rules eval cases", () => {
     expect(cases.filter((c) => c.tags[2] === "synthetic").length).toBeGreaterThanOrEqual(40);
     for (const c of cases) {
       const sentences = ruleSentences(c.message);
-      const offered = offeredRules(c.rules.map((rule) => ({ ...rule, source: 0, at: 0 })));
-      const decision = decideTriage("human", oracleAnswers(c, sentences), offered, RULE_ADD, c.message, sentences);
-      expect(grade(decision, c.gold, sentences).pass).toBe(true);
+      const changes = decideTriage("human", oracleAnswers(c, sentences), offeredOf(c, sentences), RULE_ADD, c.message, sentences);
+      expect(grade(messageDecision(changes), c.gold, sentences).pass).toBe(true);
     }
   });
 
@@ -92,6 +99,23 @@ describe("rules eval cases", () => {
     const categories = new Set(synthetic.map((c) => c.tags[3]));
     for (const category of ["templated-rule", "one-off", "question", "hypothetical", "quoted-rule", "mixed-none", "mixed-rule", "supersede", "distractor"]) {
       expect(categories.has(category)).toBe(true);
+    }
+  });
+
+  test("the pre-registered atomic set: oracle answers pass every case, and keep names whole sentences of several", async () => {
+    const text = await readFile(join(CASES_DIR, "atomic-20261106.jsonl"), "utf8");
+    const cases = text.split("\n").filter((line) => line.trim().length > 0).map((line) => JSON.parse(line) as RuleCase);
+    expect(cases).toHaveLength(51);
+    for (const c of cases) {
+      const sentences = ruleSentences(c.message);
+      if (c.gold.keep !== undefined) {
+        expect(sentences.length).toBeGreaterThan(1);
+        expect(c.gold.keep.every((index) => index >= 0 && index < sentences.length)).toBe(true);
+      }
+      const changes = decideTriage("human", oracleAnswers(c, sentences), offeredOf(c, sentences), RULE_ADD, c.message, sentences);
+      expect(grade(messageDecision(changes), c.gold, sentences).pass).toBe(true);
+      // Each kept sentence is its own change.
+      if (c.gold.rule) expect(changes).toHaveLength(c.gold.keep?.length ?? 1);
     }
   });
 

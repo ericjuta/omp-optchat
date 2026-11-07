@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
 /**
  * Rules-triage eval runner. For each case's user message it runs the production triage path, in the order the rules
- * gate runs it (src/index.ts `triage`): ruleSentences, triageState, triageQuestions, judgeWithin, decideTriage at the
- * configured threshold. The judge is OMP's `judge` role, through the recall eval's wrapper (evals/recall/judge.ts).
- * grade.ts scores each decision. Writes, under --out:
+ * gate runs it (src/index.ts `triage`): ruleSentences, triageTargets, triageState, triageQuestions, judgeWithin,
+ * decideTriage at the configured threshold. The judge is OMP's `judge` role, through the recall eval's wrapper
+ * (evals/recall/judge.ts). grade.ts scores each message's decision: the changes seen as one outcome (messageDecision).
+ * Writes, under --out:
  *
  *   results.jsonl   one line per (case, rep) with a scorable decision; `grade.score` is 0 or 1
  *   errors.jsonl    attempts with no scorable decision: judge error, timeout, budget, induced; never a zero row
@@ -29,12 +30,13 @@ import type { Rule } from "../../src/system1/ledger.ts";
 import { judgeWithin } from "../../src/system1/judge.ts";
 import {
   decideTriage,
-  offeredRules,
+  type RuleChange,
   ruleSentences,
   type TriageAnswers,
   type TriageDecision,
   triageQuestions,
   triageState,
+  triageTargets,
 } from "../../src/system1/rules.ts";
 import { type HostJudge, JudgeBudget, type Meter, metered, newMeter, openHostJudge } from "../recall/judge.ts";
 import { CASES_DIR, type RuleCase } from "./build-cases.ts";
@@ -59,7 +61,7 @@ interface Options {
 }
 
 interface Attempt {
-  readonly decision?: TriageDecision;
+  readonly changes?: readonly RuleChange[];
   readonly answers?: TriageAnswers;
   readonly sentences: readonly string[];
   readonly cls?: string;
@@ -167,26 +169,49 @@ async function recordedSlots(file: string): Promise<Set<string>> {
   return slots;
 }
 
-/** The rules the decision may replace, as the gate offers them: the newest 32 of the ledger's active rules. */
-function offeredOf(c: RuleCase): Rule[] {
-  return offeredRules(c.rules.map((rule) => ({ id: rule.id, text: rule.text, source: 0, at: 0 })));
+/** The rules each judged unit may replace or withdraw, as the gate offers them (triageTargets), in ledger order. */
+export function offeredOf(c: RuleCase, sentences: readonly string[]): Rule[][] {
+  return triageTargets(c.rules.map((rule) => ({ id: rule.id, text: rule.text, source: 0, at: 0 })), c.message, sentences);
 }
 
-/** The oracle answers the gold label: a rule at 0.95, a non-rule at 0.05, a named replacement at 0.9. */
+/**
+ * One message's changes as the single outcome grade.ts scores: `none` when there are none, the first withdrawal when
+ * any (this corpus labels no withdrawals), otherwise the kept sentences' texts joined in source order, as a replacement
+ * of the first replaced rule when there is one, else as an add. A message is a predicted rule add when any rule is added
+ * or replaced, as before rules were split per sentence.
+ */
+export function messageDecision(changes: readonly RuleChange[]): TriageDecision {
+  const texts: string[] = [];
+  let replaces: string | undefined;
+  for (const change of changes) {
+    if (change.kind === "remove") return change;
+    texts.push(change.text);
+    if (change.kind === "replace") replaces ??= change.replaces;
+  }
+  if (texts.length === 0) return { kind: "none" };
+  const text = texts.join(" ");
+  return replaces === undefined ? { kind: "add", text } : { kind: "replace", replaces, text };
+}
+
+/**
+ * The oracle answers the gold label: a rule at 0.95, a non-rule at 0.05, a named replacement at 0.9. With several
+ * sentences, the replacement is the first kept sentence's `r<k>` and every other sentence answers `none`.
+ */
 export function oracleAnswers(c: RuleCase, sentences: readonly string[]): TriageAnswers {
   const answers: Record<string, Answer> = {
     rule: { type: "noul", noul: c.gold.rule ? 0.95 : 0.05 },
     withdraw: { type: "noul", noul: 0 },
   };
-  if (c.rules.length > 0) {
-    const target = c.gold.supersedes ?? "none";
-    answers.supersedes = { type: "choice", choice: target, probabilities: { [target]: 0.9 }, confidence: 1 };
+  const target = (picked: string): Answer => ({ type: "choice", choice: picked, probabilities: { [picked]: 0.9 }, confidence: 1 });
+  if (sentences.length <= 1) {
+    if (c.rules.length > 0) answers.supersedes = target(c.gold.supersedes ?? "none");
+    return answers;
   }
-  if (sentences.length > 1) {
-    for (let k = 0; k < sentences.length; k++) {
-      const kept = c.gold.rule && (c.gold.keep === undefined || c.gold.keep.includes(k));
-      answers[`s${k}`] = { type: "noul", noul: kept ? 0.95 : 0.05 };
-    }
+  const kept = sentences.map((_, k) => c.gold.rule && (c.gold.keep === undefined || c.gold.keep.includes(k)));
+  const replacing = c.gold.supersedes === undefined ? -1 : kept.indexOf(true);
+  for (let k = 0; k < sentences.length; k++) {
+    answers[`s${k}`] = { type: "noul", noul: kept[k] ? 0.95 : 0.05 };
+    if (c.rules.length > 0) answers[`r${k}`] = target(k === replacing ? c.gold.supersedes! : "none");
   }
   return answers;
 }
@@ -198,12 +223,12 @@ async function attempt(c: RuleCase, ctx: Context, induced: boolean): Promise<Att
   const sentences = ruleSentences(c.message);
   if (ctx.budget.used >= ctx.budget.limit) return { sentences, cls: "budget", message: "judge-call budget spent", meter, latency: latency() };
   if (ctx.spend.usd >= ctx.options.maxCostUsd) return { sentences, cls: "budget", message: "cost ceiling reached", meter, latency: latency() };
-  const offered = offeredOf(c);
+  const offered = offeredOf(c, sentences);
   const judge = metered(ctx.judge!.judge, meter, ctx.budget, induced);
   try {
     const result = await judgeWithin(judge, { state: triageState(c.message, sentences), questions: triageQuestions(offered, sentences) }, TRIAGE_MS);
-    const decision = decideTriage("human", result.answers, offered, ctx.options.ruleAdd, c.message, sentences);
-    return { sentences, decision, answers: result.answers, meter, latency: latency() };
+    const changes = decideTriage("human", result.answers, offered, ctx.options.ruleAdd, c.message, sentences);
+    return { sentences, changes, answers: result.answers, meter, latency: latency() };
   } catch (error) {
     const text = errorText(error);
     const cls = induced
@@ -225,7 +250,7 @@ function costOf(meter: Meter): number | "unknown" {
   return meter.usage === undefined ? "unknown" : meter.usage.cost.total;
 }
 
-async function writeTrace(c: RuleCase, rep: number, ctx: Context, meter: Meter, decision?: TriageDecision, cls?: string): Promise<void> {
+async function writeTrace(c: RuleCase, rep: number, ctx: Context, meter: Meter, changes?: readonly RuleChange[], cls?: string): Promise<void> {
   if (!(ctx.trainIds?.has(c.id) ?? c.split === "train")) return;
   const transcript: Array<{ role: string; content: string; name?: string }> = [{ role: "user", content: c.message }];
   for (const call of meter.calls) {
@@ -236,11 +261,11 @@ async function writeTrace(c: RuleCase, rep: number, ctx: Context, meter: Meter, 
       content: call.error !== undefined ? `error: ${call.error}` : JSON.stringify(call.answers),
     });
   }
-  const outcome = decision === undefined
+  const outcome = changes === undefined
     ? `error: ${cls ?? "unknown"}`
-    : decision.kind === "none"
+    : changes.length === 0
       ? "decision: none"
-      : `decision: ${decision.kind}${decision.kind === "replace" ? ` ${decision.replaces}` : ""}`;
+      : `decision: ${changes.map((change) => change.kind === "add" ? "add" : `${change.kind} ${change.kind === "replace" ? change.replaces : change.removes}`).join(", ")}`;
   transcript.push({ role: "assistant", content: outcome });
   await mkdir(ctx.traces, { recursive: true });
   await writeFile(join(ctx.traces, `${c.id}_rep${rep}.json`), JSON.stringify(transcript, null, 2));
@@ -264,7 +289,8 @@ async function writeError(c: RuleCase, rep: number, ctx: Context, result: Attemp
 }
 
 async function writeResult(c: RuleCase, rep: number, ctx: Context, result: Attempt, retries: number): Promise<void> {
-  const decision = result.decision!;
+  const changes = result.changes!;
+  const decision = messageDecision(changes);
   const verdict = grade(decision, c.gold, result.sentences);
   const meter = result.meter;
   const models = [...meter.models].filter((model) => model.length > 0);
@@ -279,6 +305,7 @@ async function writeResult(c: RuleCase, rep: number, ctx: Context, result: Attem
     explanation: verdict.explanation,
     status: "ok",
     decision: decision.kind,
+    changes: changes.map((change) => change.kind),
     latency_s: result.latency,
     judge_calls: meter.calls.length,
     judge_bytes: meter.bytes,
@@ -294,21 +321,21 @@ async function writeResult(c: RuleCase, rep: number, ctx: Context, result: Attem
   if (models.length > 0) row.model = models[0];
   if (meter.usage) row.usage = meter.usage;
   await appendFile(ctx.results, `${JSON.stringify(row)}\n`);
-  await writeTrace(c, rep, ctx, meter, decision);
+  await writeTrace(c, rep, ctx, meter, changes);
 }
 
 async function runTrial(c: RuleCase, rep: number, ctx: Context): Promise<"result" | "error"> {
   if (ctx.options.mode !== "live") {
     const sentences = ruleSentences(c.message);
     const answers = ctx.options.mode === "oracle" ? oracleAnswers(c, sentences) : {};
-    const decision = decideTriage("human", answers, offeredOf(c), ctx.options.ruleAdd, c.message, sentences);
-    await writeResult(c, rep, ctx, { decision, answers, sentences, meter: newMeter(), latency: 0 }, 0);
+    const changes = decideTriage("human", answers, offeredOf(c, sentences), ctx.options.ruleAdd, c.message, sentences);
+    await writeResult(c, rep, ctx, { changes, answers, sentences, meter: newMeter(), latency: 0 }, 0);
     return "result";
   }
   let retries = 0;
   for (;;) {
     const result = await attempt(c, ctx, ctx.options.induce === c.id);
-    if (result.cls === undefined && result.decision !== undefined && [...result.meter.models].every((model) => model.length === 0)) {
+    if (result.cls === undefined && result.changes !== undefined && [...result.meter.models].every((model) => model.length === 0)) {
       await writeError(c, rep, ctx, { ...result, cls: "served_model_missing", message: "no judge response named a model" }, retries);
       return "error";
     }
@@ -319,7 +346,7 @@ async function runTrial(c: RuleCase, rep: number, ctx: Context): Promise<"result
       await promise;
       continue;
     }
-    if (result.cls !== undefined || result.decision === undefined) {
+    if (result.cls !== undefined || result.changes === undefined) {
       await writeError(c, rep, ctx, result, retries);
       return "error";
     }

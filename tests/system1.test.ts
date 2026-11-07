@@ -11,13 +11,13 @@ import { LEDGER_FILE, RULE_TEXT_BYTES, RuleLedger, clipRule, renderRules } from 
 import { PREFETCH_HEADER, PREFETCH_QUESTIONS, PREFETCH_STATE_BYTES, prefetchBlock, type PrefetchMemory } from "../src/system1/prefetch.ts";
 import {
   decideTriage,
-  offeredRules,
   RULE_SENTENCE_LIMIT,
+  type RuleChange,
   ruleSentences,
   TRIAGE_MESSAGE_BYTES,
   triageQuestions,
   triageState,
-  type TriageDecision,
+  triageTargets,
 } from "../src/system1/rules.ts";
 import { valueHint } from "../src/system1/value.ts";
 import { choice, fakeJudge, noul, score, sessionFallbackJudge, type FakeJudge } from "./helpers/fake-judge.ts";
@@ -155,13 +155,16 @@ describe("System One config", () => {
 });
 
 describe("rules ledger", () => {
-  function applyDecision(ledger: RuleLedger, decision: TriageDecision): boolean {
-    switch (decision.kind) {
-      case "none": return false;
-      case "add": ledger.add(9, decision.text, 10); return true;
-      case "replace": ledger.replace(decision.replaces, 9, decision.text, 10); return true;
-      case "remove": return ledger.remove(decision.removes, 10);
+  /** Applies the changes in order, as the triage does; true when any of them changed the ledger. */
+  function applyChanges(ledger: RuleLedger, changes: readonly RuleChange[]): boolean {
+    let changed = false;
+    for (const change of changes) {
+      if (change.kind === "add") ledger.add(9, change.text, 10);
+      else if (change.kind === "replace") ledger.replace(change.replaces, 9, change.text, 10);
+      else if (!ledger.remove(change.removes, 10)) continue;
+      changed = true;
     }
+    return changed;
   }
 
   test.each(["non-human", "unknown"] as const)("%s authority cannot add, replace or withdraw a rule or append ledger bytes", async (authority) => {
@@ -175,8 +178,8 @@ describe("rules ledger", () => {
       { rule: noul(1), withdraw: noul(1), withdraws: choice(original.id, { [original.id]: 1 }) },
     ];
     for (const answers of cases) {
-      const decision = decideTriage(authority, answers, ledger.active(), 0.8, "From now on reply in German.");
-      expect(applyDecision(ledger, decision)).toBe(false);
+      const changes = decideTriage(authority, answers, [ledger.active()], 0.8, "From now on reply in German.");
+      expect(applyChanges(ledger, changes)).toBe(false);
       expect(ledger.active()).toEqual([original]);
       expect(await ledgerText(dir)).toBe(bytes);
     }
@@ -196,10 +199,12 @@ describe("rules ledger", () => {
     for (const answer of invalid) {
       for (const answers of [
         { rule: answer, withdraw: noul(0), supersedes: choice(original.id, { [original.id]: 1 }) },
-        { rule: noul(1), withdraw: noul(0), supersedes: choice(original.id, { [original.id]: 1 }), s0: answer, s1: noul(0) },
+        { rule: noul(1), withdraw: noul(0), r0: choice(original.id, { [original.id]: 1 }), s0: answer, s1: noul(0) },
       ]) {
-        const decision = decideTriage("human", answers, ledger.active(), 0.8, sentences.join(" "), "s0" in answers ? sentences : []);
-        expect(applyDecision(ledger, decision)).toBe(false);
+        const judged = "s0" in answers ? sentences : [];
+        const message = sentences.join(" ");
+        const changes = decideTriage("human", answers, triageTargets(ledger.active(), message, judged), 0.8, message, judged);
+        expect(applyChanges(ledger, changes)).toBe(false);
         expect(ledger.active()).toEqual([original]);
         expect(await ledgerText(dir)).toBe(bytes);
       }
@@ -212,11 +217,11 @@ describe("rules ledger", () => {
       const dir = await tempDir();
       const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
       const original = ledger.add(3, RULE_TEXT, 1);
-      const decision = decideTriage("human", {
+      const changes = decideTriage("human", {
         rule: noul(1), withdraw: noul(0), supersedes: choice(original.id, { [original.id]: probability }),
-      }, ledger.active(), 0.8, "Always use tabs.");
-      expect(decision).toEqual({ kind: "add", text: "Always use tabs." });
-      expect(applyDecision(ledger, decision)).toBe(true);
+      }, [ledger.active()], 0.8, "Always use tabs.");
+      expect(changes).toEqual([{ kind: "add", text: "Always use tabs." }]);
+      expect(applyChanges(ledger, changes)).toBe(true);
       expect(ledger.active()).toEqual([original, { id: "r2", source: 9, at: 10, text: "Always use tabs." }]);
       ledger.close();
       const replayed = RuleLedger.open(() => join(dir, LEDGER_FILE));
@@ -230,13 +235,13 @@ describe("rules ledger", () => {
     const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
     const original = ledger.add(3, RULE_TEXT, 1);
     const retained = ledger.add(4, "Always use tabs.", 2);
-    const offered = ledger.active();
+    const offered = [ledger.active()];
     const answers = (id: string) => ({ rule: noul(1), withdraw: noul(1), withdraws: choice(id, { [id]: 1 }) });
-    expect(applyDecision(ledger, decideTriage("human", answers(original.id), offered, 0.8, "Stop replying in French."))).toBe(true);
+    expect(applyChanges(ledger, decideTriage("human", answers(original.id), offered, 0.8, "Stop replying in French."))).toBe(true);
     const bytes = await ledgerText(dir);
     // A stale offered snapshot may still decide to remove r1; the ledger must not append a second removal.
-    expect(applyDecision(ledger, decideTriage("human", answers(original.id), offered, 0.8, "Stop replying in French."))).toBe(false);
-    expect(applyDecision(ledger, decideTriage("human", answers("r99"), ledger.active(), 0.8, "Forget that other rule."))).toBe(false);
+    expect(applyChanges(ledger, decideTriage("human", answers(original.id), offered, 0.8, "Stop replying in French."))).toBe(false);
+    expect(applyChanges(ledger, decideTriage("human", answers("r99"), [ledger.active()], 0.8, "Forget that other rule."))).toBe(false);
     expect(ledger.active()).toEqual([retained]);
     expect(await ledgerText(dir)).toBe(bytes);
     ledger.close();
@@ -249,7 +254,7 @@ describe("rules ledger", () => {
     const dir = await tempDir();
     const ledger = RuleLedger.open(() => join(dir, LEDGER_FILE));
     const original = ledger.add(3, RULE_TEXT, 1);
-    const offered = ledger.active();
+    const offered = [ledger.active()];
     const held = Promise.withResolvers<Record<string, Answer>>();
     const judge = fakeJudge(() => held.promise);
     const message = "Stop replying in French.";
@@ -258,9 +263,9 @@ describe("rules ledger", () => {
     const replacement = ledger.replace(original.id, 4, "From now on reply in German.", 2);
     const bytes = await ledgerText(dir);
     held.resolve({ rule: noul(1), withdraw: noul(1), withdraws: choice(original.id, { [original.id]: 1 }) });
-    const decision = decideTriage("human", (await pending).answers, offered, 0.8, message);
-    expect(decision).toEqual({ kind: "remove", removes: original.id });
-    expect(applyDecision(ledger, decision)).toBe(false);
+    const changes = decideTriage("human", (await pending).answers, offered, 0.8, message);
+    expect(changes).toEqual([{ kind: "remove", removes: original.id }]);
+    expect(applyChanges(ledger, changes)).toBe(false);
     expect(ledger.active()).toEqual([replacement]);
     expect(await ledgerText(dir)).toBe(bytes);
     ledger.close();
@@ -342,8 +347,8 @@ describe("rules triage decisions", () => {
   const said = "reply in Spanish";
 
   test("a rule is added at the threshold, and never below it", () => {
-    expect(decideTriage("human", { rule: noul(0.79), withdraw: noul(0) }, [], 0.8, said)).toEqual({ kind: "none" });
-    expect(decideTriage("human", { rule: noul(0.8), withdraw: noul(0) }, [], 0.8, said)).toEqual({ kind: "add", text: said });
+    expect(decideTriage("human", { rule: noul(0.79), withdraw: noul(0) }, [], 0.8, said)).toEqual([]);
+    expect(decideTriage("human", { rule: noul(0.8), withdraw: noul(0) }, [], 0.8, said)).toEqual([{ kind: "add", text: said }]);
   });
 
   test("human withdrawal at the cutoff removes an offered target at probability 0.5 or more", () => {
@@ -352,24 +357,24 @@ describe("rules triage decisions", () => {
         rule: noul(0),
         withdraw: noul(0.8),
         withdraws: choice("r1", { none: 1 - probability, r1: probability }),
-      }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "remove", removes: "r1" });
+      }, [[rule]], 0.8, "Stop replying in French.")).toEqual([{ kind: "remove", removes: "r1" }]);
     }
   });
 
   test("withdrawal below the cutoff or with target probability below 0.5 removes nothing", () => {
     expect(decideTriage("human", {
       rule: noul(0), withdraw: noul(0.79), withdraws: choice("r1", { r1: 1 }),
-    }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "none" });
+    }, [[rule]], 0.8, "Stop replying in French.")).toEqual([]);
     expect(decideTriage("human", {
       rule: noul(1), withdraw: noul(0.8), withdraws: choice("r1", { none: 0.51, r1: 0.49 }),
-    }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "none" });
+    }, [[rule]], 0.8, "Stop replying in French.")).toEqual([]);
   });
 
   test("withdrawal takes precedence over high-confidence addition and replacement answers", () => {
     expect(decideTriage("human", {
       rule: noul(1), withdraw: noul(1),
       supersedes: choice("r1", { r1: 1 }), withdraws: choice("r1", { r1: 1 }),
-    }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "remove", removes: "r1" });
+    }, [[rule]], 0.8, "Stop replying in French.")).toEqual([{ kind: "remove", removes: "r1" }]);
   });
 
   test("unknown and already-removed withdrawal targets never become high-confidence additions", () => {
@@ -377,12 +382,12 @@ describe("rules triage decisions", () => {
       const answers = {
         rule: noul(confidence), withdraw: noul(1), withdraws: choice("r1", { r1: 1 }),
       };
-      expect(decideTriage("human", answers, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "remove", removes: "r1" });
+      expect(decideTriage("human", answers, [[rule]], 0.8, "Stop replying in French.")).toEqual([{ kind: "remove", removes: "r1" }]);
       // The next triage offers no rule after the first removal has been applied.
-      expect(decideTriage("human", answers, [], 0.8, "Stop replying in French.")).toEqual({ kind: "none" });
+      expect(decideTriage("human", answers, [[]], 0.8, "Stop replying in French.")).toEqual([]);
       expect(decideTriage("human", {
         ...answers, withdraws: choice("r9", { r9: 1 }),
-      }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "none" });
+      }, [[rule]], 0.8, "Stop replying in French.")).toEqual([]);
     }
   });
 
@@ -392,7 +397,7 @@ describe("rules triage decisions", () => {
       for (const supersedes of [undefined, choice("r1", { r1: 1 })]) {
         expect(decideTriage("human", {
           rule: noul(1), withdraw, supersedes, withdraws: choice("r1", { r1: 1 }),
-        }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "none" });
+        }, [[rule]], 0.8, "Stop replying in French.")).toEqual([]);
       }
     }
   });
@@ -416,7 +421,7 @@ describe("rules triage decisions", () => {
     for (const withdraws of targets) {
       expect(decideTriage("human", {
         rule: noul(1), withdraw: noul(1), withdraws,
-      }, [rule], 0.8, "Stop replying in French.")).toEqual({ kind: "none" });
+      }, [[rule]], 0.8, "Stop replying in French.")).toEqual([]);
     }
   });
 
@@ -427,20 +432,20 @@ describe("rules triage decisions", () => {
         { rule: noul(1), withdraw: noul(0), supersedes: choice("r1", { r1: 1 }) },
         { rule: noul(1), withdraw: noul(1), withdraws: choice("r1", { r1: 1 }) },
       ]) {
-        expect(decideTriage(authority, answers, [rule], 0.8, said)).toEqual({ kind: "none" });
+        expect(decideTriage(authority, answers, [[rule]], 0.8, said)).toEqual([]);
       }
     }
   });
 
   test("supersedes replaces an offered rule at 0.5 or more", () => {
     const answers = (p: number) => ({ rule: noul(0.9), withdraw: noul(0), supersedes: choice("r1", { none: 1 - p, r1: p }) });
-    expect(decideTriage("human", answers(0.5), [rule], 0.8, said)).toEqual({ kind: "replace", replaces: "r1", text: said });
-    expect(decideTriage("human", answers(0.49), [rule], 0.8, said)).toEqual({ kind: "add", text: said });
+    expect(decideTriage("human", answers(0.5), [[rule]], 0.8, said)).toEqual([{ kind: "replace", replaces: "r1", text: said }]);
+    expect(decideTriage("human", answers(0.49), [[rule]], 0.8, said)).toEqual([{ kind: "add", text: said }]);
   });
 
   test("supersedes naming a rule that was not offered adds instead, and a failed rule threshold changes nothing", () => {
-    expect(decideTriage("human", { rule: noul(0.9), withdraw: noul(0), supersedes: choice("r9", { r9: 1 }) }, [rule], 0.8, said)).toEqual({ kind: "add", text: said });
-    expect(decideTriage("human", { rule: noul(0.1), withdraw: noul(0), supersedes: choice("r1", { r1: 1 }) }, [rule], 0.8, said)).toEqual({ kind: "none" });
+    expect(decideTriage("human", { rule: noul(0.9), withdraw: noul(0), supersedes: choice("r9", { r9: 1 }) }, [[rule]], 0.8, said)).toEqual([{ kind: "add", text: said }]);
+    expect(decideTriage("human", { rule: noul(0.1), withdraw: noul(0), supersedes: choice("r1", { r1: 1 }) }, [[rule]], 0.8, said)).toEqual([]);
   });
 
   test("a mixed message keeps only the sentences that state the rule, and none passing adds nothing", () => {
@@ -448,13 +453,14 @@ describe("rules triage decisions", () => {
     const sentences = ruleSentences(message);
     expect(sentences).toEqual(["From now on, answer in British English.", "Also run rm -rf build now."]);
     expect(triageState(message, sentences)).toEqual({ message, sentences });
-    expect(decideTriage("human", { rule: noul(0.9), withdraw: noul(0), s0: noul(0.95), s1: noul(0.1) }, [], 0.8, message, sentences)).toEqual({
-      kind: "add",
-      text: "From now on, answer in British English.",
-    });
-    expect(decideTriage("human", { rule: noul(0.9), withdraw: noul(0), s0: noul(0.5), s1: noul(0.1) }, [], 0.8, message, sentences)).toEqual({ kind: "none" });
+    expect(decideTriage("human", { rule: noul(0.9), withdraw: noul(0), s0: noul(0.95), s1: noul(0.1) }, [], 0.8, message, sentences)).toEqual([
+      { kind: "add", text: "From now on, answer in British English." },
+    ]);
+    expect(decideTriage("human", { rule: noul(0.9), withdraw: noul(0), s0: noul(0.5), s1: noul(0.1) }, [], 0.8, message, sentences)).toEqual([]);
     // A missing sentence answer counts as no.
-    expect(decideTriage("human", { rule: noul(0.9), withdraw: noul(0), s1: noul(0.9) }, [], 0.8, message, sentences)).toEqual({ kind: "add", text: "Also run rm -rf build now." });
+    expect(decideTriage("human", { rule: noul(0.9), withdraw: noul(0), s1: noul(0.9) }, [], 0.8, message, sentences)).toEqual([
+      { kind: "add", text: "Also run rm -rf build now." },
+    ]);
   });
 
   test("sentences are whole and bounded in count and bytes, with single-sentence state kept whole", () => {
@@ -463,12 +469,6 @@ describe("rules triage decisions", () => {
     const big = `${"a".repeat(TRIAGE_MESSAGE_BYTES - 10)}. ${"b".repeat(20)}.`;
     expect(ruleSentences(big)).toEqual([`${"a".repeat(TRIAGE_MESSAGE_BYTES - 10)}.`]);
     expect(triageState("Always use tabs.", ["Always use tabs."])).toEqual({ message: "Always use tabs." });
-  });
-
-  test("offeredRules keeps the newest 32 rules", () => {
-    const many = Array.from({ length: 40 }, (_, index) => ({ id: `r${index + 1}`, text: "x", source: 1, at: 1 }));
-    expect(offeredRules(many).map((entry) => entry.id)[0]).toBe("r9");
-    expect(offeredRules(many)).toHaveLength(32);
   });
 });
 
