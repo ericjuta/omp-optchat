@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 export const DEFAULTS = Object.freeze({
   enabled: true,
@@ -12,6 +12,9 @@ export const DEFAULTS = Object.freeze({
   tries: 5,
   toolCap: 30_000,
   childView: true,
+  childPack: true,
+  decisions: true,
+  workDiscovery: true,
   evidence: true,
   extract: true,
   extractNull: 0.5,
@@ -37,11 +40,16 @@ export interface OptChatConfig {
   tries: number;
   toolCap: number;
   childView: boolean;
+  childPack: boolean;
+  decisions: boolean;
+  workDiscovery: boolean;
+  /** Explicit aliases for external read-only stores; no discovery or implicit rule sharing. */
+  projectStores: Readonly<Record<string, string>>;
   /** Whether `chat_evidence` is registered, in the chat and in its child views. It never resolves a judge. */
   evidence: boolean;
-  /** Whether `chat_evidence` also asks OpenRouter's Clairic extractor for the answer's span in its passages. Without an `openrouter` key it adds nothing. */
+  /** Whether `chat_evidence` asks OpenRouter's Clairic for an unverified candidate occurrence. No resolved key adds nothing. */
   extract: boolean;
-  /** An extracted answer is shown only below this null probability, in (0, 1]. */
+  /** A candidate occurrence is considered only below this null probability, in (0, 1]. This is not truth confidence. */
   extractNull: number;
   gates: GateConfig;
 }
@@ -126,6 +134,18 @@ export function registerFlags(api: FlagRegistrar): void {
     default: false,
     description: "Give subagents no snapshot of this chat, even when --optchat-child-view is present",
   });
+  for (const [flag, description] of [
+    ["optchat-child-pack", "Attach bounded task-specific deterministic evidence to child snapshots"],
+    ["optchat-decisions", "Register read-only decision history and project-state queries"],
+    ["optchat-work-discovery", "Register trusted captured-report discovery"],
+  ] as const) {
+    api.registerFlag(flag, { type: "boolean", default: true, description: `${description} (default: on; --no-${flag} wins)` });
+    api.registerFlag(`no-${flag}`, { type: "boolean", default: false, description: `Disable ${flag}, even when its enable flag is present` });
+  }
+  api.registerFlag("optchat-project-stores", {
+    type: "string",
+    description: "Explicit read-only external stores as a JSON object of alias:absolute-path, at most 8; default none. No standing rules are imported.",
+  });
   api.registerFlag("optchat-evidence", {
     type: "boolean",
     default: DEFAULTS.evidence,
@@ -139,7 +159,7 @@ export function registerFlags(api: FlagRegistrar): void {
   api.registerFlag("optchat-extract", {
     type: "boolean",
     default: DEFAULTS.extract,
-    description: "chat_evidence also asks OpenRouter's cloudflare/clairic extractor for the answer's exact span in its passages, keyed from the OMP openrouter credential; without one it does nothing (default: on; --no-optchat-extract takes precedence)",
+    description: "Send chat_evidence passages to OpenRouter's cloudflare/clairic for candidate occurrences, not verified answers; use OMP's openrouter credential cascade, no key means no call (default: on; --no-optchat-extract wins)",
   });
   api.registerFlag("no-optchat-extract", {
     type: "boolean",
@@ -149,7 +169,7 @@ export function registerFlags(api: FlagRegistrar): void {
   api.registerFlag("optchat-extract-null", {
     type: "string",
     default: String(DEFAULTS.extractNull),
-    description: "Show an extracted answer only when its null probability is below this, in (0, 1] (default: 0.5)",
+    description: "Consider an extracted occurrence only below this null probability, in (0, 1] (default: 0.5); a located span does not prove an answer",
   });
   for (const gate of GATE_FLAGS) {
     api.registerFlag(gate.flag, {
@@ -206,7 +226,7 @@ const GATE_FLAGS = [
 /** One gate, System One or not: its opt-out wins over its flag; a malformed value of either fails closed. */
 function gate(
   api: FlagReader,
-  flag: (typeof GATE_FLAGS)[number]["flag"] | "optchat-child-view" | "optchat-evidence" | "optchat-extract",
+  flag: (typeof GATE_FLAGS)[number]["flag"] | "optchat-child-view" | "optchat-child-pack" | "optchat-decisions" | "optchat-work-discovery" | "optchat-evidence" | "optchat-extract",
   fallback: boolean,
 ): boolean {
   if (boolean(api.getFlag(`no-${flag}`), `no-${flag}`, false)) return false;
@@ -288,6 +308,22 @@ function gates(api: FlagReader): GateConfig {
   };
 }
 
+function projectStores(value: FlagValue): Readonly<Record<string, string>> {
+  if (value === undefined) return Object.freeze({});
+  const fail = (): never => invalid("optchat-project-stores", "must be a JSON object with at most 8 safe aliases and absolute paths (at most 8192 characters)");
+  if (typeof value !== "string" || value.length > 8192) return fail();
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return fail(); }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return fail();
+  const entries = Object.entries(parsed);
+  if (entries.length > 8) return fail();
+  for (const [alias, path] of entries) {
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(alias) || ["__proto__", "constructor", "prototype"].includes(alias) ||
+      typeof path !== "string" || !isAbsolute(path) || /[\u0000-\u001f\u007f-\u009f]/.test(path) || !path.isWellFormed()) return fail();
+  }
+  return Object.freeze(Object.fromEntries(entries));
+}
+
 /** Only absent flags take defaults; malformed supplied values always fail closed. */
 export function readConfig(api: FlagReader, defaultDirectory: string): OptChatConfig {
   const enabled = readEnabled(api);
@@ -306,6 +342,10 @@ export function readConfig(api: FlagReader, defaultDirectory: string): OptChatCo
     tries: integer(api, "optchat-tries", DEFAULTS.tries, 1, 100),
     toolCap: integer(api, "optchat-tool-cap", DEFAULTS.toolCap, 128),
     childView: gate(api, "optchat-child-view", DEFAULTS.childView),
+    childPack: gate(api, "optchat-child-pack", DEFAULTS.childPack),
+    decisions: gate(api, "optchat-decisions", DEFAULTS.decisions),
+    workDiscovery: gate(api, "optchat-work-discovery", DEFAULTS.workDiscovery),
+    projectStores: projectStores(api.getFlag("optchat-project-stores")),
     evidence: gate(api, "optchat-evidence", DEFAULTS.evidence),
     extract: gate(api, "optchat-extract", DEFAULTS.extract),
     extractNull: probability(api, "optchat-extract-null", DEFAULTS.extractNull),

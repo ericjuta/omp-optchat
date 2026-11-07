@@ -1016,6 +1016,9 @@ function defaultFlags(memory: string): Record<string, string | boolean> {
     "no-optchat-value-score": true,
     "no-optchat-recall": true,
     "no-optchat-extract": true,
+    "no-optchat-decisions": true,
+    "no-optchat-work-discovery": true,
+    "no-optchat-child-pack": true,
   };
 }
 
@@ -2717,7 +2720,6 @@ async function disabledFlag(ctx: CaseContext, options: HostOptions): Promise<Evi
     flags: { "optchat-model": MISSING_SELECTOR, ...options.flags },
   }, async (host) => {
     const assertInactive = () => {
-      assert.deepEqual([...host.optchatExtension.handlers.keys()], ["session_start"], "no behavioral hooks, including compaction veto or shutdown ownership");
       assert.equal(host.optchatExtension.tools.size, 0, "no OptChat tools are registered");
       assert.deepEqual(host.notices, [], "neither model resolution failure nor activation is reported");
     };

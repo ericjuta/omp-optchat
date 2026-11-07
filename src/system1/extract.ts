@@ -31,18 +31,23 @@ export type Extraction =
 
 /** One request: the state text and the question. Tests inject their own. */
 export type Extractor = (state: string, question: string, signal: AbortSignal) => Promise<Extraction>;
+export type ExtractionRequest = (url: string, init: RequestInit) => Promise<Response>;
 
 /**
  * The OpenRouter extractor. `key` resolves the `openrouter` key through the host at call time (OMP's credential
  * store or, by its own cascade, an environment variable; Eric, 2026-11-08); undefined turns
  * the extractor off. Errors are reduced to a status line so neither the key nor response bodies reach the tool text.
  */
-export function openRouterExtractor(key: () => Promise<string | undefined>, request: typeof fetch = fetch): Extractor {
+export function openRouterExtractor(key: () => Promise<string | undefined>, request: ExtractionRequest = fetch): Extractor {
   return async (state, question, signal) => {
+    signal.throwIfAborted();
+    const operation = AbortSignal.any([signal, AbortSignal.timeout(EXTRACT_MS)]);
     let apiKey: string | undefined;
     try {
-      apiKey = await key();
+      apiKey = await abortable(Promise.resolve().then(() => { operation.throwIfAborted(); return key(); }), operation);
     } catch {
+      signal.throwIfAborted();
+      if (operation.aborted) return { kind: "failed", reason: "timed out" };
       return { kind: "off", reason: "OMP could not resolve an openrouter key" };
     }
     signal.throwIfAborted();
@@ -60,49 +65,76 @@ export function openRouterExtractor(key: () => Promise<string | undefined>, requ
     });
     let response: Response;
     try {
-      response = await request(EXTRACT_URL, {
+      response = await abortable(request(EXTRACT_URL, {
         method: "POST",
         headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
         body,
-        signal: AbortSignal.any([signal, AbortSignal.timeout(EXTRACT_MS)]),
-      });
+        signal: operation,
+      }), operation);
     } catch (error) {
       signal.throwIfAborted();
       return { kind: "failed", reason: error instanceof Error && error.name === "TimeoutError" ? "timed out" : "request failed" };
     }
-    if (!response.ok) return { kind: "failed", reason: `HTTP ${response.status}` };
+    if (!response.ok) {
+      void response.body?.cancel().catch(() => {});
+      return { kind: "failed", reason: `HTTP ${response.status}` };
+    }
     const length = Number(response.headers.get("content-length") ?? "0");
-    if (length > RESPONSE_BYTES) return { kind: "failed", reason: "response too large" };
+    if (length > RESPONSE_BYTES) {
+      void response.body?.cancel().catch(() => {});
+      return { kind: "failed", reason: "response too large" };
+    }
     let parsed: unknown;
     try {
-      const text = await boundedText(response, RESPONSE_BYTES);
+      const text = await boundedText(response, RESPONSE_BYTES, operation);
       if (text === null) return { kind: "failed", reason: "response too large" };
       parsed = JSON.parse(text);
     } catch {
       signal.throwIfAborted();
-      return { kind: "failed", reason: "unreadable response" };
+      return { kind: "failed", reason: operation.aborted ? "timed out" : "unreadable response" };
     }
     return parseExtraction(parsed);
   };
 }
 
-/** The body as text, read chunk by chunk; null (and the stream cancelled) once it passes `limit` bytes. */
-async function boundedText(response: Response, limit: number): Promise<string | null> {
+/** Bound even credential providers or injected transports that ignore cancellation. */
+async function abortable<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+  let abort: (() => void) | undefined;
+  try {
+    return await Promise.race([pending, new Promise<never>((_resolve, reject) => {
+      abort = () => reject(signal.reason);
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+    })]);
+  } finally {
+    if (abort) signal.removeEventListener("abort", abort);
+  }
+}
+
+/** The body as text, read chunk by chunk under the same operation deadline. */
+async function boundedText(response: Response, limit: number, signal: AbortSignal): Promise<string | null> {
   const reader = response.body?.getReader();
   if (!reader) return "";
   const chunks: Uint8Array[] = [];
   let bytes = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    bytes += value.byteLength;
-    if (bytes > limit) {
-      await reader.cancel().catch(() => {});
-      return null;
+  try {
+    for (;;) {
+      const { done, value } = await abortable(reader.read(), signal);
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > limit) {
+        void reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+    return Buffer.concat(chunks).toString("utf8");
+  } catch (error) {
+    void reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
-  return Buffer.concat(chunks).toString("utf8");
 }
 
 const record = (value: unknown): Record<string, unknown> | undefined =>
@@ -177,23 +209,35 @@ export function mapSpan(
   return null;
 }
 
-const quote = (value: string): string => JSON.stringify(value.replace(/\s+/g, " ").trim());
+const quote = (value: string): string => JSON.stringify(value);
 const cost = (value: number | null): string => (value === null ? "cost unknown" : `cost $${value.toFixed(6)}`);
 
 /**
  * The extraction line `chat_evidence` appends after its trailer. An answer is shown only when its null probability is
  * below `maxNull` (a code-owned threshold) and its span maps inside one passage; otherwise the line says why not.
  */
-export function renderExtraction(state: string, placed: readonly Placed[], extraction: Extraction, maxNull: number): string {
+export function renderExtraction(state: string, placed: readonly Placed[], extraction: Extraction, maxNull: number, question = ""): string {
   const head = `[extraction ${EXTRACT_MODEL}`;
   if (extraction.kind === "off") return `${head} off: ${extraction.reason}]`;
   if (extraction.kind === "failed") return `${head} failed: ${extraction.reason}; the passages above stand alone]`;
   const pNull = extraction.pNull === null ? "p_null unknown" : `p_null ${extraction.pNull.toFixed(3)}`;
   const tail = `${pNull}, ${cost(extraction.cost)}${extraction.truncated ? ", input truncated" : ""}`;
-  if (extraction.value === null || extraction.pNull === null || extraction.pNull >= maxNull) {
+  if (extraction.value === null || extraction.pNull === null || extraction.pNull < 0 || extraction.pNull > 1 || extraction.pNull >= maxNull) {
     return `${head}: the passages do not settle it (${tail})]`;
   }
+  if (extraction.truncated) return `${head}: withheld because the provider truncated the evidence (${tail})]`;
   const mapped = mapSpan(state, placed, extraction);
-  if (!mapped) return `${head}: answer ${quote(extraction.value)} has no verifiable span in the passages; treat it as unconfirmed (${tail})]`;
-  return `${head}: ${quote(mapped.text)} at message ${mapped.id} bytes ${mapped.start}-${mapped.end}; zoom(${mapped.id}, 1, ${mapped.start}) reopens it (${tail})]`;
+  if (!mapped || mapped.text.length === 0 || mapped.text !== extraction.value) {
+    return `${head}: withheld; the value has no verifiable span matching it exactly (${tail})]`;
+  }
+  const source = placed.find(({ passage }) => passage.id === mapped.id && passage.start <= mapped.start && passage.end >= mapped.end)?.passage;
+  // Exact identifiers in a question constrain its subject. A low p_null cannot make an occurrence about another
+  // release, ticket, path or quoted entity answer the question. Check the source passage, not unrelated neighbours.
+  const anchors = question.match(/\b\d+(?:\.\d+)+\b|\b[\p{L}\p{N}_-]+[/:][\p{L}\p{N}_./:@-]+|"[^"\n]+"/gu) ?? [];
+  const missing = anchors.map((anchor) => anchor.replace(/^"|"$/g, "").toLowerCase())
+    .filter((anchor) => !source?.text.toLowerCase().includes(anchor));
+  if (missing.length > 0) return `${head}: withheld; the source passage does not contain the question's exact identifiers (${tail})]`;
+  // This is deliberately an occurrence, never a verified answer: span validity and null confidence do not prove
+  // relevance, current authority, absence of contradictions, or the truth of text supplied by a tool or agent.
+  return `${head}: candidate occurrence ${quote(mapped.text)} at message ${mapped.id} bytes ${mapped.start}-${mapped.end}; zoom(${mapped.id}, 1, ${mapped.start}) reopens it; not a verified answer—reconcile the source and other passages (${tail})]`;
 }

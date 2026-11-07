@@ -73,6 +73,36 @@ describe("extraction span mapping", () => {
     expect(renderExtraction(state, placed, answer({ value: null, pNull: 0.9 }), 0.5)).toContain("do not settle it");
   });
 
+  test("low null probability cannot answer a release question from another release", () => {
+    const built = extractionState([passage(4, 0, "Runtime 2.3.0 runs application 7.1.0.")]);
+    const result = renderExtraction(built.state, built.placed,
+      answer({ value: "2.3.0", pNull: 0.001, span: pointSpan(built.state, "2.3.0"), stateText: built.state }),
+      0.5, "Which runtime does application 7.2.0 require?");
+    expect(result).toContain("withheld");
+    expect(result).not.toContain('candidate occurrence "2.3.0"');
+  });
+
+  test("mismatched values, truncated input and impossible probabilities never produce candidates", () => {
+    const base = { value: "deploy", span: pointSpan(state, "deploy"), stateText: state };
+    for (const over of [{ value: "stop" }, { truncated: true }, { pNull: -0.1 }, { pNull: 1.1 }]) {
+      expect(renderExtraction(state, placed, answer({ ...base, ...over }), 0.5)).not.toContain("candidate occurrence");
+    }
+  });
+
+  test("a located occurrence retains its unverified status even with near-zero null probability", () => {
+    const rendered = renderExtraction(state, placed,
+      answer({ value: "deploy", pNull: 0, span: pointSpan(state, "deploy"), stateText: state }), 0.5);
+    expect(rendered).toContain('candidate occurrence "deploy"');
+    expect(rendered).toContain("not a verified answer");
+  });
+
+  test("quoted occurrences preserve whitespace-sensitive original bytes", () => {
+    const built = extractionState([passage(9, 0, "a  b\n")]);
+    const rendered = renderExtraction(built.state, built.placed,
+      answer({ value: "a  b\n", span: pointSpan(built.state, "a  b\n"), stateText: built.state }), 0.5);
+    expect(rendered).toContain('"a  b\\n" at message 9 bytes 0-5');
+  });
+
   test("unknown cost reads as unknown, never as zero", () => {
     expect(renderExtraction(state, placed, answer({ value: null, cost: null }), 0.5)).toContain("cost unknown");
   });
@@ -101,6 +131,29 @@ describe("openRouterExtractor", () => {
     usage: { cost: 0.0000123 },
   };
 
+  test("cancellation interrupts a stalled credential lookup before transport", async () => {
+    let requests = 0;
+    const controller = new AbortController();
+    const extractor = openRouterExtractor(() => new Promise(() => {}), (async () => {
+      requests++;
+      return new Response("{}");
+    }));
+    const pending = extractor("source", "question", controller.signal);
+    controller.abort(new Error("caller cancelled"));
+    await expect(pending).rejects.toThrow("caller cancelled");
+    expect(requests).toBe(0);
+  });
+
+  test("stalled credentials expire without a network request", async () => {
+    let requests = 0;
+    const extractor = openRouterExtractor(() => new Promise(() => {}), (async () => {
+      requests++;
+      return new Response("{}");
+    }));
+    expect(await extractor("source", "question", new AbortController().signal)).toEqual({ kind: "failed", reason: "timed out" });
+    expect(requests).toBe(0);
+  }, 15000);
+
   test("posts one clairic text field with the state echo requested and the key only as a bearer header", async () => {
     const seen: { url: string; init: RequestInit }[] = [];
     const extractor = openRouterExtractor(
@@ -108,7 +161,7 @@ describe("openRouterExtractor", () => {
       (async (url: string, init: RequestInit) => {
         seen.push({ url, init });
         return new Response(JSON.stringify(ok));
-      }) as typeof fetch,
+      }),
     );
     const result = await extractor("v", "what?", new AbortController().signal);
     expect(result).toMatchObject({ kind: "answer", value: "v", span: [0, 1], cost: 0.0000123 });
@@ -128,7 +181,7 @@ describe("openRouterExtractor", () => {
       pull: (controller) => controller.enqueue(chunk),
       cancel: () => { cancelled = true; },
     });
-    const extractor = openRouterExtractor(async () => "k", (async () => new Response(endless)) as unknown as typeof fetch);
+    const extractor = openRouterExtractor(async () => "k", (async () => new Response(endless)));
     expect(await extractor("s", "q", new AbortController().signal)).toEqual({ kind: "failed", reason: "response too large" });
     expect(cancelled).toBe(true);
   });
@@ -138,7 +191,7 @@ describe("openRouterExtractor", () => {
     const fetcher = (async () => {
       calls++;
       return new Response("upstream says sk-or-secret is bad", { status: 401 });
-    }) as unknown as typeof fetch;
+    });
     expect(await openRouterExtractor(async () => undefined, fetcher)("s", "q", new AbortController().signal)).toEqual({
       kind: "off",
       reason: "no openrouter key resolved",
@@ -155,7 +208,7 @@ describe("openRouterExtractor", () => {
       const { promise, reject } = Promise.withResolvers<Response>();
       init.signal!.addEventListener("abort", () => reject(init.signal!.reason));
       return promise;
-    }) as unknown as typeof fetch;
+    });
     const pending = openRouterExtractor(async () => "k", fetcher)("s", "q", controller.signal);
     controller.abort(new Error("cancelled"));
     await expect(pending).rejects.toThrow("cancelled");

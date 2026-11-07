@@ -1,0 +1,179 @@
+{
+  "schema": 1,
+  "id": "continuation-20261107",
+  "registered": "2026-11-07",
+  "status": "Frozen before runner results; no run claimed by this manifest",
+  "budget": { "usd": 0, "providerCalls": 0, "judgeCalls": 0, "extractorCalls": 0 },
+  "question": "Does candidate public evidence retrieval retain available support beyond v0.15.2's message shortlist, and does public extraction rendering remain honest under injected adversarial outcomes?",
+  "scope": "Synthetic provider-free deterministic software behavior only. Injected outcomes do not measure Clairic, any other live model, answer accuracy, or production acceptance. Do not modify or reinterpret old eval metrics.",
+  "privateAcceptance": "The existing real-chat case must be checked privately by the parent integration owner; do not copy its text, identifiers, paths, or outcomes into this corpus. This synthetic suite cannot discharge that check.",
+  "commands": {
+    "candidate": "bun evals/evidence/continuation.ts",
+    "pairedCheckout": "bun evals/evidence/continuation.ts --baseline /absolute/path/to/v0.15.2-checkout",
+    "pairedModule": "bun evals/evidence/continuation.ts --baseline /absolute/path/to/v0.15.2-checkout/src/system1/evidence.ts",
+    "candidateOverride": "bun evals/evidence/continuation.ts --candidate /absolute/path/to/candidate-checkout --baseline /absolute/path/to/v0.15.2-checkout",
+    "typecheck": "bunx tsc --noEmit --strict --skipLibCheck --target ES2023 --lib ESNext --module ESNext --moduleResolution Bundler --allowImportingTsExtensions --types bun evals/evidence/continuation.ts",
+    "integration": "Parent runs once after all edits settle. Supply a separate pristine v0.15.2 checkout (ovnfs --rev v0.15.2 when available); each arm loads that checkout's public evidence, extraction, Memory and Store modules. JSON stdout contains manifest and module hashes, provenance, per-case rows, counts and failures. Baseline failures are reported, not used as candidate failures; any candidate behavioral failure, per-case paired regression, setup error or invalid baseline identity exits nonzero. Without --baseline output explicitly says unpaired and claims no improvement."
+  },
+  "protocol": {
+    "repetitions": 2,
+    "nodeBytes": 512,
+    "viewBytes": 8192,
+    "summarizer": "Constant deterministic synthetic summary; no judge or compressor calls. Retrieval reads original production Store pages, not summaries.",
+    "limits": { "maxPassages": 8, "maxBytes": 16384, "timeoutMs": 10000 },
+    "clock": "Constant zero for ordinary cases; cutoff uses timeoutMs=0. These are deterministic behavioral checks, not latency measurements.",
+    "maxNull": 0.5,
+    "baseline": "v0.15.2; checkout must have package.json version 0.15.2, tracked files clean, and HEAD equal the v0.15.2 tag when that tag exists locally. If the tag is absent, JSON marks the identity package-version-only; no release-authenticated claim is made.",
+    "caseExpansion": "Expand each messages entry copies times (default 1); concatenate parts, each repeated repeat times (default 1). Message IDs are zero-based positions after expansion. No random generator or candidate-derived gold.",
+    "groundTruth": "Each ground item fixes an original message ID and a unique exact quote. Full-store availability, snapshot availability, retrieved quote coverage, and semantic support are separate fields. answerable is authored here, never inferred from retrieval or p_null. All ground items must be retrieved for full support coverage. Conflicting or partial evidence may be retrieved without supporting any settled answer.",
+    "rendererIsolation": "Run every injected probe both on public gatherEvidence passages and on independently sliced source passages (control). The control isolates rendering failures from retrieval misses. Controls are not retrieval successes. Missing injected spans in retrieved state are recorded as unavailable, never fabricated or counted as renderer passes. Synthetic Extraction.cost is null; the harness's known zero spend is separate.",
+    "occurrenceContract": "An exact source occurrence may be displayed only as a candidate occurrence with an explicit not-a-verified-answer warning. Span validity is not semantic support. Wrong-version exact identifiers, mismatched value/span, mismatched state echo, cross-passage or empty spans, truncation and invalid/null/high p_null must not display an occurrence. Contradictory or incomplete source text may be shown as an unverified occurrence, never as a settled answer.",
+    "failureCriteria": [
+      "Invalid manifest, nonunique gold quote, incorrect authored availability, unsafe baseline identity, module load/build/run exception, or attempted fetch",
+      "Any mustRetrieve case omits one of its authored ground quotes from candidate passages",
+      "Source-byte mismatch, invalid UTF-8 range, overlapping returned passages, duplicate searched IDs, byte/passage budget exceeded, or any read at/above upperBound",
+      "Missing truthful cutoff, missing-term, partial-report, snapshot exclusion, or searched-message trailer",
+      "Any injected rendering probe violates its expected occurrence/withhold contract in an independent control; a renderable retrieved probe must obey it too",
+      "Any displayed occurrence lacks exact quoted source bytes, message/range provenance, candidate-occurrence label, or not-a-verified-answer warning",
+      "Repeated deterministic rows differ",
+      "Paired candidate loses any ground quote retrieved by baseline or has fewer renderer control passes"
+    ]
+  },
+  "cases": [
+    {
+      "id": "short-gold-drowned-72", "category": "short-gold-over-50-noisy-messages",
+      "question": "Quartz deployment approval owner", "answerable": true, "availableInSnapshot": true, "mustRetrieve": true,
+      "messages": [
+        { "kind": "user", "parts": [{ "text": "Quartz deployment approval owner: Mara." }] },
+        { "kind": "talk", "copies": 72, "parts": [{ "text": "Quartz " }, { "text": "ordinary archive filler. ", "repeat": 110 }, { "text": "deployment " }, { "text": "ordinary archive filler. ", "repeat": 110 }, { "text": "approval " }, { "text": "ordinary archive filler. ", "repeat": 110 }, { "text": "owner not assigned in this noisy discussion." }] }
+      ],
+      "ground": [{ "id": 0, "quote": "Quartz deployment approval owner: Mara." }],
+      "probes": [{ "id": "gold-occurrence", "source": 0, "quote": "Mara", "support": "supported", "expect": "occurrence" }]
+    },
+    {
+      "id": "deep-report", "category": "deep-report",
+      "question": "nebula rollout authorization phrase", "answerable": true, "availableInSnapshot": true, "mustRetrieve": true,
+      "messages": [
+        { "kind": "work", "parts": [{ "text": "Archived telemetry unrelated to the requested decision. ", "repeat": 900 }, { "text": "Nebula rollout authorization phrase: amber kestrel." }, { "text": " Archived measurements continue. ", "repeat": 400 }] },
+        { "kind": "user", "parts": [{ "text": "Please preserve the report." }] }
+      ],
+      "ground": [{ "id": 0, "quote": "Nebula rollout authorization phrase: amber kestrel." }],
+      "probes": [{ "id": "deep-occurrence", "source": 0, "quote": "amber kestrel", "support": "supported", "expect": "occurrence" }]
+    },
+    {
+      "id": "version-confusion", "category": "version-confusion-near-zero-null",
+      "question": "What is the release 0.15.2 rollout code?", "answerable": true, "availableInSnapshot": true, "mustRetrieve": true,
+      "messages": [
+        { "kind": "user", "parts": [{ "text": "Release 0.15.2 rollout code is cobalt." }] },
+        { "kind": "talk", "parts": [{ "text": "Release 0.14.8 rollout code is vermilion." }] },
+        { "kind": "talk", "parts": [{ "text": "Rollout discussion did not change either release." }] }
+      ],
+      "ground": [{ "id": 0, "quote": "Release 0.15.2 rollout code is cobalt." }],
+      "probes": [
+        { "id": "correct-version", "source": 0, "quote": "cobalt", "support": "supported", "expect": "occurrence" },
+        { "id": "wrong-version-near-zero", "source": 1, "quote": "vermilion", "pNull": 0.000000001, "support": "wrong-version", "expect": "withhold" }
+      ]
+    },
+    {
+      "id": "three-message-support", "category": "multi-message-support",
+      "question": "Harbor migration owner window and rollback", "answerable": true, "availableInSnapshot": true, "mustRetrieve": true,
+      "messages": [
+        { "kind": "user", "parts": [{ "text": "Harbor migration owner is Nia." }] },
+        { "kind": "talk", "parts": [{ "text": "Harbor migration window is Tuesday dawn." }] },
+        { "kind": "work", "parts": [{ "text": "Harbor migration rollback uses the cedar snapshot." }] }
+      ],
+      "ground": [{ "id": 0, "quote": "Harbor migration owner is Nia." }, { "id": 1, "quote": "Harbor migration window is Tuesday dawn." }, { "id": 2, "quote": "Harbor migration rollback uses the cedar snapshot." }],
+      "probes": [{ "id": "one-clause-not-whole-answer", "source": 0, "quote": "Nia", "support": "partial", "expect": "occurrence" }]
+    },
+    {
+      "id": "short-chat", "category": "three-message-smoothed-ranking",
+      "question": "lantern owner", "answerable": true, "availableInSnapshot": true, "mustRetrieve": true,
+      "messages": [
+        { "kind": "user", "parts": [{ "text": "Lantern owner is Ivo." }] },
+        { "kind": "talk", "parts": [{ "text": "Lantern owner discussion is archived." }] },
+        { "kind": "talk", "parts": [{ "text": "Lantern owner acknowledgement received." }] }
+      ],
+      "ground": [{ "id": 0, "quote": "Lantern owner is Ivo." }],
+      "probes": [{ "id": "short-chat-occurrence", "source": 0, "quote": "Ivo", "support": "supported", "expect": "occurrence" }]
+    },
+    {
+      "id": "absent", "category": "absence",
+      "question": "zinnia escrow password", "answerable": false, "availableInSnapshot": false, "mustRetrieve": false, "expectNoPassages": true, "missing": ["zinnia", "escrow", "password"],
+      "messages": [{ "kind": "user", "parts": [{ "text": "The orchard gate is painted green." }] }],
+      "ground": [], "probes": []
+    },
+    {
+      "id": "snapshot-bound", "category": "snapshot-cutoff",
+      "question": "juniper rollout owner", "answerable": true, "availableInSnapshot": false, "mustRetrieve": false, "upperBound": 2, "forbidden": [2],
+      "messages": [
+        { "kind": "user", "parts": [{ "text": "Juniper rollout owner has not been assigned." }] },
+        { "kind": "talk", "parts": [{ "text": "Juniper rollout discussion is pending." }] },
+        { "kind": "user", "parts": [{ "text": "Juniper rollout owner is Tess." }] }
+      ],
+      "ground": [{ "id": 2, "quote": "Juniper rollout owner is Tess." }], "probes": []
+    },
+    {
+      "id": "deadline-cutoff", "category": "time-cutoff",
+      "question": "spruce restore location", "answerable": true, "availableInSnapshot": true, "mustRetrieve": false, "timeoutMs": 0, "expectIncomplete": true, "expectNoPassages": true,
+      "messages": [{ "kind": "work", "parts": [{ "text": "Spruce restore location is the north vault." }] }],
+      "ground": [{ "id": 0, "quote": "Spruce restore location is the north vault." }], "probes": []
+    },
+    {
+      "id": "incomplete-report", "category": "incomplete-report-prefix",
+      "question": "willow deployment final outcome", "answerable": false, "availableInSnapshot": true, "mustRetrieve": true, "incomplete": [0],
+      "messages": [{ "kind": "work", "parts": [{ "text": "[incomplete: capture ended early]\nWillow deployment final outcome was not captured. Preliminary probe looked healthy." }] }],
+      "ground": [{ "id": 0, "quote": "Willow deployment final outcome was not captured." }],
+      "probes": [{ "id": "partial-not-settled", "source": 0, "quote": "healthy", "support": "partial", "expect": "occurrence" }]
+    },
+    {
+      "id": "pointer-only-report", "category": "incomplete-report-metadata",
+      "question": "birch recovery report", "answerable": false, "availableInSnapshot": true, "mustRetrieve": true, "incomplete": [0],
+      "messages": [{ "kind": "work", "completeness": "pointer-only", "parts": [{ "text": "Birch recovery report pointer only; output was not retained." }] }],
+      "ground": [{ "id": 0, "quote": "Birch recovery report pointer only; output was not retained." }], "probes": []
+    },
+    {
+      "id": "contradictory-statements", "category": "contradiction",
+      "question": "Aster approval owner", "answerable": false, "availableInSnapshot": true, "mustRetrieve": true,
+      "messages": [
+        { "kind": "user", "parts": [{ "text": "Aster approval owner is Ada." }] },
+        { "kind": "user", "parts": [{ "text": "Aster approval owner is Bea. Neither statement has been withdrawn." }] }
+      ],
+      "ground": [{ "id": 0, "quote": "Aster approval owner is Ada." }, { "id": 1, "quote": "Aster approval owner is Bea." }],
+      "probes": [{ "id": "conflict-near-zero", "source": 0, "quote": "Ada", "pNull": 0.000000001, "support": "contradicted", "expect": "occurrence" }]
+    },
+    {
+      "id": "unicode-window-overlap", "category": "unicode-overlap",
+      "question": "café launch owner Zoë", "answerable": true, "availableInSnapshot": true, "mustRetrieve": true,
+      "messages": [{ "kind": "work", "parts": [{ "text": "é🧭", "repeat": 340 }, { "text": " 🦋 Café launch owner is Zoë; retain her exact spelling." }, { "text": " quiet filler ", "repeat": 200 }] }],
+      "ground": [{ "id": 0, "quote": "🦋 Café launch owner is Zoë; retain her exact spelling." }],
+      "probes": [{ "id": "unicode-codepoints-to-bytes", "source": 0, "quote": "Zoë", "support": "supported", "expect": "occurrence" }]
+    },
+    {
+      "id": "superseded-statement", "category": "supersession",
+      "question": "Maple incident current owner", "answerable": true, "availableInSnapshot": true, "mustRetrieve": true,
+      "messages": [
+        { "kind": "user", "parts": [{ "text": "Maple incident current owner is Leon." }] },
+        { "kind": "user", "parts": [{ "text": "Correction: Maple incident current owner is Rhea; the previous assignment is superseded." }] }
+      ],
+      "ground": [{ "id": 1, "quote": "Maple incident current owner is Rhea; the previous assignment is superseded." }],
+      "probes": [{ "id": "superseded-not-verified", "source": 0, "quote": "Leon", "support": "superseded", "expect": "occurrence" }, { "id": "current-occurrence", "source": 1, "quote": "Rhea", "support": "supported", "expect": "occurrence" }]
+    }
+  ],
+  "rendererMutations": [
+    { "id": "exact-span", "change": "none", "expect": "occurrence" },
+    { "id": "near-zero-null-wrong-value", "change": "wrong-value", "expect": "withhold" },
+    { "id": "echo-mismatch", "change": "echo", "expect": "withhold" },
+    { "id": "cross-passage-span", "change": "cross-passage", "expect": "withhold" },
+    { "id": "empty-span", "change": "empty-span", "expect": "withhold" },
+    { "id": "missing-span", "change": "missing-span", "expect": "withhold" },
+    { "id": "truncated-input", "change": "truncated", "expect": "withhold" },
+    { "id": "high-null", "change": "high-null", "expect": "withhold" },
+    { "id": "threshold-null", "change": "threshold-null", "expect": "withhold" },
+    { "id": "unknown-null", "change": "unknown-null", "expect": "withhold" },
+    { "id": "negative-null", "change": "negative-null", "expect": "withhold" },
+    { "id": "above-one-null", "change": "above-one-null", "expect": "withhold" },
+    { "id": "null-value", "change": "null-value", "expect": "withhold" },
+    { "id": "extractor-failure", "change": "failed", "expect": "withhold" },
+    { "id": "extractor-off", "change": "off", "expect": "withhold" }
+  ]
+}

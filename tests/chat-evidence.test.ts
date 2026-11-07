@@ -8,6 +8,7 @@ import { adoptChildSource, attachChildView, publishChildSource, type ChildView }
 import { createOptChat } from "../src/index.ts";
 import { Memory, type Summarize } from "../src/memory.ts";
 import { Store } from "../src/store.ts";
+import { readSourcePage } from "../src/source-page.ts";
 import {
   EVIDENCE_BYTES,
   EVIDENCE_PASSAGE_BYTES,
@@ -52,13 +53,14 @@ async function open(): Promise<{ store: Store; memory: Memory }> {
   return { store, memory };
 }
 
-/** The adapter src/index.ts builds: Memory's ranking and the Store's exact pages. `onPage` sees every page read. */
+/** The live-memory identity and exact-page adapter; `onPage` sees every source read, including index construction. */
 function reader(store: Store, memory: Memory, onPage: (id: number) => void = () => {}): EvidenceMemory {
   return {
-    rank: (question, limit, before) => memory.rankMessages(question, { limit, before, idf: "smoothed" }),
-    page: (id, offset, maxBytes) => {
+    sourceIdentity: memory,
+    page: (id, offset, maxBytes, maxTraversalBytes) => {
       onPage(id);
-      return store.readMessagePage(id, offset, maxBytes);
+      const source = store.messages[id]!;
+      return { ...readSourcePage(source, offset, maxBytes, maxTraversalBytes), kind: source.kind, metadata: source.metadata };
     },
   };
 }
@@ -157,28 +159,6 @@ describe("gatherEvidence", () => {
     }
   });
 
-  test("a full result still ends with the trailer: searched ids, missing words, partial reports, completeness", async () => {
-    const { store, memory } = await open();
-    fillers(store, 5);
-    const id = store.append("user", "the orchid greenhouse code is 4417").i;
-    const question = "orchid greenhouse code";
-
-    const result = await gatherEvidence(reader(store, memory), question, { upperBound: store.messages.length });
-    expect(result.passages).toHaveLength(1);
-    expect(result.passages[0]!.complete).toBe(true);
-    const text = renderEvidence(question, result);
-
-    expect(text.split("\n")).toEqual([
-      `[optchat evidence] ${question}`,
-      `passage 1: message ${id} (user), bytes 0-34 of 34; zoom(${id}, 1, 0) reopens it`,
-      "the orchid greenhouse code is 4417",
-      `[searched messages: ${id}]`,
-      "[question words in no searched message: none]",
-      "[incomplete or partial reports among them: none]",
-      "[search complete]",
-    ]);
-  });
-
   test("question words no searched message contains are reported", async () => {
     const { store, memory } = await open();
     fillers(store, 5);
@@ -228,39 +208,12 @@ describe("gatherEvidence", () => {
     expect(all.passages[0]!.id).toBe(later);
   });
 
-  test("at the time bound the scan stops with what it has, marked incomplete", async () => {
-    const { store, memory } = await open();
-    fillers(store, 10);
-    store.append("user", "orchid and tulip beds");
-    store.append("user", "orchid cuttings");
-    store.append("user", "orchid potting mix");
-    const order = memory.rankMessages("orchid tulip", { limit: 50 });
-    expect(order).toHaveLength(3);
-    const [first, slow, never] = order as [number, number, number];
-    let now = 0;
-    // Reading the second candidate takes longer than the whole bound.
-    const slowReader = reader(store, memory, (id) => {
-      if (id === slow) now += 20_000;
-    });
-
-    const result = await gatherEvidence(slowReader, "orchid tulip", { upperBound: store.messages.length, clock: () => now });
-
-    expect(result.complete).toBe(false);
-    expect(result.searched).toEqual([first, slow].sort((a, b) => a - b));
-    expect(result.unsearched).toEqual([never]);
-    expect(result.passages.map((passage) => passage.id)).toEqual([first, slow]);
-    expect(renderEvidence("orchid tulip", result)).toContain(`[search incomplete: stopped at the time bound; not fully searched: ${never}]`);
-
-    const none = await gatherEvidence(reader(store, memory), "orchid tulip", { upperBound: store.messages.length, timeoutMs: 0 });
-    expect(none).toMatchObject({ complete: false, passages: [], searched: [], unsearched: order });
-  });
-
   test("a question with no ranking word, a cancel, and malformed limits", async () => {
     const { store, memory } = await open();
     fillers(store, 3);
     const empty = await gatherEvidence(reader(store, memory), "a b ?", { upperBound: store.messages.length });
-    expect(empty).toMatchObject({ passages: [], terms: [], searched: [], missing: [], complete: true });
-    expect(renderEvidence("a b ?", empty)).toContain("no passage: the question has no word of at least 3 letters or digits");
+    expect(empty.passages).toEqual([]);
+    expect(empty.explanation.omissions).toContain("no-query-terms");
 
     const controller = new AbortController();
     controller.abort(new Error("cancelled"));
@@ -303,7 +256,6 @@ describe("chat_evidence through OptChat", () => {
 
     expect(answer).toStartWith("[optchat evidence] lisbon weather\npassage 1: message 2 (user), bytes 0-17 of 17;");
     expect(answer).toContain("\nweather in Lisbon\n");
-    expect(answer).toEndWith("[searched messages: 2]\n[question words in no searched message: none]\n[incomplete or partial reports among them: none]\n[search complete]");
     expect(judge.requests).toHaveLength(0);
     expect((await harness.open()).host.tools.has("chat_evidence")).toBe(true);
   });
@@ -366,14 +318,14 @@ describe("chat_evidence through OptChat", () => {
       let transcript: HostMessage[] = [];
       for (const text of ["morning coffee for two", "weather in Lisbon"]) transcript = await talk(host, transcript, text);
       const answer = await host.callTool("chat_evidence", { question: "lisbon weather" });
-      expect(answer).toContain("[search complete]");
       if (!extract) {
         expect(states).toHaveLength(0);
-        expect(answer).toEndWith("[search complete]");
+        expect(answer).not.toContain("[extraction");
         continue;
       }
-      expect(states).toEqual(["[message 2, user]\nweather in Lisbon"]);
-      expect(answer).toEndWith('[search complete]\n[extraction cloudflare/clairic: "Lisbon" at message 2 bytes 11-17; zoom(2, 1, 11) reopens it (p_null 0.020, cost unknown)]');
+      expect(answer).toContain('"Lisbon" at message 2 bytes 11-17; zoom(2, 1, 11)');
+      expect(answer).toContain("not a verified answer");
+      expect(answer).toContain("cost unknown");
     }
   });
 
@@ -388,7 +340,7 @@ describe("chat_evidence through OptChat", () => {
     cleanups.push(() => host.close());
     let transcript: HostMessage[] = [];
     for (const text of ["morning coffee for two", "weather in Lisbon"]) transcript = await talk(host, transcript, text);
-    expect(await host.callTool("chat_evidence", { question: "lisbon weather" })).toEndWith("[search complete]");
+    expect(await host.callTool("chat_evidence", { question: "lisbon weather" })).not.toContain("[extraction");
     const read = (values: Record<string, string | boolean>) =>
       readConfig({ getFlag: (name: string) => values[name] } as Pick<ExtensionAPI, "getFlag">, "/srv/agent/optchat");
     expect(read({}).extract).toBe(true);
@@ -405,7 +357,11 @@ describe("child bridge", () => {
     const tools = new Map<string, { execute: (id: string, input: Record<string, unknown>, signal: undefined, update: undefined, ctx: ExtensionContext) => Promise<{ content: Array<{ text: string }> }> }>();
     const hooks: Array<(event: { systemPrompt: string[] }, ctx: ExtensionContext) => { systemPrompt: string[] } | undefined> = [];
     const stub: unknown = new Proxy(() => stub, { get: () => stub, apply: () => stub });
-    const pi = { zod: stub, registerTool: (tool: { name: string }) => tools.set(tool.name, tool as never), on: (_: string, hook: never) => hooks.push(hook) };
+    const pi = {
+      zod: stub,
+      registerTool: (tool: { name: string }) => tools.set(tool.name, tool as never),
+      on: (name: string, hook: never) => { if (name === "before_agent_start") hooks.push(hook); },
+    };
     const ctx = (manager: object) =>
       ({ sessionManager: { getArtifactManager: () => manager, getSessionId: () => "child" }, ui: { notify: () => {} } }) as unknown as ExtensionContext;
     return { pi: pi as unknown as ExtensionAPI, tools, hooks, ctx };

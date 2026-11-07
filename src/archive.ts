@@ -147,6 +147,8 @@ export interface MessageMetadata {
   readonly work?: WorkMetadata;
   readonly images?: readonly ImageAttachment[];
   readonly resultFor?: number;
+  /** Host tool completion, not process/test/project success. Imports deliberately lose host-observed authority. */
+  readonly toolOutcome?: "success" | "error" | "imported-success" | "imported-error";
   readonly coordination?: CoordinationMetadata;
 }
 
@@ -271,13 +273,20 @@ function parseAttachments(value: unknown): readonly ImageAttachment[] {
  * link target existence and semantics, kind coupling, and image storage.
  */
 export function parseMetadata(value: unknown): MessageMetadata {
-  const row = plainRecord(value, [], ["work", "images", "resultFor", "coordination"], "message metadata");
-  const result: { work?: WorkMetadata; images?: readonly ImageAttachment[]; resultFor?: number; coordination?: CoordinationMetadata } = {};
+  const row = plainRecord(value, [], ["work", "images", "resultFor", "coordination", "toolOutcome"], "message metadata");
+  const result: { work?: WorkMetadata; images?: readonly ImageAttachment[]; resultFor?: number; coordination?: CoordinationMetadata; toolOutcome?: MessageMetadata["toolOutcome"] } = {};
   if (hasOwn(row, "work")) result.work = parseWork(row.work);
   if (hasOwn(row, "images")) result.images = parseAttachments(row.images);
   if (hasOwn(row, "resultFor")) {
     if (!isIndex(row.resultFor)) fail("message metadata", "resultFor must be a nonnegative safe integer");
     result.resultFor = row.resultFor;
+  }
+  if (hasOwn(row, "toolOutcome")) {
+    if (result.resultFor === undefined) {
+      fail("message metadata", "toolOutcome requires a resultFor link and an admitted outcome");
+    }
+    if (row.toolOutcome === "success" || row.toolOutcome === "error" || row.toolOutcome === "imported-success" || row.toolOutcome === "imported-error") result.toolOutcome = row.toolOutcome;
+    else fail("message metadata", "invalid toolOutcome");
   }
   if (hasOwn(row, "coordination")) result.coordination = decodeCoordination(row.coordination);
   if (result.work === undefined && result.images === undefined && result.resultFor === undefined && result.coordination === undefined) {

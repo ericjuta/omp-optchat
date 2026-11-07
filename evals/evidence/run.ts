@@ -26,6 +26,7 @@ import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
 import { DEFAULTS } from "../../src/config.ts";
 import { Memory, type Summarize } from "../../src/memory.ts";
 import { Store } from "../../src/store.ts";
+import { readSourcePage } from "../../src/source-page.ts";
 import { gatherEvidence, type EvidenceMemory } from "../../src/system1/evidence.ts";
 import { type Extraction, type Extractor, extractionState, mapSpan, openRouterExtractor } from "../../src/system1/extract.ts";
 import { recall } from "../../src/system1/recall.ts";
@@ -95,8 +96,11 @@ async function build(c: EvidenceCase): Promise<Built> {
 }
 
 const evidenceReader = (b: Built): EvidenceMemory => ({
-  rank: (text, limit, before) => b.memory.rankMessages(text, { limit, before, idf: "smoothed" }),
-  page: (id, offset, maxBytes) => b.store.readMessagePage(id, offset, maxBytes),
+  sourceIdentity: b.memory,
+  page: (id, offset, maxBytes, maxTraversalBytes) => {
+    const source = b.store.messages[id]!;
+    return { ...readSourcePage(source, offset, maxBytes, maxTraversalBytes), kind: source.kind, metadata: source.metadata };
+  },
 });
 
 /** The oracle extractor: the gold answer's code-point span in the state, or a null answer on abstain cases. */

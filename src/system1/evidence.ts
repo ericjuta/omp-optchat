@@ -1,30 +1,34 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { MessageMetadata } from "../archive.js";
-import { RANK_TERM_CHARS, SEARCH_MAX_LIMIT } from "../memory.js";
+import {
+  EvidenceIndex, EVIDENCE_CHUNK_BYTES, EVIDENCE_INDEX_BYTES, EVIDENCE_INDEX_CHUNKS,
+  EVIDENCE_INDEX_MESSAGES, EVIDENCE_READ_BYTES, type EvidenceExplanation, type EvidenceIndexCapacity,
+} from "../evidence-index.js";
+import { RANK_TERM_CHARS } from "../memory.js";
 import type { Kind } from "../store.js";
 
 /** The question as the tool accepts it: 1 to this many characters. */
 export const EVIDENCE_QUESTION_CHARS = 1_000;
-/** The most passages one call returns, unless the caller passes `maxPassages`. */
+/** The hard passage ceiling; callers may request fewer with `maxPassages`. */
 export const EVIDENCE_PASSAGES = 8;
 /** A passage is one window of a stored message: at most this many UTF-8 bytes, cut on code-point boundaries. */
-export const EVIDENCE_PASSAGE_BYTES = 2_048;
-/** The most passage-text bytes one call returns, unless the caller passes `maxBytes`. */
+export const EVIDENCE_PASSAGE_BYTES = EVIDENCE_CHUNK_BYTES;
+/** The hard passage-text byte ceiling; callers may request fewer with `maxBytes`. */
 export const EVIDENCE_BYTES = 16_384;
 /** Wall bound for one call, unless the caller passes `timeoutMs`. */
 export const EVIDENCE_MS = 10_000;
 /** Each result's text begins with this mark; search and ranking skip such results (`MEMORY_RESULT_MARKS`). */
 export const EVIDENCE_MARK = "[optchat evidence]";
-/** Windows start every this many bytes, so a phrase cut by one window's edge lies whole inside the next window. */
-const WINDOW_STRIDE_BYTES = 1_024;
-/** Real time a scan runs before it yields to the event loop, so it never holds the host's loop longer than this. */
-const SLICE_MS = 8;
-/** A captured report whose capture was cut short starts with this (src/index.ts `reportEntries`). */
-const PARTIAL_REPORT_PREFIX = "[incomplete:";
+// A live Memory object is the identity, never a filesystem path. Replacing/resetting Memory naturally
+// drops its derived index. Older child snapshots filter the same index strictly below their bound.
+const indexes = new WeakMap<object, EvidenceIndex>();
 
-/** One page of a stored message's exact source text, as `Store.readMessagePage` returns it. */
+/** One bounded page of a stored message's exact source text. */
 export interface EvidencePage {
   readonly text: string;
+  readonly offset?: number;
+  /** Actual source bytes traversed by bounded paging, including seeking. Absent means text bytes only. */
+  readonly traversedBytes?: number;
   readonly next: number | null;
   readonly totalBytes: number;
   readonly kind: Kind;
@@ -36,21 +40,30 @@ export interface EvidencePage {
  * `RecallMemory`: neither call reaches a model.
  */
 export interface EvidenceMemory {
-  /** `Memory.rankMessages` with `idf: "smoothed"`: stored message ids below `before` whose words best match `question`, best first, at most `limit`. */
-  rank(question: string, limit: number, before: number): number[];
-  /** `Store.readMessagePage`: at most `maxBytes` of message `id`'s text from the UTF-8 byte `offset`, as `zoom(id, 1, offset)` pages it. */
-  page(id: number, offset: number, maxBytes: number): EvidencePage;
+  /** Stable live Memory identity. Must change if originals change, ids are reused, or a store is reset. */
+  readonly sourceIdentity?: object;
+  /** Recheck revocation on cache hits as well as source reads; main/child adapters call their existing live() guard. */
+  assertLive?(): void;
+  /** Exact original-source page. Adapters use readSourcePage and pass the traversal allowance through;
+   * unlike Store.readMessagePage, its first page never indexes the whole original synchronously. */
+  page(id: number, offset: number, maxBytes: number, maxTraversalBytes?: number): EvidencePage;
 }
 
 export interface EvidenceLimits {
   /** Only messages with id below this are read: the snapshot's message count. */
   readonly upperBound: number;
-  /** The most passages returned, at least 1. Absent means EVIDENCE_PASSAGES. */
+  /** The most passages returned, at least 1, clamped to EVIDENCE_PASSAGES. */
   readonly maxPassages?: number;
-  /** The most passage-text bytes returned, at least 1. Absent means EVIDENCE_BYTES. */
+  /** The most passage-text bytes returned, at least 1, clamped to EVIDENCE_BYTES. */
   readonly maxBytes?: number;
-  /** Milliseconds before the scan stops with what it has. Absent means EVIDENCE_MS. */
+  /** Milliseconds before retrieval stops, clamped to EVIDENCE_MS. */
   readonly timeoutMs?: number;
+  /** Source bytes traversed per call, including seeks and overlapping reads. Clamped to EVIDENCE_READ_BYTES. */
+  readonly maxReadBytes?: number;
+  /** Deterministic retained text/entry accounting; clamped to EVIDENCE_INDEX_BYTES. */
+  readonly maxIndexBytes?: number;
+  readonly maxChunks?: number;
+  readonly maxMessages?: number;
   readonly signal?: AbortSignal;
   /** The milliseconds clock the time bound reads. Absent means `performance.now`. */
   readonly clock?: () => number;
@@ -75,130 +88,56 @@ export interface EvidenceResult {
   readonly passages: readonly EvidencePassage[];
   /** The question's words as matched: lowercased, deduplicated, at least RANK_TERM_CHARS characters. */
   readonly terms: readonly string[];
-  /** Messages read to their end, ascending. */
+  /** Matching messages indexed and searched to their end, ascending. Snapshot-wide counts are in explanation. */
   readonly searched: readonly number[];
   /** Question words that no read window contains. */
   readonly missing: readonly string[];
   /** Read messages that are partial captured reports, ascending: "[incomplete: ...]" text or pointer-only work metadata. */
   readonly incomplete: readonly number[];
-  /** False when the time bound stopped the scan before every candidate message was read to its end. */
+  /** True only when the entire eligible snapshot was indexed and queried, not a claim of answer correctness. */
   readonly complete: boolean;
-  /** Candidate messages not read to their end, in candidate order. */
+  /** Known matching unfinished messages and the first uncovered id. explanation.coverage bounds the full omitted range. */
   readonly unsearched: readonly number[];
-}
-
-interface Window {
-  readonly id: number;
-  /** The message's position among the candidates: 0 is the best word match. */
-  readonly rank: number;
-  readonly kind: Kind;
-  readonly start: number;
-  readonly end: number;
-  readonly totalBytes: number;
-  /** Indexes into `terms` of the question words the window contains. */
-  readonly matched: readonly number[];
+  readonly explanation: EvidenceExplanation;
 }
 
 /**
- * Passages from the stored chat that bear on `question`, without a model call. Candidates are `Memory.rankMessages`'
- * widest pool (SEARCH_MAX_LIMIT messages below `upperBound`). Each candidate is read whole, in windows of at most
- * EVIDENCE_PASSAGE_BYTES that start every WINDOW_STRIDE_BYTES bytes, each cut where `zoom` paging would cut it, so no
- * UTF-8 sequence is split. A window scores the weights of the question words it contains, case-insensitively; a word
- * weighs ln(1 + (W - df + 0.5) / (df + 0.5)) over the W windows read, df of which contain it. Windows that contain a
- * word are taken best first (ties: the better-ranked message, then the earlier window), skipping one that overlaps a
- * window already taken from its message or that would pass `maxBytes`, until `maxPassages` are taken. When the time
- * bound passes, the scan stops and the windows read so far compete; the result says so. Invalid limits throw
- * RangeError; a cancel throws the signal's reason.
+ * Query a bounded, rebuildable chunk index over the originals, never the top 50 whole-message hits.
+ * The index is in-memory only and increments across calls using the live source identity. Limits apply
+ * to source I/O, retained text/entries, query scratch, time and output. Coverage is explicit when any
+ * limit prevents reaching the snapshot end. Lexical relevance is not semantic answer verification.
  */
 export async function gatherEvidence(memory: EvidenceMemory, question: string, limits: EvidenceLimits): Promise<EvidenceResult> {
   const upperBound = count(limits.upperBound, "upperBound", 0);
-  const maxPassages = count(limits.maxPassages ?? EVIDENCE_PASSAGES, "maxPassages", 1);
-  const maxBytes = count(limits.maxBytes ?? EVIDENCE_BYTES, "maxBytes", 1);
-  const timeoutMs = count(limits.timeoutMs ?? EVIDENCE_MS, "timeoutMs", 0);
-  const clock = limits.clock ?? (() => performance.now());
-  const signal = limits.signal;
-  signal?.throwIfAborted();
-  const deadline = clock() + timeoutMs;
-  // Split as `Memory.rankMessages` splits a question.
-  const terms = [...new Set(question.toLowerCase().split(/[^\p{L}\p{N}]+/u))].filter((term) => [...term].length >= RANK_TERM_CHARS);
-  const candidates = terms.length === 0 ? [] : memory.rank(question, SEARCH_MAX_LIMIT, upperBound);
-
-  const windows: Window[] = [];
-  let read = 0;
-  const found = new Array<boolean>(terms.length).fill(false);
-  const searched: number[] = [];
-  const partial: number[] = [];
-  let stopped = candidates.length;
-  let slice = performance.now();
-  scan: for (let rank = 0; rank < candidates.length; rank++) {
-    const id = candidates[rank]!;
-    for (let start = 0; ;) {
-      if (clock() >= deadline) {
-        stopped = rank;
-        break scan;
-      }
-      if (performance.now() - slice >= SLICE_MS) {
-        const { promise, resolve } = Promise.withResolvers<void>();
-        setImmediate(resolve);
-        await promise;
-        signal?.throwIfAborted();
-        slice = performance.now();
-      }
-      const page = memory.page(id, start, EVIDENCE_PASSAGE_BYTES);
-      const partialReport = page.kind === "work" && (page.text.startsWith(PARTIAL_REPORT_PREFIX) || page.metadata?.work?.completeness === "pointer-only");
-      if (start === 0 && partialReport) partial.push(id);
-      const lower = page.text.toLowerCase();
-      const matched: number[] = [];
-      terms.forEach((term, index) => {
-        if (!lower.includes(term)) return;
-        matched.push(index);
-        found[index] = true;
-      });
-      read++;
-      const end = page.next ?? page.totalBytes;
-      if (matched.length > 0) windows.push({ id, rank, kind: page.kind, start, end, totalBytes: page.totalBytes, matched });
-      if (page.next === null) break;
-      // A window that did not reach the end leaves more than a stride after its start, so the stride page has a next.
-      start = memory.page(id, start, WINDOW_STRIDE_BYTES).next!;
-    }
-    searched.push(id);
-  }
-  signal?.throwIfAborted();
-
-  const df = new Array<number>(terms.length).fill(0);
-  for (const window of windows) for (const index of window.matched) df[index]!++;
-  const weights = df.map((n) => Math.log(1 + (read - n + 0.5) / (n + 0.5)));
-  const ranked = windows
-    .map((window) => ({ window, score: window.matched.reduce((sum, index) => sum + weights[index]!, 0) }))
-    .sort((a, b) => b.score - a.score || a.window.rank - b.window.rank || a.window.start - b.window.start);
-  const taken: Window[] = [];
-  let bytes = 0;
-  for (const { window } of ranked) {
-    if (taken.length === maxPassages) break;
-    const size = window.end - window.start;
-    if (bytes + size > maxBytes) continue;
-    if (taken.some((other) => other.id === window.id && other.start < window.end && window.start < other.end)) continue;
-    taken.push(window);
-    bytes += size;
-  }
-  const passages = taken.map((window): EvidencePassage => ({
-    id: window.id,
-    kind: window.kind,
-    start: window.start,
-    end: window.end,
-    totalBytes: window.totalBytes,
-    text: memory.page(window.id, window.start, EVIDENCE_PASSAGE_BYTES).text,
-    complete: window.start === 0 && window.end === window.totalBytes,
-  }));
-  return {
-    passages,
-    terms,
-    searched: searched.sort((a, b) => a - b),
-    missing: terms.filter((_term, index) => !found[index]),
-    incomplete: partial.sort((a, b) => a - b),
-    complete: stopped === candidates.length,
-    unsearched: candidates.slice(stopped),
+  const maxPassages = capped(limits.maxPassages, EVIDENCE_PASSAGES, "maxPassages", 1);
+  const maxBytes = capped(limits.maxBytes, EVIDENCE_BYTES, "maxBytes", 1);
+  const timeoutMs = capped(limits.timeoutMs, EVIDENCE_MS, "timeoutMs", 0);
+  const maxReadBytes = capped(limits.maxReadBytes, EVIDENCE_READ_BYTES, "maxReadBytes", 0);
+  const capacity: EvidenceIndexCapacity = {
+    maxIndexBytes: capped(limits.maxIndexBytes, EVIDENCE_INDEX_BYTES, "maxIndexBytes", 0),
+    maxChunks: capped(limits.maxChunks, EVIDENCE_INDEX_CHUNKS, "maxChunks", 0),
+    maxMessages: capped(limits.maxMessages, EVIDENCE_INDEX_MESSAGES, "maxMessages", 0),
   };
+  if (question.length > EVIDENCE_QUESTION_CHARS) throw new RangeError(`question must be at most ${EVIDENCE_QUESTION_CHARS} characters`);
+  const clock = limits.clock ?? (() => performance.now());
+  limits.signal?.throwIfAborted();
+  memory.assertLive?.();
+  const started = clock();
+  const deadline = started + timeoutMs;
+  const buildDeadline = started + timeoutMs * 0.75;
+  const terms = [...new Set(question.toLowerCase().split(/[^\p{L}\p{N}]+/u))].filter((term) => [...term].length >= RANK_TERM_CHARS);
+  const identity = memory.sourceIdentity ?? memory;
+  let index = indexes.get(identity);
+  if (!index || index.capacity.maxIndexBytes !== capacity.maxIndexBytes || index.capacity.maxChunks !== capacity.maxChunks || index.capacity.maxMessages !== capacity.maxMessages) {
+    index = new EvidenceIndex(capacity);
+    indexes.set(identity, index);
+  }
+  const result = await index.query(memory, { upperBound, terms, maxReadBytes, maxPassages, maxBytes, deadline, buildDeadline, clock, signal: limits.signal });
+  return { ...result, terms };
+}
+
+function capped(value: number | undefined, maximum: number, name: string, minimum: number): number {
+  return Math.min(count(value ?? maximum, name, minimum), maximum);
 }
 
 function count(value: number, name: string, minimum: number): number {
@@ -206,12 +145,12 @@ function count(value: number, name: string, minimum: number): number {
   return value;
 }
 
-const list = (ids: readonly number[]): string => (ids.length === 0 ? "none" : ids.join(", "));
+const list = (ids: readonly number[]): string => ids.length === 0 ? "none" : `${ids.slice(0, 64).join(", ")}${ids.length > 64 ? `, … (${ids.length - 64} further ids omitted from this trailer)` : ""}`;
 
 /**
  * The result as the tool shows it: each passage's message, kind, byte range and text, then the trailer every result
  * carries, found passages or not: the messages searched, the question words none of them contains, the partial reports
- * among them, and whether the time bound cut the search short.
+ * among them, and explicit index/query/output coverage and omissions. Large id lists are visibly abbreviated.
  */
 export function renderEvidence(question: string, result: EvidenceResult): string {
   const lines = [`${EVIDENCE_MARK} ${question.replace(/\s+/g, " ").trim()}`];
@@ -224,15 +163,25 @@ export function renderEvidence(question: string, result: EvidenceResult): string
     );
   });
   if (result.passages.length === 0) {
-    lines.push(result.terms.length === 0 ? "no passage: the question has no word of at least 3 letters or digits" : "no passage: no searched message contains a question word");
+    lines.push(result.terms.length === 0
+      ? "no passage: the question has no word of at least 3 letters or digits"
+      : result.explanation.selection.matchedChunks > 0
+        ? "no passage returned: matching chunks exist but selection or output limits omitted them; inspect the coverage and omissions below"
+        : "no passage: no matching word was observed within the searched coverage; this does not establish absence outside that coverage");
   }
   lines.push(`[searched messages: ${list(result.searched)}]`);
   lines.push(`[question words in no searched message: ${result.missing.length === 0 ? "none" : result.missing.map((term) => `"${term}"`).join(", ")}]`);
   lines.push(`[incomplete or partial reports among them: ${list(result.incomplete)}]`);
+  const { coverage, selection, omissions } = result.explanation;
   lines.push(
+    `[snapshot: messages 0-${result.explanation.snapshot.upperBound} (exclusive); indexed ${coverage.fullyIndexedMessages}/${result.explanation.snapshot.upperBound}; excluded memory records: ${coverage.excludedMessages}; chunks searched: ${coverage.searchedChunks}/${coverage.indexedChunks}; source bytes covered: ${coverage.sourceBytes}]`,
+    `[selection: ${selection.matchedChunks} matching chunks; ${selection.returnedPassages} returned; omissions: ${omissions.length === 0 ? "none" : omissions.join(", ")}]`,
+    coverage.next === null
+      ? "[index coverage reaches snapshot end]"
+      : `[index incomplete: next window starts at message ${coverage.next.id}, byte ${coverage.next.offset} (may overlap the previous window); later messages below the snapshot bound are unindexed]`,
     result.complete
-      ? "[search complete]"
-      : `[search incomplete: stopped at the time bound; not fully searched: ${list(result.unsearched)}]`,
+      ? "[search complete within this snapshot; lexical matches are not verified answers]"
+      : `[search incomplete: ${coverage.unsearchedChunks} indexed chunks not searched; not fully searched: ${list(result.unsearched)}; missing words mean not observed within coverage, not absent from the chat]`,
   );
   return lines.join("\n");
 }
@@ -253,7 +202,7 @@ export function registerEvidenceTool(
     name: "chat_evidence",
     label: "OptChat evidence",
     description:
-      "Gather exact passages from the stored chat's original messages that bear on a question, without a model: the messages whose words best match it are read whole in windows of up to 2,048 bytes, and the windows holding the rarest question words win (at most 8 passages, 16,384 bytes in all). Each passage gives its message id and UTF-8 byte range; zoom(id, 1, start) reopens it. A trailer lists the messages searched, question words found in none of them, and partial reports.",
+      "Search a bounded local chunk index for exact original passages (at most 8 passages of 2,048 bytes, 16,384 bytes total). Each gives its message id and UTF-8 byte range; zoom(id, 1, start) reopens it. The trailer reports snapshot coverage, omissions and partial reports. When extraction is enabled and a key resolves, selected passages are also sent to OpenRouter/Clairic for unverified candidate occurrences. Neither lexical matches nor extracted spans verify an answer; incomplete coverage cannot establish absence.",
     parameters: params,
     approval: "read",
     loadMode: "essential",

@@ -137,6 +137,9 @@ function checkCoupling(kind: Kind, metadata: MessageMetadata | undefined, where:
   if (metadata?.resultFor !== undefined && kind !== "echo" && kind !== "work") {
     throw new Error(`resultFor requires echo or work kind at ${where}`);
   }
+  if (metadata?.toolOutcome !== undefined && kind !== "echo") {
+    throw new Error(`toolOutcome requires echo kind at ${where}`);
+  }
   if (metadata?.coordination !== undefined && kind !== "note") {
     throw new Error(`coordination requires note kind at ${where}`);
   }

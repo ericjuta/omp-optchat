@@ -123,6 +123,9 @@ export const ALL_GATES_OFF = {
   "no-optchat-value-score": true,
   "no-optchat-recall": true,
   "no-optchat-extract": true,
+  "no-optchat-decisions": true,
+  "no-optchat-work-discovery": true,
+  "no-optchat-child-pack": true,
 } as const;
 
 export function anthropicModel(): Model<"anthropic-messages"> {

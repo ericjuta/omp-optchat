@@ -69,10 +69,14 @@ import { counted, GATE_KEYS, GATE_LABEL, GATE_PURPOSE, GateCounts, INACTIVE_REAS
 import { LEDGER_FILE, RuleLedger, renderRules, type Rule } from "./system1/ledger.js";
 import { prefetchBlock, PREFETCH_MS } from "./system1/prefetch.js";
 import { recall, registerRecallTool, renderRecall } from "./system1/recall.js";
-import { gatherEvidence, registerEvidenceTool, renderEvidence, type EvidenceMemory } from "./system1/evidence.js";
+import { gatherEvidence, registerEvidenceTool, renderEvidence, type EvidenceMemory, type EvidenceResult } from "./system1/evidence.js";
 import { extractionState, openRouterExtractor, renderExtraction, type Extractor } from "./system1/extract.js";
 import { decideTriage, ruleSentences, triageProbabilities, triageQuestions, triageState, triageTargets } from "./system1/rules.js";
 import { valueHint } from "./system1/value.js";
+import { gatherDecisions, registerDecisionsTool, renderDecisions } from "./decisions.js";
+import { discoverWork, registerWorkDiscoveryTool } from "./work-discovery.js";
+import { registerProjectEvidenceTool, type ProjectEvidenceRegistration } from "./project-evidence.js";
+import { readSourcePage } from "./source-page.js";
 
 /** The `openrouter` key as the host resolves it at call time; the plugin reads no environment variable itself. */
 const hostExtractor = (ctx: ExtensionContext | undefined): Extractor =>
@@ -659,8 +663,13 @@ class OptChat {
 	private mainRetries = 0;
 	private store: Store | undefined;
 	private memory: Memory | undefined;
+	private lastEvidence: { memory: Memory; upperBound: number; result: EvidenceResult } | undefined;
+	private projectEvidence: ProjectEvidenceRegistration | undefined;
+	private externalReadsOpen = false;
 	/** Set once the tools are registered: the host rejects a second registration, so a reopened chat keeps them. */
 	private toolsRegistered = false;
+	/** These registered tools enforce their own byte limits; the ordinary text cap must not corrupt their envelopes. */
+	private readonly unclippedTools = new Set<string>(TOOL_NAMES);
 	/** Set once `chat_recall` is registered; a zero-hit `chat_search` suggests it only then. */
 	private recallRegistered = false;
 	/** Standing rules: present only when the rules gate is on and the session is ready. */
@@ -775,6 +784,14 @@ class OptChat {
 				this.registerTools();
 				if (config.gates.recall) this.registerRecall();
 				if (config.evidence) this.registerEvidence();
+				if (config.decisions) this.registerDecisions();
+				if (config.workDiscovery) this.registerWorkDiscovery();
+				if (Object.keys(config.projectStores).length > 0 && this.pi.getAllTools().some((tool) => tool.name === "chat_project_evidence")) throw new Error("chat_project_evidence is already registered");
+				this.projectEvidence = registerProjectEvidenceTool(this.pi, config.projectStores, {}, () => {
+					if (!this.externalReadsOpen) throw new Error("external evidence admission is closed");
+					this.openMemory();
+				});
+				if (this.projectEvidence) this.unclippedTools.add("chat_project_evidence");
 				this.toolsRegistered = true;
 			}
 		} catch (error) {
@@ -793,6 +810,7 @@ class OptChat {
 			hint: config.gates.valueScore ? (source, signal) => this.valueHintFor(source, signal) : undefined,
 		});
 		this.state = { kind: "ready" };
+		this.externalReadsOpen = true;
 		this.childViewEnabled = config.childView;
 		if (config.childView) this.publishChildView(ctx);
 		const status = this.memory.status();
@@ -822,13 +840,25 @@ class OptChat {
 		}
 		registerRecallTool(this.pi, (question, current, signal) => this.recallFor(question, current, signal));
 		this.recallRegistered = true;
+		this.unclippedTools.add("chat_recall");
 	}
 
-	/** The evidence gate's tool: passages of the raw log read by word overlap, no model call. Child views get their own. */
+	/** Exact raw-log evidence with optional provider extraction; child views remain snapshot-bounded. */
 	private registerEvidence(): void {
-		if (this.pi.getAllTools().some((tool) => tool.name === "chat_evidence")) {
-			throw new Error('tool name "chat_evidence" is already registered');
+		if (this.pi.getAllTools().some((tool) => tool.name === "chat_evidence" || tool.name === "chat_explain")) {
+			throw new Error('an OptChat evidence tool name is already registered');
 		}
+		const z = this.pi.zod;
+		const params = z.object({});
+		this.pi.registerTool<typeof params>({
+			name: "chat_explain",
+			label: "OptChat evidence explanation",
+			description: "Explain the last local evidence query's snapshot, coverage and gaps. No model call; never treats an extracted occurrence as a verified answer.",
+			parameters: params,
+			approval: "read",
+			loadMode: "essential",
+			execute: async () => ({ content: [{ type: "text", text: this.explainEvidence() }] }),
+		});
 		registerEvidenceTool(this.pi, (question, current, signal) => {
 			const memory = this.openMemory();
 			const live = (): Memory => {
@@ -837,6 +867,7 @@ class OptChat {
 			};
 			return this.evidenceText(live, question, memory.status().messages, signal, current);
 		});
+		this.unclippedTools.add("chat_evidence").add("chat_explain");
 	}
 
 	/** `chat_evidence` over messages below `upperBound`; every read first proves, through `live`, that the chat is still open. */
@@ -846,24 +877,72 @@ class OptChat {
 		upperBound: number,
 		signal: AbortSignal | undefined,
 		current?: ExtensionContext,
+		allowExtraction = true,
 	): Promise<string> {
 		const reader: EvidenceMemory = {
-			rank: (text, limit, before) => live().rankMessages(text, { limit, before, idf: "smoothed" }),
-			page: (id, offset, maxBytes) => {
+			sourceIdentity: live(),
+			assertLive: () => { live(); },
+			page: (id, offset, maxBytes, maxTraversalBytes) => {
 				live();
-				return this.openStore().readMessagePage(id, offset, maxBytes);
+				if (!Number.isSafeInteger(id) || id < 0 || id >= upperBound) throw new Error("message is outside the evidence snapshot");
+				const source = this.openStore().messages[id]!;
+				return { ...readSourcePage(source, offset, maxBytes, maxTraversalBytes), kind: source.kind, metadata: source.metadata };
 			},
 		};
 		const result = await gatherEvidence(reader, question, { upperBound, signal });
+		const memory = live();
+		signal?.throwIfAborted();
+		this.lastEvidence = { memory, upperBound, result };
 		const text = renderEvidence(question, result);
 		const config = this.config!;
-		if (!config.extract || result.passages.length === 0) return text;
+		if (!allowExtraction || !config.extract || result.passages.length === 0) return text;
 		// The deterministic passages always stand; the extractor only adds a line after the trailer.
 		const { state, placed } = extractionState(result.passages);
 		const extraction = await this.extractorFor(current ?? this.ctx)(state, question, signal ?? new AbortController().signal);
+		live();
+		signal?.throwIfAborted();
 		// No key: the extractor is simply absent, not a line on every call.
 		if (extraction.kind === "off") return text;
-		return `${text}\n${renderExtraction(state, placed, extraction, config.extractNull)}`;
+		return `${text}\n${renderExtraction(state, placed, extraction, config.extractNull, question)}`;
+	}
+
+	private registerDecisions(): void {
+		if (this.pi.getAllTools().some((tool) => tool.name === "chat_decisions")) throw new Error("chat_decisions is already registered");
+		registerDecisionsTool(this.pi, async (question, mode, _current, signal) => {
+			const memory = this.openMemory();
+			const store = this.openStore();
+			const upperBound = memory.status().messages;
+			const result = await gatherDecisions({ page: (id, offset, maxBytes) => {
+				if (this.openMemory() !== memory || id < 0 || id >= upperBound) throw new Error("decision source is outside the open snapshot");
+				const source = store.messages[id]!;
+				return { ...readSourcePage(source, offset, maxBytes), kind: source.kind, metadata: source.metadata };
+			}, completedResult: (id) => {
+				if (this.openMemory() !== memory || id < 0 || id >= upperBound) throw new Error("decision snapshot was revoked");
+				const entry = store.messages[id];
+				if (entry?.kind !== "echo" || entry.metadata?.toolOutcome !== "success" || entry.metadata.resultFor === undefined) return undefined;
+				return { topic: `tool invocation ${entry.metadata.resultFor}`, start: 0, end: Buffer.byteLength(entry.text) };
+			} }, question, { upperBound, signal });
+			if (this.openMemory() !== memory) throw new Error("decision snapshot was revoked");
+			signal?.throwIfAborted();
+			return renderDecisions(question, result, mode);
+		});
+		this.unclippedTools.add("chat_decisions");
+	}
+
+	private registerWorkDiscovery(): void {
+		if (this.pi.getAllTools().some((tool) => tool.name === "chat_work")) throw new Error("chat_work is already registered");
+		registerWorkDiscoveryTool(this.pi, (query, _current, signal) => {
+			const memory = this.openMemory();
+			return discoverWork(this.openStore().messages, query, { upperBound: memory.status().messages, signal });
+		});
+		this.unclippedTools.add("chat_work");
+	}
+
+	private explainEvidence(): string {
+		const memory = this.openMemory();
+		const last = this.lastEvidence;
+		if (!last || last.memory !== memory) return "[optchat explain] No evidence query in this open chat yet.";
+		return `[optchat explain] snapshot: messages below ${last.upperBound}; returned ${last.result.passages.length} passages.\n${JSON.stringify(last.result.explanation, null, 2)}\nExtraction validates an occurrence only, not relevance, truth or current authority. A missing passage is not proof that the answer is absent.`;
 	}
 
 	private async recallFor(question: string, current: ExtensionContext | undefined, signal: AbortSignal | undefined): Promise<string> {
@@ -952,6 +1031,7 @@ class OptChat {
 			},
 			// Passages come only from messages the snapshot already holds.
 			...(this.config?.evidence ? { evidence: (question: string, signal: AbortSignal | undefined) => this.evidenceText(live, question, upperBound, signal) } : {}),
+			...(this.config?.childPack ? { evidencePack: (question: string, signal: AbortSignal | undefined) => this.evidenceText(live, question.slice(0, 1000), upperBound, signal, undefined, false) } : {}),
 		};
 	}
 
@@ -1333,6 +1413,10 @@ class OptChat {
 	private fail(reason: string): void {
 		if (this.state.kind === "closed") return;
 		this.state = { kind: "failed", reason };
+		this.unpublish?.();
+		this.unpublish = undefined;
+		this.externalReadsOpen = false;
+		this.projectEvidence?.reset();
 		this.notify(reason, "error");
 	}
 
@@ -1633,7 +1717,11 @@ class OptChat {
 			const resultFor = message.role === "toolResult" && pending?.toolName === message.toolName
 				? pending.messageId : undefined;
 			for (const entry of await entriesOf(message, capture)) {
-				const metadata = resultFor === undefined ? entry.metadata : { ...entry.metadata, resultFor };
+				const metadata: MessageMetadata | undefined = resultFor === undefined ? entry.metadata : {
+					...entry.metadata, resultFor,
+					...(entry.kind === "echo" && message.role === "toolResult" && typeof message.isError === "boolean"
+						? { toolOutcome: message.isError ? "error" as const : "success" as const } : {}),
+				};
 				const stored = memory.append(entry.kind, entry.text, entry.at === undefined ? date : new Date(entry.at), metadata);
 				if (entry.call && entry.call.id.length > 0) {
 					calls.set(entry.call.id, calls.has(entry.call.id) ? null : { messageId: stored.i, toolName: entry.call.name });
@@ -1778,7 +1866,7 @@ class OptChat {
 	}
 
 	toolResult(event: ToolResultEvent): ToolResultEventResult | undefined {
-		if (this.state.kind !== "ready" || TOOL_NAMES.includes(event.toolName)) return undefined;
+		if (this.state.kind !== "ready" || this.unclippedTools.has(event.toolName)) return undefined;
 		const cap = this.config!.toolCap;
 		const text = event.content
 			.filter((part): part is TextContent => part.type === "text")
@@ -1794,6 +1882,8 @@ class OptChat {
 	/** Prior host history is not this chat's turn; reset turn tracking for the new session. */
 	sessionChanged(ctx: ExtensionContext): void {
 		this.saveUnanswered();
+		this.projectEvidence?.reset();
+		this.lastEvidence = undefined;
 		this.turn = undefined;
 		this.cutoff = Date.now();
 		this.captured = new Map();
@@ -1812,7 +1902,10 @@ class OptChat {
 	 * archive path is returned.
 	 */
 	async shutdown(archiveAt?: Date): Promise<string | undefined> {
+		this.externalReadsOpen = false;
 		this.saveUnanswered();
+		if (archiveAt === undefined) this.projectEvidence?.close();
+		else this.projectEvidence?.reset();
 		this.turn = undefined;
 		// Queued appends settle while the store is still open.
 		await this.logChain;
@@ -1830,6 +1923,7 @@ class OptChat {
 		const memory = this.memory;
 		const store = this.store;
 		this.memory = undefined;
+		this.lastEvidence = undefined;
 		this.store = undefined;
 		await memory?.close();
 		if (archiveAt === undefined) {
@@ -1945,6 +2039,10 @@ class OptChat {
 				case "status":
 					ctx.ui.notify(this.statusText(ctx), "info");
 					return;
+				case "explain":
+				case "index":
+					ctx.ui.notify(this.explainEvidence(), "info");
+					return;
 				case "view":
 					ctx.ui.notify(this.openMemory().render(), "info");
 					return;
@@ -1962,7 +2060,7 @@ class OptChat {
 					ctx.ui.notify(await this.startNewChat(ctx), "info");
 					return;
 				default:
-					throw new Error(`unknown subcommand "${action}" (use status, view, export PATH, import PATH, rules [remove ID] or new)`);
+					throw new Error(`unknown subcommand "${action}" (use status, view, explain, index, export PATH, import PATH, rules [remove ID] or new)`);
 			}
 		} catch (error) {
 			ctx.ui.notify(`/optchat ${action}: ${errorText(error)}`, "error");
@@ -2297,7 +2395,7 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 		};
 
 		pi.registerCommand("optchat", {
-			description: "OptChat memory: status | view | export PATH | import PATH | rules [remove ID] | new",
+			description: "OptChat memory: status | view | explain | index | export PATH | import PATH | rules [remove ID] | new",
 			handler: async (args, ctx) => {
 				if (!chat) {
 					const inactive = "OptChat is not active in this session (main sessions are active unless opted out with --no-optchat).";

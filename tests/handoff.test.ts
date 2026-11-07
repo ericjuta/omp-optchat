@@ -41,7 +41,9 @@ function harness() {
 	const pi = {
 		zod: schemaStub,
 		registerTool: (tool: Tool) => tools.set(tool.name, tool),
-		on: (_name: string, handler: Hook) => hooks.push(handler),
+		on: (name: string, handler: Hook) => {
+			if (name === "before_agent_start") hooks.push(handler);
+		},
 	};
 	return { pi: pi as unknown as ExtensionAPI, tools, hooks };
 }

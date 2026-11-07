@@ -39,6 +39,9 @@ const IMAGE_READ = "OPTCHAT_SMOKE_IMAGE_READ: retrieve the original image-bearin
 const IMAGE_DONE = "OPTCHAT_SMOKE_IMAGE_RETRIEVED";
 const CHILD_USER = "OPTCHAT_SMOKE_CHILD_DISPATCH: delegate the archive retrieval to the fixture child.";
 const CHILD_DONE = "OPTCHAT_SMOKE_CHILD_DONE";
+const EVIDENCE_SEED = "Decision staging: 5432";
+const EVIDENCE_USER = "What is the staging decision?";
+const EVIDENCE_DONE = "OPTCHAT_SMOKE_EVIDENCE_DONE";
 const IMAGE_DATA = [smokePng(255, 0, 0), smokePng(0, 255, 0)];
 /** The images as the host delivered them to the provider, in order: the archive stores exactly these. */
 let seenImages: Array<{ data: string; mimeType: string }> = [];
@@ -136,6 +139,7 @@ function answer(body: ObjectValue): Response {
     const results = requestMessages.filter((message) => message.role === "tool" && message.tool_call_id === "smoke-child-zoom");
     if (results.length === 0) {
       assert(requestMessages.some((message) => content(message).includes(CHILD_TASK)), "host child must receive its actual task");
+      assert(requestMessages.some((message) => content(message).includes("[optchat child evidence]")), "actual child request must receive its admitted per-task evidence pack");
       childFrozenView = snapshot;
       return sse(model, capture.sequence, undefined, undefined, [
         { index: 0, id: "smoke-child-zoom", type: "function", function: { name: "zoom", arguments: JSON.stringify({ id: targetRecord.i, n: 1 }) } },
@@ -158,7 +162,7 @@ function answer(body: ObjectValue): Response {
   const candidates = requestMessages.filter((message) => message.role === "user").map((message) => content(message).replace(/<chat>[\s\S]*?<\/chat>/g, "").trim());
   // Tool-returned images may be encoded in a new trailing user message. The original fixture
   // request remains the last user text with an exact known runtime marker.
-  const runtimePrompts = [AFTER_SIDE, WORK_READY, WORK_USER, IMAGE_USER, IMAGE_READ, CHILD_USER];
+  const runtimePrompts = [AFTER_SIDE, WORK_READY, WORK_USER, IMAGE_USER, IMAGE_READ, CHILD_USER, EVIDENCE_SEED, EVIDENCE_USER];
   const prompt = candidates.findLast((text) => runtimePrompts.includes(text)) ?? content(current).replace(/<chat>[\s\S]*?<\/chat>/g, "").trim();
   if (currentPhase.startsWith("inactive ")) {
     // The real host prepends its date/cwd reminder as a separate text part.
@@ -196,6 +200,26 @@ function answer(body: ObjectValue): Response {
   }
   assertToolNames(body);
   assert(requestMessages.some((message) => message.role === "system" && content(message).includes("# OptChat memory")), "plugin must append its memory protocol without replacing the host system prompt");
+  if (prompt === EVIDENCE_SEED) return sse(model, capture.sequence, "Decision retained.");
+  if (prompt === EVIDENCE_USER) {
+    const results = requestMessages.filter((message) => message.role === "tool" && String(message.tool_call_id).startsWith("smoke-evidence-"));
+    if (results.length === 0) return sse(model, capture.sequence, undefined, undefined, [
+      { index: 0, id: "smoke-evidence-decisions", type: "function", function: { name: "chat_decisions", arguments: JSON.stringify({ question: "staging", mode: "project-state" }) } },
+      { index: 1, id: "smoke-evidence-local", type: "function", function: { name: "chat_evidence", arguments: JSON.stringify({ question: "staging port" }) } },
+      { index: 2, id: "smoke-evidence-work", type: "function", function: { name: "chat_work", arguments: "{}" } },
+      { index: 3, id: "smoke-evidence-project", type: "function", function: { name: "chat_project_evidence", arguments: JSON.stringify({ mode: "search", question: "OPTCHAT_SMOKE_RAW_BEGIN", stores: ["archive"] }) } },
+    ]);
+    const byId = (id: string) => content(results.find((result) => result.tool_call_id === `smoke-evidence-${id}`)!);
+    assert(byId("decisions").includes('accepted "5432"'), "real host decision tool must resolve the captured staging instruction");
+    assert(byId("local").includes(EVIDENCE_SEED), "real host evidence tool must return the original instruction");
+    assert(byId("work").startsWith("[optchat work]"), "real host work discovery must execute its registered schema");
+    assert(byId("project").includes("OPTCHAT_SMOKE_RAW_BEGIN") && byId("project").includes("archive@"), "real host external evidence must return a store-scoped original passage");
+    if (!results.some((result) => result.tool_call_id === "smoke-evidence-explain")) return sse(model, capture.sequence, undefined, undefined, [
+      { index: 0, id: "smoke-evidence-explain", type: "function", function: { name: "chat_explain", arguments: "{}" } },
+    ]);
+    assert(byId("explain").includes("[optchat explain]") && byId("explain").includes("coverage"), "real host explanation must describe the executed query");
+    return sse(model, capture.sequence, EVIDENCE_DONE);
+  }
   if (prompt === FIRST_USER) {
     assertSnapshot(body, FIRST_USER, []);
     assert.equal(view(body).trim(), "", "fresh memory must have an empty snapshot");
@@ -503,7 +527,7 @@ async function runtimeCases(executable: string, baseArgs: string[], workspace: s
   await bounded("media restoration host shutdown", restored.stop());
 
   currentPhase = "real task child memory handoff";
-  const childArgs = baseArgs.filter((arg) => arg !== "--no-tools");
+  const childArgs = baseArgs.filter((arg) => arg !== "--no-tools" && arg !== "--no-optchat-child-pack");
   const parent = new Host(executable, [...childArgs, "--tools", "task", "--optchat-child-view", "--optchat-dir", memory], workspace, env);
   await parent.prompt(CHILD_USER);
   assert(childRetrieved, "actual task child must execute zoom over frozen parent memory");
@@ -512,7 +536,17 @@ async function runtimeCases(executable: string, baseArgs: string[], workspace: s
   assert(!finalRecords.some((record) => record.kind === "talk" && record.text === CHILD_REPORT), "child must not write its own talk record to the parent's store");
   assert(!finalRecords.some((record) => record.kind === "user" && record.text.includes(CHILD_TASK)), "child task must not become an independent parent user turn");
   await bounded("task parent shutdown", parent.stop());
-  return { sideTurnThenOrdinary: true, structuredAsyncReportBytes: Buffer.byteLength(workRecord.text), storedImages: IMAGE_DATA.length, mediaRestart: true, workRestart: true, actualTaskChild: true, childReadOnly: true, requests: captures.length - before };
+  currentPhase = "real evidence tools and explicit external snapshot";
+  const evidenceArgs = baseArgs.filter((arg) => arg !== "--no-optchat-decisions" && arg !== "--no-optchat-work-discovery");
+  const evidenceHost = new Host(executable, [...evidenceArgs, "--optchat-dir", join(workspace, "evidence-memory"), "--optchat-project-stores", JSON.stringify({ archive: memory })], workspace, env);
+  await evidenceHost.prompt(EVIDENCE_SEED);
+  await evidenceHost.prompt(EVIDENCE_USER);
+  for (const name of ["decisions", "local", "work", "project", "explain"]) {
+    const result = publicToolResult(evidenceHost, `smoke-evidence-${name}`);
+    assert(result.isError !== true, `real host ${name} tool must complete successfully`);
+  }
+  await bounded("evidence host shutdown", evidenceHost.stop());
+  return { sideTurnThenOrdinary: true, structuredAsyncReportBytes: Buffer.byteLength(workRecord.text), storedImages: IMAGE_DATA.length, mediaRestart: true, workRestart: true, actualTaskChild: true, childReadOnly: true, actualEvidenceTools: true, requests: captures.length - before };
 }
 
 /** Inspect the host's completed public tool result, not a fabricated provider usage response. */
@@ -593,6 +627,7 @@ async function main(): Promise<void> {
       // The loopback scripts every request: System One gates (on by default) would send judge calls to it.
       "--no-optchat-rules", "--no-optchat-prefetch", "--no-optchat-value-score",
       "--no-optchat-recall", "--no-optchat-extract",
+      "--no-optchat-decisions", "--no-optchat-work-discovery", "--no-optchat-child-pack",
     ];
     // No enable flag: the full active lifecycle below proves default activation.
     const args = [...baseArgs, "--optchat-dir", memory];

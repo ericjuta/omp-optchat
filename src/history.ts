@@ -35,7 +35,11 @@ function sameDescriptor(a: ImageDescriptor, b: ImageDescriptor): boolean {
 
 function admitMetadata(value: unknown, line: number): MessageMetadata {
   try {
-    return parseMetadata(value);
+    const metadata = parseMetadata(value);
+    // An imported assertion about a host outcome is historical evidence, not an observation by this host.
+    if (metadata.toolOutcome === 'success') return { ...metadata, toolOutcome: 'imported-success' };
+    if (metadata.toolOutcome === 'error') return { ...metadata, toolOutcome: 'imported-error' };
+    return metadata;
   } catch (error) {
     return invalid(line, error instanceof Error ? error.message : 'invalid metadata');
   }
@@ -130,6 +134,9 @@ function parseRecord(text: string, line: number): ImportRecord {
   }
   if (metadata?.resultFor !== undefined && kind !== 'echo' && kind !== 'work') {
     return invalid(line, 'resultFor is only allowed on echo or work records');
+  }
+  if (metadata?.toolOutcome !== undefined && kind !== 'echo') {
+    return invalid(line, 'toolOutcome is only allowed on echo records');
   }
   if (metadata?.coordination !== undefined && kind !== 'note') {
     return invalid(line, 'coordination is only allowed on note records');
