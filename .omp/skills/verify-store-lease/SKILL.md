@@ -112,6 +112,16 @@ A `FAIL` or `GONE` from TLC on a `current/*` check: replay the counterexample st
 
 ## Coverage record
 
+Current sync commit: `cc23d90482a2afa00df71da6e117c176c3fa8f06` (0.16.0 evidence continuation).
+
+**Verification boundary (2026-11-07).** `bun run verify:lease --strict` passed on this product commit: 32 ok, 0 open findings, 0 failed, 10.6 seconds. This includes the model, real-process guarantees and deliberate broken copies. Compared with the prior sync, `src/store.ts` adds only three lines requiring `toolOutcome` metadata to belong to an echo; all later store references below shift by three lines. Ledger, metrics, model and lease-harness sources are unchanged. No lease transition or invariant changed, so historical deep checks remain historical.
+
+Current integration mappings: `src/index.ts:1413-1421` revokes child/external readers on parent failure; `src/index.ts:1904-1934` closes external admission synchronously, drains logging/triage, then closes or archives the main store in its unchanged writer-lease order. `src/store.ts:1119-1125` resolves sidecars, `1136-1182` archives under the lease and `1188-1193` closes. Cross-store readers in `src/project-evidence.ts` never acquire a writer lease; their allowlist/dentry/revocation guarantees are tested separately and are not claims of this TLA+ model. The focused parent-failure, teardown and replay regressions and plugin lifecycle smoke passed separately.
+
+### Historical 0.14.0 mappings and evidence
+
+The following line ranges and coverage tables describe the historical sync, not the current index integration.
+
 Sync commit: `f03d2340d26b82733e90965f53e645592be931a2` (memory provenance, recorded result association, typed coordination and human rule withdrawal; lease transitions unchanged).
 
 **Verification boundary (2026-10-23).** Current source/test references below were mapped by targeted actual-source reads and read-only diffs from the previous sync commit `b37c5da5937ba22f44c476b635238c4036eb9203`. Static inspection found no changed lease acquisition/release, inode-check, or default sidecar-routing transition. The parent ran `bun run verify:lease --strict` on the product sources now committed as `f03d2340d26b82733e90965f53e645592be931a2`: 32 ok, 0 open findings, 0 failed in 16.7 seconds, including model invariants and real-process mutations. Historical deep and scratch-break results remain historical; no new deep run was needed because lease semantics did not change. Model comments and trace strings retain old citations; the current mapping tables below resolve that citation drift. This documentation synchronization is committed separately from the product change.
