@@ -592,7 +592,7 @@ async function main(): Promise<void> {
       "--optchat-model", "optchat-smoke/optchat-smoke-compact",
       // The loopback scripts every request: System One gates (on by default) would send judge calls to it.
       "--no-optchat-rules", "--no-optchat-prefetch", "--no-optchat-value-score",
-      "--no-optchat-recall",
+      "--no-optchat-recall", "--no-optchat-extract",
     ];
     // No enable flag: the full active lifecycle below proves default activation.
     const args = [...baseArgs, "--optchat-dir", memory];

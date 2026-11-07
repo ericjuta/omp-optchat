@@ -1015,6 +1015,7 @@ function defaultFlags(memory: string): Record<string, string | boolean> {
     "no-optchat-prefetch": true,
     "no-optchat-value-score": true,
     "no-optchat-recall": true,
+    "no-optchat-extract": true,
   };
 }
 

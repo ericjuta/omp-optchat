@@ -70,8 +70,13 @@ import { LEDGER_FILE, RuleLedger, renderRules, type Rule } from "./system1/ledge
 import { prefetchBlock, PREFETCH_MS } from "./system1/prefetch.js";
 import { recall, registerRecallTool, renderRecall } from "./system1/recall.js";
 import { gatherEvidence, registerEvidenceTool, renderEvidence, type EvidenceMemory } from "./system1/evidence.js";
+import { extractionState, openRouterExtractor, renderExtraction, type Extractor } from "./system1/extract.js";
 import { decideTriage, ruleSentences, triageProbabilities, triageQuestions, triageState, triageTargets } from "./system1/rules.js";
 import { valueHint } from "./system1/value.js";
+
+/** The `openrouter` key as the host resolves it at call time; the plugin reads no environment variable itself. */
+const hostExtractor = (ctx: ExtensionContext | undefined): Extractor =>
+	openRouterExtractor(async () => ctx?.modelRegistry.getApiKeyForProvider("openrouter", ctx.sessionManager.getSessionId()));
 
 type AgentMessage = ContextEvent["messages"][number];
 
@@ -161,6 +166,8 @@ export interface OptChatOptions {
 	 * Undefined means no judge: the gate does not run, and a tool call is blocked (fail closed).
 	 */
 	judge?: JudgeFactory;
+	/** The `chat_evidence` extractor while `--optchat-extract` is on. Default: OpenRouter Clairic keyed from the host's `openrouter` credential. */
+	extractor?: (ctx: ExtensionContext | undefined) => Extractor;
 }
 
 /**
@@ -704,6 +711,7 @@ class OptChat {
 		private readonly metricsFile: (store: Store) => string,
 		private readonly policy: CompressorPolicy = {},
 		private readonly judges: JudgeFactory = hostJudge,
+		private readonly extractorFor: (ctx: ExtensionContext | undefined) => Extractor = hostExtractor,
 	) {}
 
 	/** Inactive sessions pass every host hook through unchanged: no view, no capture, no compaction answer. */
@@ -821,18 +829,24 @@ class OptChat {
 		if (this.pi.getAllTools().some((tool) => tool.name === "chat_evidence")) {
 			throw new Error('tool name "chat_evidence" is already registered');
 		}
-		registerEvidenceTool(this.pi, (question, _current, signal) => {
+		registerEvidenceTool(this.pi, (question, current, signal) => {
 			const memory = this.openMemory();
 			const live = (): Memory => {
 				if (this.state.kind !== "ready" || this.memory !== memory) throw new Error("OptChat memory is not open");
 				return memory;
 			};
-			return this.evidenceText(live, question, memory.status().messages, signal);
+			return this.evidenceText(live, question, memory.status().messages, signal, current);
 		});
 	}
 
 	/** `chat_evidence` over messages below `upperBound`; every read first proves, through `live`, that the chat is still open. */
-	private async evidenceText(live: () => Memory, question: string, upperBound: number, signal: AbortSignal | undefined): Promise<string> {
+	private async evidenceText(
+		live: () => Memory,
+		question: string,
+		upperBound: number,
+		signal: AbortSignal | undefined,
+		current?: ExtensionContext,
+	): Promise<string> {
 		const reader: EvidenceMemory = {
 			rank: (text, limit, before) => live().rankMessages(text, { limit, before, idf: "smoothed" }),
 			page: (id, offset, maxBytes) => {
@@ -840,7 +854,16 @@ class OptChat {
 				return this.openStore().readMessagePage(id, offset, maxBytes);
 			},
 		};
-		return renderEvidence(question, await gatherEvidence(reader, question, { upperBound, signal }));
+		const result = await gatherEvidence(reader, question, { upperBound, signal });
+		const text = renderEvidence(question, result);
+		const config = this.config!;
+		if (!config.extract || result.passages.length === 0) return text;
+		// The deterministic passages always stand; the extractor only adds a line after the trailer.
+		const { state, placed } = extractionState(result.passages);
+		const extraction = await this.extractorFor(current ?? this.ctx)(state, question, signal ?? new AbortController().signal);
+		// No key: the extractor is simply absent, not a line on every call.
+		if (extraction.kind === "off") return text;
+		return `${text}\n${renderExtraction(state, placed, extraction, config.extractNull)}`;
 	}
 
 	private async recallFor(question: string, current: ExtensionContext | undefined, signal: AbortSignal | undefined): Promise<string> {
@@ -2299,7 +2322,7 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 				// Invalid activation must enter the same fail-closed startup as any other
 				// malformed config: open() reports it and installed context hooks refuse prompts.
 			}
-			const active = new OptChat(pi, settleTimeoutMs, observe, metricsFile, policy, judges);
+			const active = new OptChat(pi, settleTimeoutMs, observe, metricsFile, policy, judges, options.extractor ?? hostExtractor);
 			chat = active;
 			// Registered for every opted-in main session. An inactive one (startup lease conflict) passes through.
 			pi.on("before_agent_start", (event) => (active.passive ? undefined : active.beforeAgentStart(event.systemPrompt)));

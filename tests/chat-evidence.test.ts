@@ -343,6 +343,59 @@ describe("chat_evidence through OptChat", () => {
     const parent = await host.callTool("chat_evidence", { question: "orchid greenhouse code" });
     expect(parent).toContain("orchid greenhouse code is 4417");
   });
+
+  test("the extractor adds its located span after the trailer by default; --no-optchat-extract never calls it", async () => {
+    const states: string[] = [];
+    const extractor = () => async (state: string) => {
+      states.push(state);
+      const at = state.indexOf("Lisbon");
+      const start = [...state.slice(0, at)].length;
+      return { kind: "answer", value: "Lisbon", guess: "Lisbon", pNull: 0.02, span: [start, start + 6], stateText: state, truncated: false, cost: null, provider: "Cloudflare" } as const;
+    };
+    const { "no-optchat-extract": _optOut, ...gatesOff } = ALL_GATES_OFF;
+    for (const extract of [false, true]) {
+      const compressor = await startCompressorServer();
+      cleanups.push(() => compressor.stop());
+      const host: FakeHost = await openFakeHost(createOptChat({ judge: () => fakeJudge(() => ({})), extractor }), {
+        flags: extract ? gatesOff : { ...gatesOff, "optchat-extract": true, "no-optchat-extract": true },
+        model: compressor.model,
+        mainModel: anthropicModel(),
+        apiKey: "fixture-key",
+      });
+      cleanups.push(() => host.close());
+      let transcript: HostMessage[] = [];
+      for (const text of ["morning coffee for two", "weather in Lisbon"]) transcript = await talk(host, transcript, text);
+      const answer = await host.callTool("chat_evidence", { question: "lisbon weather" });
+      expect(answer).toContain("[search complete]");
+      if (!extract) {
+        expect(states).toHaveLength(0);
+        expect(answer).toEndWith("[search complete]");
+        continue;
+      }
+      expect(states).toEqual(["[message 2, user]\nweather in Lisbon"]);
+      expect(answer).toEndWith('[search complete]\n[extraction cloudflare/clairic: "Lisbon" at message 2 bytes 11-17; zoom(2, 1, 11) reopens it (p_null 0.020, cost unknown)]');
+    }
+  });
+
+  test("with no openrouter key the extractor adds nothing, and malformed extract flags fail closed", async () => {
+    const { "no-optchat-extract": _optOut, ...gatesOff } = ALL_GATES_OFF;
+    const compressor = await startCompressorServer();
+    cleanups.push(() => compressor.stop());
+    const host: FakeHost = await openFakeHost(
+      createOptChat({ judge: () => fakeJudge(() => ({})), extractor: () => async () => ({ kind: "off", reason: "no openrouter key in the OMP credential store" }) }),
+      { flags: gatesOff, model: compressor.model, mainModel: anthropicModel(), apiKey: "fixture-key" },
+    );
+    cleanups.push(() => host.close());
+    let transcript: HostMessage[] = [];
+    for (const text of ["morning coffee for two", "weather in Lisbon"]) transcript = await talk(host, transcript, text);
+    expect(await host.callTool("chat_evidence", { question: "lisbon weather" })).toEndWith("[search complete]");
+    const read = (values: Record<string, string | boolean>) =>
+      readConfig({ getFlag: (name: string) => values[name] } as Pick<ExtensionAPI, "getFlag">, "/srv/agent/optchat");
+    expect(read({}).extract).toBe(true);
+    expect(read({ "optchat-extract": true, "no-optchat-extract": true }).extract).toBe(false);
+    expect(() => read({ "optchat-extract-null": "0" })).toThrow(/--optchat-extract-null/);
+    expect(() => read({ "optchat-extract": "yes" })).toThrow(/--optchat-extract(?![-\w])/);
+  });
 });
 
 describe("child bridge", () => {

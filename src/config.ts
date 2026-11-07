@@ -13,6 +13,8 @@ export const DEFAULTS = Object.freeze({
   toolCap: 30_000,
   childView: true,
   evidence: true,
+  extract: true,
+  extractNull: 0.5,
   rules: true,
   prefetch: true,
   valueScore: true,
@@ -37,6 +39,10 @@ export interface OptChatConfig {
   childView: boolean;
   /** Whether `chat_evidence` is registered, in the chat and in its child views. It never resolves a judge. */
   evidence: boolean;
+  /** Whether `chat_evidence` also asks OpenRouter's Clairic extractor for the answer's span in its passages. Without an `openrouter` key it adds nothing. */
+  extract: boolean;
+  /** An extracted answer is shown only below this null probability, in (0, 1]. */
+  extractNull: number;
   gates: GateConfig;
 }
 
@@ -130,6 +136,21 @@ export function registerFlags(api: FlagRegistrar): void {
     default: false,
     description: "Register no chat_evidence tool, even when --optchat-evidence is present",
   });
+  api.registerFlag("optchat-extract", {
+    type: "boolean",
+    default: DEFAULTS.extract,
+    description: "chat_evidence also asks OpenRouter's cloudflare/clairic extractor for the answer's exact span in its passages, keyed from the OMP openrouter credential; without one it does nothing (default: on; --no-optchat-extract takes precedence)",
+  });
+  api.registerFlag("no-optchat-extract", {
+    type: "boolean",
+    default: false,
+    description: "Never call the extractor, even when --optchat-extract is present",
+  });
+  api.registerFlag("optchat-extract-null", {
+    type: "string",
+    default: String(DEFAULTS.extractNull),
+    description: "Show an extracted answer only when its null probability is below this, in (0, 1] (default: 0.5)",
+  });
   for (const gate of GATE_FLAGS) {
     api.registerFlag(gate.flag, {
       type: "boolean",
@@ -185,7 +206,7 @@ const GATE_FLAGS = [
 /** One gate, System One or not: its opt-out wins over its flag; a malformed value of either fails closed. */
 function gate(
   api: FlagReader,
-  flag: (typeof GATE_FLAGS)[number]["flag"] | "optchat-child-view" | "optchat-evidence",
+  flag: (typeof GATE_FLAGS)[number]["flag"] | "optchat-child-view" | "optchat-evidence" | "optchat-extract",
   fallback: boolean,
 ): boolean {
   if (boolean(api.getFlag(`no-${flag}`), `no-${flag}`, false)) return false;
@@ -286,6 +307,8 @@ export function readConfig(api: FlagReader, defaultDirectory: string): OptChatCo
     toolCap: integer(api, "optchat-tool-cap", DEFAULTS.toolCap, 128),
     childView: gate(api, "optchat-child-view", DEFAULTS.childView),
     evidence: gate(api, "optchat-evidence", DEFAULTS.evidence),
+    extract: gate(api, "optchat-extract", DEFAULTS.extract),
+    extractNull: probability(api, "optchat-extract-null", DEFAULTS.extractNull),
     gates: gates(api),
   };
 }

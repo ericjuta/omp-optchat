@@ -34,7 +34,7 @@ const DEFAULT_ARGS = [
 	"--optchat-model", "openrouter/compressor-model",
 	"--optchat-dir", "/memory",
 	"--optchat-view-bytes", "4096",
-	"--no-optchat-rules", "--no-optchat-prefetch", "--no-optchat-value-score", "--no-optchat-recall",
+	"--no-optchat-rules", "--no-optchat-prefetch", "--no-optchat-value-score", "--no-optchat-recall", "--no-optchat-extract",
 ];
 
 describe("host launch contract", () => {
