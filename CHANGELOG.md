@@ -1,8 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.16.1 — 2026-11-07
 
-- Added a separate real-chat evaluation runner with frozen source and label hashes, exact UTF-8 citation checks, private output packets, and independent review instructions. It preserves production recall concurrency and evidence rendering. It does not change the installed plugin or Clairic defaults.
+- Clairic extraction is now opt-in with `--optchat-extract`; `--no-optchat-extract` still wins. Deterministic evidence and recall remain enabled. The provider is not opened by default.
+- Frozen real-chat comparison: 40 questions, three arms, two repetitions, 240 completed outputs, and 1,352 valid citations. On 30 held-out cases, Clairic was preferred once versus four times for deterministic evidence, with 25 ties (exact sign-test p = 0.375). It added misleading candidates on nine cases versus zero without extraction, with no support-coverage gain. This fails the preregistered default-on rule; it is not a general accuracy estimate. See `evals/evidence/real40-v2-report.md`.
+- Actual billing remains unknown for all 570 paid operations. The $32.25 retained best-effort allocation is not spend. Recall served Clef, not Jev; its approximately $1.095 winner-only cost diagnostic is not an invoice.
+
+- Added a separate real-chat evaluation runner with frozen source and label hashes, exact UTF-8 citation checks, private output packets, and independent review instructions. It preserves production recall concurrency and evidence rendering. The evaluated source is preserved at commit `49c7233`, before the opt-in change.
 - Paid evaluation requires exact-manifest approval. After the original hard-cap preflight stopped, the user approved a $50 best-effort policy with fixed request counts and retained per-call allowances. These controls do not guarantee provider billing. Host winner-only cost metadata is not complete billing; unknown costs stay unknown.
 
 ## 0.16.0 — 2026-11-07

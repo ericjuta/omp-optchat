@@ -113,6 +113,8 @@ You can see it working by running the new evidence eval (Milestone 4) and by cal
   Rationale: review established that Darwin F_GETPATH can reconstruct a hardlink pathname rather than bind the opening dentry; it cannot establish the same origin invariant on all admitted filesystems. The Linux implementation retains descriptor-relative ancestry and opened-dentry checks. This does not change existing local-store macOS lease support.
   Date/Author: 2026-11-07, agent.
 
+- Decision (2026-11-07, real-chat follow-through): the frozen 40-question comparison supersedes the synthetic default-on decision. Clairic becomes opt-in from 0.16.1; deterministic evidence and recall stay on. The 30 held-out cases yielded 1 extraction preference, 4 deterministic preferences and 25 ties (p = 0.375), with 9 misleading extraction cases versus 0 and no support gain. All 240 outputs completed and all 1,352 citations reopened. Actual billing remains unknown. Full proof and limitations: `evals/evidence/real40-v2-report.md`.
+
 ## Outcomes & Retrospective
 
 - (2026-11-07 continuation) The synthetic plugin-lifecycle smoke passed with 30 tool calls and zero provider attempts: decisions and corrections, exact citations, report identity, host outcome versus project success, explicit external stores, child packs, reset and shutdown. Initial external admission failed on a search-only ancestor directory; descriptor traversal was repaired rather than broadening permissions. Two smoke assertions were incidental error-wording pins and were removed while retaining rejection checks.

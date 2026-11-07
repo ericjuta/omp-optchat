@@ -296,20 +296,30 @@ describe("chat_evidence through OptChat", () => {
     expect(parent).toContain("orchid greenhouse code is 4417");
   });
 
-  test("the extractor adds its located span after the trailer by default; --no-optchat-extract never calls it", async () => {
+  test("only explicit extraction opt-in opens the provider; opt-out wins", async () => {
     const states: string[] = [];
-    const extractor = () => async (state: string) => {
-      states.push(state);
-      const at = state.indexOf("Lisbon");
-      const start = [...state.slice(0, at)].length;
-      return { kind: "answer", value: "Lisbon", guess: "Lisbon", pNull: 0.02, span: [start, start + 6], stateText: state, truncated: false, cost: null, provider: "Cloudflare" } as const;
+    let opened = 0;
+    const extractor = () => {
+      opened++;
+      return async (state: string) => {
+        states.push(state);
+        const at = state.indexOf("Lisbon");
+        const start = [...state.slice(0, at)].length;
+        return { kind: "answer", value: "Lisbon", guess: "Lisbon", pNull: 0.02, span: [start, start + 6], stateText: state, truncated: false, cost: null, provider: "Cloudflare" } as const;
+      };
     };
     const { "no-optchat-extract": _optOut, ...gatesOff } = ALL_GATES_OFF;
-    for (const extract of [false, true]) {
+    for (const { extract, flags } of [
+      { extract: false, flags: gatesOff },
+      { extract: true, flags: { ...gatesOff, "optchat-extract": true } },
+      { extract: false, flags: { ...gatesOff, "optchat-extract": true, "no-optchat-extract": true } },
+    ]) {
+      states.length = 0;
+      opened = 0;
       const compressor = await startCompressorServer();
       cleanups.push(() => compressor.stop());
       const host: FakeHost = await openFakeHost(createOptChat({ judge: () => fakeJudge(() => ({})), extractor }), {
-        flags: extract ? gatesOff : { ...gatesOff, "optchat-extract": true, "no-optchat-extract": true },
+        flags,
         model: compressor.model,
         mainModel: anthropicModel(),
         apiKey: "fixture-key",
@@ -319,10 +329,13 @@ describe("chat_evidence through OptChat", () => {
       for (const text of ["morning coffee for two", "weather in Lisbon"]) transcript = await talk(host, transcript, text);
       const answer = await host.callTool("chat_evidence", { question: "lisbon weather" });
       if (!extract) {
+        expect(opened).toBe(0);
         expect(states).toHaveLength(0);
         expect(answer).not.toContain("[extraction");
         continue;
       }
+      expect(opened).toBe(1);
+      expect(states).toHaveLength(1);
       expect(answer).toContain('"Lisbon" at message 2 bytes 11-17; zoom(2, 1, 11)');
       expect(answer).toContain("not a verified answer");
       expect(answer).toContain("cost unknown");
@@ -335,7 +348,7 @@ describe("chat_evidence through OptChat", () => {
     cleanups.push(() => compressor.stop());
     const host: FakeHost = await openFakeHost(
       createOptChat({ judge: () => fakeJudge(() => ({})), extractor: () => async () => ({ kind: "off", reason: "no openrouter key resolved" }) }),
-      { flags: gatesOff, model: compressor.model, mainModel: anthropicModel(), apiKey: "fixture-key" },
+      { flags: { ...gatesOff, "optchat-extract": true }, model: compressor.model, mainModel: anthropicModel(), apiKey: "fixture-key" },
     );
     cleanups.push(() => host.close());
     let transcript: HostMessage[] = [];
@@ -343,7 +356,6 @@ describe("chat_evidence through OptChat", () => {
     expect(await host.callTool("chat_evidence", { question: "lisbon weather" })).not.toContain("[extraction");
     const read = (values: Record<string, string | boolean>) =>
       readConfig({ getFlag: (name: string) => values[name] } as Pick<ExtensionAPI, "getFlag">, "/srv/agent/optchat");
-    expect(read({}).extract).toBe(true);
     expect(read({ "optchat-extract": true, "no-optchat-extract": true }).extract).toBe(false);
     expect(() => read({ "optchat-extract-null": "0" })).toThrow(/--optchat-extract-null/);
     expect(() => read({ "optchat-extract": "yes" })).toThrow(/--optchat-extract(?![-\w])/);

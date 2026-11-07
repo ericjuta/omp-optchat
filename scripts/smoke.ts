@@ -537,7 +537,8 @@ async function runtimeCases(executable: string, baseArgs: string[], workspace: s
   assert(!finalRecords.some((record) => record.kind === "user" && record.text.includes(CHILD_TASK)), "child task must not become an independent parent user turn");
   await bounded("task parent shutdown", parent.stop());
   currentPhase = "real evidence tools and explicit external snapshot";
-  const evidenceArgs = baseArgs.filter((arg) => arg !== "--no-optchat-decisions" && arg !== "--no-optchat-work-discovery");
+  // This host deliberately omits both extraction flags to exercise the shipped default.
+  const evidenceArgs = baseArgs.filter((arg) => arg !== "--no-optchat-decisions" && arg !== "--no-optchat-work-discovery" && arg !== "--no-optchat-extract");
   const evidenceHost = new Host(executable, [...evidenceArgs, "--optchat-dir", join(workspace, "evidence-memory"), "--optchat-project-stores", JSON.stringify({ archive: memory })], workspace, env);
   await evidenceHost.prompt(EVIDENCE_SEED);
   await evidenceHost.prompt(EVIDENCE_USER);
@@ -545,6 +546,9 @@ async function runtimeCases(executable: string, baseArgs: string[], workspace: s
     const result = publicToolResult(evidenceHost, `smoke-evidence-${name}`);
     assert(result.isError !== true, `real host ${name} tool must complete successfully`);
   }
+  const localEvidence = content(publicToolResult(evidenceHost, "smoke-evidence-local"));
+  assert(localEvidence.includes("5432"), "default evidence must still return the original fact");
+  assert(!localEvidence.includes("[extraction"), "default evidence must not add external extraction");
   await bounded("evidence host shutdown", evidenceHost.stop());
   return { sideTurnThenOrdinary: true, structuredAsyncReportBytes: Buffer.byteLength(workRecord.text), storedImages: IMAGE_DATA.length, mediaRestart: true, workRestart: true, actualTaskChild: true, childReadOnly: true, actualEvidenceTools: true, requests: captures.length - before };
 }
