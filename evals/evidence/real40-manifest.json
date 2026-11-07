@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "protocol": "real40-v1",
+  "manifestSha256": "6ac49c78aa958cb4d18489da49fd68dccd67b3ab6277e9b89d446ef58f0d3c50",
+  "implementationSha256": "4065a4eb9403642dde70b65273660852720e1f5c5fa803b66ec593af2b6b049d",
+  "sourcesSha256": "92e864b3fbcd4b87be910128da2cba6ebc9155d7349d2d4f1c41d02b1df261ee",
+  "casesSha256": "da3a66616b503fa4079813c1a153eb918cc5e9c3e6f235afe3a5e66f87ab89dd",
+  "reviewsSha256": "f11556ef65d7182f459867065aae3a879312d89d65f7a01316587143ec089f4e",
+  "cases": 40,
+  "answerable": 32,
+  "missing": 8,
+  "calibration": 10,
+  "heldout": 30,
+  "repetitions": 2,
+  "categories": [
+    "decisions",
+    "corrections",
+    "reports",
+    "exact facts",
+    "missing answers"
+  ],
+  "capUsd": 5,
+  "liveApproval": "required exact manifest SHA",
+  "budgetEnforcement": "missing; live execution blocked",
+  "productionChange": false
+}

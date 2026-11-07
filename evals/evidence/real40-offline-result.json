@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "manifestSha256": "6ac49c78aa958cb4d18489da49fd68dccd67b3ab6277e9b89d446ef58f0d3c50",
+  "mode": "B",
+  "rows": 80,
+  "operationalFailures": 0,
+  "citationsReopened": 640,
+  "providerOperations": 0,
+  "reportedEvaluationSpendUsd": 0,
+  "sourceReviewHostOverhead": "unknown; not included",
+  "latency": {
+    "calibration": {
+      "rows": 20,
+      "medianMs": 30.616942999999537,
+      "p90Ms": 51.74622199999976
+    },
+    "heldout": {
+      "rows": 60,
+      "medianMs": 30.81236800000022,
+      "p90Ms": 54.17793900000015
+    }
+  },
+  "qualityGrades": "not performed; no support/accuracy claim",
+  "decision": "A/C and independent comparison blocked; production defaults unchanged"
+}

@@ -1,0 +1,10 @@
+{
+  "protocol": "real40-v2",
+  "manifestSha256": "27182b85839d8c4f8314855b81a1c4335c50fdc9253c08b032e8ce01987bc523",
+  "rows": 80,
+  "citationsReopened": 640,
+  "operationalFailures": 0,
+  "providerCalls": 0,
+  "qualityGraded": false,
+  "limitation": "Offline integrity proof, not answer-quality or paid-arm evidence"
+}

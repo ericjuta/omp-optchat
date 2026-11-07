@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Added a separate real-chat evaluation runner with frozen source and label hashes, exact UTF-8 citation checks, private output packets, and independent review instructions. It preserves production recall concurrency and evidence rendering. It does not change the installed plugin or Clairic defaults.
+- Paid evaluation requires exact-manifest approval. After the original hard-cap preflight stopped, the user approved a $50 best-effort policy with fixed request counts and retained per-call allowances. These controls do not guarantee provider billing. Host winner-only cost metadata is not complete billing; unknown costs stay unknown.
+
 ## 0.16.0 — 2026-11-07
 
 - Release verification: CI passed for the pinned/latest SDK and Linux/macOS leases. The 2,599 unit tests and 56 host tests passed. Remote-tag installation and installed-plugin smoke passed using real OMP with a synthetic model. Restart existing OMP sessions to load this version.
