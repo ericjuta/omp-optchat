@@ -14,12 +14,13 @@ You can see it working by running the new evidence eval (Milestone 4) and by cal
 
 - [x] (2026-11-06) Saved the source review to `docs/references/chatgpt-repository-feature-review.md` and fact-checked it in `docs/research/clairic-evidence-layer.md`.
 - [x] (2026-11-06) Charted the Wayfinder map: GitHub issue #18, with tickets #19 (host extraction role, research), #20 (`chat_evidence` contract, grilling), #21 (atomic rules, grilling) and #22 (eval pre-registration, task; blocked by #19 and #20).
-- [ ] Milestone 0: housekeeping. Fix the stale README install pin and the stale "pending" host-regression wording.
+- [x] (2026-11-06) Milestone 0: housekeeping. README install pin now `#v0.14.0`; CHANGELOG 0.14.0 proof boundary and `plans/optchat-jev.md` (decision line 93 annotated, new revision note) record the six host regressions as repaired source-only (461/0, two-process smoke passed).
 - [x] (2026-11-06) #20 resolved by Eric: `chat_evidence` is a new tool beside `chat_recall`, at most 8 passages of at most 2,048 bytes, 16,384 bytes in total, a 10 s limit, and a trailer on every result.
 - [x] (2026-11-06) #21 resolved by Eric: split rules per whole sentence now, under a pre-registered rules eval; withdraw and replace targets are the newest 16 rules plus the 16 most relevant.
 - [x] (2026-11-06) #19 amended by Eric: the host `extract` role reaches Clairic through OpenRouter first, with Workers AI as an optional second runner.
-- [ ] Milestone 1: atomic standing rules.
-- [ ] Milestone 2: deterministic `chat_evidence`.
+- [x] (2026-11-07) Milestone 1 code: atomic standing rules. `decideTriage` returns one change per kept sentence; targets are newest 16 plus 16 most relevant (`offeredRules`). Fail-before test `tests/atomic-rules.test.ts` 0/1 on old code, focused rule suites 130/0 after. Zero-cost preflight: candidate oracle 51/51, baseline (c3efa48) 49/51 (misses the two old-rule replacements).
+- [ ] Milestone 1 eval: pre-registered `evals/rules/prereg/atomic-20261106.json`, manifest SHA-256 `d36cb3c1fd3d75a01bae478c2ab1cd6d1607fdac6c52b7de93d6cb30112c11c5`, 51 synthetic cases, $0.50 cap. Awaiting Eric's SHA approval; no paid call made. Ship of rule splitting waits on this.
+- [x] (2026-11-07) Milestone 2: deterministic `chat_evidence` (`src/system1/evidence.ts`, `tests/chat-evidence.test.ts` 14/0). Live-session acceptance still unrun.
 - [x] (2026-11-06) #19 resolved: no host up to v18.17.0 has extraction. The design is in `docs/research/host-extraction-role.md`.
 - [ ] Milestone 3: upstream host `extract` role (built on v18.17.0) and the plugin's fake-backed extractor path.
 - [ ] Milestone 4: evidence eval and the pre-registered three-arm run (Eric set a $5 cap; the manifest SHA still needs his approval before any paid call).
@@ -37,6 +38,13 @@ You can see it working by running the new evidence eval (Milestone 4) and by cal
   Evidence: https://openrouter.ai/docs/guides/community/extractions and https://openrouter.ai/cloudflare/clairic, read 2026-11-06. Not yet confirmed by a live call.
 
 ## Decision Log
+
+- Decision: `chat_evidence` is not a System One gate. It never resolves a judge, so with all four gates opted out it stays registered and OptChat still resolves no judge; only `--no-optchat-evidence` removes it.
+  Rationale: the "every gate opted out" rule exists to keep Jev out of memory-only runs; a deterministic tool does not touch Jev.
+  Date/Author: 2026-11-07, agent.
+- Decision: per-sentence rules keep the whole-message `rule` and `withdraw` questions as gates; a withdrawing message adds nothing, and each sentence removes or replaces only its own target, each rule at most once per message.
+  Rationale: preserves "withdrawal beats addition" and keeps single-sentence requests byte-identical to v0.14.0.
+  Date/Author: 2026-11-07, agent.
 
 - Decision: Clairic is reached only through a host-owned extraction role, never through an HTTP client or API key inside the plugin.
   Rationale: the AGENTS.md OMP rules (Jev only through the host `judge` role; no provider client, SDK or key variable in the plugin) apply equally to a new model.
@@ -134,4 +142,5 @@ In `src/system1/extract.ts`, the `Extractor` interface mirrors whatever host typ
 
 Revision note (2026-11-06): first version, written from the ChatGPT review and its fact check.
 Revision note (2026-11-06): folded #19. The host role goes upstream (not source-only), spans are UTF-16 mapped to bytes, and the offset unit is still to be confirmed live.
+Revision note (2026-11-07): Milestone 0 done; Milestone 1 code and pre-registration done (eval awaits SHA approval); Milestone 2 done. `chat_evidence` widens the interface (adapter instead of `Memory`, `totalBytes`, `terms`, `complete`, `unsearched`) and is also offered to child views.
 Revision note (2026-11-06): folded Eric's answers to #20, #21, #22 and a #19 amendment. `chat_evidence` is a new tool (8 × 2,048 bytes, 16,384 total, 10 s, always a trailer). Rules split per sentence now under a pre-registered eval, with targets the newest 16 plus the 16 most relevant. OpenRouter is the first extraction runner and its documented spans are code points, which replaces the UTF-16 plan. The eval cap is $5.
