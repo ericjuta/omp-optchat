@@ -115,6 +115,8 @@ You can see it working by running the new evidence eval (Milestone 4) and by cal
 
 - Decision (2026-11-07, real-chat follow-through): the frozen 40-question comparison supersedes the synthetic default-on decision. Clairic becomes opt-in from 0.16.1; deterministic evidence and recall stay on. The 30 held-out cases yielded 1 extraction preference, 4 deterministic preferences and 25 ties (p = 0.375), with 9 misleading extraction cases versus 0 and no support gain. All 240 outputs completed and all 1,352 citations reopened. Actual billing remains unknown. Full proof and limitations: `evals/evidence/real40-v2-report.md`.
 
+- Decision (2026-11-07, Eric): restore default-on Clairic extraction despite the real-chat gate failure. Explicit user policy supersedes the 0.16.1 default-off decision, not the evaluation results. Keep the opt-out, no-key fallback and unverified-candidate warnings.
+
 ## Outcomes & Retrospective
 
 - (2026-11-07 continuation) The synthetic plugin-lifecycle smoke passed with 30 tool calls and zero provider attempts: decisions and corrections, exact citations, report identity, host outcome versus project success, explicit external stores, child packs, reset and shutdown. Initial external admission failed on a search-only ancestor directory; descriptor traversal was repaired rather than broadening permissions. Two smoke assertions were incidental error-wording pins and were removed while retaining rejection checks.

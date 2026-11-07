@@ -32,10 +32,10 @@ When history still fits the model's context, OptChat costs more than plain OMP f
 - OMP **18.10.3 or newer**, Bun, and Linux. CI checks every push and runs a weekly check against the latest published OMP SDK.
 - An authenticated model for the main chat and an authenticated compressor model. Compression uses OMP's `@smol` role by default. Choose a competent, inexpensive model explicitly if that role is unsuitable.
 
-Install the current release, **0.16.1**:
+Install the current release, **0.16.2**:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.16.1'
+omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.16.2'
 PI_OPENAI_STATEFUL=0 omp
 ```
 
@@ -136,13 +136,13 @@ The trailer distinguishes indexed coverage, searched chunks, omitted ranges, mis
 
 #### Optional extraction
 
-Extraction is **off by default**. With `--optchat-extract` and an OMP-resolved `openrouter` key, the extractor sends selected passages to OpenRouter/Cloudflare Clairic. OMP can resolve the key from its credential store or its accepted environment fallback. The result is an **unverified candidate occurrence, not a verified answer**.
+Extraction is **on by default**, at Eric's explicit request after reviewing the evaluation. With an OMP-resolved `openrouter` key, the extractor sends selected passages to OpenRouter/Cloudflare Clairic. OMP can resolve the key from its credential store or its accepted environment fallback. The result is an **unverified candidate occurrence, not a verified answer**.
 
 Code checks the null threshold, exact value/span equality, unchanged source echo, Unicode offsets, and exact identifiers in the question. It withholds truncated or invalid results. These checks do not prove truth, relevance, current authority, or agreement between passages.
 
 Extraction has a separate 10-second bound and a 262,144-byte streamed response cap. Missing keys add nothing. Failures preserve the local evidence. Cost without a credible positive report is unknown. `--no-optchat-extract` prevents this transmission, even beside the opt-in flag.
 
-The [frozen real-chat comparison](evals/evidence/real40-v2-report.md) did not establish an extraction benefit and found more misleading candidates. This supersedes the earlier synthetic default-on decision. Deterministic evidence and recall remain enabled. These selected historical cases do not establish general model accuracy.
+The [frozen real-chat comparison](evals/evidence/real40-v2-report.md) did not establish an extraction benefit and found more misleading candidates. Eric chose to retain default-on extraction despite these findings; this is a user policy decision, not an evaluation win. Deterministic evidence and recall remain enabled. These selected historical cases do not establish general model accuracy.
 
 `chat_explain()` or `/optchat explain` shows the last query's snapshot, index usage, coverage, selected matches, and omissions. It does not repeat the original passages. `/optchat index` shows the same current index/query accounting. This state stays in memory and resets with the chat.
 
@@ -326,7 +326,7 @@ If the `judge` role has no candidate at all but the session has a model, OMP ret
 ```sh
 omp --no-optchat-prefetch --no-optchat-value-score
 omp --no-optchat-recall                          # no chat_recall tool; chat_search and zoom stay
-omp --no-optchat-rules --no-optchat-prefetch --no-optchat-value-score --no-optchat-recall   # judge gates off; extraction stays opt-in
+omp --no-optchat-rules --no-optchat-prefetch --no-optchat-value-score --no-optchat-recall   # judge gates off; extraction remains on
 omp --no-optchat-evidence                        # no chat_evidence tool; it never used a judge
 omp --optchat-extract                            # explicitly enable external Clairic extraction
 omp --no-optchat-extract                         # chat_evidence never calls the Clairic extractor

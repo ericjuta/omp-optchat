@@ -548,7 +548,7 @@ async function runtimeCases(executable: string, baseArgs: string[], workspace: s
   }
   const localEvidence = content(publicToolResult(evidenceHost, "smoke-evidence-local"));
   assert(localEvidence.includes("5432"), "default evidence must still return the original fact");
-  assert(!localEvidence.includes("[extraction"), "default evidence must not add external extraction");
+  assert(!localEvidence.includes("[extraction"), "without an OpenRouter key evidence must remain local");
   await bounded("evidence host shutdown", evidenceHost.stop());
   return { sideTurnThenOrdinary: true, structuredAsyncReportBytes: Buffer.byteLength(workRecord.text), storedImages: IMAGE_DATA.length, mediaRestart: true, workRestart: true, actualTaskChild: true, childReadOnly: true, actualEvidenceTools: true, requests: captures.length - before };
 }

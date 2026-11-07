@@ -296,7 +296,7 @@ describe("chat_evidence through OptChat", () => {
     expect(parent).toContain("orchid greenhouse code is 4417");
   });
 
-  test("only explicit extraction opt-in opens the provider; opt-out wins", async () => {
+  test("extraction opens the provider by default; opt-out wins", async () => {
     const states: string[] = [];
     let opened = 0;
     const extractor = () => {
@@ -310,7 +310,8 @@ describe("chat_evidence through OptChat", () => {
     };
     const { "no-optchat-extract": _optOut, ...gatesOff } = ALL_GATES_OFF;
     for (const { extract, flags } of [
-      { extract: false, flags: gatesOff },
+      { extract: true, flags: gatesOff },
+      { extract: false, flags: { ...gatesOff, "no-optchat-extract": true } },
       { extract: true, flags: { ...gatesOff, "optchat-extract": true } },
       { extract: false, flags: { ...gatesOff, "optchat-extract": true, "no-optchat-extract": true } },
     ]) {

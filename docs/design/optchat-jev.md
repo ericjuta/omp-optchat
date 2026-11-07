@@ -1,6 +1,6 @@
 # OptChat + Jev: design reference
 
-Current extraction policy (0.16.1): Clairic is opt-in with `--optchat-extract`; the four judge gates and deterministic evidence remain on. The [real-chat comparison](../../evals/evidence/real40-v2-report.md) supersedes the earlier synthetic extraction decision. The historical gate design below is unchanged.
+Current extraction policy: Clairic is on by default at Eric's explicit request after reviewing the failed real-chat gate; `--no-optchat-extract` disables it; the four judge gates and deterministic evidence remain on. The [real-chat comparison](../../evals/evidence/real40-v2-report.md) supersedes the earlier synthetic extraction decision. The historical gate design below is unchanged.
 
 Status: **built (v0.9.1); measurement in progress.** OptChat is implemented by the OMP plugin omp-optchat. The System One gates ship in it, on by default with per-gate opt-outs, as described in `plans/optchat-jev.md`. Sections citing v0.5.0 (`bc633ac`) describe the base this design started from. Every default below is a starting position; the plan's Decision Log and `.scratch/optchat-jev/map.md` record what is settled.
 

@@ -16,7 +16,7 @@ export const DEFAULTS = Object.freeze({
   decisions: true,
   workDiscovery: true,
   evidence: true,
-  extract: false,
+  extract: true,
   extractNull: 0.5,
   rules: true,
   prefetch: true,
@@ -159,7 +159,7 @@ export function registerFlags(api: FlagRegistrar): void {
   api.registerFlag("optchat-extract", {
     type: "boolean",
     default: DEFAULTS.extract,
-    description: "Send chat_evidence passages to OpenRouter's cloudflare/clairic for candidate occurrences, not verified answers; use OMP's openrouter credential cascade, no key means no call (default: off; --optchat-extract enables; --no-optchat-extract wins)",
+    description: "Send chat_evidence passages to OpenRouter's cloudflare/clairic for candidate occurrences, not verified answers; use OMP's openrouter credential cascade, no key means no call (default: on; --no-optchat-extract wins)",
   });
   api.registerFlag("no-optchat-extract", {
     type: "boolean",

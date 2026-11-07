@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.2 — 2026-11-07
+
+- Restore default-on Clairic extraction at Eric's explicit request after reviewing the real-chat evaluation. `--no-optchat-extract` still wins; no key means no call. The failed evaluation gate, misleading-candidate findings and unknown billing remain unchanged.
+
 ## 0.16.1 — 2026-11-07
 
 - Clairic extraction is now opt-in with `--optchat-extract`; `--no-optchat-extract` still wins. Deterministic evidence and recall remain enabled. The provider is not opened by default.
