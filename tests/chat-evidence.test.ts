@@ -55,7 +55,7 @@ async function open(): Promise<{ store: Store; memory: Memory }> {
 /** The adapter src/index.ts builds: Memory's ranking and the Store's exact pages. `onPage` sees every page read. */
 function reader(store: Store, memory: Memory, onPage: (id: number) => void = () => {}): EvidenceMemory {
   return {
-    rank: (question, limit, before) => memory.rankMessages(question, { limit, before }),
+    rank: (question, limit, before) => memory.rankMessages(question, { limit, before, idf: "smoothed" }),
     page: (id, offset, maxBytes) => {
       onPage(id);
       return store.readMessagePage(id, offset, maxBytes);
@@ -95,6 +95,22 @@ describe("gatherEvidence", () => {
     expect(Buffer.byteLength(passage!.text)).toBe(passage!.end - passage!.start);
     const page = memory.zoom(report, 1, passage!.start);
     expect(Buffer.from(page.text).subarray(0, passage!.end - passage!.start).toString("utf8")).toBe(passage!.text);
+  });
+
+  test("in a short chat whose current question shares the report's words, the report still yields the passage", async () => {
+    // Live failure 2026-11-07: report, "stored", then the question. Every word the report shares with the question
+    // has df 2 of 3, whose BM25 weight clamps to 0, so only the question itself ranked and no report was searched.
+    const { store, memory } = await open();
+    const filler = "Migration job log line: copied shard without incident.\n".repeat(300);
+    const fact = "The exact command the migration job ran was: bun run db:migrate --target=shard-7";
+    const report = store.append("user", `${filler}${fact}\n${filler}`).i;
+    store.append("talk", "stored");
+    store.append("user", "Call chat_evidence with 'what exact command did the migration job run'.");
+
+    const result = await gatherEvidence(reader(store, memory), "what exact command did the migration job run", { upperBound: store.messages.length });
+
+    expect(result.searched).toContain(report);
+    expect(result.passages.some((passage) => passage.id === report && passage.text.includes(fact))).toBe(true);
   });
 
   test("passages never split a UTF-8 sequence, and their byte offsets match the source bytes", async () => {

@@ -834,7 +834,7 @@ class OptChat {
 	/** `chat_evidence` over messages below `upperBound`; every read first proves, through `live`, that the chat is still open. */
 	private async evidenceText(live: () => Memory, question: string, upperBound: number, signal: AbortSignal | undefined): Promise<string> {
 		const reader: EvidenceMemory = {
-			rank: (text, limit, before) => live().rankMessages(text, { limit, before }),
+			rank: (text, limit, before) => live().rankMessages(text, { limit, before, idf: "smoothed" }),
 			page: (id, offset, maxBytes) => {
 				live();
 				return this.openStore().readMessagePage(id, offset, maxBytes);

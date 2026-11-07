@@ -89,6 +89,12 @@ export interface RankOptions {
   readonly limit: number;
   /** Only messages with id below this, as in `search`. */
   readonly before?: number;
+  /**
+   * "bm25" (default): a word weighs max(0, ln((N - df + 0.5) / (df + 0.5))), so a word in half or more of the scanned
+   * messages counts for nothing. "smoothed": ln(1 + (N - df + 0.5) / (df + 0.5)), always positive, so in a short chat a
+   * message sharing only common words with the question still ranks.
+   */
+  readonly idf?: "bm25" | "smoothed";
 }
 
 export interface SearchHit {
@@ -700,7 +706,10 @@ export class Memory {
       }
       if (found) matched.push({ id, terms: found });
     }
-    const weight = df.map((count) => Math.max(0, Math.log((scanned - count + 0.5) / (count + 0.5))));
+    const weight = df.map((count) => {
+      const ratio = (scanned - count + 0.5) / (count + 0.5);
+      return options.idf === "smoothed" ? Math.log(1 + ratio) : Math.max(0, Math.log(ratio));
+    });
     return matched
       .map(({ id, terms: found }) => ({ id, score: found.reduce((sum, term) => sum + weight[term]!, 0) }))
       .filter((entry) => entry.score > 0)

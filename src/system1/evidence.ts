@@ -36,7 +36,7 @@ export interface EvidencePage {
  * `RecallMemory`: neither call reaches a model.
  */
 export interface EvidenceMemory {
-  /** `Memory.rankMessages`: stored message ids below `before` whose words best match `question`, best first, at most `limit`. */
+  /** `Memory.rankMessages` with `idf: "smoothed"`: stored message ids below `before` whose words best match `question`, best first, at most `limit`. */
   rank(question: string, limit: number, before: number): number[];
   /** `Store.readMessagePage`: at most `maxBytes` of message `id`'s text from the UTF-8 byte `offset`, as `zoom(id, 1, offset)` pages it. */
   page(id: number, offset: number, maxBytes: number): EvidencePage;
