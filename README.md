@@ -1,16 +1,16 @@
 # OMP OptChat
 
-An OMP extension implementing [Victor Taelin's OptChat specification](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449): one durable chat, a binary tree of contextual summaries, and a fresh model context for each user turn. Original text remains retrievable with `zoom`; summaries are navigation, not a replacement for the log.
+An OMP extension based on [Victor Taelin's OptChat specification](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449). It provides one durable chat, a binary tree of contextual summaries, and a fresh model context for each user turn. Use `zoom` to retrieve original text. Summaries help the model navigate the log. They do not replace it.
 
 ## At a glance
 
-- **One chat that never ends.** Every user message, reply, tool call, tool result and subagent report is appended to a local, fsynced log under OMP's agent directory, one store per git worktree. Nothing is ever deleted or rewritten.
-- **A view instead of a transcript.** Each turn the model sees a fixed-size view of the whole history: one-line summaries, oldest first, where older lines cover more messages. The view replaces the old inference history between turns, so a long chat stops growing the context.
-- **Nothing is lost.** The model navigates the view with memory tools: `zoom` opens a line into its halves (or several levels at once) down to the original message, `chat_search` finds exact words in the original messages, `chat_evidence` returns the exact passages of the original messages that bear on a question, `date` and `work` fetch timestamps and captured subagent reports.
-- **System One gates, on by default.** Four small judgments through OMP's `judge` role keep standing rules across turns, prefetch relevant history before a turn, hint the compressor about what matters, and power `chat_recall`, which seeds candidates from exact-word matches in the original messages and scans the messages under its top lines for the one that answers a question. Each has its own opt-out flag.
-- **Plain OMP is one flag away.** `omp --no-optchat` runs an ordinary session with no memory tools, logging, compression or context changes.
+- **One continuous chat.** OptChat appends every user message, reply, tool call, tool result, and subagent report to a local, fsynced log. Each git worktree has one store under OMP's agent directory. OptChat never deletes or rewrites these records.
+- **A view instead of a transcript.** Each turn, the model sees a fixed-size view of the whole history. The view contains one-line summaries, oldest first. Older lines cover more messages. Between turns, this view replaces the old inference history. A long chat therefore does not keep expanding the context.
+- **Access to original records.** Memory tools let the model navigate the view. `zoom` opens a line into its halves, or several levels at once, down to the original message. `chat_search` finds exact words in original messages. `chat_evidence` returns exact passages that relate to a question. `date` retrieves timestamps, and `work` retrieves captured subagent reports.
+- **System One gates, on by default.** Four small judgments use OMP's `judge` role. They retain standing rules across turns, prefetch relevant history, guide the compressor, and support `chat_recall`. Recall starts with exact-word matches in original messages. It then scans messages under its top lines for an answer. Each gate has an opt-out flag.
+- **Plain OMP remains available.** `omp --no-optchat` runs an ordinary session without OptChat memory tools, logging, compression, or context changes.
 
-What the model sees at the start of a turn (illustrative, shortened):
+This shortened example shows what the model sees at the start of a turn:
 
 ```text
 <chat>
@@ -21,21 +21,34 @@ What the model sees at the start of a turn (illustrative, shortened):
 </chat>
 ```
 
-Each `id+n|text` line summarizes the `n` messages starting at `id`. To check the exact error from message 97, the model calls `zoom(96, 2)`, then `zoom(97, 1)` for the original text; if no line mentions it any more, `chat_search("DATABASE_URL")` finds it by its words, and `chat_recall("why did the staging deploy fail?")` has the judge score the top lines and the messages under them instead.
+Each `id+n|text` line summarizes the `n` messages starting at `id`. To check the exact error from message 97, the model calls `zoom(96, 2)`, then `zoom(97, 1)` for the original text. If no line still mentions the error, `chat_search("DATABASE_URL")` finds it by its words. Alternatively, `chat_recall("why did the staging deploy fail?")` asks the judge to score the top lines and the messages under them.
 
-What it costs: a compressor call per stored message and per merge, plus judge calls with the default gates: one rules request per user message, and on a turn whose view merged, one prefetch request per chunk of up to 64 view lines. When the history still fits the model's context, OptChat costs more than plain OMP for the same answers; its value is recall past the context window (see "0.5.0 measurements"). Every compressor call is also recorded, counts only and never content, in `metrics.jsonl` in the store directory, and `/optchat status` sums it (see **Cost.** below).
+OptChat costs one compressor call per stored message and per merge. The default gates add one rules request per user message. On turns whose view merged, they also add one prefetch request per chunk of up to 64 view lines.
+
+When history still fits the model's context, OptChat costs more than plain OMP for the same answers. Its value is recall beyond the context window (see "0.5.0 measurements"). Each compressor call also adds a counts-only record to `metrics.jsonl` in the store directory. These records never contain message content. `/optchat status` sums them (see **Compressor cost record** below).
 
 ## Requirements and start
 
 - OMP **18.10.3 or newer**, Bun, and Linux. CI checks every push and runs a weekly check against the latest published OMP SDK.
-- An authenticated model for the main chat and an authenticated compressor model. Compression uses OMP's `@smol` role by default; choose a competent inexpensive model explicitly if that role is unsuitable.
+- An authenticated model for the main chat and an authenticated compressor model. Compression uses OMP's `@smol` role by default. Choose a competent, inexpensive model explicitly if that role is unsuitable.
 
-Install the tagged release:
+Install the current release, **0.16.0**:
 
 ```sh
 omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.16.0'
 PI_OPENAI_STATEFUL=0 omp
 ```
+
+Restart existing OMP sessions after an upgrade. They retain the previously loaded plugin.
+
+Version 0.16.0 passed these checks:
+
+- CI with the pinned and latest SDKs.
+- Linux and macOS lease checks.
+- 2,599 unit tests and 56 host tests.
+- An installed-plugin smoke check with the real OMP host and a synthetic model.
+
+These are software checks, not proof of live-model answer accuracy.
 
 From a local checkout:
 
@@ -51,55 +64,171 @@ omp plugin link .
 PI_OPENAI_STATEFUL=0 omp
 ```
 
-Installing or linking the enabled plugin activates OptChat automatically in new main-agent sessions. This default applies to both fresh installations and upgrades; no first-install marker is used. `--optchat` remains an optional explicit enable flag. Use `omp --no-optchat` for an ordinary session with no OptChat memory tools, logging, compression, or context changes; `/optchat` remains registered. The opt-out wins even when both flags are present, in either order. Do not use `--optchat=false`: OMP's boolean CLI parser treats that as enabled.
+Installing or linking the enabled plugin activates OptChat automatically in new main-agent sessions. This default applies to fresh installations and upgrades. There is no first-install marker. `--optchat` remains an optional explicit enable flag.
 
-Subagents never open or write the main chat. Run just one enabled session per chat directory. To select a different memory or compressor:
+Use `omp --no-optchat` for an ordinary session without OptChat memory tools, logging, compression, or context changes. The `/optchat` command remains registered. The opt-out wins when both flags are present, in either order. Do not use `--optchat=false`: OMP's boolean CLI parser treats that as enabled.
+
+Subagents never open or write the main chat. Run only one enabled session per chat directory. To select a different memory or compressor:
 
 ```sh
 PI_OPENAI_STATEFUL=0 omp -e . --optchat-dir /path/to/private/chat --optchat-model anthropic/claude-sonnet-4-6
 ```
 
-Memory is per git worktree. A session inside a git checkout defaults to a directory under `optchat-worktrees/` beside the global store in OMP's agent directory, named from the worktree's basename and a hash of its real path. Each worktree therefore has its own memory, and a new worktree starts empty. Subdirectories and symlinks to the same root share their worktree's memory. Outside git, the default is the global `optchat/` store; if another session already holds it, the session instead uses its working directory's own store under `optchat-dirs/` (named like the worktree stores, from the real path of the cwd) and says so in one notice. That fallback applies only without `--optchat-dir`. To keep one memory across worktrees, pass the same `--optchat-dir` to each, at the cost of only one active session at a time. Stores of deleted worktrees remain under `optchat-worktrees/` until you remove them manually. Working-directory changes within a worktree and OMP session restarts do not start a new memory. The extension does not import existing OMP sessions automatically.
+### Memory directories
 
-Each memory directory has exactly one writer. If another live session already holds the directory (for example, the same `--optchat-dir` in another terminal), this session becomes inactive instead of refusing prompts: it shows one warning and runs as if started with `--no-optchat`, with no memory tools, logging, compression, or context changes. `/optchat status` reports the reason and directory, and the reason is also stored in the session log as a custom `optchat-inactive` entry (its data holds `reason` and `directory`), so a session that ran without memory can be told apart afterwards. The holder of the directory is not identified: the lock is held by the kernel and carries no owner record. A store that cannot be opened for another reason, such as corruption, still refuses every prompt until restart. Subagents never open the store and do not conflict.
+Memory is per git worktree. Inside a git checkout, the default store is under `optchat-worktrees/`, beside the global store in OMP's agent directory. Its name combines the worktree's basename with a hash of its real path. Each worktree has its own memory, and a new worktree starts empty. Subdirectories and symlinks to the same root share that worktree's memory.
 
-Advanced overrides are `--optchat-node-bytes`, `--optchat-view-bytes`, `--optchat-jobs`, `--optchat-tries`, and `--optchat-tool-cap`; their defaults are described below. `--optchat-retry-ms` was removed in 0.4.0, because failed summaries now retry on the next message. Keep the defaults unless you have measured a reason to change them. An enabled session refuses inference if `zoom`, `date`, `work` or `chat_search` is unavailable, including host modes that prohibit late tool registration.
+Outside git, the default is the global `optchat/` store. If another session holds it, the session uses a store for its working directory under `optchat-dirs/` instead. Like worktree stores, this store's name uses the cwd's real path. The session reports the fallback in one notice. This fallback applies only without `--optchat-dir`.
+
+To share memory across worktrees, pass the same `--optchat-dir` to each session. Only one of those sessions can be active at a time. Stores for deleted worktrees remain under `optchat-worktrees/` until you remove them manually. Changing directories within a worktree or restarting OMP does not start a new memory. The extension does not automatically import existing OMP sessions.
+
+Each memory directory has exactly one writer. Another live session might already hold the directory, for example through the same `--optchat-dir` in another terminal. In that case, OptChat becomes inactive instead of refusing prompts. It shows one warning and runs as if started with `--no-optchat`: no memory tools, logging, compression, or context changes.
+
+`/optchat status` reports the reason and directory. The session log also stores a custom `optchat-inactive` entry with `reason` and `directory` in its data. This lets you identify sessions that ran without memory. The warning does not identify the holder. The kernel holds the lock, which has no owner record.
+
+If the store cannot open for another reason, such as corruption, the session still refuses every prompt until restart. Subagents never open the store and do not conflict.
+
+Advanced overrides are `--optchat-node-bytes`, `--optchat-view-bytes`, `--optchat-jobs`, `--optchat-tries`, and `--optchat-tool-cap`. Their defaults appear below. Version 0.4.0 removed `--optchat-retry-ms` because failed summaries now retry on the next message. Keep the defaults unless measurements justify a change.
+
+An enabled session refuses inference if `zoom`, `date`, `work`, or `chat_search` is unavailable. This includes host modes that prohibit late tool registration.
 
 ## Using memory
 
-The model receives the settled historical summary view before your new message, then retains its ordinary tool loop until the turn ends. Between turns, old inference history is replaced by the view. OMP's display transcript and normal tools remain available.
+The model receives the settled historical summary view before your new message. It then keeps its ordinary tool loop until the turn ends. Between turns, the view replaces old inference history. OMP's display transcript and normal tools remain available.
 
-- `zoom(id, n)` opens an aligned power-of-two summary range into its children. `zoom(id, n, depth)` opens `depth` levels at once (1 to 4, at most `log2(n)`): the `2^depth` lines `depth` levels under the range, each covering `n / 2^depth` messages. The default `depth` is 1, the same as `zoom(id, n)`. `zoom(id, 1, offset)` returns one 16 KB page of the original record, cut on a UTF-8 boundary, plus its stored images. Follow `details.next` until it is `null`; together the pages reproduce the record byte for byte.
-- `chat_search(text, kind, limit, before)` finds stored messages that contain every whitespace-separated word of `text`, case-insensitively, newest first. It searches the original messages, not the summaries, so it finds names, paths, numbers and errors that a summary dropped. `kind` restricts hits to one of `user`, `talk`, `tool`, `echo`, `note` or `work`; `limit` returns 1 to 50 hits (default 10); `before` (1 or more) returns only messages with an id below it. A search of two or more distinct words that has no hit also lists how many messages contain each word, so a word can be dropped, and names `chat_recall` when that tool is registered. A `zoom(id, 1)` page of a tool call gives `[result: message N]` only when capture recorded an explicit link to that call. When a result expands into several records, the pointer names the first; every result record retains the same call link. Older or unmatched records have no inferred pointer. Each hit prints its id, kind and a snippet of about 240 bytes. Open a hit with `zoom(id, 1)`. When older hits remain, the last line gives `before=<id>` for the next call. Memory tool calls and search, recall or evidence results are never hits. `text` is at most 200 characters and 8 words.
-- `chat_evidence(question)` searches a bounded, rebuildable local chunk index, not a top-50 whole-message shortlist. It returns at most 8 non-overlapping passages of at most 2,048 UTF-8 bytes, 16,384 passage bytes total, with exact message/byte citations reopened by `zoom`. The index is incremental in memory, never a second durable authority: at most 64 MiB of accounted retained data, 32,768 chunks and 65,536 messages, with at most 32 MiB of source reads per call. A 10-second retrieval deadline yields partial results. The trailer distinguishes indexed coverage, searched chunks, omitted ranges, missing words, partial reports and output limits. An incomplete scan cannot establish absence. `--no-optchat-evidence` removes this tool and `chat_explain`; it does not disable the independent features below. No judge is used. Optional extraction has separate provider transmission and timing, described next.
-  - When OMP resolves an `openrouter` key (credential store or its accepted environment fallback), selected passages are sent to OpenRouter/Cloudflare Clairic. The result is an **unverified candidate occurrence, not a verified answer**. Code checks the null threshold, exact value/span equality, unchanged source echo, Unicode offsets and exact identifiers in the question; truncated or invalid results are withheld. These checks do not prove truth, relevance, current authority or agreement between passages. A separate 10-second extraction bound and 262,144-byte streamed response cap apply. Missing keys add nothing; failures preserve the local evidence. Cost without a credible positive report is unknown. `--no-optchat-extract` prevents this transmission.
-- `chat_explain()` or `/optchat explain` shows the last query's snapshot, index usage, coverage, selected matches and omissions without repeating the original passages. `/optchat index` shows the same current index/query accounting. This state is in-memory and resets with the chat.
-- `chat_decisions(question, mode)` provides a source-linked `timeline` or `project-state` (default), distinguishing proposals, human decisions, replacements, withdrawals, reported completion and host-observed tool completion. It makes no model call and writes no instructions. Conservative explicit forms such as `Use port 5432 for staging.`, `Change staging to 6543.` and `Revert it to 5432.` can establish state; quoted, conditional or ambiguous prose stays unresolved. A later historical mention is not a new decision. The scan is bounded to 256 messages, 256 KiB, 4 KiB per source, 64 events and one second; incomplete coverage cannot establish current state. `--no-optchat-decisions` removes it.
-- `chat_work({question?, name?, limit?, before?})` discovers captured reports and their explicitly associated calls. Reused names remain separate captures; absent host call/run/report identifiers stay unknown rather than being parsed from prose. Each result includes completeness, capture time and exact `zoom` citations; `work(name)` still selects the newest name match. Discovery scans at most 2,048 records/256 KiB and returns at most 20 captures. `--no-optchat-work-discovery` removes it.
-- `chat_project_evidence` is Linux-only and exists only with an explicit `--optchat-project-stores '{"branch":"/absolute/canonical/store"}'` allowlist (at most 8). `mode: "search"` searches selected aliases; `mode: "read"` reopens a returned opaque store key, message id and byte offset. External ids are **not local zoom ids**. The first request pins read-only file descriptors, complete-record cutoffs and SHA-256 digests; later appends are excluded. Retrieval makes no secondary provider call, acquires no writer lease, mutates no store and imports no rules; returned evidence still enters the requesting main-model conversation. Other platforms fail closed because their pathname APIs do not establish Linux-style opened-link identity. Symlink paths are refused: configure canonical roots. `/optchat new` and host session changes revoke these snapshots; search again for fresh keys. Aggregate admission is bounded to 128 MiB, 256 daily files and 100,000 records; returned passage text keeps the eight-passage/16 KiB limit, and diagnostic id lists are bounded with explicit omission counts.
-- `work(name, offset)` pages a captured subagent or background report by job ID, agent ID, or name; the newest match wins.
-- `date(id)` returns the original message's local date and time. New records keep the host's event timestamp, not the time of writing.
-- `/optchat status` reports the loaded plugin version, current session identity, memory and background compression state, and the last observed main/compressor cache modes. A mode describes the encoder path, not a cache hit or savings; before a request it is unknown. Once the store has recorded compressor calls, status also reports their number and the cost the host reported for them.
-- `/optchat view` displays the current view.
-- `/optchat export /path/to/history.html` creates a self-contained, navigable HTML history (treat it as private).
-- `/optchat import /path/to/history.txt` imports plain text as a note. JSONL accepts the stored kinds and strict metadata; all records and images are validated before appending. Imported tool-success/error claims are explicitly downgraded to historical imported outcomes and cannot become host-observed completion. A live host `isError: false` proves only that its linked tool invocation returned without a host tool error—not process exit, tests passing or project completion. New `toolOutcome` metadata requires version 0.16.0 or newer to reopen; older stores without it remain readable.
-- `/optchat new` starts a fresh, empty chat. It needs this session's memory open and the agent idle, and asks first when the UI can. The current store moves unchanged to a sibling archive `<dir>.<UTC stamp>` (for example `chat.20261013T081500Z`, with a numeric suffix if taken), and an empty store opens at the original path. Reopen the old chat with `--optchat-dir <archive>`. OMP's own `/new` keeps the same OptChat memory by design; use `/optchat new` to reset it.
+### Summary and source tools
 
-The continuation checks are available as `bun run evals:evidence:continuation --baseline /path/to/v0.15.2-checkout` and `bun run smoke:evidence`. The former is a frozen, zero-provider-call software comparison with injected extraction outcomes, **not** a measurement of live Clairic quality. The latter exercises the plugin's exported lifecycle, tool registration, citations, source scopes, child packs and reset/shutdown fences using a synthetic host.
+`zoom(id, n)` opens an aligned power-of-two summary range into its children.
+
+- `zoom(id, n, depth)` opens `depth` levels at once. The range is 1 to 4, with a maximum of `log2(n)`.
+- The result contains the `2^depth` lines at that depth. Each line covers `n / 2^depth` messages.
+- The default `depth` is 1, which is the same as `zoom(id, n)`.
+- `zoom(id, 1, offset)` returns one 16 KB page of the original record, cut on a UTF-8 boundary, plus its stored images.
+- Follow `details.next` until it is `null`. Together, the pages reproduce the record byte for byte.
+
+`chat_search(text, kind, limit, before)` searches original messages, not summaries. It finds messages that contain every whitespace-separated word of `text`, without regard to case, newest first. This can recover names, paths, numbers, and errors that a summary dropped.
+
+- `text` accepts at most 200 characters and 8 words.
+- `kind` restricts hits to `user`, `talk`, `tool`, `echo`, `note`, or `work`.
+- `limit` accepts 1 to 50 hits. The default is 10.
+- `before` accepts 1 or more and returns only messages with an id below it.
+- Each hit shows its id, kind, and a snippet of about 240 bytes. Open it with `zoom(id, 1)`.
+- If older hits remain, the last line gives `before=<id>` for the next call.
+- Memory tool calls and search, recall, or evidence results never appear as hits.
+
+A search with two or more distinct words can return no hits. In that case, it also reports how many messages contain each word. This helps the model choose a word to omit. The result also names `chat_recall` when that tool is registered.
+
+A `zoom(id, 1)` page of a tool call shows `[result: message N]` only when capture recorded an explicit link to that call. If a result spans several records, the pointer names the first record. Every result record retains the same call link. Older or unmatched records have no inferred pointer.
+
+`work(name, offset)` pages a captured subagent or background report by job ID, agent ID, or name. The newest match wins.
+
+`date(id)` returns the original message's local date and time. New records keep the host's event timestamp, not the time of writing.
+
+### Local evidence
+
+`chat_evidence(question)` searches a bounded local chunk index that can be rebuilt. It does not use a top-50 shortlist of whole messages. It returns at most 8 non-overlapping passages. Each passage contains at most 2,048 UTF-8 bytes, with a total limit of 16,384 passage bytes. Exact message and byte citations let `zoom` reopen the passages.
+
+The index updates incrementally in memory. It is not a second durable source of truth. Its limits are:
+
+- 64 MiB of accounted retained data.
+- 32,768 chunks and 65,536 messages.
+- 32 MiB of source reads per call.
+- A 10-second retrieval deadline, after which the tool returns partial results.
+
+The trailer distinguishes indexed coverage, searched chunks, omitted ranges, missing words, partial reports, and output limits. An incomplete scan cannot establish absence. No judge is used.
+
+`--no-optchat-evidence` removes `chat_evidence` and `chat_explain`. It does not disable the independent features below. Optional extraction has separate provider transmission and timing limits.
+
+#### Optional extraction
+
+When OMP resolves an `openrouter` key, the extractor sends selected passages to OpenRouter/Cloudflare Clairic. OMP can resolve the key from its credential store or its accepted environment fallback. The result is an **unverified candidate occurrence, not a verified answer**.
+
+Code checks the null threshold, exact value/span equality, unchanged source echo, Unicode offsets, and exact identifiers in the question. It withholds truncated or invalid results. These checks do not prove truth, relevance, current authority, or agreement between passages.
+
+Extraction has a separate 10-second bound and a 262,144-byte streamed response cap. Missing keys add nothing. Failures preserve the local evidence. Cost without a credible positive report is unknown. `--no-optchat-extract` prevents this transmission.
+
+`chat_explain()` or `/optchat explain` shows the last query's snapshot, index usage, coverage, selected matches, and omissions. It does not repeat the original passages. `/optchat index` shows the same current index/query accounting. This state stays in memory and resets with the chat.
+
+### Decisions and report discovery
+
+`chat_decisions(question, mode)` provides a source-linked `timeline` or `project-state`. The default mode is `project-state`. It distinguishes proposals, human decisions, replacements, withdrawals, reported completion, and host-observed tool completion. It makes no model call and writes no instructions.
+
+Conservative explicit forms can establish state. Examples are `Use port 5432 for staging.`, `Change staging to 6543.`, and `Revert it to 5432.` Quoted, conditional, or ambiguous prose stays unresolved. A later historical mention is not a new decision.
+
+The scan is limited to 256 messages, 256 KiB, 4 KiB per source, 64 events, and one second. Incomplete coverage cannot establish current state. `--no-optchat-decisions` removes this tool.
+
+`chat_work({question?, name?, limit?, before?})` discovers captured reports and calls explicitly associated with them. Reused names remain separate captures. Missing host call, run, or report identifiers stay unknown. The tool does not infer them from prose.
+
+Each result includes completeness, capture time, and exact `zoom` citations. `work(name)` still selects the newest name match. Discovery scans at most 2,048 records/256 KiB and returns at most 20 captures. `--no-optchat-work-discovery` removes this tool.
+
+### Evidence from other stores
+
+`chat_project_evidence` is Linux-only. It exists only with an explicit allowlist such as `--optchat-project-stores '{"branch":"/absolute/canonical/store"}'`, with at most 8 stores.
+
+- `mode: "search"` searches selected aliases.
+- `mode: "read"` reopens a returned opaque store key, message id, and byte offset.
+- External ids are **not local zoom ids**.
+
+The first request pins read-only file descriptors, complete-record cutoffs, and SHA-256 digests. Later appends are excluded. Retrieval makes no secondary provider call, acquires no writer lease, mutates no store, and imports no rules. Returned evidence still enters the requesting main-model conversation.
+
+Other platforms fail closed because their pathname APIs do not establish Linux-style opened-link identity. Symlink paths are refused. Configure canonical roots. `/optchat new` and host session changes revoke these snapshots. Search again for fresh keys.
+
+Aggregate admission is limited to 128 MiB, 256 daily files, and 100,000 records. Returned passage text keeps the eight-passage/16 KiB limit. Diagnostic id lists are bounded and include explicit omission counts.
+
+### Commands
+
+- `/optchat status` reports the loaded plugin version, current session identity, memory state, and background compression state. It also reports the last observed main/compressor cache modes. A mode describes the encoder path, not a cache hit or savings. Before a request, the mode is unknown. Once the store records compressor calls, status reports their count and the host-reported cost.
+- `/optchat view` shows the current view.
+- `/optchat export /path/to/history.html` creates a self-contained, navigable HTML history. Treat it as private.
+- `/optchat import /path/to/history.txt` imports plain text as a note. JSONL accepts stored kinds and strict metadata. All records and images undergo validation before append.
+- `/optchat new` starts a fresh, empty chat. This session's memory must be open, and the agent must be idle. The command asks first when the UI can.
+
+Imports explicitly downgrade tool-success/error claims to historical imported outcomes. Those claims cannot become host-observed completion. A live host `isError: false` proves only that the linked tool invocation returned without a host tool error. It does not prove process exit, passing tests, or project completion. Reopening new `toolOutcome` metadata requires version 0.16.0 or newer. Older stores without it remain readable.
+
+`/optchat new` moves the current store unchanged to a sibling archive named `<dir>.<UTC stamp>`. For example, it can create `chat.20261013T081500Z`, with a numeric suffix if that name is taken. An empty store then opens at the original path. Reopen the old chat with `--optchat-dir <archive>`. OMP's own `/new` deliberately keeps the same OptChat memory. Use `/optchat new` to reset it.
+
+### Continuation checks
+
+Run `bun run evals:evidence:continuation --baseline /path/to/v0.15.2-checkout` for the continuation comparison. It is a frozen software comparison with zero provider calls and injected extraction outcomes. It is **not** a measurement of live Clairic quality.
+
+`bun run smoke:evidence` uses a synthetic host. It exercises the exported plugin lifecycle, tool registration, citations, source scopes, child packs, and reset/shutdown fences.
 
 ### Subagents
 
-OMP subagents are ordinary sessions. They never open the Store or write to the chat. Their task, async, and launch reports become `work` records in the parent's log, captured before the ordinary tool-result cap. A report the agent recovers with `wait` is captured the same way, as one `work` record per finished task job under its job ID, agent ID and name, so `work(name)` finds it; a job OMP already delivered by itself keeps its first record, and the other jobs a `wait` result lists (bash, still running) stay an ordinary tool result. Each record carries provenance (source, job ID, agent ID, name, completeness), full structured data, and the typed artifact output where the host supplies one. When OMP delivered only a preview and no trusted full-output reference, the record says so: it starts with `[incomplete: reason]` and has `completeness: "pointer-only"`. URIs found in report text are never followed.
+OMP subagents are ordinary sessions. They never open the Store or write to the chat. Their task, async, and launch reports become `work` records in the parent's log. Capture occurs before the ordinary tool-result cap.
 
-A matching **source-only OMP host patch** also retains cumulative public report publications in an immutable artifact (up to 4 MiB), independently of the final structured answer. Its typed descriptor binds the run, byte count and SHA-256 digest. OptChat verifies and copies that body into its own log before paging it, so later artifact replacement or a short final acknowledgement cannot replace the archived report. Missing, mismatched or partial artifacts remain explicitly incomplete. This host capability is not installed by the plugin and is not a claim about the currently installed stock host.
+Reports recovered with `wait` use the same capture path. Each finished task job gets one `work` record under its job ID, agent ID, and name, so `work(name)` finds it. A job that OMP already delivered automatically keeps its first record. Other jobs listed by `wait`, such as bash jobs or still-running jobs, remain an ordinary tool result.
 
-Typed inter-agent delivery likewise requires that source-only host patch. The host authenticates sender and recipient generations and emits an agent-attributed `collab:agent-message`; OptChat stores the full bounded body as a `note`, with sender/recipient provenance, never as a human instruction. Invalid attribution or metadata is rejected. Terminal paste-and-Enter is not a typed transport: it cannot establish agent provenance and must not be used as its fallback. No running host, launcher or configuration is changed by this work.
+Each record carries provenance: source, job ID, agent ID, name, and completeness. It also carries full structured data and typed artifact output when the host supplies it. If OMP supplies only a preview without a trusted full-output reference, the record starts with `[incomplete: reason]`. Its metadata has `completeness: "pointer-only"`. OptChat never follows URIs found in report text.
 
-The sender's atomic commit authorizes delivery: closing or rotating it blocks new commits, but already committed messages may still finish. The receiver checks its own current generation immediately before admission and deduplicates the request. Shutdown waits a bounded time for acknowledgements; unresolved deliveries report `revocation_incomplete`, not successful revocation. The timeout is source-local and is not a cross-process clock or message-expiry guarantee.
+#### Unreleased host capabilities
 
-The child view, on by default since 0.11.0, gives each subagent a frozen, read-only snapshot of the parent's view and `zoom`/`date`/`work`/`chat_search`, plus `chat_evidence` while the parent's `--optchat-evidence` is on, over messages up to that point. A child's `chat_search` and `chat_evidence` only see messages that existed when the snapshot was taken. Every read and every prompt injection checks that the parent's publication is still live and that the child is still in the session that adopted it. The snapshot is revoked when the parent switches sessions or shuts down, and is refused if the child resumes, forks, or branches into another session. `--no-optchat-child-view` turns it off for a session (OMP boolean flags are presence flags, so `--optchat-child-view=false` does not); then include the facts a child needs in its task. A child that uses the snapshot pays for reading it: in the 0.5.0 child experiment below, children cost $0.20 with the view and $0.09 without.
+An **unpublished, source-only OMP host patch** was developed to retain cumulative public report publications in an immutable artifact of up to 4 MiB. This artifact is independent of the final structured answer. The upstream submission was abandoned. The patch is not part of the released plugin or a required setup step.
 
-Task-focused child packs are also on by default: each task receives up to 4,096 UTF-8 bytes of quoted relevant evidence from its frozen parent snapshot, with citations. Pack construction uses deterministic retrieval only, never Clairic or the judge, and checks session/revocation both before and after the asynchronous read. It adds a per-turn message, not variable tool definitions or system-guide text. `--no-optchat-child-pack` disables just this supplement; `--no-optchat-child-view` disables the entire parent handoff. Preparing and consuming a pack is not a measured cost-saving claim.
+Its typed descriptor binds the run, byte count, and SHA-256 digest. OptChat verifies the artifact body and copies it into its own log before paging it. Later artifact replacement or a short final acknowledgement therefore cannot replace the archived report. Missing, mismatched, or partial artifacts remain explicitly incomplete. The plugin does not install this host capability. This description makes no claim about the currently installed stock host.
+
+Typed inter-agent delivery also requires that source-only host patch. The host authenticates sender and recipient generations and emits an agent-attributed `collab:agent-message`. OptChat stores the full bounded body as a `note`, with sender/recipient provenance, never as a human instruction. Invalid attribution or metadata is rejected.
+
+Terminal paste-and-Enter is not a typed transport. It cannot establish agent provenance and must not serve as a fallback. This work changes no running host, launcher, or configuration.
+
+The sender's atomic commit authorizes delivery. Closing or rotating the sender blocks new commits, but already committed messages may still finish. The receiver checks its own current generation immediately before admission and deduplicates the request. Shutdown waits a bounded time for acknowledgements. Unresolved deliveries report `revocation_incomplete`, not successful revocation. The timeout is source-local, not a cross-process clock or message-expiry guarantee.
+
+#### Child views and packs
+
+The child view is on by default since 0.11.0. Each subagent receives a frozen, read-only snapshot of the parent's view and these tools:
+
+- `zoom`, `date`, `work`, and `chat_search`.
+- `chat_evidence` while the parent's `--optchat-evidence` is on.
+
+The snapshot covers only messages that existed when it was taken. A child's `chat_search` and `chat_evidence` cannot see later messages. Every read and prompt injection checks that the parent's publication remains live. It also checks that the child remains in the session that adopted the snapshot.
+
+The snapshot is revoked when the parent switches sessions, fails durable logging, or shuts down. It is refused if the child resumes, forks, or branches into another session. `--no-optchat-child-view` disables it for a session. OMP boolean flags are presence flags, so `--optchat-child-view=false` does not disable it. Without the snapshot, include the facts a child needs in its task.
+
+A child that reads the snapshot pays for that reading. In the 0.5.0 child experiment below, children cost $0.20 with the view and $0.09 without it.
+
+Task-focused child packs are also on by default. Each task receives up to 4,096 UTF-8 bytes of quoted relevant evidence from its frozen parent snapshot, with citations. Pack construction uses deterministic retrieval only, never Clairic or the judge. It checks session and revocation state before and after the asynchronous read.
+
+A pack adds a per-turn message, not variable tool definitions or system-guide text. `--no-optchat-child-pack` disables only this supplement. `--no-optchat-child-view` disables the entire parent handoff. Preparing and consuming a pack is not a measured cost-saving claim.
 
 ## Storage and compression
 
@@ -112,53 +241,95 @@ chat/
   images/                 # content-addressed image blobs referenced by message metadata
 ```
 
-Messages may carry an optional strict `metadata` field with work provenance, ordered image references (digest, MIME type, byte count), explicit `resultFor` links to earlier tool calls, or typed `coordination` provenance on agent notes. Older five-field records are read unchanged. Older plugin versions reject unfamiliar metadata fields; do not reopen a store containing these new fields with an older binary.
+Messages can carry an optional strict `metadata` field with:
 
-Records are appended and fsynced before publication; replay also fsyncs recovered files before admitting them. Daily filenames use the local day of writing, while each record retains its original timestamp, including imported historical dates. IDs are permanent. Malformed/torn lines are reported; missing IDs or conflicting records are not silently renumbered. The tree can be rebuilt conceptually, but existing summaries are retained to avoid paying twice.
+- Work provenance.
+- Ordered image references: digest, MIME type, and byte count.
+- Explicit `resultFor` links to earlier tool calls.
+- Typed `coordination` provenance on agent notes.
 
-The main view is atomically replaced and fsynced before a new tiling is published. Its versioned envelope stores both the main and compactor tilings and their unfinished batch latches in a single transaction. Restarts load those exact tilings instead of reconstructing them, so the compactor's cache prefix survives a restart. A v0.3.0 snapshot is migrated once: its main tiling is kept exactly, and the compactor tiling is initialized from it. After a crash, durable messages beyond the saved view are appended to its existing prefix. A pre-0.2.0 chat without `view.json` is migrated once; malformed or inconsistent snapshots fail closed rather than silently rebuilding a different view.
+Older five-field records remain readable unchanged. Older plugin versions reject unfamiliar metadata fields. Do not reopen a store containing these new fields with an older binary.
 
-The summary target is 512 UTF-8 bytes. The main view grows by appending leaves until its summary text exceeds 128,000 bytes, then merges a batch down to 64,000 bytes. Merge priority measures age from the sibling pair's **last** message, with oldest-first ties. Only built parents can be used; an unfinished batch remains active across subsequent node completions, messages, and restarts. The view never splits.
+OptChat appends and fsyncs records before publication. Replay also fsyncs recovered files before admitting them. Daily filenames use the local day of writing. Each record retains its original timestamp, including imported historical dates. IDs are permanent.
 
-The compressor has its own 16,000–32,000-byte sawtooth view, coarsened from the main view and refreshed when the main view merges. It contains only built, addressed summary lines before the target message, or through the end of a target merge—never later messages. It measures age against its own available endpoint, not the main chat's queued tail. Compression instructions use a 512-dash ruler rather than example content. Sizes govern summary text, not token estimates or provider-envelope overhead.
+OptChat reports malformed or torn lines. It does not silently renumber missing IDs or conflicting records. In principle, the tree can be rebuilt. Existing summaries remain in place to avoid paying twice.
 
-Compressor replies cannot attribute a span to `user:` when it contains no user record. The check recognizes nested speaker labels and presentational wrappers, while preserving genuinely quoted text. Invalid candidates are retried and cannot become fallback summaries; if no safe candidate remains, the existing marked source excerpt keeps the tree progressing. Historical summaries are not rewritten.
+### Saved views
 
-New tool-result records use optional strict `metadata.resultFor`, pointing to an earlier tool record. Indexed JSONL imports remap these links into the destination store; unindexed link-bearing imports are rejected. Older logs remain readable without invented associations. Older plugin binaries that do not know the new metadata cannot reopen a store containing it.
+OptChat atomically replaces and fsyncs the main view before publishing a new tiling. A tiling is the set of summary ranges that make up a view. The versioned envelope stores both main and compactor tilings, plus their unfinished batch latches, in one transaction. Restarts load those exact tilings instead of reconstructing them. This preserves the compactor's cache prefix across restarts.
 
-Short records and child pairs that already fit are free nodes. Longer records are read in bounded UTF-8 pages. Each page is summarized, and the page summaries are reduced in bounded groups to one leaf. No source byte is skipped, and no permanent ID is added. Page summaries are not persisted; after a restart, an unfinished long leaf is recomputed.
+OptChat migrates a v0.3.0 snapshot once. It keeps the main tiling exactly and initializes the compactor tiling from it. After a crash, durable messages beyond the saved view append to its existing prefix. A pre-0.2.0 chat without `view.json` also migrates once. Malformed or inconsistent snapshots fail closed instead of silently producing a different view.
 
-Work sits in dependency-ready queues, as upstream specifies; the tree is never scanned for work. A message's leaf is admitted while fewer than eight earlier leaves are unbuilt, and a merge becomes ready as soon as both halves exist, in any order. At most eight calls run at once. Each summary gets five shortening attempts with bounded feedback, and the shortest whole reply is kept. If no attempt fits a 16 KB safety ceiling, the summary fails rather than being cut. A failed call releases its slot immediately and is retried on the next appended message; there are no idle retry timers.
+The summary target is 512 UTF-8 bytes. The main view appends leaves until its summary text exceeds 128,000 bytes. It then merges a batch down to 64,000 bytes. Merge priority measures age from the sibling pair's **last** message, with oldest-first ties. Only built parents can be used. An unfinished batch stays active across later node completions, messages, and restarts. The view never splits.
 
-**Refusals.** A compressor refusal is a provider reply with `stopReason: "error"` whose message starts with `Refusal` (how pi-ai reports Anthropic `stop_reason: refusal`). That compaction is retried once with the session's main model, under the same admission, cache, and token rules, and its metric line names the model that answered. The fallback has a 30-second wall deadline covering admission, auth, and the whole provider response; a fallback that exceeds it is cancelled and treated as a refusal. If the main model also refuses, or is the compressor itself, OptChat commits a deterministic excerpt of the node's source, prefixed `[unsummarized: compressor refused]`, within the node's byte budget. A stand-in is navigation, not a model summary: `zoom` returns the originals, and the tree keeps progressing so later prompts are not refused. Other provider errors (transport, HTTP, rate limit, aborts, length) keep the retry-on-next-message behavior. Each fallback is reported once, and `/optchat status` counts main-model retries and stand-ins.
+The compressor has its own view, which cycles between 16,000 and 32,000 bytes. It combines main-view ranges into coarser summaries and refreshes when the main view merges. It contains only built, addressed summary lines before the target message, or through the end of a target merge. It never contains later messages.
 
-A model turn waits for summaries rather than seeing partial source text. Compression failures are reported. Cancel a wait if the provider is unavailable; history already accepted by the plugin is retained. Reasoning/thinking is not written to the OptChat log. Ordinary tool-result text is head-and-tail capped at 30,000 characters; registered memory tools enforce their own bounds and are exempt, so their citations and JSON envelopes remain intact.
+The compressor measures age against its own available endpoint, not the main chat's queued tail. Compression instructions use a 512-dash ruler instead of example content. Sizes apply to summary text, not token estimates or provider-envelope overhead.
+
+### Summary integrity and scheduling
+
+Compressor replies cannot attribute a span to `user:` if the span contains no user record. The check recognizes nested speaker labels and presentational wrappers while preserving genuinely quoted text. Invalid candidates are retried and cannot become fallback summaries. If no safe candidate remains, the existing marked source excerpt lets the tree continue. Historical summaries are not rewritten.
+
+New tool-result records use optional strict `metadata.resultFor`, which points to an earlier tool record. Indexed JSONL imports remap these links into the destination store. Unindexed imports that contain links are rejected. Older logs remain readable without invented associations. Older plugin binaries that do not recognize the new metadata cannot reopen stores containing it.
+
+Short records and child pairs that already fit are free nodes. Longer records use bounded UTF-8 pages. The compressor summarizes each page, then reduces those summaries in bounded groups to one leaf. It skips no source byte and adds no permanent ID. Page summaries are not persisted. After a restart, an unfinished long leaf is recomputed.
+
+Work uses dependency-ready queues, as the upstream specification requires. The tree is never scanned for work. A message's leaf is admitted while fewer than eight earlier leaves remain unbuilt. A merge becomes ready when both halves exist, in any order. At most eight calls run at once.
+
+Each summary gets five shortening attempts with bounded feedback. OptChat keeps the shortest whole reply. If no attempt fits a 16 KB safety ceiling, the summary fails instead of being cut. A failed call releases its slot immediately and retries on the next appended message. There are no idle retry timers.
+
+### Refusals
+
+A compressor refusal is a provider reply with `stopReason: "error"` whose message starts with `Refusal`. This is how pi-ai reports Anthropic's `stop_reason: refusal`.
+
+OptChat retries that compaction once with the session's main model, under the same admission, cache, and token rules. Its metric line names the model that answered. This fallback has a 30-second wall deadline covering admission, authentication, and the whole provider response. If it exceeds the deadline, OptChat cancels it and treats it as a refusal.
+
+If the main model also refuses, or is the compressor itself, OptChat commits a deterministic excerpt of the node's source. The excerpt starts with `[unsummarized: compressor refused]` and fits the node's byte budget. This stand-in helps navigation but is not a model summary. `zoom` returns the originals. The tree continues so later prompts are not refused.
+
+Other provider errors retain retry-on-next-message behavior: transport, HTTP, rate limit, aborts, and length errors. Each fallback is reported once. `/optchat status` counts main-model retries and stand-ins.
+
+A model turn waits for summaries instead of seeing partial source text. OptChat reports compression failures. Cancel a wait if the provider is unavailable. History that the plugin already accepted remains stored.
+
+OptChat does not write reasoning/thinking to its log. Ordinary tool-result text has a 30,000-character cap that retains the head and tail. Registered memory tools enforce their own bounds and are exempt from this cap. Their citations and JSON envelopes therefore remain intact.
 
 ## System One gates (Jev)
 
-Four gates send text to the host's `judge` model role. All four are on by default. Turn one off for a session with its opt-out flag (`--no-optchat-rules`, `--no-optchat-prefetch`, `--no-optchat-value-score`, `--no-optchat-recall`); an opt-out takes precedence over the gate's own flag, which is kept for explicit launches. OMP boolean flags are presence flags, so `--optchat-rules=false` does not turn a gate off. With all four opted out, OptChat resolves no judge, registers no `chat_recall` tool, and sends no gate messages: its context and `/optchat status` are the memory-only ones (0.5.0's, plus `chat_search` and `zoom` depth since 0.7.0, and `chat_evidence`). `chat_evidence` is not one of the four: it never resolves a judge, so it stays registered with every gate opted out, and `--no-optchat-evidence` removes it. Subagents never run the gates.
+Four gates send text to the host's `judge` model role. All four are on by default. Use the corresponding opt-out flag to disable a gate for a session:
 
-The tool gate, which screened tool calls before they ran, was removed in 0.8.0. Risky-call confirmation is OMP's own tool approval (`tools.approval` in OMP's settings).
+- `--no-optchat-rules`
+- `--no-optchat-prefetch`
+- `--no-optchat-value-score`
+- `--no-optchat-recall`
+
+An opt-out takes precedence over the gate's own flag, which remains available for explicit launches. OMP boolean flags are presence flags. For example, `--optchat-rules=false` does not disable the rules gate.
+
+With all four gates disabled, OptChat resolves no judge, registers no `chat_recall` tool, and sends no gate messages. Its context and `/optchat status` use the memory-only behavior from 0.5.0, with later memory features. These include `chat_search` and `zoom` depth from 0.7.0, plus `chat_evidence`.
+
+`chat_evidence` is not one of the four gates and never resolves a judge. It remains registered when every gate is disabled. Use `--no-optchat-evidence` to remove it. Subagents never run the gates.
+
+Version 0.8.0 removed the tool gate, which screened tool calls before execution. OMP's own tool approval handles risky-call confirmation through `tools.approval` in OMP's settings.
 
 ### Choosing the judge
 
-The gates use whatever model OMP's `judge` role resolves to. Set it under `modelRoles` in OMP's `config.yml` (not `models.yml`), or assign it in `/models`:
+The gates use the model that OMP's `judge` role resolves to. Set it under `modelRoles` in OMP's `config.yml`, not `models.yml`. Alternatively, assign it in `/models`:
 
 ```yaml
 modelRoles:
   judge: openrouter/~typesafe/jev-latest
 ```
 
-Jev (TypeSafe's typed decision model, directly or through OpenRouter) answers natively. The role also accepts tiny and ordinary chat models, which answer through OMP's prompted judge. Judge credentials resolve through OMP; the separate Clairic adapter above is the sole approved plugin-side provider client and reads no environment variable itself. If no candidate is credentialed, the gates simply do not run and `/optchat status` says so.
+Jev is TypeSafe's typed decision model, available directly or through OpenRouter. It answers natively. The role also accepts tiny and ordinary chat models, which answer through OMP's prompted judge.
 
-When the `judge` role has no candidate at all but the session has a model, OMP answers with the session model. OptChat then runs no gate on that model: rules, prefetch, value-score and recall are inactive, and `/optchat status` says why. `chat_recall` stays registered, so tool definitions do not change; it answers that it is inactive. No judged text is sent to the session model's provider.
+OMP resolves judge credentials. The separate Clairic adapter described above is the sole approved plugin-side provider client. It reads no environment variable itself. If no candidate has credentials, the gates do not run. `/optchat status` reports this condition.
+
+If the `judge` role has no candidate at all but the session has a model, OMP returns the session model. OptChat runs no gate on that model. Rules, prefetch, value-score, and recall become inactive, and `/optchat status` explains why. `chat_recall` stays registered so tool definitions do not change, but it reports that it is inactive. No judged text goes to the session model's provider.
 
 ### Turning gates off
 
 ```sh
 omp --no-optchat-prefetch --no-optchat-value-score
 omp --no-optchat-recall                          # no chat_recall tool; chat_search and zoom stay
-omp --no-optchat-rules --no-optchat-prefetch --no-optchat-value-score --no-optchat-recall   # memory only
+omp --no-optchat-rules --no-optchat-prefetch --no-optchat-value-score --no-optchat-recall   # judge gates off; Clairic remains on
 omp --no-optchat-evidence                        # no chat_evidence tool; it never used a judge
 omp --no-optchat-extract                         # chat_evidence never calls the Clairic extractor
 omp --no-optchat                                 # plain OMP: no memory, no gates
@@ -166,7 +337,7 @@ omp --no-optchat                                 # plain OMP: no memory, no gate
 
 ### What you will see
 
-`/optchat status` gains a gate section while any gate is on:
+`/optchat status` adds a gate section while any gate is on:
 
 ```text
 System One gates: rules on, prefetch on, value-score on, recall on
@@ -179,9 +350,9 @@ value-score counts: 0 judge calls, 0 failures, 0 hints
 recall counts: 0 judge calls, 0 failures, 0 answered, 0 none, 0 failed
 ```
 
-The judge-call counters count judgments, including answers served from the shared judgment cache, so OMP's billed `model_usage` rows can be fewer.
+Judge-call counters include answers served from the shared judgment cache. OMP's billed `model_usage` rows can therefore be fewer.
 
-On the session-model fallback, the gate section reads instead:
+With the session-model fallback, the gate section reads:
 
 ```text
 judge: openrouter/anthropic/claude-sonnet (session model fallback: the judge role has no native candidate; no gate runs)
@@ -191,9 +362,18 @@ value-score inactive: no native judge model (judge role resolves to session mode
 recall inactive: no native judge model (judge role resolves to session model)
 ```
 
-The counts above are an illustrative sample, not a measurement. They are in memory for this session only. Judge calls count every judgment a gate makes; failures count the failures recorded in the last-failure line. Outcomes: rules `added`, `replaced` and `removed`; prefetch `blocks` built and their `bytes`; value-score `hints` added to a compaction instruction; recall `answered`, `none` and `failed`. A block is counted for each request that carries one. The counts never enter the system prompt, the view or a provider request. With every gate off, status has no gate lines.
+These counts are an illustrative sample, not a measurement. They stay in memory for this session only. Judge calls count every judgment a gate makes. Failures count those recorded in the last-failure line.
 
-Active standing rules follow the view as their own message, with the id, the source message id and the user's words, for example:
+The outcome counters are:
+
+- Rules: `added`, `replaced`, and `removed`.
+- Prefetch: `blocks` built and their `bytes`. Each request that carries a block counts that block.
+- Value-score: `hints` added to a compaction instruction.
+- Recall: `answered`, `none`, and `failed`.
+
+These counts never enter the system prompt, view, or provider request. With every gate off, status has no gate lines.
+
+Active standing rules follow the view in their own message. Each rule includes its id, source message id, and the user's words:
 
 ```text
 <rules>
@@ -201,9 +381,9 @@ r1 [42] From now on, always answer in British English spelling.
 </rules>
 ```
 
-A prefetch block, when the judge finds relevant lines, follows as `<prefetch>` with the opened lines and a header marking them as data, not instructions. A screened tool call above the danger threshold opens a confirm dialog in an interactive session; in print or JSON mode it is blocked and the model is told why, for example "danger 0.96, no UI to confirm".
+When the judge finds relevant lines, a `<prefetch>` block follows with the opened lines. Its header marks them as data, not instructions. OptChat does not screen or approve ordinary tool calls.
 
-A `chat_recall` call returns the scanned view line that covers the message it chose (if any) and then the message itself, for example:
+A `chat_recall` result shows the scanned view line that covers the chosen message, if any, followed by the message itself:
 
 ```text
 [optchat recall] why did the staging deploy fail?
@@ -218,58 +398,193 @@ Error: DATABASE_URL is not set in environment "staging" …
 
 | Flag | Gate | What it does | Judged per |
 | --- | --- | --- | --- |
-| `--optchat-rules` | Standing rules | Judges human user messages for standing instructions, replacements, or explicit withdrawals. Accepted changes append to `ledger.jsonl`; active rules appear in a `<rules>` block after the view. Agent messages cannot mutate this ledger. | human user message |
-| `--optchat-prefetch` | Prefetch | Judges merged view lines against the new user message and zooms the relevant ones into a `<prefetch>` block. Bounded to 5 s, and to the settle deadline's remaining time. | user message |
-| `--optchat-value-score` | Value hint | Judges each long leaf's label and importance, and adds one fixed sentence to its compaction instruction. The sentence never contains record text or ids. | compacted leaf |
-| `--optchat-recall` | Recall | Registers the `chat_recall(question)` tool. Candidates are the view lines plus up to `--optchat-recall-seeds` (default `8`, integer 0–32) raw-log matches: the word search's widest pool re-ranked locally with BM25-style length normalization (no model call), so a short message that states the answer beats a long dump, and the top seeds become single-message lines. All candidates are scored against the question in the same relevance requests, and if no line reaches `--optchat-recall-min` the call says so. Otherwise the top `max(--optchat-recall-k, 4)` multi-message lines at or above `--optchat-recall-min` are scanned: every built message under them is scored in one more round, at most 256 messages (a line that would pass the cap is skipped whole). The messages that reached `--optchat-recall-min` or lie under a scanned line compete: those within 0.1 of the best score (at most 8) are shown side by side in one choice question, and the likeliest is returned with its path (the scanned line covering it, then the message) and first 8 KB. With `--optchat-recall-k` above 1 it also lists the next messages by rank and any scanned line that failed. About ⌈(lines+seeds)/64⌉ scoring requests, plus 1–4 scan requests, plus at most 1 pick; bounded to 20 s overall and 5 s per call. A failed pick keeps the score ranking; a failure or timeout returns an explicit "recall failed" result, never a guessed answer. | tool call |
+| `--optchat-rules` | Standing rules | Judges human user messages for standing instructions, replacements, or explicit withdrawals. Accepted changes append to `ledger.jsonl`. Active rules appear in a `<rules>` block after the view. Agent messages cannot change this ledger. | human user message |
+| `--optchat-prefetch` | Prefetch | Judges merged view lines against the new user message. It zooms relevant lines into a `<prefetch>` block. It is bounded to 5 s and to the settle deadline's remaining time. | user message |
+| `--optchat-value-score` | Value hint | Judges each long leaf's label and importance. It adds one fixed sentence to the compaction instruction. That sentence never contains record text or ids. | compacted leaf |
+| `--optchat-recall` | Recall | Registers `chat_recall(question)`. It scores candidates, scans messages under the top lines, and selects a likely answer as described below. | tool call |
 
-Thresholds: `--optchat-rule-add` (default `0.8`), `--optchat-prefetch-k` (default `8`, integer 1–32), `--optchat-prefetch-min` (default `0.5`), `--optchat-recall-min` (default `0.5`), `--optchat-recall-k` (default `1`, integer 1–8; widens the recall scan beyond the top 4 lines and, above 1, lists the losing candidates), `--optchat-recall-seeds` (default `8`, integer 0–32). Probabilities are plain decimals in (0, 1]. A malformed value fails the session's configuration closed.
+Recall follows these steps:
 
-Behavior:
+1. Collect the view lines and up to `--optchat-recall-seeds` raw-log matches. The default is `8`, with an integer range of 0–32. The word search's widest pool is re-ranked locally with BM25-style length normalization, without a model call. This lets a short message that states the answer beat a long dump. The top seeds become single-message lines.
+2. Score all candidates against the question in the same relevance requests. If no line reaches `--optchat-recall-min`, report that result.
+3. Otherwise, scan the top `max(--optchat-recall-k, 4)` multi-message lines at or above `--optchat-recall-min`. Score every built message under those lines in one more round, up to 256 messages. Skip a whole line if it would exceed the cap.
+4. Compare messages that reached `--optchat-recall-min` or lie under a scanned line. Show those within 0.1 of the best score, at most 8, side by side in one choice question.
+5. Return the likeliest message, its path, and its first 8 KB. The path shows the scanned line that covers it, then the message. With `--optchat-recall-k` above 1, also list the next messages by rank and any scanned line that failed.
 
-- **Judge.** The judge is the host's `judge` role, resolved per call. If the role has no credentialed candidate, or resolving it throws, that gate does not run. `/optchat status` says so. OptChat keeps working. With no role candidate and a session model, the session model is the fallback judge, and every gate is inactive on it (see above).
-- **Failures.** A judge failure, a timeout, or a missing judge changes no rule and adds no prefetch block. `/optchat status` shows the last failure, cut to 200 characters.
-- **Privacy.** An enabled gate sends the text it judges to the judge role's provider: user messages, view lines, tool names and inputs, and record text for the value hint. On the session-model fallback no gate runs, so nothing is sent. With every gate opted out, nothing is sent.
-- **Cost.** With the defaults, each user message costs one rules request, plus, on a turn whose view merged, one prefetch request per packed chunk of view lines (at most 64 lines or 24,000 bytes each; the live run saw 3 per such turn), and each long compacted leaf costs one. A `chat_recall` call costs one scoring request per 64 candidate lines (view lines and `--optchat-recall-seeds` raw-log matches) plus 1–4 scan requests for the messages under the top lines and at most one choice question among the near-tied messages, and only when the model calls it.
-- **Compressor cost record.** Each completed compressor call appends one line to `metrics.jsonl` in the store directory (append-only, mode 0600, best effort: a failed write is reported as a warning and never stops the chat). A line has `type: "compressor"` and holds the completion time (`at`, ISO-8601 UTC), the model, input, output, cache-read and cache-write token counts as the host reports them, `node` (`leaf` for a message or one page of a long one, `merge` for two lines), the 1-based `attempt` within one compaction and the `retry` cause of that attempt (`null` on the first; otherwise `head`, `length`, `marker` or `user`), `waitMs` (time spent in admission and waiting for the cache lease before the request was sent), `latencyMs` (provider time only, without `waitMs`), the host's reported cost in USD (`null` when the host reports none), the stop reason and a bounded error text, never message content. The same file also holds two other row types, counts only: `host-compaction` (`at`, `outcome` `marker`, `cut-moved`, `cut-in-turn` or `cancelled`, a closed `reason` when cancelled, and `tokensBefore`) for each host compaction OptChat answered, and `rules` (`at`, the judge's P(rule) for the message and the highest per-sentence P(rule), the sentence count, the `--optchat-rule-add` cutoff and whether any rule was written) for each triage, which never stores the message or a rule's text. Only compressor rows count as calls; a line without a `type`, written before rows were typed, is a compressor row. `/optchat status` shows the store's calls and the sum of the reported costs; a call without a reported cost is counted and shown as unknown, never as $0. `/optchat new` archives the file with the old chat. The evidence runner sets `OPTCHAT_METRICS_FILE` to a per-host path outside the store copy, because it must count only that host's calls; the variable redirects the sink and is not needed otherwise.
-- **Measured compressor cost (one cold, parallel build; not typical).** On 2026-10-17, OMP 18.11.3 with `@smol` = `anthropic/claude-sonnet-5-5` ran a fresh store over 64 consecutive real messages (61,601 text bytes, `--optchat-view-bytes 8192`, default 8 jobs). The 8 leaf calls started at once on a cold cache, so none could read another's cache; the run was stopped after 7 returned. Those n=7 leaf calls each had 4 input tokens, 0 cache-read tokens, 66,022 to 68,491 cache-write tokens, 158 to 218 output tokens, and a host-reported cost of $0.1666 to $0.1733 ($1.1799 in all). Each compressor call carries the host's system prompt as its shared prefix (176,452 bytes in a host started with the same flags); how much of the cache write that prefix accounts for was not separated. No merge call ran, and no call read the cache, so the warm cost of a leaf or a merge, and any cost per stored message, are unmeasured here. `metrics.jsonl` and `/optchat status` now record them in live use.
-- **Rules.** A rule's text is the user's own words. When a message has several sentences, the judge rates each one, and every sentence that reaches `--optchat-rule-add` becomes its own rule, the whole sentence with any "unless…" clause it carries, so "Use British English. Always ask before deploying." stores two rules, and "From now on, answer in British English. Also run the tests." stores only the first sentence. Each sentence also picks its own replacement or withdrawal target. Rule IDs (`r1`, `r2`, …) are never reused. `/optchat rules` lists active rules, and `/optchat rules remove ID` removes one. A human message can also explicitly withdraw a rule or declare that its scope ended: withdrawal is judged separately from adding a new standing rule, then checked against an offered active ID before durable removal. Automatic targets for each sentence are the newest 16 active rules plus up to 16 older ones whose words best match that sentence; the command can remove any rule. Unknown, stale or ambiguous targets do nothing, and duplicate withdrawals never resurrect a rule. No time-based expiry is inferred. A triage that is still running at shutdown is abandoned and writes nothing.
-- **Where standing instructions live.** Each store holds different things by scope. The rules ledger (`ledger.jsonl`, per store and so per worktree by default) holds instructions you state in this chat. OMP TTSR rule files hold enforced guardrails that apply to every session. Sharpshooter holds cross-session project decisions learned from friction. An item in one is not copied into the others.
-- **Shutdown.** A print or JSON run exits right after its reply. On `session_shutdown`, OptChat waits up to 1.5 s for queued rule triage, then abandons whatever is still running. The bound stays under the host's 2 s session-shutdown cap, so the wait is shorter than the 5 s the design allowed.
-- **Frozen per turn, except retirement.** Rule additions and prefetch are frozen when a turn starts. A new rule or replacement successor applies from the next turn. Retired rule IDs disappear from subsequent context assemblies, including tool loops and an assembly that was waiting for prefetch. Already assembled or transmitted requests are not rewritten.
+Recall uses about ⌈(lines+seeds)/64⌉ scoring requests, plus 1–4 scan requests and at most one pick. The overall bound is 20 s, with 5 s per call. A failed pick keeps the score ranking. A failure or timeout returns an explicit "recall failed" result, never a guessed answer.
 
-Verified in this repository: the unit and integration tests in `tests/system1.test.ts`, `tests/system1-e2e.test.ts` and `tests/memory.test.ts`; a cache test (`tests/cache.test.ts`) showing that the system prompt, tools and view text in an encoded Anthropic request are unchanged when the rules and prefetch messages follow the view; a one-off comparison in which a 12-turn conversation produced byte-identical context and status with every gate opted out, against 0.5.0; and live print-mode runs with the real judge on OMP 18.9.1, where the tool gate (removed in 0.8.0) blocked `rm -rf build` with no UI and a two-sentence message stored only its rule sentence. Not verified: the judge's accuracy beyond those runs, prefetch on a live merged view, and the confirm dialog in an interactive session.
+Thresholds and selection limits:
+
+| Flag | Default | Range or effect |
+| --- | --- | --- |
+| `--optchat-rule-add` | `0.8` | Probability cutoff |
+| `--optchat-prefetch-k` | `8` | Integer 1–32 |
+| `--optchat-prefetch-min` | `0.5` | Probability cutoff |
+| `--optchat-recall-min` | `0.5` | Probability cutoff |
+| `--optchat-recall-k` | `1` | Integer 1–8. Widens the recall scan beyond the top 4 lines. Above 1, also lists losing candidates. |
+| `--optchat-recall-seeds` | `8` | Integer 0–32 |
+
+Probabilities are plain decimals in (0, 1]. A malformed value causes the session's configuration to fail closed.
+
+### Gate behavior and privacy
+
+The host resolves the `judge` role for each call. If it has no credentialed candidate, or resolution throws, that gate does not run. `/optchat status` reports the condition, and OptChat keeps working. If the role has no candidate but a session model exists, OMP uses that model as the fallback judge. Every gate remains inactive on it.
+
+A judge failure, timeout, or missing judge changes no rule and adds no prefetch block. `/optchat status` shows the last failure, cut to 200 characters.
+
+An enabled gate sends the text it judges to the judge role's provider. This includes user messages, view lines, tool names and inputs, and record text for the value hint. With the session-model fallback, no gate runs and no gate text is sent. The same is true when every gate is disabled.
+
+### Cost
+
+With default settings:
+
+- Each user message costs one rules request.
+- A turn whose view merged adds one prefetch request per packed chunk of view lines. Each chunk holds at most 64 lines or 24,000 bytes. The live run observed 3 requests per such turn.
+- Each long compacted leaf costs one value-hint request.
+- `chat_recall` costs one scoring request per 64 candidate lines, including view lines and `--optchat-recall-seeds` raw-log matches. It adds 1–4 scan requests for messages under the top lines and at most one choice question among near-tied messages. This cost occurs only when the model calls the tool.
+
+#### Compressor cost record
+
+Each completed compressor call appends one line to `metrics.jsonl` in the store directory. The file is append-only with mode 0600. Writes are best effort: a failed write produces a warning but never stops the chat. Records contain counts and diagnostics, never message content.
+
+A compressor row has `type: "compressor"` and these fields:
+
+- `at`: completion time in ISO-8601 UTC.
+- The model and host-reported input, output, cache-read, and cache-write token counts.
+- `node`: `leaf` for a message or one page of a long message, or `merge` for two lines.
+- `attempt`: the 1-based attempt within one compaction.
+- `retry`: `null` on the first attempt, otherwise `head`, `length`, `marker`, or `user`.
+- `waitMs`: time in admission and waiting for the cache lease before sending the request.
+- `latencyMs`: provider time only, excluding `waitMs`.
+- The host-reported USD cost, or `null` if the host reports none.
+- The stop reason and bounded error text.
+
+The same file holds two other counts-only row types:
+
+- `host-compaction`: one row for each host compaction OptChat answered. Fields are `at`, `outcome`, a closed `reason` when cancelled, and `tokensBefore`. Outcomes are `marker`, `cut-moved`, `cut-in-turn`, or `cancelled`.
+- `rules`: one row per triage. Fields include `at`, the judge's P(rule) for the message, the highest per-sentence P(rule), and the sentence count. It also records the `--optchat-rule-add` cutoff and whether any rule was written. It never stores message or rule text.
+
+Only compressor rows count as calls. A line without a `type`, written before rows had types, is a compressor row. `/optchat status` shows the store's call count and sum of reported costs. A call without a reported cost still counts and appears as unknown, never as $0. `/optchat new` archives the file with the old chat.
+
+The evidence runner sets `OPTCHAT_METRICS_FILE` to a per-host path outside the store copy. This lets it count only that host's calls. The variable redirects the output file and is not needed otherwise.
+
+#### Measured compressor cost
+
+This was one cold, parallel build, **not a typical cost measurement**. On 2026-10-17, OMP 18.11.3 used `@smol` = `anthropic/claude-sonnet-5-5` with a fresh store. The input was 64 consecutive real messages with 61,601 text bytes. Settings were `--optchat-view-bytes 8192` and the default 8 jobs.
+
+Eight leaf calls started at once on a cold cache, so none could read another's cache. The run stopped after 7 returned. Each of those n=7 calls had:
+
+- 4 input tokens and 0 cache-read tokens.
+- 66,022 to 68,491 cache-write tokens.
+- 158 to 218 output tokens.
+- A host-reported cost of $0.1666 to $0.1733, totaling $1.1799.
+
+Each compressor call carries the host's system prompt as its shared prefix. That prompt was 176,452 bytes in a host started with the same flags. The measurement did not isolate the prefix's share of the cache write.
+
+No merge call ran, and no call read the cache. This run therefore did not measure warm leaf cost, warm merge cost, or cost per stored message. `metrics.jsonl` and `/optchat status` now record these in live use.
+
+### Standing rules
+
+A rule uses the user's own words. For a message with several sentences, the judge rates each sentence separately. Every sentence that reaches `--optchat-rule-add` becomes its own rule. The full sentence remains intact, including any "unless…" clause.
+
+For example, "Use British English. Always ask before deploying." stores two rules. "From now on, answer in British English. Also run the tests." stores only the first sentence. Each sentence also selects its own replacement or withdrawal target. Rule IDs (`r1`, `r2`, …) are never reused.
+
+`/optchat rules` lists active rules. `/optchat rules remove ID` removes one. A human message can also explicitly withdraw a rule or declare that its scope ended. The judge assesses withdrawal separately from adding a standing rule. OptChat then checks the withdrawal against an offered active ID before durable removal.
+
+Automatic targets for each sentence include the newest 16 active rules and up to 16 older rules whose words best match that sentence. The command can remove any rule. Unknown, stale, or ambiguous targets do nothing. Duplicate withdrawals never resurrect a rule. OptChat infers no time-based expiry. A triage still running at shutdown is abandoned and writes nothing.
+
+Standing instructions have different scopes:
+
+- The rules ledger (`ledger.jsonl`) holds instructions you state in this chat. It is per store, and therefore per worktree by default.
+- OMP TTSR rule files hold enforced guardrails for every session.
+- Sharpshooter holds cross-session project decisions learned from friction.
+
+An item in one location is not copied to the others.
+
+A print or JSON run exits immediately after its reply. On `session_shutdown`, OptChat waits up to 1.5 s for queued rule triage, then abandons any remaining work. This stays below the host's 2 s shutdown cap. The wait is shorter than the 5 s allowed by the design.
+
+Rule additions and prefetch freeze when a turn starts. A new rule or replacement successor applies from the next turn. Retirement is the exception: retired IDs disappear from later context assemblies. This includes tool loops and an assembly waiting for prefetch. Already assembled or transmitted requests are not rewritten.
+
+### Verification scope
+
+Repository verification includes:
+
+- Unit and integration tests in `tests/system1.test.ts`, `tests/system1-e2e.test.ts`, and `tests/memory.test.ts`.
+- A cache test in `tests/cache.test.ts`. It shows unchanged system prompt, tools, and view text in an encoded Anthropic request when rules and prefetch messages follow the view.
+- A one-off, 12-turn comparison against 0.5.0. With every gate disabled, context and status were byte-identical.
+- Live print-mode runs with the real judge on OMP 18.9.1. The tool gate, removed in 0.8.0, blocked `rm -rf build` without a UI. A two-sentence message stored only its rule sentence.
+
+These checks did not verify judge accuracy beyond those runs, prefetch on a live merged view, or the confirm dialog in an interactive session.
 
 ## OMP-specific boundaries
 
-- OMP caps extension context handlers at 30 seconds. OptChat therefore cancels a turn if memory has not settled within 25 seconds, before the host could ignore a timed-out hook. The unanswered user message stays in the log, and compression continues; send the request again after memory is ready. It never substitutes raw old history or half a summary.
-- The extension preserves OMP's system instructions, tool policy, display, and in-turn reasoning rather than replacing the harness. It does not change your delegation policy or create its own subagent system.
-- Activation does not change host settings or replace the Sharpshooter memory backend. When OMP compacts the chat (automatically, with `/compact`, or by the experimental rollover), OptChat answers with one fixed marker summary and makes no model call. The host then keeps only recent messages, while the full history stays in OptChat's log and tree, and the model reads it through the OptChat view. A cut that would drop part of the open turn moves to the turn's first message while the older history is at least as large as the turn's dropped part. When the turn is most of what the host would drop, or the cut cannot move there, the host's cut stands inside the turn, and the marker names the turn's first message so the model can reread it with `zoom(id, 1)`; earlier steps of the turn are in the log too. OMP shows the marker in place of the older transcript, as it does for any compaction. Automatic shake pruning still bypasses the hook. Activation changes none of OMP's maintenance settings. Because a marker compaction costs no model call, set `compaction.thresholdTokens` to about 200,000–300,000 in OMP's config: OMP's own side requests (skill capture, away recaps) send the raw session history, and with the default threshold on a 1M-token model they failed 12 times with "prompt is too long" in sessions before 0.12.0.
-- Images that reach OMP as `ImageContent` (user, assistant, tool-result, and report messages) are validated as PNG, JPEG, or WebP and stored by digest. Audio, video, and original files are not archived, because OMP 18.9.0 exposes no ingress for them. Unreferenced image blobs and abandoned image/view staging files are garbage-collected after successful writer replay and snapshot validation; referenced blobs remain verified on read, and cleanup failures warn without blocking the store.
-- OMP side turns, such as idle recaps and `/btw`, pass through untouched. They are recognized as host-authored, agent-attributed messages that are absent from the session branch, and they never open, reuse, or poison a main turn. OMP 18.9.0 has no typed request purpose, so another future host-authored side-turn shape could need a matching update.
-- Permanent storage uses fsync, not automatic Git commits. Backups remain the operator's responsibility.
+### Turn settlement and compaction
+
+OMP caps extension context handlers at 30 seconds. OptChat cancels a turn if memory does not settle within 25 seconds, before the host could ignore a timed-out hook. The unanswered user message stays in the log, and compression continues. Send the request again after memory is ready. OptChat never substitutes raw old history or a partial summary.
+
+The extension preserves OMP's system instructions, tool policy, display, and in-turn reasoning. It does not replace the harness, change your delegation policy, or create its own subagent system. Activation does not change host settings or replace the Sharpshooter memory backend.
+
+When OMP compacts the chat, OptChat answers with one fixed marker summary and makes no model call. This applies to automatic compaction, `/compact`, and experimental rollover. The host then keeps only recent messages. Full history remains in OptChat's log and tree, and the model reads it through the OptChat view.
+
+A compaction cut can otherwise drop part of the open turn. OptChat moves that cut to the turn's first message when older history is at least as large as the turn's dropped part. If the turn is most of what the host would drop, or the cut cannot move there, the cut stays inside the turn. The marker then names the turn's first message so the model can reread it with `zoom(id, 1)`. Earlier steps of the turn are also in the log.
+
+OMP shows the marker in place of the older transcript, as with any compaction. Automatic shake pruning still bypasses the hook. Activation changes none of OMP's maintenance settings.
+
+A marker compaction costs no model call. Set `compaction.thresholdTokens` to about 200,000–300,000 in OMP's config. OMP's own side requests, such as skill capture and away recaps, send raw session history. With the default threshold on a 1M-token model, these requests failed 12 times with "prompt is too long" in sessions before 0.12.0.
+
+### Other host boundaries
+
+Images that reach OMP as `ImageContent` undergo PNG, JPEG, or WebP validation and are stored by digest. This includes user, assistant, tool-result, and report messages. Audio, video, and original files are not archived because OMP 18.9.0 exposes no ingress for them.
+
+After successful writer replay and snapshot validation, OptChat garbage-collects unreferenced image blobs and abandoned image/view staging files. Referenced blobs remain verified on read. Cleanup failures produce warnings without blocking the store.
+
+OMP side turns, such as idle recaps and `/btw`, pass through unchanged. OptChat recognizes them as host-authored, agent-attributed messages absent from the session branch. They never open, reuse, or corrupt a main turn. OMP 18.9.0 has no typed request purpose. A future host-authored side-turn shape could therefore require a matching update.
+
+Permanent storage uses fsync, not automatic Git commits. Backups remain the operator's responsibility.
 
 ### Provider caching
 
-For native official Anthropic requests to image-capable models, the view is split into blocks of **four summary lines**, with a cache mark on the last whole block and another at the request end. Other routes, including text-only Anthropic-compatible models whose encoder joins text blocks with newlines, keep the original fixed-offset blocks, so the view's wire bytes never change. Existing markers are bounded to four total, using five-minute entries. Concurrent compressor requests sharing a marked prefix, or the same anchored tools and system head, wait for its writer's response to start; failed or canceled writers release their waiters. Main requests never wait on a head alone. Before 0.10.3, concurrent cold compressor calls each wrote the whole system prefix and none read it, because each call's last mark is its own task line; in a live check after the change (n = 3, no same-session control), the first call wrote 65,171 tokens and the next two each read 61,980 at about a tenth of its cost ($0.1646, $0.0163, $0.0158). Coordination follows Anthropic's 20-block prefix lookup window and is limited to this enabled session. It does not send renewal requests.
+For native official Anthropic requests to image-capable models, OptChat splits the view into blocks of **four summary lines**. It places a cache mark on the last whole block and another at the request end.
 
-Official OpenAI Responses models with the host's explicit-breakpoint capability retain their supported view markers; supported official Codex requests retain reasoning across turns of an active tool loop using `all_turns`. The new writer coordination is Anthropic-only.
+Other routes keep the original fixed-offset blocks, so the view's wire bytes never change. This includes text-only Anthropic-compatible models whose encoders join text blocks with newlines. Existing markers are bounded to four total and use five-minute entries.
 
-Gateways and unsupported transports (including OpenRouter, Azure, Bedrock, Vertex, Foundry, custom endpoints, and pi-native) keep the host's existing cache behavior. Wire-level marker and coordination checks are not proof of real-provider cache hits, account sharing, or savings.
+Concurrent compressor requests can share a marked prefix, or the same anchored tools and system head. Those requests wait for the writer's response to start. Failed or cancelled writers release their waiters. Main requests never wait on a head alone.
 
-Turns and compactions share the effective host system prompt plus one stable OptChat guide. After a compatible host request exposes an encoded prefix, compactions can reuse its system prefix and passive callable-tool schemas; they never execute tools and reject tool-call responses. Reuse requires the encoded system content to match the compressor's own effective prompt, so side requests cannot replace its guide. Tool schemas also require matching request dialect, tool support, freeform `apply_patch` grammar, and computer-use capability; models that disable reasoning when tools are present stay tool-free. Before the first compatible request, compression is tool-free. This avoids exposing tools hidden by the host: OMP's public tool inventory is not the final model-visible catalog. Hosted-native tool schemas are not replayed, and a model requiring native tool execution cannot be selected as the compressor.
+Before 0.10.3, concurrent cold compressor calls each wrote the whole system prefix and none read it. Each call's last mark was its own task line. A live check after the change used n = 3 calls, with no same-session control. The first call wrote 65,171 tokens. The next two each read 61,980 tokens at about a tenth of its cost: $0.1646, $0.0163, and $0.0158.
 
-OMP's public provider hooks carry no request identity: side requests share them, and provider retries or advisors can report a response without a matching request event. The plugin therefore tracks only compressor requests as in-flight cache writers; main requests can wait for those writers, but are not tracked themselves. Main requests still use the provider's normal cache. Compressor callbacks are directly correlated, and an abandoned tracked writer has a 20-second fail-open bound. Other extensions that change payloads after this plugin's hook are outside its prefix-sharing guarantee.
+Coordination follows Anthropic's 20-block prefix lookup window and applies only within this enabled session. It sends no renewal requests.
 
-**Use `PI_OPENAI_STATEFUL=0` as shown above for the specification's stateless `store:false` OpenAI requests.** OMP otherwise defaults to stateful official OpenAI Responses. A plugin cannot change the host's main-request options; deleting a response ID or changing retention mid-chain would lose context. With stateful mode left enabled, fresh turns still replace the prefix, but in-turn continuation requests keep the host's chain and receive no extra view markers. The compressor is already stateless. An explicit host caching-off setting is respected where exposed (`PI_CACHE_RETENTION=none` for OpenAI).
+Official OpenAI Responses models retain supported view markers when the host provides explicit-breakpoint capability. Supported official Codex requests retain reasoning across turns of an active tool loop through `all_turns`. The new writer coordination applies only to Anthropic.
+
+Gateways and unsupported transports keep the host's existing cache behavior. These include OpenRouter, Azure, Bedrock, Vertex, Foundry, custom endpoints, and pi-native. Wire-level marker and coordination checks do not prove real-provider cache hits, account sharing, or savings.
+
+#### Shared prefixes and tool schemas
+
+Turns and compactions share the effective host system prompt plus one stable OptChat guide. After a compatible host request exposes an encoded prefix, compactions can reuse its system prefix and passive callable-tool schemas. Compactions never execute tools and reject tool-call responses.
+
+Reuse requires the encoded system content to match the compressor's own effective prompt. Side requests therefore cannot replace its guide. Tool schemas also require matching request dialect, tool support, freeform `apply_patch` grammar, and computer-use capability. Models that disable reasoning when tools are present stay tool-free. Before the first compatible request, compression is tool-free.
+
+This avoids exposing tools that the host hides. OMP's public tool inventory is not the final model-visible catalog. Hosted-native tool schemas are not replayed. A model that requires native tool execution cannot be the compressor.
+
+OMP's public provider hooks carry no request identity, and side requests share them. Provider retries or advisors can report a response without a matching request event. The plugin therefore tracks only compressor requests as in-flight cache writers. Main requests can wait for those writers but are not tracked themselves. They still use the provider's normal cache.
+
+Compressor callbacks are directly correlated. An abandoned tracked writer has a 20-second fail-open bound. Other extensions that change payloads after this plugin's hook are outside its prefix-sharing guarantee.
+
+#### Stateless OpenAI requests
+
+**Use `PI_OPENAI_STATEFUL=0` as shown above for the specification's stateless `store:false` OpenAI requests.** OMP otherwise defaults to stateful official OpenAI Responses. A plugin cannot change the host's main-request options. Deleting a response ID or changing retention mid-chain would lose context.
+
+If stateful mode stays enabled, fresh turns still replace the prefix. In-turn continuation requests keep the host's chain and receive no extra view markers. The compressor is already stateless. OptChat respects explicit host caching-off settings where exposed, including `PI_CACHE_RETENTION=none` for OpenAI.
 
 ## Privacy and operation
 
-**This is permanent local history, not a secret scrubber.** User text, public assistant replies, tool arguments, and tool-result text may contain secrets. The compressor receives historical content through your configured provider. Do not use it for material you cannot retain or send there. OMP may independently persist its own sessions and diagnostics; `--no-session` controls OMP session files, not the OptChat log.
+**This is permanent local history, not a secret scrubber.** User text, public assistant replies, tool arguments, and tool-result text may contain secrets. The compressor receives historical content through your configured provider. Do not use OptChat for material you cannot retain or send there. OMP may independently persist its own sessions and diagnostics. `--no-session` controls OMP session files, not the OptChat log.
 
-Keep the memory directory private and back it up. The extension never commits or publishes it. HTML exports contain the original log. No telemetry or external storage service is added. Stop the enabled session before restoring backups or copying a consistent set of log, tree, and view files.
+Keep the memory directory private and back it up. The extension never commits or publishes it. HTML exports contain the original log. OptChat adds no telemetry or external storage service. Stop the enabled session before restoring backups or copying a consistent set of log, tree, and view files.
 
-On Linux, the single-writer lock uses an OS-owned abstract Unix socket keyed by the directory's filesystem identity; filesystem operations stay anchored to held directory descriptors through `/proc/self/fd`, even if a path is renamed. A second writer in the same network namespace fails; containers in different network namespaces must not share a writable chat. Linux procfs is required. On macOS, the single-writer lock uses an exclusive non-blocking `flock` on the held root directory descriptor; filesystem operations resolve held descriptor paths via `F_GETPATH`. Both locks avoid PID-age guesses and stale-file unlink races, and process death releases the lock. A local fsync-capable POSIX filesystem is required.
+On Linux, the single-writer lock uses an OS-owned abstract Unix socket keyed by the directory's filesystem identity. Filesystem operations stay anchored to held directory descriptors through `/proc/self/fd`, even if a path is renamed. A second writer in the same network namespace fails. Containers in different network namespaces must not share a writable chat. Linux procfs is required.
+
+On macOS, the lock uses an exclusive non-blocking `flock` on the held root directory descriptor. Filesystem operations resolve held descriptor paths through `F_GETPATH`. Both locks avoid PID-age guesses and stale-file unlink races. Process death releases the lock. A local fsync-capable POSIX filesystem is required.
 
 ## Development
 
@@ -281,50 +596,167 @@ bun run test:host
 bun run smoke
 ```
 
-`bun run test` covers the unit and fake-host suites. `bun run test:host` covers `tests/host/`: real OMP host launches (the real-host integration suite and the paired evidence run). CI runs this sequence with the pinned SDK cohort and with the latest published cohort, on every push and pull request, weekly, and on demand.
+`bun run test` covers unit and fake-host suites. `bun run test:host` covers `tests/host/`, which launches real OMP hosts for the integration suite and paired evidence run. CI runs this sequence with both the pinned SDK cohort and the latest published cohort. It runs on every push and pull request, weekly, and on demand.
 
-`bun run verify:lease` checks the store writer lease, about 12 seconds: a TLA+ model under TLC (needs Java 21, found through `$JAVA`, `mise` or PATH; it fetches the pinned `tla2tools.jar` when missing) and real-process tests against `src/store.ts`. CI runs it as two jobs: `verify-lease` on Linux runs everything (`bun run verify:lease --strict`, the model and the real-process phase), and `verify-lease-macos` runs the real-process phase only (`--real-only --strict`) plus the store suites (`tests/store.test.ts`, `tests/store-directory.test.ts`, `tests/crash.test.ts`, `tests/new-chat.test.ts`), because macOS takes the `flock` path of `acquireLease` and `F_GETPATH` descriptor paths that Linux never runs. The model is platform-independent, so it stays on Linux. On macOS the harness lists descriptors through `/dev/fd` and the store's own `fdPath`, and the breaks of the lease itself (`lease-name-per-process`, `failed-open-keeps-lease`, `gc-before-lease`, `close-keeps-lease`) are written against the flock code, under the same ids and probes. Run it after changing the lease, `Store.open`/`close`, `/optchat new`, or how the rules ledger and metrics are written; `.omp/skills/verify-store-lease/SKILL.md` says how to read it. `--deep` adds the five guarantees with three sessions (about 4.1 million states each, about 6 minutes and up to 24 GB of RAM in total, so neither the default run nor CI includes it). It reports no open findings: F1 (`/optchat new` renaming a store another session had open) and F2 (the rules ledger and `metrics.jsonl` written by pathname) are fixed (CHANGELOG, 0.13.1) and now checked as guarantees; `--strict` exits 0.
+### Writer lease verification
 
-`bun run evidence:recall` is an opt-in recall and usage experiment against real models with a synthetic corpus. Without `--confirm-live-provider-calls` it checks prerequisites and prints its plan. It runs the host with private HOME and agent directories that hold only the selected credentials, so no global context files reach a provider. Call count, compressor output, and wall time are capped. The artifact separates main, compressor, and auxiliary usage and records unobserved fields as `null`, never zero. Auxiliary usage is the session's `model_usage` entries for side phases: exact SDK costs, or unobserved. Maintenance (native compaction) has its own summary: a compaction count and an estimated low/high cost interval, priced from the captured compaction frames (tokens before compaction at the cache-read and input rates, and the summary's UTF-8 bytes divided by four at the output rate). A frame that cannot be priced leaves the interval null, and zero compactions is an exact zero. A frame whose summary is OptChat's fixed marker made no model call, so it counts as a compaction and costs exactly zero. A run's total cost sums the exact main, compressor, and auxiliary costs with the maintenance interval; it is null, with a reason, when any part is unobserved. Cache-read share is reported for each role and over all roles; the all-role share is null whenever maintenance is estimated or unobserved. The per-question steady-state main share sums cache reads and prompt tokens over each phase's turns after the first, and is null in batch mode. A paired delta is the off-minus-on interval difference (off low minus on high, and off high minus on low) plus the steady-state difference, present only when both arms are observed. It never reports savings it did not measure. `OPTCHAT_METRICS_FILE=/path` appends one content-free JSON line per compressor call.
+`bun run verify:lease` checks the store writer lease in about 12 seconds. It runs a TLA+ model under TLC and real-process tests against `src/store.ts`. Java 21 is required and located through `$JAVA`, `mise`, or PATH. The command fetches the pinned `tla2tools.jar` if it is missing.
 
-`bun run evidence:retrieval` is an offline, deterministic comparison of the retrieval strategies (zoom one level at a time, zoom with depth, `chat_search`, prefetch, `chat_recall`, and a scripted beam descent) on the same probes. It builds a real memory in a temporary directory over a synthetic 256-message chat with 12 planted facts, a rule-based summariser that drops values and, with depth, topics, and a fake judge that scores word overlap. It reports per strategy the probes found, agent steps, judge calls, zoom calls and bytes returned, plus a per-fact table by age; `--seed` and `--out` select the seed and write a JSON artifact. It makes no provider calls and measures navigation mechanics only, not real summaries or Jev. The 0.7.0 results are in `.scratch/optchat-jev/issues/10-codemode-retrieval.md`: every summary-navigating strategy found only the facts whose topic survived in the view (3/12 and 5/12 over two seeds), `chat_search` found 12/12, and `chat_recall` reached the surviving facts in one agent step instead of about 200 zoom calls.
+CI splits verification into two jobs:
 
-`--arms on,off` pairs the OptChat arm with a plain-OMP arm over the same corpus and questions. The off arm resumes a seeded session with OptChat disabled: it is offered no memory tools, its prompt never mentions them, and native compaction may run inside that session. Off-arm maintenance is estimated the same way as on-arm maintenance, from its captured compaction frames. A paired delta is computed only when both arms completed every requested scenario and both totals are observed, and the artifact claims no savings.
+- `verify-lease` on Linux runs everything with `bun run verify:lease --strict`: the model and real-process phase.
+- `verify-lease-macos` runs the real-process phase with `--real-only --strict`. It also runs `tests/store.test.ts`, `tests/store-directory.test.ts`, `tests/crash.test.ts`, and `tests/new-chat.test.ts`.
 
-`--compressors a/b,c/d` runs one on-arm unit per compressor, and the paired comparison is reported per compressor. `--turn-mode per-question` sends one question per prompt and records each turn's latency and usage; the default `batch` sends all questions in one prompt. `--experiments child` runs the child-memory experiment: the parent delegates each question to a `task` child, once with the saved view and once blind. Grading uses only the child's delegated output.
+macOS exercises the `flock` path of `acquireLease` and `F_GETPATH` descriptor paths, which Linux never runs. The model is platform-independent and stays on Linux. On macOS, the harness lists descriptors through `/dev/fd` and the store's own `fdPath`. Lease-breaking variants target the flock code under the same ids and probes: `lease-name-per-process`, `failed-open-keeps-lease`, `gc-before-lease`, and `close-keeps-lease`.
 
-Spend has two ceilings. `--max-cost-usd` (above 0, at most 30) is a worst-case dollar ceiling: every prompt and compressor call is admitted against its model's worst-case bound before it is dispatched, and a model with unknown rates or context window blocks rather than passes. `--max-calls` (default 80, at most 2000) caps total provider calls; when it or the deadline is reached, remaining work is refused and reported as a refusal, not silently dropped. Without `--max-cost-usd`, only the call and deadline limits apply.
+Run lease verification after changes to the lease, `Store.open`/`close`, `/optchat new`, or rules-ledger and metrics writes. See `.omp/skills/verify-store-lease/SKILL.md` for how to interpret it.
 
-The dollar bound prices input by UTF-8 bytes, not tokens: a prompt's tokens never exceed its bytes, so no tokenizer is assumed. A main prompt's bytes are the measured effective system prompt, the OptChat block, a 32 KiB tool-schema allowance, the view (on arm) or the seeded history (off arm) plus prior turns, four 16 KiB zoom pages, and the question. Tokens are clamped to the context window and priced at the dearest input-side rate. Output is priced at the pinned cap `--max-main-output` (default 4096, at most 32000): the runner writes that cap as `maxTokens` for each main model into the isolated agent directory's `models.yml`, never the source's. The bound is multiplied by the prompt's four worst-case calls, not by the number of prompts. Each on-arm compressor host reserves `--compressor-share` (default 0.5) of the uncommitted cap as its allowance, and a main prompt is admitted only if observed spend, live host allowances, and its bound together stay within the cap. When a host stops, its allowance is replaced by its observed compressor spend. An off-arm prompt also adds a native-compaction bound over the seeded history, prior turns, and the question, at the pinned cap. Compressor calls are bounded by the compactor's prompt bytes and the compressor output cap. An unknown rate, context window, or unmeasured system prompt refuses. The run prints the per-prompt main bound, the compressor per-call bound, and the host allowance in its plan. After each prompt, observed spend is charged once: exact auxiliary costs and maintenance's high bound, so bounds that were never observed are not charged. `limits.spentUsd` is that running high-bound total. A dispatched child task with no observable child cost leaves spend unobserved and blocks further live work; refused, incomplete, and not-delegated children add no child cost.
+`--deep` adds the five guarantees with three sessions. Each guarantee has about 4.1 million states. The full deep run takes about 6 minutes and up to 24 GB of RAM. Neither the default run nor CI includes it.
 
-`--main-context-window` accepts an integer from 32000 up to the main model's catalog context window (the runner rejects larger values) and overrides only the main model's `contextWindow` in the isolated agent directory's `models.yml`, leaving source configuration and other models unchanged. When omitted, the requested override is `null` and the main model inherits its catalog context window. The artifact records the requested override in `models.mainContextWindow` and the effective main-model context window used by the run alongside it.
+Verification reports no open findings. F1 concerned `/optchat new` renaming a store that another session had open. F2 concerned pathname writes to the rules ledger and `metrics.jsonl`. Both are fixed (CHANGELOG, 0.13.1) and checked as guarantees. `--strict` exits 0.
 
-Limits of this bound: the four-call prompt limit is not an enforced tool-loop cap, and the output cap is trusted from the pinned `models.yml` entry (verified for built-in catalog models through `omp models --json`; the offline fixture provider ignores it). On-arm compaction of the main session is observed but not bounded in advance; OptChat's marker compactions make no model call.
+### Live recall and usage experiment
 
-The runner waits for memory to settle before each prompt for as long as compressor calls, dispatches, or tree growth keep progressing, within the run deadline (`--deadline-ms`, at most 30 minutes). It reports a stall after 120 s without progress. A completed compressor call holds its observed cost against the host's dollar allowance; only calls still in flight hold their worst case. Admissions refused by either ceiling are counted and reported, because a refused admission fails that summary and OptChat then refuses the next turn.
+`bun run evidence:recall` is an opt-in experiment against real models with a synthetic corpus. Without `--confirm-live-provider-calls`, it checks prerequisites and prints its plan. It runs the host with private HOME and agent directories containing only selected credentials. No global context files reach a provider. Call count, compressor output, and wall time are capped.
 
-`--fixture-provider` swaps in the loopback `optchat-smoke/*` models, which are priced at zero. The whole pipeline, including both arms, the compressors, and the child experiment, then runs without provider calls or credentials. It is for testing the runner, requires `optchat-smoke/*` selectors, and is mutually exclusive with `--confirm-live-provider-calls`. `tests/evidence-benchmark.test.ts` drives it end to end and skips when no `omp` executable is found (set `OPTCHAT_EVIDENCE_OMP` to choose one).
+The artifact separates main, compressor, and auxiliary usage. Unobserved fields are `null`, never zero. Auxiliary usage comes from the session's `model_usage` entries for side phases. These are exact SDK costs or unobserved values.
 
-Before copying credentials or starting host discovery, the runner parses the source agent directory's `models.yml`, `models.yaml`, and legacy `models.json` (JSONC). Any selected provider entry blocks the run: copying its credential without its routing could send it to a different endpoint. Read failures, parse errors, and invalid root or provider-map shapes also block, without exposing config contents in diagnostics. This check deliberately includes shadowed files rather than following OMP's first-file precedence; unrelated provider entries are allowed. Source configuration is never migrated, evaluated, or copied.
+Maintenance, meaning native compaction, has its own summary: a compaction count and estimated low/high cost interval. Pricing uses captured compaction frames:
 
-The smoke harness links the plugin into an isolated fresh host environment, then exercises automatic discovery and activation without `--optchat` or an explicit plugin extension path. It uses the actual OMP host with a local deterministic model endpoint, captures inference requests, and checks fresh turns, shared main/compactor prompt and tools, the dash ruler, lossless retrieval, saved-view stability, and restart persistence. Separate opt-out processes prove ordinary history remains intact, no memory store or tools are created, and no compressor requests occur, including both positive/negative flag orders. Set `OPTCHAT_SMOKE_OMP` to a compiled OMP executable and `OPTCHAT_SMOKE_PLUGIN` to an installed plugin directory to verify that artifact rather than the checkout. It is not a measurement of summary quality or real-provider cache hit rates.
+- Tokens before compaction at cache-read and input rates.
+- The summary's UTF-8 bytes divided by four at the output rate.
 
-The 0.4.0 release was exercised on compiled OMP 18.9.0. Beyond the checks above, the smoke drives a `/btw` side turn followed by an ordinary prompt, a 54 KB structured async report, two images retrieved after a restart, `work` retrieval after a restart, and a real `task` child that reads the parent view without writing. A deterministic restart probe confirmed that reopening a fully built 200-message chat makes no compressor calls and leaves all 397 nodes unchanged, and that one new message costs one call.
+If a frame cannot be priced, the interval stays null. Zero compactions is an exact zero. A frame with OptChat's fixed marker made no model call. It counts as a compaction but costs exactly zero.
+
+A run's total cost combines exact main, compressor, and auxiliary costs with the maintenance interval. If any part is unobserved, total cost is null with a reason. Cache-read share appears for each role and across all roles. The all-role share is null whenever maintenance is estimated or unobserved.
+
+The per-question steady-state main share sums cache reads and prompt tokens over each phase's turns after the first. It is null in batch mode. A paired delta is the off-minus-on interval difference: off low minus on high, and off high minus on low. It also includes the steady-state difference and appears only when both arms are observed. The runner never reports unmeasured savings. `OPTCHAT_METRICS_FILE=/path` appends one content-free JSON line per compressor call.
+
+### Offline retrieval comparison
+
+`bun run evidence:retrieval` compares retrieval strategies deterministically and offline on the same probes:
+
+- One-level `zoom`.
+- `zoom` with depth.
+- `chat_search`.
+- Prefetch.
+- `chat_recall`.
+- Scripted beam descent.
+
+It builds a real memory in a temporary directory over a synthetic 256-message chat with 12 planted facts. A rule-based summariser drops values and, at greater depth, topics. A fake judge scores word overlap.
+
+For each strategy, the report shows probes found, agent steps, judge calls, zoom calls, and bytes returned. It also includes a per-fact table by age. `--seed` selects the seed, and `--out` writes a JSON artifact. The comparison makes no provider calls. It measures navigation mechanics, not real summaries or Jev.
+
+The 0.7.0 results are in `.scratch/optchat-jev/issues/10-codemode-retrieval.md`. Every summary-navigating strategy found only facts whose topics survived in the view: 3/12 and 5/12 over two seeds. `chat_search` found 12/12. `chat_recall` reached surviving facts in one agent step instead of about 200 zoom calls.
+
+### Experiment options
+
+`--arms on,off` pairs OptChat with plain OMP over the same corpus and questions. The off arm resumes a seeded session with OptChat disabled. It receives no memory tools, and its prompt never mentions them. Native compaction may run inside that session.
+
+Off-arm maintenance uses the same estimate as on-arm maintenance, based on captured compaction frames. A paired delta requires both arms to complete every requested scenario and both totals to be observed. The artifact claims no savings.
+
+`--compressors a/b,c/d` runs one on-arm unit per compressor. The report compares the paired arms separately for each compressor.
+
+`--turn-mode per-question` sends one question per prompt and records each turn's latency and usage. The default, `batch`, sends all questions in one prompt.
+
+`--experiments child` runs the child-memory experiment. The parent delegates each question to a `task` child, once with the saved view and once without it. Grading uses only the child's delegated output.
+
+### Spend limits
+
+Spend has two ceilings:
+
+- `--max-cost-usd` accepts values above 0 and at most 30. It sets a worst-case dollar ceiling. Each prompt and compressor call must fit its model's worst-case bound before dispatch. Unknown model rates or context windows block admission.
+- `--max-calls` defaults to 80 and accepts at most 2000. It caps total provider calls. At the cap or deadline, remaining work is refused and reported, not silently dropped.
+
+Without `--max-cost-usd`, only call and deadline limits apply.
+
+The dollar bound prices input by UTF-8 bytes, not tokens. A prompt's tokens never exceed its bytes, so the runner needs no tokenizer. A main prompt's byte count includes:
+
+- The measured effective system prompt and OptChat block.
+- A 32 KiB tool-schema allowance.
+- The view for the on arm, or seeded history for the off arm, plus prior turns.
+- Four 16 KiB zoom pages and the question.
+
+The runner clamps tokens to the context window and prices them at the highest input-side rate. Output uses the pinned `--max-main-output` cap, default 4096 and at most 32000. The runner writes this cap as `maxTokens` for each main model into the isolated agent directory's `models.yml`. It never writes the source configuration. It multiplies the bound by the prompt's four worst-case calls, not by the number of prompts.
+
+Each on-arm compressor host reserves `--compressor-share` of the uncommitted cap as its allowance. The default share is 0.5. A main prompt is admitted only if observed spend, live host allowances, and the prompt bound together stay within the cap. When a host stops, its observed compressor spend replaces its allowance.
+
+An off-arm prompt also adds a native-compaction bound over seeded history, prior turns, and the question, at the pinned cap. Compressor calls use the compactor's prompt bytes and compressor output cap. An unknown rate, unknown context window, or unmeasured system prompt causes refusal. The plan prints the per-prompt main bound, compressor per-call bound, and host allowance.
+
+After each prompt, the runner charges observed spend once: exact auxiliary costs and maintenance's high bound. It does not charge unobserved bounds. `limits.spentUsd` is this running high-bound total.
+
+A dispatched child task with no observable child cost leaves spend unobserved and blocks further live work. Refused, incomplete, and not-delegated children add no child cost.
+
+`--main-context-window` accepts an integer from 32000 through the main model's catalog context window. The runner rejects larger values. It overrides only that model's `contextWindow` in the isolated agent directory's `models.yml`. Source configuration and other models remain unchanged.
+
+Without this option, the requested override is `null`, and the main model inherits its catalog context window. The artifact records the requested override in `models.mainContextWindow`. It also records the effective main-model context window used by the run.
+
+The bound has these limits:
+
+- The four-call prompt limit is not an enforced tool-loop cap.
+- The output cap relies on the pinned `models.yml` entry. Built-in catalog models were checked through `omp models --json`. The offline fixture provider ignores this cap.
+- On-arm compaction of the main session is observed but not bounded in advance. OptChat's marker compactions make no model call.
+
+Before each prompt, the runner waits for memory to settle while compressor calls, dispatches, or tree growth continue to progress. The run deadline still applies: `--deadline-ms`, at most 30 minutes. The runner reports a stall after 120 s without progress.
+
+A completed compressor call holds its observed cost against the host's dollar allowance. Only in-flight calls hold their worst-case cost. Admissions refused by either ceiling are counted and reported. A refused admission fails that summary, after which OptChat refuses the next turn.
+
+### Fixture provider and credential isolation
+
+`--fixture-provider` selects the loopback `optchat-smoke/*` models, priced at zero. The whole pipeline then runs without provider calls or credentials, including both arms, compressors, and the child experiment. This option tests the runner and requires `optchat-smoke/*` selectors. It is mutually exclusive with `--confirm-live-provider-calls`.
+
+`tests/evidence-benchmark.test.ts` exercises the fixture pipeline end to end. It skips if no `omp` executable is found. Set `OPTCHAT_EVIDENCE_OMP` to select one.
+
+Before copying credentials or starting host discovery, the runner parses the source agent directory's `models.yml`, `models.yaml`, and legacy `models.json` (JSONC). Any selected provider entry blocks the run. Copying its credential without its routing could send the credential to a different endpoint.
+
+Read failures, parse errors, and invalid root or provider-map shapes also block the run. Diagnostics do not expose configuration contents. This check deliberately includes shadowed files rather than following OMP's first-file precedence. Unrelated provider entries are allowed. Source configuration is never migrated, evaluated, or copied.
+
+### Smoke harness
+
+The smoke harness links the plugin into a fresh, isolated host environment. It exercises automatic discovery and activation without `--optchat` or an explicit plugin extension path. It uses the actual OMP host with a local deterministic model endpoint and captures inference requests.
+
+The harness checks:
+
+- Fresh turns.
+- Shared main/compactor prompt and tools.
+- The dash ruler and lossless retrieval.
+- Saved-view stability and restart persistence.
+
+Separate opt-out processes check that ordinary history stays intact, no memory store or tools appear, and no compressor requests occur. They include both orders of the positive and negative flags.
+
+Set `OPTCHAT_SMOKE_OMP` to a compiled OMP executable and `OPTCHAT_SMOKE_PLUGIN` to an installed plugin directory to check that artifact instead of the checkout. This is not a measurement of summary quality or real-provider cache hit rates.
+
+The 0.4.0 release was exercised on compiled OMP 18.9.0. Beyond the checks above, the smoke covered:
+
+- A `/btw` side turn followed by an ordinary prompt.
+- A 54 KB structured async report.
+- Two images retrieved after restart.
+- `work` retrieval after restart.
+- A real `task` child that reads the parent view without writing.
+
+A deterministic restart probe reopened a fully built 200-message chat. It made no compressor calls and left all 397 nodes unchanged. One new message cost one call.
 
 ### 0.5.0 measurements
 
-Paired runs on OMP 18.9.1 used Claude Sonnet 5.5 as the main model and Claude Haiku 5.5 as the compressor, with per-question turns and adversarial questions: multi-step and reverted corrections, late distractors, near-duplicate names, and an unanswerable fact. Each run asked 8 questions. "On" is OptChat; "off" is plain OMP resuming a session that holds the same records as ordinary messages. Costs are provider-reported; compressor cost includes building the memory. These are small samples (n = 3 per setting), not savings claims.
+Paired runs on OMP 18.9.1 used Claude Sonnet 5.5 as the main model and Claude Haiku 5.5 as the compressor. They used per-question turns and adversarial questions: multi-step and reverted corrections, late distractors, near-duplicate names, and an unanswerable fact. Each run asked 8 questions.
 
-**History that fits the context window** (48 records of 4 KB, about 74k tokens, 64 KB view; seeds 1–3):
+"On" means OptChat. "Off" means plain OMP resuming a session with the same records as ordinary messages. Costs are provider-reported. Compressor cost includes building the memory. These are small samples, n = 3 per setting, not savings claims.
+
+**History that fits the context window**: 48 records of 4 KB, about 74k tokens, a 64 KB view, and seeds 1–3.
 
 | Arm | Correct | Grounded | Main cost | Compressor cost | Main prompt tokens | Main cache-read share |
 |---|---|---|---|---|---|---|
 | On | 24/24 | 24/24 | $0.41–0.43 | $0.04–0.09 | ~218k | 56–57% |
 | Off | 24/24 | 24/24 | $0.32 | — | ~539k | 88% |
 
-When everything fits, OptChat costs more: about $0.13–0.20 per run. The main model reads 60% fewer prompt tokens, but each turn's fresh view is written to the cache instead of read from it, and zooming adds a round trip per question.
+When everything fits, OptChat costs about $0.13–0.20 more per run. The main model reads 60% fewer prompt tokens. However, each turn's fresh view is written to the cache instead of read from it. Zooming also adds a round trip per question.
 
-**History past the context window** (160 records of 4 KB, about 650 KB; main model pinned to a 200k window with `--main-context-window`; 128 KB view; plain OMP compacted once in every off run):
+**History past the context window** used these settings:
+
+- 160 records of 4 KB, about 650 KB.
+- A main model pinned to a 200k window with `--main-context-window`.
+- A 128 KB view.
+- One plain-OMP compaction in every off run.
 
 | Seed | On: correct / grounded | On: total cost | Off: correct value / grounded | Off: total cost |
 |---|---|---|---|---|
@@ -332,33 +764,40 @@ When everything fits, OptChat costs more: about $0.13–0.20 per run. The main m
 | 2 | 8/8, 8/8 | $1.10 | 7/8, 7/8 | $0.06–0.56 |
 | 3 | 8/8, 8/8 | $1.18 | 8/8, 2/8 | $0.05–0.55 |
 
-Seed 3's on arm comes from a separate on-only run (`long-s3-on`), after the runner's settle wait was fixed; its paired run stopped while the build was still progressing. Off-arm cost is an interval because OMP 18.9.1 reported `tokensBefore: 0` for its compactions: the high bound bills the whole 200k window at the input rate. After compaction, plain OMP sometimes still names the right value but can no longer quote the original record. In one of three seeds it abstained on most questions. OptChat answered every question correctly with an exact quote, at roughly twice the cost of the worst off-arm case.
+Seed 3's on arm comes from a separate on-only run, `long-s3-on`, after the runner's settle wait was fixed. Its paired run stopped while the build still progressed.
 
-**Compressors** (48-record build, seed 4): Haiku 5.5 needed 103 calls (17 shortening retries), $0.034, and 211 s of summed call time, and the run then answered 8/8. Haiku 4.5 needed 303 calls (230 shortening retries, because it overshoots the byte limit), $0.76, and 961 s, and had not settled when the run stopped.
+Off-arm cost is an interval because OMP 18.9.1 reported `tokensBefore: 0` for compactions. The high bound bills the whole 200k window at the input rate. After compaction, plain OMP sometimes names the right value but can no longer quote the original record. In one of three seeds, it abstained on most questions. OptChat answered every question correctly with an exact quote, at roughly twice the cost of the worst off-arm case.
 
-**Subagent memory** (`--experiments child`, 24 records, 4 delegated tasks per arm): with `--optchat-child-view`, children answered 4/4 correctly after 2–4 `zoom` calls each (child cost $0.20 in total); without it, children answered 0/4, saying the facts were not available to them (child cost $0.09).
+**Compressors**, using a 48-record build and seed 4:
 
-**Refusals:** Claude 5.x models sometimes reject benign summarization requests with `Refusal (bio)`. An early corpus padded with word lists (words such as replica, vector, probe, drift) triggered it on most long prompts; natural prose padding reduced it to about 1 in 100 compressor calls. The refusal fallback above keeps memory settling when it happens.
+- Haiku 5.5 needed 103 calls, including 17 shortening retries. It cost $0.034 and 211 s of summed call time. The run then answered 8/8.
+- Haiku 4.5 needed 303 calls, including 230 shortening retries because it overshoots the byte limit. It cost $0.76 and 961 s. It had not settled when the run stopped.
+
+**Subagent memory** used `--experiments child`, 24 records, and 4 delegated tasks per arm. With `--optchat-child-view`, children answered 4/4 correctly after 2–4 `zoom` calls each, for $0.20 total child cost. Without it, children answered 0/4 and said the facts were unavailable to them. Child cost was $0.09.
+
+**Refusals:** Claude 5.x models sometimes reject benign summarization requests with `Refusal (bio)`. An early corpus used word-list padding, including replica, vector, probe, and drift. It triggered refusals on most long prompts. Natural-prose padding reduced this to about 1 in 100 compressor calls. The refusal fallback described above lets memory settle when this occurs.
 
 ### 0.4.0 measurements
 
-A bounded `evidence:recall` run used real models: Claude Sonnet 4.6 for the main chat, Claude Haiku 4.5 as the compressor, and a synthetic 24-source corpus. It ran a cold phase and a fresh-process restart phase; the deepest summary level was 5 in the cold phase and 6 after restart. Results:
+A bounded `evidence:recall` run used real models and a synthetic 24-source corpus. Claude Sonnet 4.6 handled the main chat, and Claude Haiku 4.5 handled compression. The run included a cold phase and a fresh-process restart phase. The deepest summary level was 5 in the cold phase and 6 after restart.
 
 | Phase | Correct | Grounded in a zoomed original | Hallucinated | Main cache-read share | Compressor cache-read share | Cost (USD) |
 |---|---|---|---|---|---|---|
 | Cold | 8/8 | 8/8 | 0 | 76% | 46% | 0.30 |
 | Restart | 7/8 | 8/8 | 0 | 86% | 53% | 0.46 |
 
-The one miss named only part of an ambiguous answer. "Cache-read share" is cache-read tokens divided by all prompt tokens, as the provider reported them. This short run starts cold and writes most prefixes for the first time, so it is far from the specification's steady-state 96–98% model. It is a sample, not a savings measurement.
+The one miss named only part of an ambiguous answer. "Cache-read share" is cache-read tokens divided by all prompt tokens, as reported by the provider. This short run starts cold and writes most prefixes for the first time. It is therefore far from the specification's steady-state 96–98% model. It is a sample, not a savings measurement.
 
-The 0.2.0 release was exercised with compiled OMP 18.8.9 against the synthetic provider. A separate real-filesystem run ingested 300 synthetic messages, observed the 128,000-to-64,000-byte main batch and 32,000-to-16,000-byte compactor cycle, and checked byte-identical saved views on restart plus migration from a log without a snapshot.
+The 0.2.0 release was exercised with compiled OMP 18.8.9 against the synthetic provider. A separate real-filesystem run ingested 300 synthetic messages. It observed the 128,000-to-64,000-byte main batch and 32,000-to-16,000-byte compactor cycle. It also checked byte-identical saved views on restart and migration from a log without a snapshot.
 
-The initial release was also exercised with the compiled OMP 18.6.1 binary and an authenticated `@smol` model: a long synthetic note was compressed to 185 bytes and its canary name/color were recalled correctly in a new process. Fresh-process discovery after `omp plugin link .` was verified without an explicit extension path. The HTML export was checked in Chromium at desktop and 375-pixel mobile widths, including navigation and escaped script text. These checks do not establish real-provider cache hit rates.
+The initial release was exercised with compiled OMP 18.6.1 and an authenticated `@smol` model. A long synthetic note compressed to 185 bytes. A new process correctly recalled its canary name/color. Fresh-process discovery after `omp plugin link .` was verified without an explicit extension path.
+
+The HTML export was checked in Chromium at desktop and 375-pixel mobile widths. Checks included navigation and escaped script text. These checks do not establish real-provider cache hit rates.
 
 ## Planning and specs
 
-The System One plan lives in the repository. Start with `AGENTS.md` for how to work here and the verification commands. The living ExecPlan is `plans/optchat-jev.md`, with progress, decisions and open items. The design is `docs/design/optchat-jev.md`. Project skills (Wayfinder, ExecPlan, grilling and others) load from `.omp/skills/`.
+The System One plan is in this repository. Start with `AGENTS.md` for working instructions and verification commands. The living ExecPlan, `plans/optchat-jev.md`, records progress, decisions, and open items. The design is in `docs/design/optchat-jev.md`. Project skills, including Wayfinder, ExecPlan, and grilling, load from `.omp/skills/`.
 
 ## Attribution
 
-Design and compression prompt: Victor Taelin, [UniiChat / OptChat — how to replicate my setup](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449), revised October 8 and retrieved October 11, 2026. This project is an independent OMP adaptation, not an official upstream release.
+Design and compression prompt: Victor Taelin, [UniiChat / OptChat — how to replicate my setup](https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449). The source was revised October 8 and retrieved October 11, 2026. This project is an independent OMP adaptation, not an official upstream release.
