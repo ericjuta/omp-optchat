@@ -7,7 +7,7 @@
 - Added conservative `chat_decisions` timelines/project state, trusted-metadata `chat_work` discovery, deterministic task-focused child packs, and explicitly allowlisted Linux-only read-only `chat_project_evidence` snapshots. Other platforms fail closed for cross-store reads; local memory is unchanged. No upstream host patch is required or installed.
 - Persist host tool success/error only with its exact captured call link. Import downgrades those observations to historical claims. Host tool success does not prove process, test or project success. Stores containing the new metadata require 0.16.0+ to reopen.
 - Added frozen zero-dollar paired software evaluation and lifecycle smoke. Synthetic/injected-outcome evidence is not live-model quality evidence; uncertainty and unknown costs remain visible.
-- Removed obsolete tool-wording and argv-copy assertions; retained memory/context and behavioral safety contracts.
+- Removed obsolete tool-wording and argv-copy assertions; retained memory/context and behavioral safety contracts. Child fixtures supply the current SDK's prompt/revive event reason while remaining compatible with the pinned SDK.
 
 ## 0.15.2 — 2026-11-08
 

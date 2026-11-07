@@ -81,7 +81,10 @@ function attach(snapshot: (() => ChildView) | null = () => base) {
 	const revoke = snapshot === null ? () => {} : publishChildSource(publishedManager, { owner: "parent", snapshot });
 	cleanups.push(revoke);
 	attachChildView(pi, current, "static guide");
-	const start = (prompt: string) => hooks.at(-1)!({ type: "before_agent_start", prompt, systemPrompt: ["base policy"] }, current);
+	const start = (prompt: string) => {
+		const event = { type: "before_agent_start" as const, reason: "prompt" as const, prompt, systemPrompt: ["base policy"] };
+		return hooks.at(-1)!(event, current);
+	};
 	const context = async (messages: ContextEvent["messages"]) => {
 		for (const hook of contextHooks) {
 			const result = await hook({ type: "context", messages }, current);
