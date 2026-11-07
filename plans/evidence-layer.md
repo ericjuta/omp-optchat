@@ -6,7 +6,7 @@ This ExecPlan is a living document. The sections `Progress`, `Surprises & Discov
 
 OptChat (this repository, an OMP plugin) keeps one endless chat. Every message is stored in an append-only log, compressed into a binary tree of one-line summaries, and navigable with memory tools (`zoom`, `chat_search`, `chat_recall`, `date`, `work`). Today, when the agent asks "what did we decide about X, and why?", `chat_recall` returns exactly one message: the first 8,000 bytes of whichever message a relevance judge picks. Answers spread over several messages (proposal, objection, final decision), or buried late in a long report, need repeated manual navigation.
 
-After this plan, the agent can call `chat_evidence(question)` and get several exact passages, each with its message id, source kind, byte location and completeness. It also gets an honest account of what was searched and what was not found. Standing rules stop sharing one identity when a user states several instructions at once, so withdrawing one never retires another. Finally, a pre-registered, paid-but-capped experiment decides whether Cloudflare's Clairic extraction model, reached through an OMP host role, adds anything over plain deterministic chunk retrieval. If it does not, it is not adopted.
+After this plan, the agent can call `chat_evidence(question)` and get several exact passages, each with its message id, source kind, byte location and completeness. It also gets an honest account of what was searched and what was not found. Standing rules stop sharing one identity when a user states several instructions at once, so withdrawing one never retires another. Finally, a pre-registered, paid-but-capped experiment evaluates Cloudflare's Clairic extraction model, reached through the explicitly approved plugin-side OpenRouter adapter, against plain deterministic chunk retrieval. If it does not, it is not adopted.
 
 You can see it working by running the new evidence eval (Milestone 4) and by calling `chat_evidence` in a real OMP session with the plugin installed (Milestone 2 acceptance).
 
@@ -28,6 +28,18 @@ You can see it working by running the new evidence eval (Milestone 4) and by cal
 - [x] (2026-11-07) Milestone 5: NOT adopted as default. The span criterion as written ("span text equals value in ≥0.95 of span-bearing answers") counts 48/80 = 0.60, because the 32 correct abstentions also carried spans with a null value; the rule did not say how null values count. Eric delegated the call; the agent applied the rule literally, since flipping a pre-registered result by a post-hoc reading is what pre-registration forbids, and default-on would send chat passages to a third party for every user with an OpenRouter key. `--optchat-extract` ships as an opt-in flag. A new run needs a manifest that defines the null-value case.
 - [x] (2026-11-07) Milestone 5, second run. Eric delegated the call ("CTO delegation", up to $50). The agent pre-registered `evals/evidence/prereg/evidence-20261108.json` (SHA-256 `a4b82ffbbd7d3fc91b0549ac2250ce706a7cf0bee7c55da52c16275e83c187ad`) on fresh cases (seed 20261108). It counts span equality over non-null values only and adds abstainSuccess ≥ 0.80; the first run is not re-scored. Oracle 1.0/1.0. Live: 0 errors; C grounded 1.0, abstain 1.0, misleading 0, echo 80/80, span equals value 48/48, cost reported $0 on every row, p90 275 ms; B grounded 1.0; A grounded 0.667, abstain 0.125, misleading 0.35 (served `cloudflare/clef`), $0.0306. ADOPTED: `DEFAULTS.extract` true, `--no-optchat-extract` opt-out, and no key adds nothing. Harnesses opt out explicitly (smoke, host integration, evidence host, ALL_GATES_OFF). Live isolated OMP 18.17.0 with the real key: `"eu-west-3-41" at message 0 bytes 75-87`, and those bytes are exact after "🚀 café".
 
+### End-to-end continuation (approved 2026-11-07)
+
+- [x] (2026-11-07) Reconciled map and implemented plugin-only extraction; retained the aborted host PR as out of scope.
+- [x] (2026-11-07) Replaced whole-message candidate starvation with bounded incremental chunk retrieval, bounded source paging and query explanations.
+- [x] (2026-11-07) Extracted occurrences are explicitly unverified; invalid, truncated, mismatched and wrong-subject spans are withheld. Credential lookup shares the extraction deadline; quoted bytes preserve whitespace.
+- [x] (2026-11-07) Added conservative decision timelines/project state, original citations and unresolved states; mixed multi-statement instructions cannot preserve stale accepted state.
+- [x] (2026-11-07) Added metadata-backed report discovery; reused names remain separate, unknown host identities remain unknown.
+- [x] (2026-11-07) Added bounded task-focused child evidence, including context-time filtering of persisted packs after revocation or task/session changes.
+- [x] (2026-11-07) Added explicitly allowed Linux external-store snapshots, source identity/digests, exact reopening, no writer or rule imports, and teardown/publication fences.
+- [x] (2026-11-07) Frozen 13-case, two-repetition paired software check passed on the repaired sources; $0, zero network calls. Standalone eval-runner typecheck passed. Private pre-probe snapshot retrieved supporting original evidence and withheld the recorded wrong-span candidate without a provider call.
+- [ ] Run all release gates, publish a signed release, install from the remote tag, and smoke the installed plugin.
+
 ## Surprises & Discoveries
 
 - Observation: the review is right that rule triage joins several standing sentences into one rule.
@@ -48,7 +60,7 @@ You can see it working by running the new evidence eval (Milestone 4) and by cal
   Rationale: preserves "withdrawal beats addition" and keeps single-sentence requests byte-identical to v0.14.0.
   Date/Author: 2026-11-07, agent.
 
-- Decision: Clairic is reached only through a host-owned extraction role, never through an HTTP client or API key inside the plugin.
+- Decision (superseded by Eric's plugin-only authorization): Clairic was initially planned through a host-owned extraction role, never through an HTTP client or API key inside the plugin.
   Rationale: the AGENTS.md OMP rules (Jev only through the host `judge` role; no provider client, SDK or key variable in the plugin) apply equally to a new model.
   Date/Author: 2026-11-06, agent (Eric delegated "wayfinder and exec plans it out").
 - Decision: deterministic chunk retrieval ships first and is the comparison arm. Clairic must beat it, not just the current `chat_recall`.
@@ -69,11 +81,11 @@ You can see it working by running the new evidence eval (Milestone 4) and by cal
 - Decision: the three-arm evidence eval is capped at $5, covering the live offset probe and every arm. Paid calls still wait for Eric's approval of the manifest SHA-256.
   Rationale: Eric set the cap (#22). It leaves room for repeated runs and a fresh confirmation set.
   Date/Author: 2026-11-06, Eric (#22).
-- Decision: the decision-history, index, explain, child-pack and cross-worktree ideas stay as map fog, not milestones.
+- Decision (superseded by the end-to-end continuation below): the decision-history, index, explain, child-pack and cross-worktree ideas initially stayed as map fog, not milestones.
   Rationale: each depends on the evidence record shape chosen in #20.
   Date/Author: 2026-11-06, agent.
 
-- Decision: the host extraction role goes upstream on oh-my-pi v18.17.0, not as a source-only patch. The plugin uses the extractor only after a feature check (dynamic import of `@oh-my-pi/pi-coding-agent/extraction`) and falls back to deterministic retrieval when it is absent.
+- Decision (superseded; upstream effort aborted): the host extraction role was initially proposed upstream on oh-my-pi v18.17.0, not as a source-only patch. The plugin uses the extractor only after a feature check (dynamic import of `@oh-my-pi/pi-coding-agent/extraction`) and falls back to deterministic retrieval when it is absent.
   Rationale: the installed compiled host serves plugin imports from its own bundled packages, so a source-only patch never runs, and the 18.12.6 checkout is five minors behind (#19 findings).
   Date/Author: 2026-11-06, agent, from ticket #19.
 
@@ -89,7 +101,25 @@ You can see it working by running the new evidence eval (Milestone 4) and by cal
   Rationale: the route reported $0 on every eval row although Clairic is listed at $0.10/M input tokens. The old size check read the whole body before measuring it.
   Date/Author: 2026-11-08, agent.
 
+- Decision: implement the remaining reference proposals end-to-end, then release and install. The upstream host PR remains aborted; no host installation or publication is authorized by this continuation.
+  Rationale: Eric requested all proposals through release/install after the map audit. Plugin-side extraction and the accepted host credential cascade remain the current contract. Earlier host-role paragraphs are historical design, not implementation instructions.
+  Date/Author: 2026-11-07, Eric; engineering choices below by agent.
+
+- Decision: derived retrieval indexes are bounded, rebuildable in-memory data, not a second durable authority. Decision history is read-only and conservative: proposals and completion claims never become accepted or observed facts solely because they occur later. External stores require an explicit allowlist and remain read-only, separately identified snapshots. Child packs use deterministic evidence only and do not trigger provider calls.
+  Rationale: deliver the reference capabilities without reviving the aborted host transport or allowing model-generated identities, arbitrary cross-store reads, or implicit rule scope expansion.
+  Date/Author: 2026-11-07, agent.
+
+- Decision: cross-store retrieval follows the repository's existing Linux product requirement and refuses other platforms before opening selected paths. Removed speculative Darwin traversal support.
+  Rationale: review established that Darwin F_GETPATH can reconstruct a hardlink pathname rather than bind the opening dentry; it cannot establish the same origin invariant on all admitted filesystems. The Linux implementation retains descriptor-relative ancestry and opened-dentry checks. This does not change existing local-store macOS lease support.
+  Date/Author: 2026-11-07, agent.
+
 ## Outcomes & Retrospective
+
+- (2026-11-07 continuation) The synthetic plugin-lifecycle smoke passed with 30 tool calls and zero provider attempts: decisions and corrections, exact citations, report identity, host outcome versus project success, explicit external stores, child packs, reset and shutdown. Initial external admission failed on a search-only ancestor directory; descriptor traversal was repaired rather than broadening permissions. Two smoke assertions were incidental error-wording pins and were removed while retaining rejection checks.
+- A read-only private snapshot check was first contaminated by later acceptance discussions. Re-running the corrected pre-probe cutoff (5,954 original records) retrieved a supporting original record containing the known requirement; the original runtime-error record itself was not in the returned eight. This is one retrieval regression check, not a live-model quality measurement. No private corpus is published.
+- The frozen provider-free continuation manifest (`5c6c1f6333e648b0ae355c85b19e5f45b57e3165efa485fe47358e911aad91ed`) passed its final source-bound paired 13-case, two-repetition software check against v0.15.2, at $0 and zero network attempts. Candidate retrieved 26/28 available quotes versus baseline 24/28; injected renderer controls passed 52/52 versus 14/52. Sixteen unsupported occurrences were explicitly marked unverified, not counted as supported answers. Renderer outcomes are injected, not Clairic measurements.
+- Independent source review identified lifecycle/namespace races, child-pack replay, mixed directive/question ambiguity, cold paging work outside the read budget, long Unicode query boundaries, a credential-resolution deadline gap, altered whitespace in extracted quotes, and inaccurate empty-result wording. These were repaired and covered by targeted regressions. A final review additionally found failed-parent pack replay and two stale-decision paths (compound questions and human text carrying a result marker). All three reproduced before the fixes; the focused repair set passed 105/0 with typecheck and lifecycle smoke. Parent failure now synchronously revokes child publication; neutral questions use closed forms about known topics, and only actual echoes receive result-marker exclusion. Final CI still gates publication.
+
 - (2026-11-08) Real-chat check, n = 3, in-repo plugin with the real OpenRouter key, on a copy of this repo's own store (about 5,950 messages). (1) "what manifest SHA-256 did Eric approve for the M4 evidence eval": exact SHA returned at message 5685 bytes 5992–6056, p_null 0.000. (2) "which compressor model had a p90 latency of 120.4s in the Perps store": abstained, p_null 0.662. (3) "which minimum Bun runtime version does omp 18.18.0 require": MISLEADING. The gold record (message 5770, "Bun runtime must be >= 1.4.4") was not among the 50 ranked candidates, and Clairic answered "1.4.0" from an unrelated Bun note (message 4268) with p_null 0.078. Extraction cost was reported as unknown on every call. Three questions measure nothing reliably; they show two open defects: on natural questions in a large chat, ranking can miss the gold, and a confident wrong span gets past the 0.5 null threshold.
 
 ## Context and Orientation
@@ -110,11 +140,23 @@ Milestone 1 (atomic rules). In `src/system1/rules.ts`, change `decideTriage` so 
 
 Milestone 2 (deterministic `chat_evidence`). Add `src/system1/evidence.ts` with a pure function that takes a question, the memory, a snapshot upper bound and limits. It reuses `rankMessages` seeds and the `chat_recall` scan to pick up to N candidate messages. It splits each into byte-aligned chunks (default 2,048 bytes, never splitting a UTF-8 sequence), ranks the chunks by word overlap, and returns up to `maxPassages` (8) passages within `maxBytes` (16,384) in total, stopping at `timeoutMs` (10,000) with what it has, marked incomplete. Each passage carries `{id, kind, start, end, text, complete}`. Every result, including a full one, ends with a trailer listing searched message ids, not-found terms, and incomplete or partial reports. Register the tool in `src/index.ts` beside `chat_recall`, behind a new gate `--optchat-evidence` (default on) with opt-out `--no-optchat-evidence`, and respect the child-view upper bound (`src/index.ts:849-901`). Update the `system1-off` golden test only for the new tool's deliberate appearance.
 
-Milestone 3 (host extraction role). Follow `docs/research/host-extraction-role.md`. The host side, proposed upstream on oh-my-pi v18.17.0, adds four things. The first is a model kind `extract` with runner API `openrouter-extractions` (`POST /api/alpha/extractions`, model `cloudflare/clairic`, `provider.options.cloudflare.return_state_text: true`) and an optional runner `workers-ai-clairic` (`@cf/cloudflare/clairic`), with catalog seeds for both (input $0.10/M, context 65,536). The second is a built-in `extract` role that accepts only native extractors. The third is `NativeExtractor` in `pi-ai/src/extraction`, which reuses the host's existing OpenRouter credential and retry code for the OpenRouter runner, and the Workers AI credentials and auth for the optional runner. The fourth is `resolveExtractor()`, exported from `@oh-my-pi/pi-coding-agent/extraction`, which reports usage with role `extract` and `costSource` reported, catalog or unknown. The host returns half-open code-point spans, validated against the returned state text, and nulls spans that overlap redactions; the Workers AI runner must normalize to the same unit or report its spans as unavailable. Tests inject a fake through `OptChatOptions.extractor`. In the plugin, `src/system1/extract.ts` maps code-point spans to UTF-8 bytes with the same `utf8Width` walk as `readTextPage` and checks that each span's bytes equal the stored text. Adapt the 18 offset test cases in the research doc to code points. One paid live OpenRouter call with an astral character must confirm the documented code-point unit before any adoption; it goes inside the Milestone 4 budget. The plugin validator rejects any answer with `value === null`, a failed span check, or confidence below a code-owned `--optchat-evidence-min`. `chat_evidence` uses the extractor only when it resolves; otherwise it stays deterministic.
+Milestone 3 (completed plugin-side extraction). `src/system1/extract.ts` calls OpenRouter's alpha extractions endpoint with plain fetch, using only the host's `openrouter` credential resolver. There is no host extraction role or provider SDK. The adapter bounds response bytes and time, validates echoed state and code-point spans against the exact source, and maps to UTF-8 byte citations. Missing credentials leave deterministic retrieval usable. `--no-optchat-extract` disables provider transmission. Code owns the null threshold; an exact span establishes only occurrence, not semantic truth. The initial host-role proposal in `docs/research/host-extraction-role.md` is historical research and is not to be implemented.
 
 Milestone 4 (eval). Per #22, add `evals/evidence/` with frozen cases. They must include absent, ambiguous and incomplete-source labels, where the correct behaviour is to abstain. Arms: A = current `chat_recall`, B = deterministic `chat_evidence`, C = B plus the Clairic extractor, all on the same frozen snapshots. Pre-register the budget, the metrics (grounded answer success, misleading-extraction rate, omissions, latency, cost per success) and the adoption rule in a manifest with a SHA-256, and get Eric's approval of that SHA before any paid call. The cap is $5 (Eric, #22), covering the live offset probe and all arms.
 
 Milestone 5. Adopt C only if the pre-registered rule passes. Otherwise keep B and record the rejection. Release with the usual gates.
+
+### Continuation milestones
+
+Milestone 6 adds `src/evidence-index.ts` and integrates it through `src/system1/evidence.ts` and `src/index.ts`. Candidate selection must not discard a short relevant original simply because fifty noisy whole messages rank higher. The index stores only derived bounded chunks, respects the caller's exclusive message cutoff, yields under cancellation and reports any unindexed or unsearched coverage. `chat_evidence` keeps its eight-passage, 16,384-byte output limit. The extractor validates occurrence, not truth: unsupported output must not be promoted to an answer. Query explanations report coverage, source completeness and reasons for abstention without exposing credentials.
+
+Milestone 7 adds `src/decisions.ts` and `src/work-discovery.ts`, registered in `src/index.ts`. Decision queries return source-linked timelines and project-state summaries, preserving proposed, accepted, superseded, withdrawn, reported complete, observed complete and unresolved distinctions. Unstructured ambiguous language remains unresolved rather than inventing authority. Work discovery uses stored metadata and explicit result associations; repeated display names remain separate runs, missing capture remains unknown, and later reports cannot enter earlier snapshots.
+
+Milestone 8 extends `src/handoff.ts` with a bounded deterministic evidence pack for the actual delegated task. The parent adapter supplies only the frozen snapshot. Both pre-read and post-await checks enforce revocation and adopting-session identity. `src/project-evidence.ts` implements opt-in cross-store retrieval using explicitly configured named roots and bounded read-only snapshots. External citations carry store identity and a reopen operation; they must never be offered as local zoom references or added to the local rule ledger.
+
+Milestone 9 adds broader paired evaluation without changing the frozen earlier scorers or reinterpreting their results. Use independent frozen cases for retrieval coverage, extraction support, historical cutoffs, ambiguity and operation identity. Provider-free checks have a zero-dollar budget; any paid extension needs a preregistered manifest and an explicit remaining spend cap. Record availability, retrieval and extraction separately, retain the known real-chat failures as failures until repaired, and do not claim universal answer correctness from a small sample.
+
+Milestone 10 updates user documentation and the map to match the completed implementation, runs typecheck, unit tests, real-host tests and the loopback smoke, then pushes a signed release after CI passes. Install from the published Git tag and smoke that installed path. No private transcripts, local paths, credentials or real-case fixtures enter the public release.
 
 ## Concrete Steps
 
@@ -145,13 +187,9 @@ Source review: `docs/references/chatgpt-repository-feature-review.md`. Fact chec
 
 ## Interfaces and Dependencies
 
-In `src/system1/evidence.ts`:
+`src/system1/evidence.ts` owns `EvidenceMemory`, `EvidenceLimits`, `EvidencePassage` and `EvidenceResult`. `gatherEvidence(memory, question, limits)` uses bounded source paging, a stable source identity and a revocation check; its result includes snapshot coverage and retrieval omissions. Optional extraction is a separate integration step, not part of the deterministic gather operation. `src/source-page.ts` accounts for actual UTF-8 traversal, including cold seeks.
 
-    export interface EvidencePassage { id: number; kind: Kind; start: number; end: number; text: string; complete: boolean }
-    export interface EvidenceResult { passages: EvidencePassage[]; searched: number[]; missing: string[]; incomplete: number[] }
-    export function gatherEvidence(memory: Memory, question: string, limits: { upperBound: number; maxPassages: number; maxBytes: number; timeoutMs: number }, extractor?: Extractor): Promise<EvidenceResult>
-
-In `src/system1/extract.ts`, the `Extractor` interface mirrors whatever host type #19 defines. No Cloudflare SDK and no API-key variable may appear in this repository.
+In `src/system1/extract.ts`, `Extractor` is a plugin-owned injected function from state, question and abort signal to a typed result. Its production implementation uses the approved plain-fetch OpenRouter adapter and host credential resolution. No provider SDK or direct environment-variable read is permitted.
 
 Revision note (2026-11-06): first version, written from the ChatGPT review and its fact check.
 Revision note (2026-11-06): folded #19. The host role goes upstream (not source-only), spans are UTF-16 mapped to bytes, and the offset unit is still to be confirmed live.

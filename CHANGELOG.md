@@ -1,4 +1,14 @@
 # Changelog
+
+## 0.16.0 — 2026-11-07
+
+- Added bounded incremental chunk retrieval and `chat_explain`/`/optchat explain` accounting. Removed the top-50 whole-message candidate bottleneck; coverage and omissions are explicit.
+- Extracted spans are now unverified candidate occurrences, never verified answers. Mismatched values, truncated input, impossible null probabilities and wrong exact question identifiers are withheld. Provider transmission remains default-on when a key resolves; `--no-optchat-extract` disables it.
+- Added conservative `chat_decisions` timelines/project state, trusted-metadata `chat_work` discovery, deterministic task-focused child packs, and explicitly allowlisted Linux-only read-only `chat_project_evidence` snapshots. Other platforms fail closed for cross-store reads; local memory is unchanged. No upstream host patch is required or installed.
+- Persist host tool success/error only with its exact captured call link. Import downgrades those observations to historical claims. Host tool success does not prove process, test or project success. Stores containing the new metadata require 0.16.0+ to reopen.
+- Added frozen zero-dollar paired software evaluation and lifecycle smoke. Synthetic/injected-outcome evidence is not live-model quality evidence; uncertainty and unknown costs remain visible.
+- Removed obsolete tool-wording and argv-copy assertions; retained memory/context and behavioral safety contracts.
+
 ## 0.15.2 — 2026-11-08
 
 - **Fixed: the extractor's response-size bound.** The body used to be read in full before its size was checked, so a response without a content-length header could be of any size. It is now read as a stream and cancelled once it passes 262,144 bytes.
