@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.1 — 2026-11-07
+
+- **Fixed: CI on the latest SDK.** omp 18.18.0 refuses to start on Bun below 1.4.4, so every host test that launches `omp` failed in the latest-SDK job (red since d66f41f, including the v0.15.0 tag). CI now pins Bun 1.4.4, the version the local gates use. No plugin code changed.
+
 ## 0.15.0 — 2026-11-07
 
 - **Added: Clairic extraction in `chat_evidence`, on when an `openrouter` key exists.** Sends the passages to OpenRouter's `cloudflare/clairic` extractor, keyed from the host's `openrouter` credential at call time, and adds one line after the trailer: the answer's exact message bytes and a `zoom` that reopens them, shown only below `--optchat-extract-null` (0.5) and only when its span maps inside one passage. No key adds nothing; an error or the 10 s bound leaves the passages unchanged. `--no-optchat-extract` turns it off. This sends chat passages to OpenRouter and Cloudflare. Evidence: a first pre-registered run (seed 20261107) failed its own span criterion only because the criterion did not define null-value abstentions (48/80), so it was not adopted. A second pre-registered run on fresh cases (seed 20261108) defined that case and passed every criterion: extractor grounded 1.0, abstain 1.0, misleading 0, span equals value 48/48, p90 275 ms, cost reported $0 on every row; `chat_evidence` alone grounded 1.0; `chat_recall` grounded 0.667 and misleading 0.35 (judge served `cloudflare/clef`). Total spend for both runs $0.061. Live check on installed OMP 18.17.0: the returned bytes after an emoji and an accented letter were exact.
