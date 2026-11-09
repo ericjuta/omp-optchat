@@ -178,6 +178,16 @@ describe("/optchat status cache observations", () => {
     expectModes(await statusOf(host), "anthropic-breakpoints");
   });
 
+  test("a view line holding a private-use icon keeps the main request's breakpoints through pi-ai's glyph codec", async () => {
+    const host = await open();
+    // Nerd-font icons from OMP and Tern titles reach the view verbatim. pi-ai sends each one as a token and
+    // appends its <glyph-tokens> notice to the first text it rewrote: here, the view block holding the icon.
+    const transcript = await talk(host, [], "Opened the \u{F0307} ENV tab.");
+    const request = await encodeCachedMainRequest(host, transcript, "Keep this request short.");
+    expect(JSON.stringify(request.messages[0])).toContain(String.raw`\n\n<glyph-tokens>\n`);
+    expectModes(await statusOf(host), "anthropic-breakpoints");
+  });
+
   test.each(["unsupported model", "missing view"])("a subsequent %s request records unchanged rather than a selected-model capability", async (kind) => {
     const host = await open();
     const request = await encodeCachedMainRequest(host, [], "First encoded request.");

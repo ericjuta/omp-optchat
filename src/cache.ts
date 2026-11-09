@@ -27,6 +27,15 @@ const CHAT_VIEW = /^<chat>\n(?:\d+\+[1-9]\d*\|[^\n]*\n)*<\/chat>$/;
  */
 const HOST_REMINDER_OPEN = "<system-reminder>\n";
 const HOST_REMINDER_CLOSE = "\n</system-reminder>";
+/**
+ * pi-ai's glyph codec sends private-use characters (nerd-font icons) as `⟦U…⟧`
+ * tokens and appends its convention notice, once per request, to the first
+ * text it rewrote. When that text is a view block, the notice follows the
+ * block's own lines. View lines are never empty, so no view text holds the
+ * blank line that opens it.
+ */
+const HOST_GLYPH_NOTICE_OPEN = "\n\n<glyph-tokens>\n";
+const HOST_GLYPH_NOTICE_CLOSE = "\n</glyph-tokens>\n";
 /** Fields of a plain host text block; anything else (citations, files) is never treated as the view. */
 const VIEW_BLOCK_FIELDS: Record<string, true> = {
 	type: true,
@@ -136,7 +145,8 @@ function plainText(block: unknown, textType: string): block is WireObject & { te
  * The plugin's view: leading plain text blocks of the first user message
  * (after Responses developer/system items), from `<chat>\n` to the first block
  * closing `</chat>` (possibly its own block). Only OMP's date/cwd reminder
- * blocks may precede it. A pasted later view is never considered.
+ * blocks may precede it, and only pi-ai's glyph notice may end one of its
+ * blocks. A pasted later view is never considered.
  */
 function leadingView(messages: unknown[], textType: string): LeadingView | undefined {
 	let index = 0;
@@ -160,11 +170,13 @@ function leadingView(messages: unknown[], textType: string): LeadingView | undef
 	for (let position = first; position < content.length; position++) {
 		const block = content[position];
 		if (!plainText(block, textType)) return;
-		if (texts.length === 0 && !block.text.startsWith("<chat>\n")) return;
-		texts.push(block.text);
-		length += block.text.length;
+		const notice = block.text.endsWith(HOST_GLYPH_NOTICE_CLOSE) ? block.text.indexOf(HOST_GLYPH_NOTICE_OPEN) : -1;
+		const text = notice < 0 ? block.text : block.text.slice(0, notice);
+		if (texts.length === 0 && !text.startsWith("<chat>\n")) return;
+		texts.push(text);
+		length += text.length;
 		ends.push(length);
-		if (!block.text.endsWith("</chat>")) continue;
+		if (!text.endsWith("</chat>")) continue;
 		const view = texts.join("");
 		if (!view.endsWith("\n</chat>")) continue;
 		if (!CHAT_VIEW.test(view)) return;

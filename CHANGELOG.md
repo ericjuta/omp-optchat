@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.16.4 — 2026-11-09
+
+- **Fixed: a nerd-font icon in the view removed OptChat's prompt-cache marks.** pi-ai sends each private-use character, such as the icons in OMP and Tern titles, as a `⟦U…⟧` token. It also appends a `<glyph-tokens>` notice, once per request, to the first text that it changed. When an icon was in a view line, that text was a view block, so the cache adapter did not recognize the view and left the request as the host built it. Main and compressor requests then had no mark on the view and no mark on the last system block. OptChat now ignores that notice when it reads the view.
+- Session-log evidence after 0.16.3 (Opus, OMP 18.18.3, 2026-11-09 from 11:08 to 11:53 UTC, no paired control): the one multi-turn session with OptChat on had an icon in its view. Each of its 12 turn starts that did not follow a host prompt rebuild read only the host prefix (87,995 to 88,012 tokens) and wrote 1.94 million tokens in total. OMP's cost fields put these 12 requests at $16.00. A concurrent session with OptChat inactive read 99.8% or more of its prompt at both of its turn starts. Requests later in a turn read a median of 99.4% (n = 97). Two of the 14 stores used in the last seven days had a view that pi-ai rewrites. The effect of this fix is not measured yet.
+- Tests now send a view line with a private-use icon through pi-ai's real encoder.
+
 ## 0.16.3 — 2026-11-09
 
 - **Fixed: on real OMP hosts, main requests carried none of OptChat's prompt-cache marks.** OMP puts a date/cwd `<system-reminder>` block at the start of each request's first user message, which is OptChat's view. The cache adapter required the view to come first, so it left every main request as the host built it: no mark on the view and no mark on the last system block. At each new turn, Anthropic then reused only the system prefix before `<project-context>`. It wrote the rest of the system prompt and the whole view again. OptChat now skips that reminder block and marks the view after it. The same fix applies to OpenAI Responses breakpoints and Codex `all_turns`. This explains the 38–55% turn-start cache reads that 0.13.0 left unexplained.

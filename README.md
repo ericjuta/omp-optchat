@@ -32,16 +32,16 @@ When history still fits the model's context, OptChat costs more than plain OMP f
 - OMP **18.10.3 or newer**, Bun, and Linux. CI checks every push and runs a weekly check against the latest published OMP SDK.
 - An authenticated model for the main chat and an authenticated compressor model. Compression uses OMP's `@smol` role by default. Choose a competent, inexpensive model explicitly if that role is unsuitable.
 
-Install the current release, **0.16.3**:
+Install the current release, **0.16.4**:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.16.3'
+omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.16.4'
 PI_OPENAI_STATEFUL=0 omp
 ```
 
 Restart existing OMP sessions after an upgrade. They retain the previously loaded plugin.
 
-Local 0.16.3 verification passed typecheck, 2,602 unit tests, 56 host tests, and a real-OMP smoke with a synthetic model. The smoke exercised ten host processes and 38 requests. Release CI also checks the pinned/latest SDKs and Linux/macOS leases.
+Local 0.16.4 verification passed typecheck, 2,603 unit tests, 56 host tests, and a real-OMP smoke with a synthetic model. The smoke exercised ten host processes and 38 requests. Release CI also checks the pinned/latest SDKs and Linux/macOS leases.
 
 These are software checks, not proof of live-model answer accuracy.
 
@@ -545,6 +545,8 @@ Permanent storage uses fsync, not automatic Git commits. Backups remain the oper
 For native official Anthropic requests to image-capable models, OptChat splits the view into blocks of **four summary lines**. It places a cache mark on the last whole block and another at the request end. When the host anchored its system prompt, OptChat also marks the last system block, after the host's volatile `<project-context>`.
 
 OMP puts its date/cwd `<system-reminder>` block ahead of the view, in the same first user message. OptChat skips that block and marks the view after it. Before 0.16.3, the block hid the view from OptChat on real hosts. Main requests then carried no OptChat mark, and each new turn rewrote the system prompt after the host's anchor and the whole view.
+
+pi-ai sends each private-use character, such as the nerd-font icons in OMP and Tern titles, as a `⟦U…⟧` token. It appends a `<glyph-tokens>` notice to the first text that it changed in a request. When an icon is in the view, that text is a view block. OptChat ignores the notice and marks the view. Before 0.16.4, one icon in the view removed OptChat's marks from main and compressor requests.
 
 Other routes keep the original fixed-offset blocks, so the view's wire bytes never change. This includes text-only Anthropic-compatible models whose encoders join text blocks with newlines. Markers are bounded to four total. A marker that the host wrote keeps its value. A marker that OptChat adds copies the host's latest marker, so it keeps the host's cache lifetime: OMP gives OAuth Anthropic requests one-hour entries. Before 0.16.3, OptChat rewrote every marker of a request it changed to a five-minute entry. On real hosts, that reached only compressor requests.
 
