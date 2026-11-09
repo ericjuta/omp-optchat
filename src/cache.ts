@@ -21,6 +21,12 @@ const MAX_BREAKPOINTS = 4;
 const ANTHROPIC_URL = "https://api.anthropic.com";
 /** A rendered view: `<chat>`, one `id+n|text` line per part, `</chat>` (Memory.render). */
 const CHAT_VIEW = /^<chat>\n(?:\d+\+[1-9]\d*\|[^\n]*\n)*<\/chat>$/;
+/**
+ * OMP's request-time date/cwd reminder envelope. The host prepends it to the
+ * first user turn, the view message, as its own text block.
+ */
+const HOST_REMINDER_OPEN = "<system-reminder>\n";
+const HOST_REMINDER_CLOSE = "\n</system-reminder>";
 /** Fields of a plain host text block; anything else (citations, files) is never treated as the view. */
 const VIEW_BLOCK_FIELDS: Record<string, true> = {
 	type: true,
@@ -117,10 +123,20 @@ interface LeadingView {
 	marks: number[];
 }
 
+/** A plain text block of the given wire type, with no field beyond text and cache metadata. */
+function plainText(block: unknown, textType: string): block is WireObject & { text: string } {
+	if (!object(block) || block.type !== textType || typeof block.text !== "string") return false;
+	for (const field in block) {
+		if (!Object.hasOwn(VIEW_BLOCK_FIELDS, field)) return false;
+	}
+	return true;
+}
+
 /**
  * The plugin's view: leading plain text blocks of the first user message
  * (after Responses developer/system items), from `<chat>\n` to the first block
- * closing `</chat>` (possibly its own block). A pasted later view is never considered.
+ * closing `</chat>` (possibly its own block). Only OMP's date/cwd reminder
+ * blocks may precede it. A pasted later view is never considered.
  */
 function leadingView(messages: unknown[], textType: string): LeadingView | undefined {
 	let index = 0;
@@ -131,14 +147,19 @@ function leadingView(messages: unknown[], textType: string): LeadingView | undef
 	}
 	const entry = messages[index];
 	if (!object(entry) || entry.role !== "user" || !Array.isArray(entry.content)) return;
+	const content: unknown[] = entry.content;
+	let first = 0;
+	while (first < content.length) {
+		const block = content[first];
+		if (!plainText(block, textType) || !block.text.startsWith(HOST_REMINDER_OPEN) || !block.text.endsWith(HOST_REMINDER_CLOSE)) break;
+		first++;
+	}
 	const texts: string[] = [];
 	const ends: number[] = [];
 	let length = 0;
-	for (const block of entry.content) {
-		if (!object(block) || block.type !== textType || typeof block.text !== "string") return;
-		for (const field in block) {
-			if (!Object.hasOwn(VIEW_BLOCK_FIELDS, field)) return;
-		}
+	for (let position = first; position < content.length; position++) {
+		const block = content[position];
+		if (!plainText(block, textType)) return;
 		if (texts.length === 0 && !block.text.startsWith("<chat>\n")) return;
 		texts.push(block.text);
 		length += block.text.length;
@@ -150,7 +171,7 @@ function leadingView(messages: unknown[], textType: string): LeadingView | undef
 		const cuts = new Set(textType === "text" ? viewCuts(view) : responseCuts(view));
 		const marks: number[] = [];
 		for (let i = 0; i < ends.length; i++) {
-			if (cuts.has(ends[i]!)) marks.push(i);
+			if (cuts.has(ends[i]!)) marks.push(first + i);
 		}
 		return { index, marks };
 	}
@@ -172,7 +193,7 @@ function mapChanged(values: unknown[], change: (value: unknown, index: number) =
 /** Set or remove one metadata key, copying only when it changes. */
 function withMarker(value: unknown, key: string, marker: WireObject | undefined): unknown {
 	if (!object(value)) return value;
-	if (marker) return { ...value, [key]: marker };
+	if (marker) return value[key] === marker ? value : { ...value, [key]: marker };
 	if (!(key in value)) return value;
 	const result = { ...value };
 	delete result[key];
@@ -182,10 +203,10 @@ function withMarker(value: unknown, key: string, marker: WireObject | undefined)
 function withBlockMarkers(
 	message: unknown,
 	key: string,
-	marker: (block: number) => WireObject | undefined,
+	marker: (block: number, value: unknown) => WireObject | undefined,
 ): unknown {
 	if (!object(message) || !Array.isArray(message.content)) return message;
-	const content = mapChanged(message.content, (block, j) => withMarker(block, key, marker(j)));
+	const content = mapChanged(message.content, (block, j) => withMarker(block, key, marker(j, block)));
 	return content === message.content ? message : { ...message, content };
 }
 
@@ -220,7 +241,9 @@ function officialOpenAIEndpoint(baseUrl: string): boolean {
  * prefix and rewritten whenever an early view line changed. Within the
  * four-marker budget the order is: view block, request end, last system block,
  * the host's latest system anchor, its latest tools anchor, then earlier host
- * anchors newest first. Every marker is a 5-minute ephemeral one.
+ * anchors newest first. A kept host marker stays as the host wrote it; an added
+ * one copies the host's latest marker, so it keeps the host's cache lifetime
+ * (OMP defaults OAuth requests to one hour) and any option an endpoint refused.
  */
 function cacheAnthropic(payload: WireObject): unknown {
 	const messages = payload.messages;
@@ -229,12 +252,16 @@ function cacheAnthropic(payload: WireObject): unknown {
 	if (!view) return payload;
 	// Prefix order is tools, then system, then messages.
 	const head: Array<{ field: "tools" | "system"; index: number }> = [];
+	let latest: unknown;
 	for (const field of ["tools", "system"] as const) {
 		const values = payload[field];
 		if (!Array.isArray(values)) continue;
 		for (let index = 0; index < values.length; index++) {
 			const value = values[index];
-			if (object(value) && value.cache_control != null) head.push({ field, index });
+			if (object(value) && value.cache_control != null) {
+				head.push({ field, index });
+				latest = value.cache_control;
+			}
 		}
 	}
 	// The host's latest message breakpoint is its request-end anchor; it already
@@ -249,11 +276,16 @@ function cacheAnthropic(payload: WireObject): unknown {
 			if (object(value) && value.cache_control != null &&
 				!(typeof value.type === "string" && Object.hasOwn(ANTHROPIC_UNCACHEABLE, value.type))) {
 				end = { message, block };
+				latest = value.cache_control;
 			}
 		}
 	}
 	// No host breakpoint at all means caching is off for this request (retention "none").
 	if (!end && head.length === 0 && payload.cache_control == null) return payload;
+	const source = latest ?? payload.cache_control;
+	if (!object(source)) return payload;
+	const retained = (value: unknown): WireObject =>
+		object(value) && object(value.cache_control) ? value.cache_control : { ...source };
 	const viewMark = view.marks.at(-1);
 	const endInView = end?.message === view.index && viewMark === end.block;
 	const allowedHead = MAX_BREAKPOINTS - (viewMark === undefined ? 0 : 1) - (end && !endInView ? 1 : 0);
@@ -284,15 +316,11 @@ function cacheAnthropic(payload: WireObject): unknown {
 		result[field] = mapChanged(values, (value, index) => withMarker(
 			value,
 			"cache_control",
-			keep.some((entry) => entry.field === field && entry.index === index)
-				? { type: "ephemeral", ttl: "5m" }
-				: undefined,
+			keep.some((entry) => entry.field === field && entry.index === index) ? retained(value) : undefined,
 		));
 	}
-	result.messages = mapChanged(messages, (message, i) => withBlockMarkers(message, "cache_control", (j) =>
-		(i === view.index && j === viewMark) || (i === end?.message && j === end.block)
-			? { type: "ephemeral", ttl: "5m" }
-			: undefined));
+	result.messages = mapChanged(messages, (message, i) => withBlockMarkers(message, "cache_control", (j, block) =>
+		(i === view.index && j === viewMark) || (i === end?.message && j === end.block) ? retained(block) : undefined));
 	return result;
 }
 

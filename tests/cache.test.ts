@@ -28,7 +28,6 @@ const ROW_UNITS = 1_000;
 /** OpenAI's stable cuts for fixed-row views over 100,000 units: line ends at or before 50k, 80k and 100k. */
 const CUTS = [49_007, 79_007, 99_007];
 const HOST_LONG: WireObject = { type: "ephemeral", ttl: "1h" };
-const FIVE_MINUTES: WireObject = { type: "ephemeral", ttl: "5m" };
 const EXPLICIT: WireObject = { mode: "explicit" };
 const ENV_KEYS = ["PI_CACHE_RETENTION", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_FOUNDRY"];
 
@@ -364,12 +363,12 @@ describe("local cache mutation modes", () => {
 // ---- native Anthropic --------------------------------------------------------
 
 describe("native Anthropic Messages", () => {
-  test("a short view keeps the host's three head breakpoints and request end, each as a 5m marker", () => {
+  test("a short view keeps the host's three head breakpoints and request end, each as the host wrote it", () => {
     const input = nativePayload("<chat>\n0+1|short memory\n</chat>");
     const host = ["$.tools.0", "$.system.0", "$.system.1", "$.messages.2.content.0"];
     expect(markersAt(input, "cache_control")).toEqual(expectedMarkers(HOST_LONG, ...host));
     const result = apply(input, anthropicModel());
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, ...host));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, ...host));
     expect(markersAt(result, "prompt_cache_breakpoint")).toEqual({});
     expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
   });
@@ -402,9 +401,9 @@ describe("native Anthropic Messages", () => {
       const head = cuts.length === 0 ? ["$.tools.0", "$.system.0", "$.system.1"] : ["$.tools.0", "$.system.1"];
       const viewPath = cuts.length === 0 ? [] : [`$.messages.0.content.${cuts.length - 1}`];
       const markers = markersAt(result, "cache_control");
-      expect(markers).toEqual(expectedMarkers(FIVE_MINUTES, ...head, ...viewPath, "$.messages.2.content.0"));
+      expect(markers).toEqual(expectedMarkers(HOST_LONG, ...head, ...viewPath, "$.messages.2.content.0"));
       expect(Object.keys(markers)).toHaveLength(4);
-      for (const marker of Object.values(markers)) expect(marker).toEqual(FIVE_MINUTES);
+      for (const marker of Object.values(markers)) expect(marker).toEqual(HOST_LONG);
       expect(markedPrefixes(at(result, "messages", 0, "content"), "cache_control")).toEqual(cuts.slice(-1).map((cut) => text.slice(0, cut)));
       expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
     });
@@ -413,7 +412,7 @@ describe("native Anthropic Messages", () => {
       { rows: 110, blocks: 28, last: 26, cut: 108_007 },
       { rows: 4_096, blocks: 1_025, last: 1_023, cut: 4_096_007 },
       { rows: 4_097, blocks: 1_025, last: 1_023, cut: 4_096_007 },
-    ])(`${name}: large $rows-row views keep four-line blocks but at most four 5m markers`, ({ rows, blocks, last, cut }) => {
+    ])(`${name}: large $rows-row views keep four-line blocks but at most four markers`, ({ rows, blocks, last, cut }) => {
       const text = view(rows);
       const input = nativePayload(text);
       expect(input.messages[0].content).toHaveLength(blocks);
@@ -427,9 +426,9 @@ describe("native Anthropic Messages", () => {
       expect(Buffer.from(texts.join("")).equals(Buffer.from(text))).toBe(true);
       expect(markedPrefixes(at(result, "messages", 0, "content"), "cache_control")).toEqual([text.slice(0, cut)]);
       const markers = markersAt(result, "cache_control");
-      expect(markers).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.1", `$.messages.0.content.${last}`, "$.messages.2.content.0"));
+      expect(markers).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.1", `$.messages.0.content.${last}`, "$.messages.2.content.0"));
       expect(Object.keys(markers)).toHaveLength(4);
-      for (const marker of Object.values(markers)) expect(marker).toEqual(FIVE_MINUTES);
+      for (const marker of Object.values(markers)) expect(marker).toEqual(HOST_LONG);
     });
   }
 
@@ -440,17 +439,17 @@ describe("native Anthropic Messages", () => {
     expect(blockTexts(input.messages[0].content)).toEqual([`<chat>\n${body}`, "</chat>"]);
     const result = apply(input, anthropicModel());
     expect(markedPrefixes(at(result, "messages", 0, "content"), "cache_control")).toEqual([`<chat>\n${body}`]);
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.1", "$.messages.0.content.0", "$.messages.2.content.0"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.1", "$.messages.0.content.0", "$.messages.2.content.0"));
   });
 
-  test("one tool, one system, the latest full group and request end all retain a 5m marker", () => {
+  test("one tool, one system, the latest full group and request end all carry the host's marker", () => {
     const input = nativePayload(labeledView(8));
     input.system = [{ type: "text", text: "Only system anchor.", cache_control: hostMarker() }];
     const result = apply(input, anthropicModel());
     const markers = markersAt(result, "cache_control");
-    expect(markers).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.0", "$.messages.0.content.1", "$.messages.2.content.0"));
+    expect(markers).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.0", "$.messages.0.content.1", "$.messages.2.content.0"));
     expect(Object.keys(markers)).toHaveLength(4);
-    for (const marker of Object.values(markers)) expect(marker).toEqual(FIVE_MINUTES);
+    for (const marker of Object.values(markers)) expect(marker).toEqual(HOST_LONG);
     expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
   });
 
@@ -459,15 +458,16 @@ describe("native Anthropic Messages", () => {
     input.tools.push({ name: "another_tool", input_schema: { type: "object" }, cache_control: hostMarker() });
     input.system.push({ type: "text", text: "Latest system anchor.", cache_control: hostMarker() });
     const result = apply(input, anthropicModel());
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.1", "$.system.2", "$.messages.0.content.1", "$.messages.2.content.0"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.1", "$.system.2", "$.messages.0.content.1", "$.messages.2.content.0"));
     expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
   });
 
-  test.each(["short", "long"])("host %s retention is normalized to four 5m markers, never 1h", (retention) => {
+  test.each(["short", "long"])("host %s retention keeps the host's cache lifetime on every kept and added marker", (retention) => {
     process.env.PI_CACHE_RETENTION = retention;
-    const input = nativePayload(labeledView(9), () => retention === "long" ? hostMarker() : { type: "ephemeral" });
+    const marker = retention === "long" ? HOST_LONG : { type: "ephemeral" };
+    const input = nativePayload(labeledView(9), () => ({ ...marker }));
     const result = apply(input, anthropicModel());
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.1", "$.messages.0.content.1", "$.messages.2.content.0"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(marker, "$.tools.0", "$.system.1", "$.messages.0.content.1", "$.messages.2.content.0"));
   });
 
   test("host retention none supplies no breakpoints and remains untouched", () => {
@@ -486,7 +486,7 @@ describe("native Anthropic Messages", () => {
     input.messages[1].content[0] = { ...input.messages[1].content[0], cache_control: hostMarker() };
     const result = apply(input, anthropicModel());
     expect(result).not.toHaveProperty("cache_control");
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.1", "$.messages.0.content.26", "$.messages.2.content.0"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.1", "$.messages.0.content.26", "$.messages.2.content.0"));
     expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
   });
 
@@ -494,7 +494,7 @@ describe("native Anthropic Messages", () => {
     const input = nativePayload(labeledView(110), () => undefined);
     input.cache_control = { type: "ephemeral" };
     const result = apply(input, anthropicModel());
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.messages.0.content.26"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers({ type: "ephemeral" }, "$.messages.0.content.26"));
     expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
   });
 
@@ -503,7 +503,7 @@ describe("native Anthropic Messages", () => {
     input.messages = [input.messages[0]];
     input.messages[0].content[1] = { ...input.messages[0].content[1], cache_control: hostMarker() };
     const result = apply(input, anthropicModel());
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.0", "$.system.1", "$.messages.0.content.1"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.0", "$.system.1", "$.messages.0.content.1"));
     expect(at(result, "messages", 0, "content", 2)).toEqual({ type: "text", text: "</chat>" });
   });
 
@@ -511,7 +511,7 @@ describe("native Anthropic Messages", () => {
     const input = nativePayload(labeledView(9));
     input.messages[2].content[0] = { type: "text", text: "Unmarked current turn." };
     const result = apply(input, anthropicModel());
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.0", "$.system.1", "$.messages.0.content.1"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.0", "$.system.1", "$.messages.0.content.1"));
     expect(at(result, "messages", 2)).toBe(input.messages[2]);
   });
 
@@ -520,7 +520,7 @@ describe("native Anthropic Messages", () => {
     input.tools = [];
     input.system.push({ type: "text", text: "Latest system anchor.", cache_control: hostMarker() });
     const result = apply(input, anthropicModel());
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.system.1", "$.system.2", "$.messages.0.content.1", "$.messages.2.content.0"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.system.1", "$.system.2", "$.messages.0.content.1", "$.messages.2.content.0"));
   });
 
   test("without any host breakpoint caching is off and the payload is returned by reference", () => {
@@ -540,7 +540,7 @@ describe("native Anthropic Messages", () => {
     ];
     const result = apply(input, anthropicModel());
     const markers = markersAt(result, "cache_control");
-    expect(markers).toEqual(expectedMarkers(FIVE_MINUTES, "$.system.0", "$.system.2", "$.messages.0.content.1", "$.messages.2.content.0"));
+    expect(markers).toEqual(expectedMarkers(HOST_LONG, "$.system.0", "$.system.2", "$.messages.0.content.1", "$.messages.2.content.0"));
     expect(Object.keys(markers)).toHaveLength(4);
     expect(at(result, "system", 1)).toBe(input.system[1]);
     expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
@@ -553,7 +553,7 @@ describe("native Anthropic Messages", () => {
       { type: "thinking", text: SYSTEM_BLOCK },
     ];
     const result = apply(input, anthropicModel());
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.0", "$.messages.0.content.1", "$.messages.2.content.0"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.0", "$.messages.0.content.1", "$.messages.2.content.0"));
   });
 
   test("the latest existing host breakpoint stays the request end when unmarked continuation messages follow", () => {
@@ -563,7 +563,7 @@ describe("native Anthropic Messages", () => {
       { role: "user", content: [{ type: "text", text: "Continue." }] },
     );
     const result = apply(input, anthropicModel());
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.1", "$.messages.0.content.26", "$.messages.2.content.0"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.1", "$.messages.0.content.26", "$.messages.2.content.0"));
     expect(at(result, "messages", 3)).toBe(input.messages[3]);
     expect(at(result, "messages", 4)).toBe(input.messages[4]);
   });
@@ -977,6 +977,24 @@ describe("view admission", () => {
     expectPassthrough(laterBlock, adapter.model());
   });
 
+  test.each(ADAPTERS)("$name: OMP's date/cwd reminder ahead of the view changes no other breakpoint", (adapter) => {
+    // OMP prepends this block to the first user turn of every provider request.
+    const reminder = {
+      type: adapter.textType,
+      text: "<system-reminder>\nToday: 2026-11-09; current working directory: '/work'. Do not repeat this information in your reply.\n</system-reminder>",
+    };
+    const reminded = adapter.payload();
+    list(at(reminded, adapter.list, 0, "content")).unshift(reminder);
+    const result = expectChanged(reminded, adapter.model());
+    const content = list(at(result, adapter.list, 0, "content"));
+    expect(content[0]).toEqual(reminder);
+    content.shift();
+    expect(result).toEqual(apply(adapter.payload(), adapter.model()));
+    const unclosed = adapter.payload();
+    list(at(unclosed, adapter.list, 0, "content")).unshift({ type: adapter.textType, text: "<system-reminder>\nPasted without its closing tag." });
+    expectPassthrough(unclosed, adapter.model());
+  });
+
   {
     const name = "indexed chat";
     const view = labeledView;
@@ -989,7 +1007,7 @@ describe("view admission", () => {
       expect(at(result, "messages", 0, "content")).toHaveLength(1);
       expect(blockTexts(at(result, "messages", 0, "content"))).toEqual([text]);
       expect(markedPrefixes(at(result, "messages", 0, "content"), "cache_control")).toEqual([]);
-      expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.0", "$.system.1", "$.messages.2.content.0"));
+      expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.0", "$.system.1", "$.messages.2.content.0"));
       expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
     });
   }
@@ -1024,7 +1042,7 @@ describe("view admission", () => {
     pasted[27] = { ...pasted[27], cache_control: hostMarker() };
     input.messages[2] = { role: "user", content: pasted };
     const result = apply(input, anthropicModel());
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.1", "$.messages.0.content.26", "$.messages.2.content.27"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.1", "$.messages.0.content.26", "$.messages.2.content.27"));
     expect(blockTexts(at(result, "messages", 2, "content"))).toEqual(blockTexts(pasted));
   });
 
@@ -1095,7 +1113,7 @@ describe("compactor views", () => {
     if (rows > 0 && rows % 4 === 0) expect(texts[viewCount - 1]).toBe("</chat>");
     const viewPath = last === undefined ? [] : [`$.messages.0.content.${last}`];
     const prefixes = cut === undefined ? [] : [context.slice(0, cut)];
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.system.0", ...viewPath, `$.messages.0.content.${viewCount}`));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.system.0", ...viewPath, `$.messages.0.content.${viewCount}`));
     expect(markedPrefixes(at(result, "messages", 0, "content"), "cache_control")).toEqual([...prefixes, context + COMPACTOR_INSTRUCTION]);
     expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
   });
@@ -1118,7 +1136,7 @@ describe("compactor views", () => {
     };
     const result = apply(input, anthropicModel());
     const markers = markersAt(result, "cache_control");
-    expect(markers).toEqual(expectedMarkers(FIVE_MINUTES, "$.system.0", "$.system.2", "$.messages.0.content.26", "$.messages.0.content.28"));
+    expect(markers).toEqual(expectedMarkers(HOST_LONG, "$.system.0", "$.system.2", "$.messages.0.content.26", "$.messages.0.content.28"));
     expect(Object.keys(markers)).toHaveLength(4);
     expect(stripKey(result, "cache_control")).toEqual(stripKey(input, "cache_control"));
   });
@@ -1139,7 +1157,7 @@ describe("compactor views", () => {
     const content = at(result, "messages", 0, "content");
     const texts = blockTexts(content);
     expect(texts).toHaveLength(29);
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.system.0", "$.messages.0.content.26", "$.messages.0.content.28"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.system.0", "$.messages.0.content.26", "$.messages.0.content.28"));
     expect(Buffer.from(texts.slice(0, 28).join("")).equals(Buffer.from(COMPACTOR_CONTEXT))).toBe(true);
     expect(texts[28]).toBe(COMPACTOR_INSTRUCTION);
     expect(markedPrefixes(content, "cache_control")).toEqual([COMPACTOR_CONTEXT.slice(0, 108_007), COMPACTOR_CONTEXT + COMPACTOR_INSTRUCTION]);
@@ -1226,7 +1244,7 @@ describe("stable cache prefixes", () => {
       expect(afterTexts.at(-1)).toBe(appended.slice(cut + 4_000));
       expect(markedPrefixes(at(before, "messages", 0, "content"), "cache_control")).toEqual([original.slice(0, cut)]);
       expect(markedPrefixes(at(after, "messages", 0, "content"), "cache_control")).toEqual([appended.slice(0, cut + 4_000)]);
-      expect(markersAt(after, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.1", `$.messages.0.content.${groups}`, "$.messages.2.content.0"));
+      expect(markersAt(after, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.1", `$.messages.0.content.${groups}`, "$.messages.2.content.0"));
       expect(Buffer.from(afterTexts.join("")).equals(Buffer.from(appended))).toBe(true);
     });
   }
@@ -1326,7 +1344,7 @@ describe("byte fidelity", () => {
     expect(at(result, "messages", 0, "content", 350)).toBe(input.messages[0].content[350]);
     expect(at(result, "messages", 0, "content", 351)).toBe(trailing);
     expect(markedPrefixes(at(result, "messages", 0, "content"), "cache_control")).toEqual([view.slice(0, -7)]);
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.1", "$.messages.0.content.349", "$.messages.2.content.0"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.1", "$.messages.0.content.349", "$.messages.2.content.0"));
   });
 
   test("Responses: Unicode view blocks and a separate trailing text block keep their exact UTF-8 bytes", () => {
@@ -1356,7 +1374,7 @@ describe("frozen inputs", () => {
     expect(input).toEqual(before);
     expect(result).not.toBe(input);
     expect(markersAt(input, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.0", "$.system.1", "$.messages.2.content.0"));
-    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(FIVE_MINUTES, "$.tools.0", "$.system.1", "$.messages.0.content.26", "$.messages.2.content.0"));
+    expect(markersAt(result, "cache_control")).toEqual(expectedMarkers(HOST_LONG, "$.tools.0", "$.system.1", "$.messages.0.content.26", "$.messages.2.content.0"));
     expect(result.messages).not.toBe(input.messages);
     expect(at(result, "messages", 0)).not.toBe(input.messages[0]);
     expect(at(result, "messages", 0, "content")).not.toBe(input.messages[0].content);
@@ -1680,7 +1698,7 @@ describe("cache-prefix writer coordination", () => {
 
   test("a fresh-store compressor request shares only the host's system anchor with its concurrent siblings", () => {
     expect(markersAt(compressorPayload("compress message 0"), "cache_control"))
-      .toEqual(expectedMarkers(FIVE_MINUTES, "$.system.0", "$.messages.0.content.1"));
+      .toEqual(expectedMarkers(HOST_LONG, "$.system.0", "$.messages.0.content.1"));
   });
 
   test("concurrent compressor calls sharing only the system anchor wait for the first writer's response start", async () => {

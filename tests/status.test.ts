@@ -161,14 +161,18 @@ describe("/optchat status cache observations", () => {
     const host = await open();
     const request = await encodeCachedMainRequest(host, [], "Keep this request short.");
     expect(request.payload.messages).toBe(request.messages);
+    // OMP's date/cwd reminder leads the first user turn; the view follows it.
     expect(request.messages[0]).toMatchObject({
       role: "user",
-      content: { 0: { type: "text", text: expect.stringMatching(/^<chat>\n/) } },
+      content: {
+        0: { type: "text", text: expect.stringMatching(/^<system-reminder>\n[^]*\n<\/system-reminder>$/) },
+        1: { type: "text", text: expect.stringMatching(/^<chat>\n/) },
+      },
     });
     expect(request.messages.at(-1)).toMatchObject({
       role: "user",
       content: expect.arrayContaining([
-        expect.objectContaining({ cache_control: { type: "ephemeral", ttl: "5m" } }),
+        expect.objectContaining({ cache_control: expect.objectContaining({ type: "ephemeral" }) }),
       ]),
     });
     expectModes(await statusOf(host), "anthropic-breakpoints");

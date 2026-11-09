@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.3 — 2026-11-09
+
+- **Fixed: on real OMP hosts, main requests carried none of OptChat's prompt-cache marks.** OMP puts a date/cwd `<system-reminder>` block at the start of each request's first user message, which is OptChat's view. The cache adapter required the view to come first, so it left every main request as the host built it: no mark on the view and no mark on the last system block. At each new turn, Anthropic then reused only the system prefix before `<project-context>`. It wrote the rest of the system prompt and the whole view again. OptChat now skips that reminder block and marks the view after it. The same fix applies to OpenAI Responses breakpoints and Codex `all_turns`. This explains the 38–55% turn-start cache reads that 0.13.0 left unexplained.
+- Session-log evidence before the fix (Opus, OMP 18.14–18.18, requests from 2026-10-30 to 2026-11-09, no paired control): with OptChat on, the first request after a user message read a median of 43.1% of its prompt from cache (n = 511). Later requests in a turn read 99.6% (n = 4,890). With OptChat inactive, the first request read 99.7% (n = 77). Of 488 first requests that recorded the host's system size, 227 read only the host prefix (median 82,039 tokens). They wrote a median of 101,283 tokens of system prompt after it, plus 46,081 tokens of view and new messages. OMP's cost fields put these 227 requests at $223.06. The effect of this fix is not measured yet.
+- **Changed: added marks keep the host's cache lifetime.** OptChat used to rewrite every mark of a request it changed to a five-minute entry. On real hosts, that reached only compressor requests. A mark that the host wrote now keeps its value. A mark that OptChat adds copies the host's latest mark, so its entry lasts as long as the host's own: OMP asks for one-hour entries on OAuth Anthropic requests.
+- **Known limit:** Anthropic looks back about 20 blocks from a mark for an earlier cached prefix. A turn that adds more than about 80 view lines can still rewrite the view at the next turn; the system prompt stays cached.
+- Tests now encode the main request with OMP's real date/cwd reminder injector, as the host does.
+
 ## 0.16.2 — 2026-11-07
 
 - Restore default-on Clairic extraction at Eric's explicit request after reviewing the real-chat evaluation. `--no-optchat-extract` still wins; no key means no call. The failed evaluation gate, misleading-candidate findings and unknown billing remain unchanged.

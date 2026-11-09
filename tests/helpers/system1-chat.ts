@@ -5,6 +5,7 @@
  */
 import { completeSimple, type Answer, type Model } from "@oh-my-pi/pi-ai";
 import { getBundledModels } from "@oh-my-pi/pi-catalog";
+import { DateCwdReminderInjector } from "@oh-my-pi/pi-coding-agent/session/date-cwd-reminder";
 import { createOptChat, SYSTEM_BLOCK } from "../../src/index.ts";
 import { isRecord } from "../../src/type-guards.ts";
 import { choice, fakeJudge, noul, score, type FakeJudge } from "./fake-judge.ts";
@@ -157,8 +158,9 @@ export interface EncodedRequest {
 }
 
 /**
- * Encodes the main request for `text` the way the host does: the context hook's messages through the real
- * pi-ai Anthropic encoder, aborted inside onPayload so nothing is sent, then OptChat's payload hook.
+ * Encodes the main request for `text` the way the host does: the context hook's messages, then the host's
+ * date/cwd reminder on the first user turn, through the real pi-ai Anthropic encoder, aborted inside
+ * onPayload so nothing is sent, then OptChat's payload hook.
  */
 export async function encodeMainRequest(host: FakeHost, transcript: HostMessage[], text: string): Promise<EncodedRequest> {
   const model = anthropicModel();
@@ -166,12 +168,18 @@ export async function encodeMainRequest(host: FakeHost, transcript: HostMessage[
   const [started] = await host.fire("before_agent_start", { systemPrompt: ["Host prompt for the test."] });
   const system = systemOf(started);
   if (!system.includes(SYSTEM_BLOCK)) throw new Error("before_agent_start did not add the OptChat system block");
+  // The host's provider-context transform runs between the context hook and the encoder.
+  const context = new DateCwdReminderInjector().transform(
+    // The context messages are the host's own LLM messages; pi-ai's typed encoder is the only validator, so the cast stays here.
+    { systemPrompt: system, messages: messages as never, tools: TOOLS as never },
+    "2026-10-12",
+    "/work",
+  );
   let captured: Record<string, unknown> | undefined;
   const stop = new AbortController();
   const reply = await completeSimple(
     model,
-    // The context messages are the host's own LLM messages; pi-ai's typed encoder is the only validator, so the cast stays here.
-    { systemPrompt: system, messages: messages as never, tools: TOOLS as never },
+    context,
     {
       apiKey: "fixture-key",
       statefulResponses: false,
