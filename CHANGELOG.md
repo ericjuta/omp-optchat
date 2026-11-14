@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.6 — 2026-11-14
+
+- **Changed: a summary that is too long is asked to leave room.** The retry message told the compressor to cut "just enough" to fit, and many retries missed the limit again by a few bytes. Each miss now asks for a shorter line: 32 bytes under the 512-byte limit after the first miss, 64 after the second, and so on, to at most half the limit. The limit itself, the five tries and the rule that a stored line is never truncated are unchanged.
+- **Fixed: more preambles are cut from summary lines.** The guard now recognizes a `⁂` in front of a label (`⁂ Compaction:`), a message-range label (`Msgs 5672–5687 (high, finding):`), labels with `to`, `into`, `one`, `single`, `result` or `≤512` in them (`Merged line for messages 8 to 15 (under 512 bytes):`), and a one-line compaction label followed by a blank line. A reply that opens this way is retried, as before; if every try repeats it, the stored line has the preamble cut.
+- Metrics evidence (live stores, 2026-11-09 to 2026-11-14, no paired control): 41% of compressor calls were retries. Length retries repeated most: of gpt-6.1-terra merges that got a length retry, 43% used all five tries, and for Haiku 5.5 it was 8%. 1,868 stored lines were over 512 bytes, with a median of 520. The new guard matches 1,655 of 40,480 lines stored in that window (4.1%) that the old guard let through; a read of the matched openings found no ordinary summary among them. The effect of both changes on retries, cost and stored sizes is not measured yet.
+- Checked, no change: `chat_search` returning 0 hits for a hyphenated term was correct. The term first entered the log in the search call itself. A check of host compactions after 0.16.5 found no compaction rows yet.
+- Tests: ten head cases failed before the guard change and pass after.
+
 ## 0.16.5 — 2026-11-14
 
 - **Fixed: a turn that opened on a host notice could not be compacted, and the session ran into the model's context limit.** OMP often puts a notice (a skill, device or tool-roster notice) ahead of the user's prompt. OptChat stores nothing for such a notice, so the turn never recorded its first stored message. When the host later asked to compact inside that turn, OptChat cancelled with `nothing-older`, every time. The turn kept growing. The turn now records the first entry it stores, whichever message that is, and an in-turn cut points there.

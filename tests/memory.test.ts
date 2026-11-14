@@ -523,12 +523,12 @@ test("size enforcement trims whitespace, cuts feedback to the limit, keeps the w
   expect(second.request.instruction).toBe(first.request.instruction);
   expect(second.request.feedback.map((turn) => turn.reply.trim())).toEqual(["x".repeat(30)]);
   const cut = second.request.feedback[0]!.instruction;
-  // The stored line is "user: " + the reply: 36 bytes. The cut leaves room for those 6 bytes.
+  // The stored line is "user: " + the reply: 36 bytes. The cut leaves room for those 6 bytes and a 2-byte margin.
   expect(cut).toContain("36 bytes");
   expect(cut).toContain("6-byte kind label");
   expect(cut).toContain("20-byte limit");
-  expect(cut).toContain(`\n${"x".repeat(14)}| ← LIMIT`);
-  expect(cut).not.toContain("x".repeat(15));
+  expect(cut).toContain(`\n${"x".repeat(12)}| ← CUT`);
+  expect(cut).not.toContain("x".repeat(13));
   second.resolve(`${"y".repeat(25)}  `);
 
   await until(() => model.calls.length === 3, "third try");
@@ -536,7 +536,8 @@ test("size enforcement trims whitespace, cuts feedback to the limit, keeps the w
   // Only the latest try is replayed: the x30 reply is no longer in feedback.
   expect(third.request.feedback.map((turn) => turn.reply)).toEqual(["y".repeat(25)]);
   expect(third.request.feedback[0]!.instruction).toContain("31 bytes");
-  expect(third.request.feedback[0]!.instruction).toContain(`\n${"y".repeat(14)}| ← LIMIT`);
+  // A second miss asks for twice the margin.
+  expect(third.request.feedback[0]!.instruction).toContain(`\n${"y".repeat(10)}| ← CUT`);
   third.resolve("z".repeat(27));
 
   // Every try overflowed the 20-byte target but fit the ceiling: the shortest
@@ -569,7 +570,7 @@ test("feedback cuts on UTF-8 boundaries and the shortest try is measured in byte
   await until(() => model.calls.length === 2, "second try");
   const firstCut = model.calls[1]!.request.feedback[0]!.instruction;
   expect(firstCut).toContain("16 bytes"); // behind "user: "
-  expect(firstCut).toContain("\nééé| ← LIMIT");
+  expect(firstCut).toContain("\nééé| ← CUT");
   expect(firstCut).not.toContain("\uFFFD");
 
   model.calls[1]!.resolve("abc🙂defgh"); // 12 bytes; byte 7 ends the emoji exactly
@@ -577,7 +578,7 @@ test("feedback cuts on UTF-8 boundaries and the shortest try is measured in byte
   expect(model.calls[2]!.request.feedback).toHaveLength(1); // latest try only
   const secondCut = model.calls[2]!.request.feedback[0]!.instruction;
   expect(secondCut).toContain("18 bytes");
-  expect(secondCut).toContain("\nabc🙂| ← LIMIT");
+  expect(secondCut).toContain("\nabc| ← CUT"); // the emoji would cross the cut
 
   // 8 bytes versus ééééé's 10 bytes (5 UTF-16 units): bytes decide, and the
   // whole shortest reply is kept without cutting.
@@ -682,6 +683,11 @@ describe("merge replies that open with their own ids or a label", () => {
     ["Merged line (a+n and b+n):", "Merged line (0+1 and 1+1): Eric wants it", "Eric wants it"],
     ["Compaction output: a-b:", "Compaction output: 0-1: Eric wants it", "Eric wants it"],
     ["merged-line tag", `<merged-line id="0+2">Eric wants it`, "Eric wants it"],
+    ["asterism label", "⁂ Compaction: Eric wants it", "Eric wants it"],
+    ["asterism label, then Msgs a–b (…):", "⁂ Compaction: Msgs 0–1 (high, finding): Eric wants it", "Eric wants it"],
+    ["Compaction a–b, ≤N bytes:", "Compaction 0–1, ≤512 bytes: Eric wants it", "Eric wants it"],
+    ["Merged line for messages a to b (…):", "Merged line for messages 0 to 1 (under 512 bytes):\n\nEric wants it", "Eric wants it"],
+    ["label paragraph", "Compaction line, rewritten to fit 512 bytes:\n\nEric wants it", "Eric wants it"],
   ];
   for (const [name, reply, echo] of cases) {
     test(`${name} is retried, the echo drops it, and the clean reply is stored`, async () => {
@@ -708,7 +714,7 @@ describe("merge replies that open with their own ids or a label", () => {
   }
 
   test("a number outside the merge's own range, or a count, is content and is not retried", async () => {
-    for (const reply of ["Merged 14 PRs, 9 green", "45 tests pass in 3 files", "Compaction of 14 files: all kept", "2026 roadmap: ship it"]) {
+    for (const reply of ["Merged 14 PRs, 9 green", "45 tests pass in 3 files", "Compaction of 14 files: all kept", "2026 roadmap: ship it", "Merged to main: 3 PRs, CI green", "Compaction cancelled: nothing older"]) {
       const { store, model, merge } = await openMerge({ nodeBytes: 40, tries: 3 });
       merge.resolve(reply);
       await until(() => store.nodes.has(nodeKey(1, 0)), `merge saved for ${reply}`);
@@ -991,7 +997,7 @@ test("five giant multilingual replies publish no node, and every request stays b
       expect(turn.reply).not.toContain("\uFFFD");
       expect(utf8Bytes(turn.instruction)).toBeLessThanOrEqual(16 + 512);
       expect(turn.instruction).toContain("Previous reply excerpt only");
-      expect(turn.instruction).toContain("| ← LIMIT");
+      expect(turn.instruction).toContain("| ← CUT");
     }
   });
 });

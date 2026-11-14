@@ -157,16 +157,18 @@ const MARK_TEXT = EXTRACTIVE_MARK.trimEnd();
  */
 const HEAD_ID = String.raw`\d+(?:[+\-–]\d+)?`;
 const HEAD_IDS = String.raw`${HEAD_ID}(?:(?:\s*,\s*|\s+and\s+|\s+)${HEAD_ID})*`;
-const HEAD_WORDS = String.raw`(?:\s*[,;]|\s+(?:\([^)\n]*\)|\d+-byte|${HEAD_ID}|of|for|messages?|msgs?|and|with|merged|covers|within|under|or|less|at|most|max|limit|ruler|respected|bytes|lines?|chat|output))*`;
+const HEAD_WORDS = String.raw`(?:\s*[,;]|\s+(?:\([^)\n]*\)|\d+-byte|(?:≤|<=?)\s*\d+|${HEAD_ID}|of|for|messages?|msgs?|and|with|merged|covers|within|under|or|less|at|most|max|limit|ruler|respected|bytes|lines?|chat|output|to|into|one|single|result))*`;
 const HEAD_LABEL = String.raw`(?:compact(?:ed|ion)|compress(?:ed|ion)|merged?|lines?|summary)` +
   String.raw`(?:${HEAD_WORDS}\s*:(?!\d)|(?:\s+lines?)?\s*(?:${HEAD_IDS}\s*)?\([^)\n]*\)[^:\n]{0,60}:(?!\d))`;
 const HEAD = new RegExp(
-  String.raw`^(?:\p{Extended_Pictographic}\uFE0F?\s*)?(?:` + [
+  String.raw`^(?:[\p{Extended_Pictographic}⁂]\uFE0F?\s*)?(?:` + [
     String.raw`<\/?[a-z][\w-]*(?:\s[^>\n]*)?>`, // <summary>, <merged-line id="…">, <chat>
     String.raw`\[\/?merged-line\b[^\]\n]*\]`, // [merged-line id="…"]
     "```[\\w-]*", // code fence
     String.raw`the\s+(?:merged|compressed|compacted|summary)\s+line\s+(?:is|covers|below|above)\b[^\n.]*\.?(?:\s+It\s+is\s+\d+\s+bytes\b[^\n.]*\.?)?`,
     HEAD_LABEL, // Compaction 725 (medium): / Merged line (476+2, 478+2):
+    String.raw`(?:compact(?:ed|ion)|compress(?:ed|ion)|merged?)\b[^\n]{0,120}:[ \t]*\n\s*\n`, // Compaction line, rewritten to fit 512 bytes:⏎⏎
+    String.raw`(?:messages?|msgs?)\s+${HEAD_IDS}\s*(?:\([^)\n]*\))?\s*:(?!\d)`, // Msgs 5672–5687 (high, finding):
     String.raw`${HEAD_IDS}\s*\|`, // 476+4| / 908 |
     String.raw`${HEAD_IDS}\s*:(?!\d)`, // 921: / 936-939:
     String.raw`${HEAD_IDS}\s+merged?(?:\s*\([^)\n]*\))?\s*:(?!\d)`, // 634+1 and 635+1 merged (≤512 bytes):
@@ -1284,6 +1286,7 @@ export class Memory {
     let shortest: { text: string; size: number } | undefined;
     let refused = false;
     let retry: CompactionRetry | null = null;
+    let overlong = 0;
     for (let attempt = 0; attempt < this.tries; attempt++) {
       if (this.stopped || signal.aborted) return undefined;
       this.compressorCalls++;
@@ -1321,8 +1324,10 @@ export class Memory {
       const notes = mark ? [MARK_FEEDBACK] : head > 0 ? [HEAD_FEEDBACK] : [];
       if (falseUser) notes.push(USER_FEEDBACK);
       if (!fits) {
+        // Replies that miss the limit tend to miss it again by a few bytes, so each miss asks for more room.
+        const target = this.nodeBytes - Math.min(Math.floor(this.nodeBytes / 2), Math.ceil(this.nodeBytes / 16) * ++overlong);
         const label = added > 0 ? ` (code puts a ${added}-byte kind label in front of it)` : "";
-        notes.push(`${utf8Bytes(body) > this.summaryLimit ? "Previous reply excerpt only; omitted bytes are not a complete summary. " : ""}Too long: your line is ${size} bytes${label}, over the ${this.nodeBytes}-byte limit. Write\nthe whole line again for the same <input>, cutting just enough of the\nleast valuable items to fit before this cut:\n${utf8Prefix(excerpt, Math.max(0, this.nodeBytes - added))}| ← LIMIT`);
+        notes.push(`${utf8Bytes(body) > this.summaryLimit ? "Previous reply excerpt only; omitted bytes are not a complete summary. " : ""}Too long: your line is ${size} bytes${label}, over the ${this.nodeBytes}-byte limit. Leave room: write\nthe whole line again for the same <input>, dropping the least valuable\nitems until it ends before this cut:\n${utf8Prefix(excerpt, Math.max(0, target - added))}| ← CUT`);
       }
       // Keep one bounded feedback turn, not an ever-growing history of full
       // provider replies. The original input stays unchanged on every attempt.

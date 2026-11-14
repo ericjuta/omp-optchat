@@ -313,7 +313,7 @@ describe("false-speaker attribution on real Memory merges", () => {
     expect(turn.instruction).toContain("Previous reply excerpt only; omitted bytes are not a complete summary.");
     expect(turn.instruction).toContain(`Too long: your line is ${utf8Bytes(oversized)} bytes`);
     expect(turn.instruction).toContain("over the 512-byte limit");
-    expect(turn.instruction).toContain(`${oversized.slice(0, 512)}| ← LIMIT`);
+    expect(turn.instruction).toContain(`${oversized.slice(0, 480)}| ← CUT`);
     expect(utf8Bytes(turn.instruction)).toBeLessThanOrEqual(summaryLimit);
     expect(turn.instruction).not.toContain("head or preamble");
     expect(turn.instruction).not.toContain("marker only the code writes");
