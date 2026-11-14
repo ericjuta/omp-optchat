@@ -32,16 +32,16 @@ When history still fits the model's context, OptChat costs more than plain OMP f
 - OMP **18.10.3 or newer**, Bun, and Linux. CI checks every push and runs a weekly check against the latest published OMP SDK.
 - An authenticated model for the main chat and an authenticated compressor model. Compression uses OMP's `@smol` role by default. Choose a competent, inexpensive model explicitly if that role is unsuitable.
 
-Install the current release, **0.16.4**:
+Install the current release, **0.16.5**:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.16.4'
+omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.16.5'
 PI_OPENAI_STATEFUL=0 omp
 ```
 
 Restart existing OMP sessions after an upgrade. They retain the previously loaded plugin.
 
-Local 0.16.4 verification passed typecheck, 2,603 unit tests, 56 host tests, and a real-OMP smoke with a synthetic model. The smoke exercised ten host processes and 38 requests. Release CI also checks the pinned/latest SDKs and Linux/macOS leases.
+Local 0.16.5 verification passed typecheck, 2,605 unit tests, 56 host tests, and a real-OMP smoke with a synthetic model. The smoke exercised ten host processes and 38 requests. Release CI also checks the pinned/latest SDKs and Linux/macOS leases.
 
 These are software checks, not proof of live-model answer accuracy.
 

@@ -561,10 +561,14 @@ interface Turn {
 	extra: UserMessage[];
 	/** First host message of the turn. */
 	first?: Mark;
-	/** Memory id of the turn's first message once it is durable: a compaction that cuts inside the turn points here. */
+	/** Set once the log reaches `first`, whether or not that message stores an entry (most host notices store none). */
+	begun?: boolean;
+	/** Memory id of the first entry the turn stored, once durable: a compaction that cuts inside the turn points here. */
 	firstId?: number;
 	/** Last host message before the turn, when the turn began with no new message. */
 	after?: Mark;
+	/** Set once the host list starts the turn at an in-turn compaction summary: `first`/`after` are gone from it. */
+	cut?: boolean;
 }
 
 interface Pending {
@@ -1601,10 +1605,20 @@ class OptChat {
 
 	/** Index of the turn's first message in this host list; -1 when the list does not hold the turn. */
 	private turnStart(messages: AgentMessage[], turn: Turn): number {
-		if (turn.first) return this.find(messages, turn.first);
-		if (!turn.after) return 0;
-		const after = this.find(messages, turn.after);
-		return after < 0 ? -1 : after + 1;
+		const anchor = turn.first ?? turn.after;
+		if (!anchor) return 0;
+		const at = this.find(messages, anchor);
+		if (at >= 0) return turn.first ? at : at + 1;
+		// A compaction cut inside the turn dropped its anchor: the turn goes on from that summary, which points at the log.
+		if (turn.firstId === undefined) return -1;
+		const summary = hostCompactionSummaryInTurn(turn.firstId);
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index]!;
+			if (message.role !== "compactionSummary" || message.summary !== summary) continue;
+			turn.cut = true;
+			return index;
+		}
+		return -1;
 	}
 
 	/** Hash only messages with the target's timestamp: host lists hold the whole session history. */
@@ -1713,6 +1727,7 @@ class OptChat {
 			let typed: { source: number; text: string } | undefined;
 			const turn = this.turn;
 			const opens = turn?.first?.key === key;
+			if (opens) turn.begun = true;
 			const pending = message.role === "toolResult" ? calls.get(message.toolCallId) : undefined;
 			const resultFor = message.role === "toolResult" && pending?.toolName === message.toolName
 				? pending.messageId : undefined;
@@ -1726,7 +1741,8 @@ class OptChat {
 				if (entry.call && entry.call.id.length > 0) {
 					calls.set(entry.call.id, calls.has(entry.call.id) ? null : { messageId: stored.i, toolName: entry.call.name });
 				}
-				if (opens && turn.firstId === undefined) turn.firstId = stored.i;
+				// The turn's first stored entry: `first` itself, or the next message when `first` (or a turn with none) stores nothing.
+				if (turn && turn.firstId === undefined && (turn.begun || !turn.first)) turn.firstId = stored.i;
 				// Only a user's own text can state a rule. Skill prompts, reports and agent-authored messages never reach here as role user.
 				if (message.role === "user" && entry.kind === "user") typed = { source: stored.i, text: entry.text };
 			}
@@ -1830,9 +1846,7 @@ class OptChat {
 		const anchor = this.turn?.first ?? this.turn?.after;
 		const dropped = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
 		const at = anchor ? this.find(dropped, anchor) : -1;
-		if (!anchor || at < 0) return marker(preparation.firstKeptEntryId);
-		if (dropped[at]!.role === "compactionSummary") return cancel("leftover-summary");
-		const firstId = this.turn?.first ? this.turn.firstId : undefined;
+		const firstId = this.turn?.firstId;
 		// The host's cut inside the open turn, with a pointer to the turn's first message in the log.
 		const inTurn = (): CompactionAnswer | undefined =>
 			firstId === undefined
@@ -1848,6 +1862,9 @@ class OptChat {
 						outcome: "cut-in-turn",
 						reason: null,
 					};
+		// An earlier cut already dropped the turn's anchor: this cut is inside the turn too, and points at the same message.
+		if (!anchor || at < 0) return (this.turn?.cut ? inTurn() : undefined) ?? marker(preparation.firstKeptEntryId);
+		if (dropped[at]!.role === "compactionSummary") return cancel("leftover-summary");
 		const size = (messages: readonly AgentMessage[]): number => messages.reduce((sum, m) => sum + utf8Length(JSON.stringify(m)), 0);
 		// Moving the cut back frees only the older history: too little when the open turn is most of the drop.
 		if (at === 0 || size(dropped.slice(0, at)) < size(dropped.slice(at))) {

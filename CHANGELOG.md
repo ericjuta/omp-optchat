@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.16.5 — 2026-11-14
+
+- **Fixed: a turn that opened on a host notice could not be compacted, and the session ran into the model's context limit.** OMP often puts a notice (a skill, device or tool-roster notice) ahead of the user's prompt. OptChat stores nothing for such a notice, so the turn never recorded its first stored message. When the host later asked to compact inside that turn, OptChat cancelled with `nothing-older`, every time. The turn kept growing. The turn now records the first entry it stores, whichever message that is, and an in-turn cut points there.
+- **Fixed: after a cut inside an open turn, the next request was refused.** The cut removes the message that marked where the turn began, so OptChat no longer found the turn in the host's list. The turn now goes on from its in-turn summary, and a second cut in the same turn points at the same first message.
+- Session-log evidence (2026-11-09 to 2026-11-14, no paired control): 138 of 485 user prompts directly followed a notice that OptChat does not store. Live stores recorded 77 `nothing-older` cancels in two sessions (60 and 17). One of them, a long Opus turn, ended with three HTTP 400 "prompt is too long" replies at about 1,002,000 tokens. The fixes are proven by tests only; they are not measured on a live session yet.
+- Tests: two regression tests failed before the fixes and pass after.
+
 ## 0.16.4 — 2026-11-09
 
 - **Fixed: a nerd-font icon in the view removed OptChat's prompt-cache marks.** pi-ai sends each private-use character, such as the icons in OMP and Tern titles, as a `⟦U…⟧` token. It also appends a `<glyph-tokens>` notice, once per request, to the first text that it changed. When an icon was in a view line, that text was a view block, so the cache adapter did not recognize the view and left the request as the host built it. Main and compressor requests then had no mark on the view and no mark on the last system block. OptChat now ignores that notice when it reads the view.
