@@ -1,10 +1,11 @@
 import { closeSync, openSync, readFileSync, writeSync } from "node:fs";
 import { Buffer } from "node:buffer";
 import type { CompactionRequest } from "./memory.js";
+import { PLUGIN_VERSION } from "./version.js";
 
 /**
  * The store's metric sink: one `MetricRow` per line, counts only, appended by OptChat by default. Rows carry a `type`
- * discriminator; a line without one predates it and is a compressor row.
+ * discriminator; a line without one predates it and is a compressor row. New lines are stamped with `pluginVersion`.
  */
 export const METRICS_FILE = "metrics.jsonl";
 
@@ -47,6 +48,33 @@ export type HostCompactionCancelReason =
 	| "anchor-not-cut-point"
 	| "anchor-not-in-branch";
 
+/** The branch that chose the cut, even when multiple branches produce the same outcome. */
+export type HostCutDecision =
+	| "not-ready"
+	| "no-anchor"
+	| "anchor-not-dropped"
+	| "prior-in-turn-cut"
+	| "leftover-summary"
+	| "no-older-history"
+	| "open-turn-larger"
+	| "anchor-cut-point"
+	| "anchor-not-cut-point"
+	| "anchor-not-in-branch";
+
+/** Counts and fixed labels, never entry IDs, anchor hashes or summaries. */
+export interface HostCutDiagnostic {
+	readonly decision: HostCutDecision;
+	readonly messagesToSummarize: number;
+	readonly turnPrefixMessages: number;
+	readonly anchor: "first" | "after" | null;
+	/** Position in the host's proposed drop (summary messages followed by turn prefix); null if not matched. */
+	readonly droppedAnchorIndex: number | null;
+	readonly hasRecoveryPointer: boolean;
+	/** UTF-8 bytes of the serialized messages on each side of the anchor; null when no comparison ran. */
+	readonly olderBytes: number | null;
+	readonly openTurnBytes: number | null;
+}
+
 /** One host compaction request and its answer (`type: "host-compaction"`). */
 export interface HostCompactionRow {
 	readonly type: "host-compaction";
@@ -56,6 +84,29 @@ export interface HostCompactionRow {
 	readonly reason: HostCompactionCancelReason | null;
 	/** The host's token count before the compaction; null when the host gave none. */
 	readonly tokensBefore: number | null;
+	readonly cut: HostCutDiagnostic;
+}
+
+export type RequestRefusalReason =
+	| "tools-inactive"
+	| "turn-missing"
+	| "memory-failed"
+	| "memory-inactive"
+	| "memory-opening"
+	| "memory-closed"
+	| "summary-failed"
+	| "settle-timeout"
+	| "unexpected-error";
+
+/** A main context request OptChat aborted, not a cancelled wait or a compressor provider refusal. */
+export interface RequestRefusalRow {
+	readonly type: "request-refusal";
+	readonly at: string;
+	readonly reason: RequestRefusalReason;
+	readonly hostMessages: number;
+	readonly openTurn: boolean;
+	readonly hasRecoveryPointer: boolean;
+	readonly priorInTurnCut: boolean;
 }
 
 /** One rules-gate triage of a user message (`type: "rules"`): probabilities and the decision, never the message or any rule text. */
@@ -75,7 +126,7 @@ export interface RulesRow {
 }
 
 /** Every row type the sink holds. */
-export type MetricRow = CompressorUsage | HostCompactionRow | RulesRow;
+export type MetricRow = CompressorUsage | HostCompactionRow | RequestRefusalRow | RulesRow;
 
 /** Bounds provider error text for diagnostics: control characters removed, at most 200 characters. */
 export function boundedProviderError(value: unknown): string | null {
@@ -102,7 +153,7 @@ export interface CompressorSpend {
 }
 
 /**
- * Sums a metric sink's compressor rows; host-compaction and rules rows are not calls. A missing file is zero calls. A line
+ * Sums a metric sink's compressor rows; non-compressor rows are not calls. A missing file is zero calls. A line
  * that does not parse (a torn final append) or carries no finite `costUsd` is still one call, with unknown cost. Other read
  * failures throw.
  */
@@ -136,7 +187,7 @@ export function readCompressorSpend(path: string): CompressorSpend {
 
 /** Append one JSON line with O_APPEND, creating the file with mode 0600. Best effort: the caller reports failures. */
 export function appendMetric(path: string, row: MetricRow): void {
-	const bytes = Buffer.from(`${JSON.stringify(row)}\n`, "utf8");
+	const bytes = Buffer.from(`${JSON.stringify({ ...row, pluginVersion: PLUGIN_VERSION })}\n`, "utf8");
 	const fd = openSync(path, "a", 0o600);
 	try {
 		let written = 0;

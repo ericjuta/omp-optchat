@@ -34,12 +34,14 @@
  * reaches a loopback recorder that holds it open.
  */
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { describe, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { deflateSync } from "node:zlib";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createInterface } from "node:readline";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
@@ -113,6 +115,7 @@ const CASE_TITLES = {
   "reasoning-tools-compressor-when-thinking": "with base disableReasoningWithTools false and whenThinking true the tool-bearing main request reasons none; the compressor stays medium and tool-free",
   "tool-cap-zoom": "ordinary tool output is capped live but stored whole; zoom pages the original record",
   "lock-held": "a store held by another writer activates inactive: prompts reach the model without memory tools or a compaction veto",
+  "lock-recovery": "a separate process holds the writer lease through a passive prompt; release during a tool loop recovers only at the next fresh prompt",
   "lock-held-hooks": "a session inactive on a lease conflict passes context, provider and compaction hooks through, writes no store log and records why in the session log",
   "corrupt-store": "a corrupt store still refuses prompts with zero chat requests",
   "missing-compressor": "an unresolvable compressor selector refuses prompts with zero chat requests",
@@ -280,7 +283,7 @@ interface CaseContext {
   cwd: string;
   agentDir: string;
   memory: string;
-  /** This child's private metric file, read directly; the OptChat host appends one line per compressor attempt. */
+  /** This child's private metric file, read directly; compressor attempts and other diagnostics are typed. */
   metrics: string;
 }
 
@@ -1588,9 +1591,11 @@ async function compressorErrorAppendRetry(ctx: CaseContext): Promise<Evidence> {
     const node = await fixture.until("retried summary persisted", () => persistedNode(memory, 0, 0));
     assert.equal(node.text, LEAF_SUMMARY.user, "the append's retry stores the compressor's summary");
     const lines = await fixture.until("retry attempt metered", () => {
-      const records = metricRecords(metrics);
+      const records = metricRecords(metrics).filter((row) => row.type === "compressor");
       return records.length >= 2 ? records : undefined;
     });
+    assert.deepEqual(metricRecords(metrics).filter((row) => row.type === "request-refusal").map((row) => row.reason),
+      ["summary-failed"], "only the aborted prompt is metered as a request refusal");
     assert.deepEqual(seedRequests(fixture).map((capture) => capture.model), [COMPACT_MODEL, COMPACT_MODEL], "the retry is the compressor again, never the main model");
     assert.deepEqual([lines[1]!.model, lines[1]!.stopReason], [`${PROVIDER}/${COMPACT_MODEL}`, "stop"], "the retry is metered as a successful compressor call");
     assert(!host.notices.some((notice) => notice.message.includes("unsummarized")), "the recovered summary is not a stand-in");
@@ -2209,6 +2214,108 @@ async function lockHeld(ctx: CaseContext): Promise<Evidence> {
   }
 }
 
+async function lockRecovery(ctx: CaseContext): Promise<Evidence> {
+  const { fixture, memory } = ctx;
+  const storeChild = join(REPO_ROOT, "scripts/verify-store-lease/child.ts");
+  // Drive the same Store in a distinct process, with acknowledged commands rather than release sleeps.
+  const holder = spawn(process.execPath, [storeChild], { stdio: ["pipe", "pipe", "inherit"] });
+  const exit = new Promise<void>((done) => holder.once("close", () => done()));
+  const output = createInterface({ input: holder.stdout });
+  const lines = output[Symbol.asyncIterator]();
+  const reply = async () => {
+    const line = await bounded("lease holder reply", lines.next());
+    assert(!line.done, "lease holder closed prematurely");
+    return object(JSON.parse(line.value) as Json, "lease holder reply");
+  };
+  const command = async (cmd: string, fields: WireObject = {}) => {
+    holder.stdin.write(`${JSON.stringify({ cmd, ...fields })}\n`);
+    return reply();
+  };
+  const probeStarted = Promise.withResolvers<void>();
+  const probeGate = fixture.gate();
+  const STEER_LOCKED = "Lease steering stays plain.";
+  const RECOVERED_USER = "Resume OptChat now.";
+  const RECOVERED_TALK = "Memory is back.";
+  // A later prompt must pass the longest retry cooldown reached here (500 ms after one renewed conflict).
+  const passBackoff = () => Bun.sleep(600);
+  try {
+    const ready = await reply();
+    assert.equal(ready.event, "ready");
+    assert.equal(ready.pid, holder.pid);
+    assert.notEqual(holder.pid, process.pid);
+    assert.equal((await command("open", { dir: memory })).ok, true);
+    assert.equal((await command("append", { text: HOLDER_SEED })).i, 0);
+    await withHost(ctx, {
+      notices: true,
+      flags: { "optchat-node-bytes": "1024" },
+      probe: { started: () => probeStarted.resolve(), release: probeGate.promise },
+    }, async (host) => {
+      try {
+        assert.equal(host.optchatExtension.tools.size, 0, "there are no OptChat tools at conflicted startup");
+        await passBackoff();
+        fixture.queueChat("plain while writer is held", { calls: [{ id: PROBE_CALL_ID, name: "probe", args: PROBE_ARGS }] });
+        fixture.queueChat("plain after in-turn release", { text: LOCK_TALK });
+        const plain = host.prompt(LOCK_USER);
+        await bounded("passive probe running", probeStarted.promise, STEP_MS, fixture.fatal);
+        assert.equal((await command("append", { text: "Holder still writes." })).i, 1, "the holder remains the sole writer");
+        assert.deepEqual(pairs(mainRows(memory)), [["user", HOLDER_SEED], ["user", "Holder still writes."]]);
+        assert.equal((await command("close")).ok, true);
+        await passBackoff();
+        await bounded("enqueue passive steering", host.session.steer(STEER_LOCKED), STEP_MS, fixture.fatal);
+        probeGate.release();
+        expectCompleted(await bounded("passive tool turn", plain, STEP_MS, fixture.fatal), "passive tool turn");
+        await host.idle();
+        assert.equal(host.optchatExtension.tools.size, 0, "steering did not activate OptChat halfway through the run");
+        assert.equal(fixture.chat().length, 2);
+        for (const { body } of fixture.chat()) {
+          assert(!systemText(body).includes(ctx.lib.optchat.SYSTEM_BLOCK), "plain requests have no OptChat guide");
+          assert.deepEqual(views(body), [], "plain requests have no OptChat view");
+          assert(!toolNames(body).includes("zoom"), "plain requests have no OptChat tools");
+        }
+        assert.equal(occurrences(outsideTexts(fixture.chat()[1]!.body), STEER_LOCKED), 1, "steering reaches the plain continuation");
+        assert.deepEqual(pairs(mainRows(memory)), [["user", HOLDER_SEED], ["user", "Holder still writes."]], "no passive record was stored");
+        assert.equal(fixture.compact().length, 0);
+
+        fixture.queueChat("recovered reply", { text: RECOVERED_TALK });
+        expectCompleted(await bounded("recovering prompt", host.prompt(RECOVERED_USER), STEP_MS, fixture.fatal), "recovering prompt");
+        await host.idle();
+        const rows = await durableRows(ctx, 4, "recovered durable rows");
+        assert.deepEqual(pairs(rows), [
+          ["user", HOLDER_SEED], ["user", "Holder still writes."], ["user", RECOVERED_USER], ["talk", RECOVERED_TALK],
+        ], "old passive history stays out and the recovering prompt is recorded once");
+        const recovered = fixture.chat()[2]?.body;
+        assert(recovered, "the first recovered turn reaches the model");
+        assert.equal(soleView(recovered, "recovered view"), `<chat>\n0+1|user: ${HOLDER_SEED}\n1+1|user: Holder still writes.\n</chat>`);
+        assert(systemText(recovered).includes(ctx.lib.optchat.SYSTEM_BLOCK), "the recovered turn has the guide");
+        for (const name of ["zoom", "date", "work", "chat_search"]) assert(toolNames(recovered).includes(name), `${name} is available on recovery`);
+        assert.equal(occurrences(outsideTexts(recovered), RECOVERED_USER), 1);
+        for (const prior of [LOCK_USER, LOCK_TALK, STEER_LOCKED]) assert(!JSON.stringify(recovered).includes(prior), "plain host history is not replayed into the active context");
+        assert.equal(host.notices.filter(({ message }) => message.startsWith("OptChat is inactive:")).length, 1);
+        assert.equal(host.notices.filter(({ message }) => message.startsWith("OptChat active:")).length, 1);
+        assert.deepEqual(host.runtimeErrors, []);
+        fixture.assertScriptsConsumed();
+        const conflict = await command("open", { dir: memory });
+        assert.equal(conflict.ok, false, "the old holder cannot become a second writer after recovery");
+        assert.equal(conflict.name, "StoreLeaseConflictError");
+      } finally {
+        probeGate.release();
+      }
+    });
+    assert.equal((await command("open", { dir: memory })).messages, 4, "the recovered session releases the lease at shutdown");
+    assert.equal((await command("close")).ok, true);
+    return { chatRequests: fixture.chat().length, recoveredRows: mainRows(memory).length };
+  } finally {
+    output.close();
+    holder.stdin.end();
+    try {
+      await bounded("lease holder shutdown", exit, CLEANUP_STEP_MS);
+    } finally {
+      if (holder.exitCode === null && holder.signalCode === null) holder.kill("SIGKILL");
+      await exit;
+    }
+  }
+}
+
 /** A malformed store is not a lease conflict: startup fails closed and every prompt is refused. */
 async function corruptStore(ctx: CaseContext): Promise<Evidence> {
   const { fixture, memory } = ctx;
@@ -2246,7 +2353,7 @@ async function missingCompressor(ctx: CaseContext): Promise<Evidence> {
 }
 
 async function settleTimeout(ctx: CaseContext): Promise<Evidence> {
-  const { fixture, memory } = ctx;
+  const { fixture, memory, metrics } = ctx;
   await seedStore(ctx, [["user", SEED_HANG]]);
   fixture.compactPolicy = (input) => (input.input.includes(SEED_MARK) ? "hang" : undefined);
   return withHost(ctx, { settleTimeoutMs: TIMEOUT_SETTLE_MS, notices: true }, async (host) => {
@@ -2262,6 +2369,15 @@ async function settleTimeout(ctx: CaseContext): Promise<Evidence> {
     assert(elapsed < 15_000, `refused after ${Math.round(elapsed)}ms: not the injected deadline`);
     assert(refusal.message.includes("unanswered"), "the refusal says the prompt is saved unanswered");
     assert.equal(refusal.type, "error");
+    const refusalRows = metricRecords(metrics).filter((row) => row.type === "request-refusal");
+    assert.equal(refusalRows.length, 1);
+    const { at, ...diagnostic } = refusalRows[0]!;
+    assert.equal(typeof at, "string");
+    const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")) as { version: string };
+    assert.deepEqual(diagnostic, {
+      type: "request-refusal", pluginVersion: pkg.version, reason: "settle-timeout", hostMessages: 1,
+      openTurn: false, hasRecoveryPointer: false, priorInTurnCut: false,
+    });
     assert.equal(fixture.chat().length, 0, "zero chat requests");
     const rows = await durableRows(ctx, 2, "unanswered prompt durable");
     assert.deepEqual(pairs(rows), [["user", SEED_HANG], ["user", TIMEOUT_USER]], "the prompt is stored once, with nothing after it");
@@ -2397,7 +2513,7 @@ async function deliverReport(host: Host, fixture: Fixture, channel: ReportChanne
   const request = await fixture.until("background report chat request", () => fixture.chat()[chatBefore]);
   await fixture.until("background report run ended", () =>
     channel.ends.length > endsBefore &&
-    host.events.slice(eventsBefore).some((event) => event.type === "agent_end" && event.isTerminal !== false));
+    host.events.slice(eventsBefore).some((event) => event.type === "agent_end" && (!("isTerminal" in event) || event.isTerminal !== false)));
   await host.idle();
   assert.equal(fixture.chat().length, chatBefore + 1, "the report run made exactly one chat request");
   return request.body;
@@ -3995,6 +4111,7 @@ const CASES: Record<CaseName, (ctx: CaseContext) => Promise<Evidence>> = {
   }),
   "tool-cap-zoom": toolCapZoom,
   "lock-held": lockHeld,
+  "lock-recovery": lockRecovery,
   "lock-held-hooks": lockHeldHooks,
   "corrupt-store": corruptStore,
   "missing-compressor": missingCompressor,

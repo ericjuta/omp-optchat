@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.7 — 2026-11-17
+
+- A session that starts without memory because another writer owns its store can recover at a later fresh prompt. It stays in passthrough until it acquires the lease, never switches memory on mid-turn, and does not backfill passthrough history.
+- Every new metric row records the loaded OptChat package version shown by `/optchat status`. Host compaction rows explain the cut decision with counts and flags; context requests aborted by OptChat get a fixed refusal reason, without message text or exception details.
+
+- Added a read-only retry census that keeps versioned and unversioned metric cohorts separate, grouped by compressor model, node type, attempt and retry cause. No compressor prompt or retry policy changed.
+- The loopback smoke follows the child completion protocol advertised by the host: structured `yield` when available, otherwise a final assistant message. Both paths must still deliver the report to the parent and recover it from durable memory.
+
 ## 0.16.6 — 2026-11-14
 
 - **Changed: a summary that is too long is asked to leave room.** The retry message told the compressor to cut "just enough" to fit, and many retries missed the limit again by a few bytes. Each miss now asks for a shorter line: 32 bytes under the 512-byte limit after the first miss, 64 after the second, and so on, to at most half the limit. The limit itself, the five tries and the rule that a stored line is never truncated are unchanged.

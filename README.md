@@ -32,16 +32,16 @@ When history still fits the model's context, OptChat costs more than plain OMP f
 - OMP **18.10.3 or newer**, Bun, and Linux. CI checks every push and runs a weekly check against the latest published OMP SDK.
 - An authenticated model for the main chat and an authenticated compressor model. Compression uses OMP's `@smol` role by default. Choose a competent, inexpensive model explicitly if that role is unsuitable.
 
-Install the current release, **0.16.6**:
+Install the current release, **0.16.7**:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.16.6'
+omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.16.7'
 PI_OPENAI_STATEFUL=0 omp
 ```
 
 Restart existing OMP sessions after an upgrade. They retain the previously loaded plugin.
 
-Local 0.16.6 verification passed typecheck, 2,615 unit tests, 56 host tests, and a real-OMP smoke with a synthetic model. The smoke exercised ten host processes and 38 requests. Release CI also checks the pinned/latest SDKs and Linux/macOS leases.
+Local 0.16.7 verification passed typecheck, 2,626 unit tests, 57 host tests, and a real-OMP smoke with a synthetic model. The smoke exercised ten host processes and 38 main chat requests. Strict lease verification passed 32 checks; the deep model suite passed 18, including all five three-session guarantees. Release CI also checks the pinned/latest SDKs and Linux/macOS leases.
 
 These are software checks, not proof of live-model answer accuracy.
 
@@ -80,6 +80,8 @@ To share memory across worktrees, pass the same `--optchat-dir` to each session.
 Each memory directory has exactly one writer. Another live session might already hold the directory, for example through the same `--optchat-dir` in another terminal. In that case, OptChat becomes inactive instead of refusing prompts. It shows one warning and runs as if started with `--no-optchat`: no memory tools, logging, compression, or context changes.
 
 `/optchat status` reports the reason and directory. The session log also stores a custom `optchat-inactive` entry with `reason` and `directory` in its data. This lets you identify sessions that ran without memory. The warning does not identify the holder. The kernel holds the lock, which has no owner record.
+
+After a startup conflict, OptChat tries the same directory again at the start of a fresh prompt, never during steering or a tool loop. There is no background polling. It makes at most one attempt per eligible prompt, with cooldowns that double from 250 ms to at most 4 seconds. If the lease is still held, the whole turn runs without OptChat. Once acquired, the recovering prompt uses the existing memory; earlier passthrough turns remain only in OMP history and are not imported.
 
 If the store cannot open for another reason, such as corruption, the session still refuses every prompt until restart. Subagents never open the store and do not conflict.
 
@@ -443,7 +445,7 @@ With default settings:
 
 #### Compressor cost record
 
-Each completed compressor call appends one line to `metrics.jsonl` in the store directory. The file is append-only with mode 0600. Writes are best effort: a failed write produces a warning but never stops the chat. Records contain counts and diagnostics, never message content.
+Each completed compressor call appends one line to `metrics.jsonl` in the store directory. The file is append-only with mode 0600. Writes are best effort: a failed write produces a warning but never stops the chat. Every newly written row carries `pluginVersion`, the loaded package version shown by `/optchat status`, or `"unknown"` if the package metadata is unavailable. An older row without this field cannot identify its writer’s version.
 
 A compressor row has `type: "compressor"` and these fields:
 
@@ -457,9 +459,10 @@ A compressor row has `type: "compressor"` and these fields:
 - The host-reported USD cost, or `null` if the host reports none.
 - The stop reason and bounded error text.
 
-The same file holds two other counts-only row types:
+The same file holds three other row types with no message or error text:
 
-- `host-compaction`: one row for each host compaction OptChat answered. Fields are `at`, `outcome`, a closed `reason` when cancelled, and `tokensBefore`. Outcomes are `marker`, `cut-moved`, `cut-in-turn`, or `cancelled`.
+- `host-compaction`: one row for each host compaction OptChat answered. Fields are `at`, `outcome`, a closed `reason` when cancelled, and `tokensBefore`. Outcomes are `marker`, `cut-moved`, `cut-in-turn`, or `cancelled`. The `cut` diagnostic records the decision branch, proposed drop counts, anchor kind and position, whether a durable recovery pointer exists, and the two byte totals when OptChat compared them. It never includes the pointer itself, any entry IDs, or summary text.
+- `request-refusal`: one row when OptChat aborts a context request. It records `at`, a fixed `reason` such as `turn-missing` or `settle-timeout`, the host message count, and open-turn and recovery flags. Abandoned waits, passive sessions, and compressor provider refusals do not produce this row. If there is no writable metric sink, `/optchat status` still shows the last refusal label for the current session.
 - `rules`: one row per triage. Fields include `at`, the judge's P(rule) for the message, the highest per-sentence P(rule), and the sentence count. It also records the `--optchat-rule-add` cutoff and whether any rule was written. It never stores message or rule text.
 
 Only compressor rows count as calls. A line without a `type`, written before rows had types, is a compressor row. `/optchat status` shows the store's call count and sum of reported costs. A call without a reported cost still counts and appears as unknown, never as $0. `/optchat new` archives the file with the old chat.

@@ -148,6 +148,11 @@ function answer(body: ObjectValue): Response {
     assert(content(results[0]!).includes("OPTCHAT_SMOKE_RAW_BEGIN"), "child zoom must reach actual parent source bytes");
     assert.equal(snapshot, childFrozenView, "child retrieval must retain the same frozen view");
     childRetrieved = true;
+    // Newer OMP versions only expose yield for schema-bound tasks. Use the
+    // wire-advertised protocol; both paths must pass the same parent assertions.
+    const hasYield = Array.isArray(body.tools) && body.tools.some((tool) =>
+      object(object(tool, "child tool").function, "child tool function").name === "yield");
+    if (!hasYield) return sse(model, capture.sequence, CHILD_REPORT);
     return sse(model, capture.sequence, undefined, undefined, [
       { index: 0, id: "smoke-child-yield", type: "function", function: { name: "yield", arguments: JSON.stringify({ data: { report: CHILD_REPORT } }) } },
     ]);

@@ -1,8 +1,7 @@
 /**
- * The store's metric sink. By default every completed compressor call, every answered host compaction and every rules
- * triage is appended, counts only, to `metrics.jsonl` in the active store directory, and `/optchat status` sums the
- * compressor rows: a call without a reported cost is unknown, never $0. A session that cannot open the store records why
- * in its session log. Runs the real OptChat hooks on the fake host against the loopback compressor.
+ * OptChat's real metric hooks on a fake host and loopback compressor. The active store's metrics.jsonl records
+ * compressor usage, host cuts, context refusals, and rules triage. Only compressor rows contribute to spend;
+ * a call without a reported cost is unknown, never $0.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -11,6 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DEFAULTS, fallbackStoreDirectory, globalStoreDirectory } from "../src/config.ts";
 import { createOptChat } from "../src/index.ts";
+import { hostCompactionSummaryInTurn } from "../src/prompts.ts";
 import { appendMetric, METRICS_FILE, readCompressorSpend, type CompressorUsage } from "../src/metrics.ts";
 import { startCompressorServer, type CompressorServer } from "./helpers/compressor-server.ts";
 import { fakeJudge, noul } from "./helpers/fake-judge.ts";
@@ -37,6 +37,8 @@ afterEach(async () => {
   for (const server of servers.splice(0)) await server.stop();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
+
+const { version: pluginVersion } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
 
 const USAGE: CompressorUsage = {
   type: "compressor",
@@ -126,8 +128,8 @@ describe("compressor metric sink", () => {
     expect(seen.length).toBeGreaterThan(0);
     const lines = readFileSync(metrics, "utf8").split("\n").filter((line) => line.length > 0);
     expect(lines).toHaveLength(seen.length);
-    expect(lines.map((line) => JSON.parse(line))).toEqual(seen);
-    expect(Object.keys(JSON.parse(lines[0]!) as object).sort()).toEqual(Object.keys(USAGE).sort());
+    expect(lines.map((line) => JSON.parse(line))).toEqual(seen.map((row) => ({ ...row, pluginVersion })));
+    expect(await statusOf(host)).toContain(`version: ${pluginVersion}`);
     for (const text of SEED_TEXTS) expect(readFileSync(metrics, "utf8")).not.toContain(text);
     expect(statSync(metrics).mode & 0o777).toBe(0o600);
     expect(await statusOf(host)).toContain(`compressor spend (this store): ${seen.length} calls, $0.0000 reported`);
@@ -161,7 +163,7 @@ describe("compressor metric sink", () => {
     const { host, metrics, seen } = await openChat();
     await seed(host);
     expect(seen.length).toBeGreaterThan(0);
-    expect(readFileSync(redirected, "utf8").split("\n").filter((line) => line.length > 0)).toHaveLength(seen.length);
+    expect(rowsOf(redirected) as unknown[]).toEqual(seen.map((row) => ({ ...row, pluginVersion })));
     expect(existsSync(metrics)).toBe(false);
   });
 });
@@ -206,7 +208,7 @@ describe("compressor rows: what each call was", () => {
     // A first attempt is attempt 1 with no cause; every retry names one.
     for (const each of seen) expect(each.attempt === 1).toBe(each.retry === null);
     expect(seen.some((each) => each.attempt === 1)).toBe(true);
-    expect(rowsOf(metrics) as unknown[]).toEqual(seen);
+    expect(rowsOf(metrics) as unknown[]).toEqual(seen.map((row) => ({ ...row, pluginVersion })));
   });
 
   test("a long message's own call is a leaf, on its first attempt with no retry cause", async () => {
@@ -242,14 +244,19 @@ describe("compressor rows: what each call was", () => {
 });
 
 describe("host compaction rows", () => {
-  const COMPACTION_KEYS = ["at", "outcome", "reason", "tokensBefore", "type"];
+  const COMPACTION_KEYS = ["at", "cut", "outcome", "pluginVersion", "reason", "tokensBefore", "type"];
+  const NO_ANCHOR = {
+    anchor: null, droppedAnchorIndex: null, hasRecoveryPointer: false, olderBytes: null, openTurnBytes: null,
+  };
+  const size = (messages: HostMessage[]): number => messages.reduce((bytes, message) => bytes + Buffer.byteLength(JSON.stringify(message)), 0);
 
   test("the marker kept at the host's cut: one row with the host's token count, no message text", async () => {
     const { host, metrics } = await openChat();
     await compact(host, { dropped: [], firstKeptEntryId: "e1", tokensBefore: 55 }, []);
     const rows = rowsOfType(metrics, "host-compaction");
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ type: "host-compaction", outcome: "marker", reason: null, tokensBefore: 55 });
+    expect(rows[0]).toMatchObject({ type: "host-compaction", pluginVersion, outcome: "marker", reason: null, tokensBefore: 55 });
+    expect(rows[0]!.cut).toEqual({ ...NO_ANCHOR, decision: "no-anchor", messagesToSummarize: 0, turnPrefixMessages: 0 });
     expect(isIso(rows[0]!.at)).toBe(true);
     expect(Object.keys(rows[0]!).sort()).toEqual(COMPACTION_KEYS);
   });
@@ -257,18 +264,20 @@ describe("host compaction rows", () => {
   test("a cut moved to the open turn's first message is cut-moved", async () => {
     const { host, metrics } = await openChat();
     const history = await talk(host, await talk(host, [], "first question"), "second question");
-    const prompt = host.user("third question");
+    const prompt = host.user("third question 🗃️");
     await host.context([...history, prompt]);
     const reply = host.assistant("reading the file", { id: "t1", name: "read", arguments: {} });
     const result = host.toolResult("t1", "read", "file text");
     const all = [...history, prompt, reply, result, host.assistant("done reading")];
     await compact(host, { dropped: history, prefix: [prompt, reply, result], firstKeptEntryId: "e8", tokensBefore: 777 }, branchOf(all));
     expect(rowsOfType(metrics, "host-compaction")).toEqual([
-      { type: "host-compaction", at: expect.any(String), outcome: "cut-moved", reason: null, tokensBefore: 777 },
+      { type: "host-compaction", at: expect.any(String), pluginVersion, outcome: "cut-moved", reason: null, tokensBefore: 777,
+        cut: { decision: "anchor-cut-point", messagesToSummarize: 4, turnPrefixMessages: 3, anchor: "first", droppedAnchorIndex: 4,
+          hasRecoveryPointer: true, olderBytes: size(history), openTurnBytes: size([prompt, reply, result]) } },
     ]);
   });
 
-  test("an open turn that is the first dropped message is cut where the host put it, pointing at the turn's message", async () => {
+  test("a first and repeated in-turn cut each record a distinct decision, never the recovery summary", async () => {
     const { host, metrics } = await openChat();
     const prompt = host.user("only question");
     await host.context([prompt]);
@@ -276,9 +285,21 @@ describe("host compaction rows", () => {
     const result = host.toolResult("t1", "read", "file text");
     const all = [prompt, reply, result, host.assistant("done")];
     await compact(host, { dropped: [], prefix: [prompt, reply, result], firstKeptEntryId: "e4" }, branchOf(all));
-    expect(rowsOfType(metrics, "host-compaction")).toEqual([
-      { type: "host-compaction", at: expect.any(String), outcome: "cut-in-turn", reason: null, tokensBefore: 1000 },
+    const recoverySummary = hostCompactionSummaryInTurn(0);
+    const summary = { role: "compactionSummary", summary: recoverySummary, timestamp: Date.now() } as HostMessage;
+    await host.context([summary, all[3]!]);
+    await compact(host, { dropped: [summary], prefix: [all[3]!], firstKeptEntryId: "private-cut-id" }, branchOf(all));
+    expect(host.aborts).toBe(0);
+    expect(rowsOf(metrics)).toEqual([
+      { type: "host-compaction", at: expect.any(String), pluginVersion, outcome: "cut-in-turn", reason: null, tokensBefore: 1000,
+        cut: { ...NO_ANCHOR, decision: "no-older-history", messagesToSummarize: 0, turnPrefixMessages: 3,
+          anchor: "first", droppedAnchorIndex: 0, hasRecoveryPointer: true } },
+      { type: "host-compaction", at: expect.any(String), pluginVersion, outcome: "cut-in-turn", reason: null, tokensBefore: 1000,
+        cut: { ...NO_ANCHOR, decision: "prior-in-turn-cut", messagesToSummarize: 1, turnPrefixMessages: 1,
+          anchor: "first", hasRecoveryPointer: true } },
     ]);
+    const raw = readFileSync(metrics, "utf8");
+    for (const privateText of [recoverySummary, "private-cut-id", "only question", "file text"]) expect(raw).not.toContain(privateText);
   });
 
   test("an open turn larger than the older history is cut inside, not moved back", async () => {
@@ -291,7 +312,9 @@ describe("host compaction rows", () => {
     const all = [...history, prompt, reply, result, host.assistant("done")];
     await compact(host, { dropped: history, prefix: [prompt, reply, result], firstKeptEntryId: "e6", tokensBefore: 9 }, branchOf(all));
     expect(rowsOfType(metrics, "host-compaction")).toEqual([
-      { type: "host-compaction", at: expect.any(String), outcome: "cut-in-turn", reason: null, tokensBefore: 9 },
+      { type: "host-compaction", at: expect.any(String), pluginVersion, outcome: "cut-in-turn", reason: null, tokensBefore: 9,
+        cut: { decision: "open-turn-larger", messagesToSummarize: 2, turnPrefixMessages: 3, anchor: "first", droppedAnchorIndex: 2,
+          hasRecoveryPointer: true, olderBytes: size(history), openTurnBytes: size([prompt, reply, result]) } },
     ]);
   });
 
@@ -312,6 +335,24 @@ describe("host compaction rows", () => {
     expect(Object.keys(rows[0]!).sort()).toEqual(COMPACTION_KEYS);
   });
 
+  test("nothing older and no durable pointer: the same drop position is cancelled, not cut in turn", async () => {
+    const { host, metrics } = await openChat();
+    const notice = {
+      role: "custom", customType: "private-notice-kind", content: "private notice text", display: false,
+      attribution: "agent", timestamp: Date.now() + 1,
+    } as HostMessage;
+    await host.context([notice]);
+    const outcome = await compact(host, { dropped: [], prefix: [notice], firstKeptEntryId: "private-cut-id" }, branchOf([notice]));
+    expect(outcome).toEqual({ cancel: true });
+    expect(rowsOf(metrics)).toEqual([
+      { type: "host-compaction", at: expect.any(String), pluginVersion, outcome: "cancelled", reason: "nothing-older", tokensBefore: 1000,
+        cut: { ...NO_ANCHOR, decision: "no-older-history", messagesToSummarize: 0, turnPrefixMessages: 1,
+          anchor: "first", droppedAnchorIndex: 0 } },
+    ]);
+    const raw = readFileSync(metrics, "utf8");
+    for (const privateText of ["private-notice-kind", "private notice text", "private-cut-id"]) expect(raw).not.toContain(privateText);
+  });
+
   test("a compaction row is not a compressor call: status and spend count only the compressor rows", async () => {
     const { host, metrics, seen } = await openChat();
     await seed(host);
@@ -320,6 +361,55 @@ describe("host compaction rows", () => {
     expect(rowsOf(metrics)).toHaveLength(seen.length + 1);
     expect(readCompressorSpend(metrics).calls).toBe(seen.length);
     expect(await statusOf(host)).toContain(`compressor spend (this store): ${seen.length} calls, $0.0000 reported`);
+  });
+});
+
+describe("request refusal rows", () => {
+  test("a lost turn aborts once, but a steering batch does not; record only its fixed reason and shape", async () => {
+    const { host, metrics } = await openChat();
+    await host.context([host.user("private original prompt")]);
+    expect(await host.context([host.user("private steering batch")])).toBeUndefined();
+    expect(rowsOf(metrics)).toEqual([]);
+    expect(await host.context([host.assistant("private displaced reply")])).toEqual({ messages: [] });
+    expect(host.aborts).toBe(1);
+    expect(rowsOf(metrics)).toEqual([
+      { type: "request-refusal", at: expect.any(String), pluginVersion, reason: "turn-missing", hostMessages: 1,
+        openTurn: true, hasRecoveryPointer: true, priorInTurnCut: false },
+    ]);
+    expect(readFileSync(metrics, "utf8")).not.toContain("private");
+    expect(readCompressorSpend(metrics)).toEqual({ calls: 0, reportedUsd: 0, unknownCost: 0 });
+    expect(await statusOf(host)).toContain("last OptChat request refusal: turn-missing");
+    await host.fire("session_switch");
+    expect(await statusOf(host)).not.toContain("last OptChat request refusal");
+  });
+
+  test("a closed store is not written; status still shows the fixed refusal reason", async () => {
+    const { host, metrics } = await openChat();
+    await host.shutdown();
+    expect(await host.context([host.user("private prompt")])).toEqual({ messages: [] });
+    expect(host.aborts).toBe(1);
+    expect(existsSync(metrics)).toBe(false);
+    const status = await statusOf(host);
+    expect(status).toContain("last OptChat request refusal: memory-closed");
+    expect(status).toContain(`version: ${pluginVersion}`);
+    expect(status).not.toContain("private prompt");
+  });
+
+  test("unexpected error details stay in the UI, not in the diagnostic", async () => {
+    const { host, metrics } = await openChat();
+    const getSystemPrompt = spyOn(host.ctx, "getSystemPrompt").mockImplementation(() => { throw new Error("private exception text"); });
+    try {
+      expect(await host.context([host.user("private prompt")])).toEqual({ messages: [] });
+    } finally {
+      getSystemPrompt.mockRestore();
+    }
+    expect(host.aborts).toBe(1);
+    expect(host.notices.some((notice) => notice.type === "error" && notice.message.includes("private exception text"))).toBe(true);
+    expect(rowsOf(metrics)).toEqual([
+      { type: "request-refusal", at: expect.any(String), pluginVersion, reason: "unexpected-error", hostMessages: 1,
+        openTurn: true, hasRecoveryPointer: true, priorInTurnCut: false },
+    ]);
+    expect(readFileSync(metrics, "utf8")).not.toContain("private");
   });
 });
 
@@ -340,8 +430,8 @@ describe("rules rows", () => {
 
     const rows = rowsOfType(metrics, "rules");
     expect(rows).toEqual([
-      { type: "rules", at: expect.any(String), pRule: 0.95, pSentenceMax: null, sentences: 1, cutoff: DEFAULTS.ruleAdd, added: true },
-      { type: "rules", at: expect.any(String), pRule: 0, pSentenceMax: null, sentences: 1, cutoff: DEFAULTS.ruleAdd, added: false },
+      { type: "rules", at: expect.any(String), pluginVersion, pRule: 0.95, pSentenceMax: null, sentences: 1, cutoff: DEFAULTS.ruleAdd, added: true },
+      { type: "rules", at: expect.any(String), pluginVersion, pRule: 0, pSentenceMax: null, sentences: 1, cutoff: DEFAULTS.ruleAdd, added: false },
     ]);
     for (const row of rows) expect(isIso(row.at)).toBe(true);
     // Counts only: neither the message nor the rule's text reaches the sink.
@@ -389,15 +479,16 @@ describe("readCompressorSpend", () => {
     expect(readCompressorSpend(path)).toEqual({ calls: 3, reportedUsd: 0.5, unknownCost: 2 });
   });
 
-  test("a line written before rows were typed is a compressor call; host-compaction and rules rows are not", async () => {
+  test("untyped and unstamped compressor rows count alongside stamped rows; other row types do not", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "optchat-spend-")));
     roots.push(root);
     const path = join(root, METRICS_FILE);
-    await Bun.write(path, `${JSON.stringify({ model: "fake/compressor", purpose: "leaf", costUsd: 0.5 })}\n`);
-    appendMetric(path, { type: "host-compaction", at: USAGE.at, outcome: "marker", reason: null, tokensBefore: 10 });
+    await Bun.write(path, `${JSON.stringify({ model: "fake/compressor", purpose: "leaf", costUsd: 0.5 })}\n${JSON.stringify({ ...USAGE, costUsd: 1 })}\n`);
+    appendMetric(path, { type: "request-refusal", at: USAGE.at, reason: "memory-failed", hostMessages: 1,
+      openTurn: false, hasRecoveryPointer: false, priorInTurnCut: false });
     appendMetric(path, { type: "rules", at: USAGE.at, pRule: 0.9, pSentenceMax: null, sentences: 1, cutoff: 0.8, added: true });
     appendMetric(path, { ...USAGE, costUsd: 0.25 });
-    expect(readCompressorSpend(path)).toEqual({ calls: 2, reportedUsd: 0.75, unknownCost: 0 });
+    expect(readCompressorSpend(path)).toEqual({ calls: 3, reportedUsd: 1.75, unknownCost: 0 });
   });
 });
 

@@ -58,6 +58,9 @@ import {
 	type HostCompactionCancelReason,
 	type HostCompactionRow,
 	type MetricRow,
+	type HostCutDecision,
+	type HostCutDiagnostic,
+	type RequestRefusalReason,
 } from "./metrics.js";
 import { captureWaitReports, captureWorkReports, type ArtifactPathSource, type CapturedWorkReport } from "./reports.js";
 import { parseCoordination, type ImageAttachment, type ImageMimeType, type MessageMetadata, type WorkMetadata } from "./archive.js";
@@ -77,27 +80,13 @@ import { gatherDecisions, registerDecisionsTool, renderDecisions } from "./decis
 import { discoverWork, registerWorkDiscoveryTool } from "./work-discovery.js";
 import { registerProjectEvidenceTool, type ProjectEvidenceRegistration } from "./project-evidence.js";
 import { readSourcePage } from "./source-page.js";
+import { PLUGIN_VERSION } from "./version.js";
 
 /** The `openrouter` key as the host resolves it at call time; the plugin reads no environment variable itself. */
 const hostExtractor = (ctx: ExtensionContext | undefined): Extractor =>
 	openRouterExtractor(async () => ctx?.modelRegistry.getApiKeyForProvider("openrouter", ctx.sessionManager.getSessionId()));
 
 type AgentMessage = ContextEvent["messages"][number];
-
-/** Read once from this plugin's package, never from the host or a session directory. */
-const PLUGIN_VERSION = (() => {
-	try {
-		const metadata: unknown = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-		if (metadata === null || typeof metadata !== "object" || !("version" in metadata)) return "unknown";
-		const version = metadata.version;
-		return typeof version === "string" && version.length <= 128
-			&& !/[^0-9A-Za-z.+-]/.test(version)
-			&& /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)
-			? version : "unknown";
-	} catch {
-		return "unknown";
-	}
-})();
 
 /** A command reads the current identity; neither a stale context nor a path is an identity fallback. */
 function statusSessionId(ctx: ExtensionCommandContext): string {
@@ -151,6 +140,9 @@ const TRIAGE_MS = 20_000;
 const SHUTDOWN_TRIAGE_MS = 1_500;
 /** Prefetch uses the settle deadline's remaining time minus this margin, so it never delays past that deadline. */
 const PREFETCH_MARGIN_MS = 500;
+/** At most one non-blocking lease attempt at a fresh prompt; no idle polling. */
+const LEASE_RETRY_MIN_MS = 250;
+const LEASE_RETRY_MAX_MS = 4_000;
 
 export interface OptChatOptions {
 	/** Bounded wait for startup and the view's summaries before a fresh turn is refused; below 30 s. */
@@ -189,7 +181,11 @@ interface CompressorPolicy {
 	readonly maxTokens?: number;
 }
 
-class Refusal extends Error {}
+class Refusal extends Error {
+	constructor(readonly reason: RequestRefusalReason, message: string) {
+		super(message);
+	}
+}
 
 /** pi-ai reports a provider refusal (Anthropic `stop_reason: refusal`) as stopReason "error" with an errorMessage beginning "Refusal". */
 function isProviderRefusal(reply: AssistantMessage): boolean {
@@ -584,7 +580,7 @@ type State =
 	| { kind: "ready" }
 	| { kind: "failed"; reason: string }
 	/** Lease conflict at startup: no memory and no host changes; the reason names the directory. */
-	| { kind: "inactive"; reason: string }
+	| { kind: "inactive"; reason: string; retry?: { after: number; delay: number } }
 	| { kind: "closed" };
 
 /** The session entry type OptChat appends when it goes inactive; its data holds the `reason` and the store `directory`. */
@@ -597,6 +593,7 @@ interface CompactionAnswer {
 	readonly result: SessionBeforeCompactResult;
 	readonly outcome: HostCompactionRow["outcome"];
 	readonly reason: HostCompactionCancelReason | null;
+	readonly cut: HostCutDiagnostic;
 }
 
 function wireObject(value: unknown): value is WireObject {
@@ -665,6 +662,7 @@ class OptChat {
 	private compressor: Model | undefined;
 	/** Compactions the compressor refused that were retried with the main model, this process. */
 	private mainRetries = 0;
+	private lastRequestRefusal: RequestRefusalReason | undefined;
 	private store: Store | undefined;
 	private memory: Memory | undefined;
 	private lastEvidence: { memory: Memory; upperBound: number; result: EvidenceResult } | undefined;
@@ -687,12 +685,17 @@ class OptChat {
 	/** Per-gate judge calls, failures and outcomes, in memory, for `/optchat status` only. */
 	private counts = new GateCounts();
 	private ready: Promise<void> = Promise.resolve();
+	/** A passive run stays passive through steering, retries and queued continuations. */
+	private passiveRunOpen = false;
+	/** Only one recovery open may run, even after its boundary was cancelled or timed out. */
+	private leaseRetryAttempt: AbortController | undefined;
 	private turn: Turn | undefined;
 	private pending: Pending | undefined;
 	/** Completed messages that arrived while no turn was open: logged after the next snapshot. */
 	private held: AgentMessage[] = [];
 	/** Messages created before activation or a session switch are prior history, never this chat. */
 	private cutoff = Date.now();
+	/** Messages already logged, or explicitly excluded as pre-recovery host history. */
 	private readonly logged = new Set<string>();
 	/** Full ordinary tool output captured before the live cap; consumed by its durable log entry. */
 	private captured = new Map<string, string>();
@@ -735,13 +738,11 @@ class OptChat {
 	start(ctx: ExtensionContext): Promise<void> {
 		this.ctx = ctx;
 		this.cutoff = Date.now();
-		this.ready = this.open(ctx).catch((error: unknown) => {
-			this.fail(`OptChat is off for this session: ${errorText(error)}. Every prompt will be refused until restart.`);
-		});
+		this.ready = this.open(ctx, true).catch((error: unknown) => this.failOpening(error));
 		return this.ready;
 	}
 
-	private async open(ctx: ExtensionContext): Promise<void> {
+	private async open(ctx: ExtensionContext, retryOnConflict = false): Promise<void> {
 		const agentDirectory = this.pi.pi.getAgentDir();
 		let config = readConfig(this.pi, defaultStoreDirectory(agentDirectory, ctx.cwd));
 		this.config = config;
@@ -763,7 +764,7 @@ class OptChat {
 			// Outside git with no --optchat-dir, a held global store falls back to this directory's own store.
 			const held = config.directory;
 			if (this.pi.getFlag("optchat-dir") !== undefined || held !== globalStoreDirectory(agentDirectory)) {
-				this.inactivate(`${held} is in use by another session`);
+				this.inactivate(`${held} is in use by another session`, retryOnConflict);
 				return;
 			}
 			config = { ...config, directory: fallbackStoreDirectory(agentDirectory, ctx.cwd) };
@@ -772,7 +773,7 @@ class OptChat {
 				store = await Store.open(config.directory, report);
 			} catch (fallbackError) {
 				if (!(fallbackError instanceof StoreLeaseConflictError) || this.state.kind !== "starting") throw fallbackError;
-				this.inactivate(`${held} and ${config.directory} are in use by other sessions`);
+				this.inactivate(`${held} and ${config.directory} are in use by other sessions`, retryOnConflict);
 				return;
 			}
 			this.notify(`OptChat: ${held} is in use by another session, so this session uses ${config.directory}.`, "info");
@@ -781,7 +782,18 @@ class OptChat {
 			await store.close();
 			return;
 		}
+		try {
+			this.activate(ctx, store, config, model);
+		} catch (error) {
+			if (this.store !== store) await store.close();
+			throw error;
+		}
+	}
+
+	/** Publish tools, memory and sidecars only after Store.open has acquired and replayed the store. */
+	private activate(ctx: ExtensionContext, store: Store, config: OptChatConfig, model: Model): void {
 		let rules: RuleLedger | undefined;
+		let memory: Memory;
 		try {
 			rules = config.gates.rules ? RuleLedger.open(() => store.sidecarPath(LEDGER_FILE)) : undefined;
 			if (!this.toolsRegistered) {
@@ -798,21 +810,23 @@ class OptChat {
 				if (this.projectEvidence) this.unclippedTools.add("chat_project_evidence");
 				this.toolsRegistered = true;
 			}
+			memory = new Memory(store, this.summarize, {
+				nodeBytes: config.nodeBytes,
+				viewBytes: config.viewBytes,
+				jobs: config.jobs,
+				tries: config.tries,
+				report: (message) => this.notify(`OptChat compressor: ${message}`, "warning"),
+				// With the value-score gate off, the compressor is never asked for a hint.
+				hint: config.gates.valueScore ? (source, signal) => this.valueHintFor(source, signal) : undefined,
+			});
 		} catch (error) {
-			await store.close();
+			rules?.close();
 			throw error;
 		}
+		this.ctx = ctx;
 		this.store = store;
 		this.rules = rules;
-		this.memory = new Memory(store, this.summarize, {
-			nodeBytes: config.nodeBytes,
-			viewBytes: config.viewBytes,
-			jobs: config.jobs,
-			tries: config.tries,
-			report: (message) => this.notify(`OptChat compressor: ${message}`, "warning"),
-			// Requested only when the value-score gate is on: with it off, the compressor is never asked for a hint.
-			hint: config.gates.valueScore ? (source, signal) => this.valueHintFor(source, signal) : undefined,
-		});
+		this.memory = memory;
 		this.state = { kind: "ready" };
 		this.externalReadsOpen = true;
 		this.childViewEnabled = config.childView;
@@ -822,6 +836,65 @@ class OptChat {
 			`OptChat active: ${status.messages} messages in ${store.directory}; compressor ${model.provider}/${model.id}.`,
 			"info",
 		);
+	}
+
+	/** Retry the final startup path, never switch a cwd fallback session back to the global store. */
+	private async retryStartupLease(ctx: ExtensionContext, state: Extract<State, { kind: "inactive" }>): Promise<void> {
+		const retry = state.retry;
+		if (!retry || this.passiveRunOpen) return;
+		if (this.leaseRetryAttempt) {
+			// A concurrent preflight must not pass through while the earlier one can still activate.
+			this.leaseRetryAttempt.abort();
+			return;
+		}
+		if (performance.now() < retry.after) return;
+		const config = this.config!;
+		const model = this.compressor!;
+		const attempt = new AbortController();
+		this.leaseRetryAttempt = attempt;
+		const deadline = performance.now() + this.settleTimeoutMs;
+		const { promise: cancelled, resolve: finish } = Promise.withResolvers<void>();
+		attempt.signal.addEventListener("abort", () => finish(), { once: true });
+		const timer = setTimeout(() => attempt.abort(), this.settleTimeoutMs);
+		const current = () => !attempt.signal.aborted && this.state === state && performance.now() < deadline;
+		const open = async () => {
+			let store: Store | undefined;
+			let activating = false;
+			try {
+				store = await Store.open(config.directory, (message) => {
+					if (current()) this.notify(message, "warning");
+				});
+				if (!current()) return;
+				// OMP timestamps the new prompt before preflight. Exclude the existing branch,
+				// not everything older than Date.now(), which would also exclude the new prompt.
+				for (const entry of ctx.sessionManager.getBranch()) {
+					const message = branchEntryMessage(entry);
+					if (message && stamp(message) >= this.cutoff) this.logged.add(keyOf(message));
+				}
+				if (!current()) return;
+				activating = true;
+				this.activate(ctx, store, config, model);
+			} catch (error) {
+				// Only typed lease contention from Store.open is retryable. Once we start publishing,
+				// setup must finish or fail closed, never leave half-registered tools on a plain turn.
+				if (activating || (current() && !(error instanceof StoreLeaseConflictError))) this.failOpening(error);
+			} finally {
+				try {
+					// A late success can acquire the kernel lease but cannot publish memory or keep the lease.
+					if (store && store !== this.store) await store.close();
+				} catch (error) {
+					this.notify(`OptChat could not close the recovery store: ${errorText(error)}`, "warning");
+				}
+				retry.after = performance.now() + retry.delay;
+				retry.delay = Math.min(retry.delay * 2, LEASE_RETRY_MAX_MS);
+				this.leaseRetryAttempt = undefined;
+			}
+		};
+		try {
+			await Promise.race([open(), cancelled]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	private registerTools(): void {
@@ -1424,9 +1497,17 @@ class OptChat {
 		this.notify(reason, "error");
 	}
 
-	/** Lease conflict at startup: the session runs without memory, exactly like --no-optchat, and says why once. */
-	private inactivate(reason: string): void {
-		this.state = { kind: "inactive", reason };
+	private failOpening(error: unknown): void {
+		this.fail(`OptChat is off for this session: ${errorText(error)}. Every prompt will be refused until restart.`);
+	}
+
+	/** A live writer keeps this session passive; only a startup conflict gets a retry schedule. */
+	private inactivate(reason: string, retryOnConflict: boolean): void {
+		this.state = {
+			kind: "inactive",
+			reason,
+			retry: retryOnConflict ? { after: performance.now() + LEASE_RETRY_MIN_MS, delay: LEASE_RETRY_MIN_MS * 2 } : undefined,
+		};
 		this.notify(`OptChat is inactive: ${reason}. Use --optchat-dir for a separate memory.`, "warning");
 		// The notice is UI-only: the session log keeps why this session ran without memory.
 		try {
@@ -1437,13 +1518,38 @@ class OptChat {
 	}
 
 	/** The only supported way to stop a request from a context hook: abort the run, send nothing. */
-	private refuse(ctx: ExtensionContext, reason: string): ContextEventResult {
+	private refuse(ctx: ExtensionContext, reason: RequestRefusalReason, notice: string, hostMessages: number): ContextEventResult {
 		ctx.abort();
-		this.notify(reason, "error");
+		this.lastRequestRefusal = reason;
+		this.record({
+			type: "request-refusal",
+			at: new Date().toISOString(),
+			reason,
+			hostMessages,
+			openTurn: this.turn !== undefined,
+			hasRecoveryPointer: this.turn?.firstId !== undefined,
+			priorInTurnCut: this.turn?.cut === true,
+		});
+		this.notify(notice, "error");
 		return { messages: [] };
 	}
 
 	// --- host events -----------------------------------------------------------------
+
+	/** This hook also runs for dequeued steering, so it is not by itself proof of a fresh boundary. */
+	preparePrompt(systemPrompt: string[], ctx: ExtensionContext): { systemPrompt: string[] } | Promise<{ systemPrompt: string[] } | undefined> | undefined {
+		const state = this.state;
+		if (state.kind === "inactive") {
+			return this.retryStartupLease(ctx, state).then(() => this.state.kind === "ready" ? this.beforeAgentStart(systemPrompt) : undefined);
+		}
+		return this.beforeAgentStart(systemPrompt);
+	}
+
+	agentStart(): void {
+		if (!this.passive) return;
+		this.passiveRunOpen = true;
+		this.leaseRetryAttempt?.abort();
+	}
 
 	async beforeProviderRequest(payload: unknown, ctx: ExtensionContext): Promise<unknown> {
 		if (!ctx.model) {
@@ -1492,12 +1598,16 @@ class OptChat {
 			// A side turn is not this chat's turn: it passes through before any turn, pending, log or cutoff use.
 			if (this.state.kind === "ready" && this.isSideTurn(messages, ctx)) return undefined;
 			if (this.state.kind === "starting") await this.waitForStart(deadline);
-			// Inactive (startup lease conflict): the request passes through untouched.
-			if (this.state.kind === "inactive") return undefined;
+			// A plain request got here without recovery. A concurrent preflight must not
+			// publish memory later and change the request halfway through this run.
+			if (this.state.kind === "inactive") {
+				this.leaseRetryAttempt?.abort();
+				return undefined;
+			}
 			const memory = this.requireReady();
 			const active = new Set(this.pi.getActiveTools());
 			if (!TOOL_NAMES.every((name) => active.has(name))) {
-				throw new Refusal(`OptChat refused the request: the ${TOOL_NAMES.join(", ")} tools are not active in this session.`);
+				throw new Refusal("tools-inactive", `OptChat refused the request: the ${TOOL_NAMES.join(", ")} tools are not active in this session.`);
 			}
 			let turn = this.turn;
 			if (!turn) {
@@ -1511,7 +1621,7 @@ class OptChat {
 				if (messages.length > 0 && messages.every((message) => message.role === "user" || message.role === "custom")) {
 					return undefined;
 				}
-				throw new Refusal("OptChat refused the request: this turn's messages are missing from the host context.");
+				throw new Refusal("turn-missing", "OptChat refused the request: this turn's messages are missing from the host context.");
 			}
 			const partition = viewPartition(ctx.model);
 			if (turn.partition !== partition) {
@@ -1538,7 +1648,7 @@ class OptChat {
 		} catch (error) {
 			const reason = error instanceof Refusal ? error.message : `OptChat refused the request: ${errorText(error)}`;
 			if (!(error instanceof Refusal) && this.state.kind === "ready") this.fail(reason);
-			return this.refuse(ctx, reason);
+			return this.refuse(ctx, error instanceof Refusal ? error.reason : "unexpected-error", reason, messages.length);
 		}
 	}
 
@@ -1592,15 +1702,15 @@ class OptChat {
 				if (this.memory) return this.memory;
 				break;
 			case "failed":
-				throw new Refusal(this.state.reason);
+				throw new Refusal("memory-failed", this.state.reason);
 			case "inactive":
-				throw new Refusal(`OptChat refused the request: ${this.state.reason}.`);
+				throw new Refusal("memory-inactive", `OptChat refused the request: ${this.state.reason}.`);
 			case "starting":
-				throw new Refusal("OptChat refused the request: memory is still opening.");
+				throw new Refusal("memory-opening", "OptChat refused the request: memory is still opening.");
 			case "closed":
 				break;
 		}
-		throw new Refusal("OptChat refused the request: memory is closed.");
+		throw new Refusal("memory-closed", "OptChat refused the request: memory is closed.");
 	}
 
 	/** Index of the turn's first message in this host list; -1 when the list does not hold the turn. */
@@ -1664,15 +1774,17 @@ class OptChat {
 			// Durable and unanswered: the next turn's snapshot holds it.
 			this.logNew(tail);
 			if (job.abandoned) return undefined;
-			if (this.state.kind !== "ready") throw new Refusal("OptChat refused the request: memory is closed.");
+			if (this.state.kind !== "ready") throw new Refusal("memory-closed", "OptChat refused the request: memory is closed.");
 			// Only the deadline aborts this wait. A false settle without it is a failed summary, retried on the next append.
 			if (!job.controller.signal.aborted) {
 				throw new Refusal(
+					"summary-failed",
 					"OptChat: a memory summary failed and is retried only when the next message is saved, so nothing was sent. " +
 						"Your message is saved in the chat log, unanswered. Send it again to retry the summary.",
 				);
 			}
 			throw new Refusal(
+				"settle-timeout",
 				`OptChat: the memory summaries were not ready after ${Math.round(this.settleTimeoutMs / 1000)} s, so nothing was sent. ` +
 					"Your message is saved in the chat log, unanswered. The compressor keeps working in the background; " +
 					"resend once /optchat status shows no pending work.",
@@ -1784,6 +1896,7 @@ class OptChat {
 
 	/** The returned promise settles once every queued entry of this run is durable. */
 	agentEnd(messages: AgentMessage[], willContinue: boolean): Promise<void> {
+		if (!willContinue) this.passiveRunOpen = false;
 		this.endTurn(messages, willContinue);
 		return this.logChain;
 	}
@@ -1828,27 +1941,44 @@ class OptChat {
 			outcome: answer.outcome,
 			reason: answer.reason,
 			tokensBefore: typeof tokens === "number" && Number.isFinite(tokens) ? tokens : null,
+			cut: answer.cut,
 		});
 		return answer.result;
 	}
 
 	/** The answer to one host compaction and what it is called in the metric sink. */
 	private answerCompaction(event: SessionBeforeCompactEvent): CompactionAnswer {
-		const cancel = (reason: HostCompactionCancelReason): CompactionAnswer => ({ result: { cancel: true }, outcome: "cancelled", reason });
-		if (this.state.kind !== "ready") return cancel("not-ready");
 		const { preparation } = event;
-		const marker = (firstKeptEntryId: string): CompactionAnswer => ({
+		const turn = this.turn;
+		const anchor = turn?.first ?? turn?.after;
+		const firstId = turn?.firstId;
+		let at = -1;
+		let olderBytes: number | null = null;
+		let openTurnBytes: number | null = null;
+		const cut = (decision: HostCutDecision): HostCutDiagnostic => ({
+			decision,
+			messagesToSummarize: preparation.messagesToSummarize.length,
+			turnPrefixMessages: preparation.turnPrefixMessages.length,
+			anchor: turn?.first ? "first" : turn?.after ? "after" : null,
+			droppedAnchorIndex: at < 0 ? null : at,
+			hasRecoveryPointer: firstId !== undefined,
+			olderBytes,
+			openTurnBytes,
+		});
+		const cancel = (reason: HostCompactionCancelReason, decision: HostCutDecision): CompactionAnswer =>
+			({ result: { cancel: true }, outcome: "cancelled", reason, cut: cut(decision) });
+		if (this.state.kind !== "ready") return cancel("not-ready", "not-ready");
+		const marker = (firstKeptEntryId: string, decision: HostCutDecision): CompactionAnswer => ({
 			result: { compaction: { summary: HOST_COMPACTION_SUMMARY, firstKeptEntryId, tokensBefore: preparation.tokensBefore } },
 			// The cut moved when it no longer sits where the host put it.
 			outcome: firstKeptEntryId === preparation.firstKeptEntryId ? "marker" : "cut-moved",
 			reason: null,
+			cut: cut(decision),
 		});
-		const anchor = this.turn?.first ?? this.turn?.after;
 		const dropped = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
-		const at = anchor ? this.find(dropped, anchor) : -1;
-		const firstId = this.turn?.firstId;
+		at = anchor ? this.find(dropped, anchor) : -1;
 		// The host's cut inside the open turn, with a pointer to the turn's first message in the log.
-		const inTurn = (): CompactionAnswer | undefined =>
+		const inTurn = (decision: HostCutDecision): CompactionAnswer | undefined =>
 			firstId === undefined
 				? undefined
 				: {
@@ -1861,25 +1991,31 @@ class OptChat {
 						},
 						outcome: "cut-in-turn",
 						reason: null,
+						cut: cut(decision),
 					};
 		// An earlier cut already dropped the turn's anchor: this cut is inside the turn too, and points at the same message.
-		if (!anchor || at < 0) return (this.turn?.cut ? inTurn() : undefined) ?? marker(preparation.firstKeptEntryId);
-		if (dropped[at]!.role === "compactionSummary") return cancel("leftover-summary");
-		const size = (messages: readonly AgentMessage[]): number => messages.reduce((sum, m) => sum + utf8Length(JSON.stringify(m)), 0);
+		if (!anchor || at < 0) {
+			return (turn?.cut ? inTurn("prior-in-turn-cut") : undefined) ??
+				marker(preparation.firstKeptEntryId, anchor ? "anchor-not-dropped" : "no-anchor");
+		}
+		if (dropped[at]!.role === "compactionSummary") return cancel("leftover-summary", "leftover-summary");
 		// Moving the cut back frees only the older history: too little when the open turn is most of the drop.
-		if (at === 0 || size(dropped.slice(0, at)) < size(dropped.slice(at))) {
-			const answer = inTurn();
+		if (at === 0) return inTurn("no-older-history") ?? cancel("nothing-older", "no-older-history");
+		const size = (messages: readonly AgentMessage[]): number => messages.reduce((sum, m) => sum + utf8Length(JSON.stringify(m)), 0);
+		olderBytes = size(dropped.slice(0, at));
+		openTurnBytes = size(dropped.slice(at));
+		if (olderBytes < openTurnBytes) {
+			const answer = inTurn("open-turn-larger");
 			if (answer) return answer;
-			if (at === 0) return cancel("nothing-older");
 		}
 		for (let index = event.branchEntries.length - 1; index >= 0; index--) {
 			const entry = event.branchEntries[index]!;
 			const message = branchEntryMessage(entry);
 			if (!message || stamp(message) !== anchor.stamp || keyOf(message) !== anchor.key) continue;
-			if (isCutPoint(entry)) return marker(entry.id);
-			return inTurn() ?? cancel("anchor-not-cut-point");
+			if (isCutPoint(entry)) return marker(entry.id, "anchor-cut-point");
+			return inTurn("anchor-not-cut-point") ?? cancel("anchor-not-cut-point", "anchor-not-cut-point");
 		}
-		return inTurn() ?? cancel("anchor-not-in-branch");
+		return inTurn("anchor-not-in-branch") ?? cancel("anchor-not-in-branch", "anchor-not-in-branch");
 	}
 
 	toolResult(event: ToolResultEvent): ToolResultEventResult | undefined {
@@ -1898,6 +2034,9 @@ class OptChat {
 
 	/** Prior host history is not this chat's turn; reset turn tracking for the new session. */
 	sessionChanged(ctx: ExtensionContext): void {
+		this.leaseRetryAttempt?.abort();
+		this.passiveRunOpen = false;
+		this.lastRequestRefusal = undefined;
 		this.saveUnanswered();
 		this.projectEvidence?.reset();
 		this.lastEvidence = undefined;
@@ -1919,6 +2058,8 @@ class OptChat {
 	 * archive path is returned.
 	 */
 	async shutdown(archiveAt?: Date): Promise<string | undefined> {
+		if (this.state.kind === "inactive") this.state.retry = undefined;
+		this.leaseRetryAttempt?.abort();
 		this.externalReadsOpen = false;
 		this.saveUnanswered();
 		if (archiveAt === undefined) this.projectEvidence?.close();
@@ -1982,6 +2123,7 @@ class OptChat {
 		this.counts = new GateCounts();
 		this.gateFailure = undefined;
 		this.mainRetries = 0;
+		this.lastRequestRefusal = undefined;
 		const failure = await this.reopen(ctx);
 		if (failure !== undefined) {
 			throw new Error(
@@ -2109,6 +2251,7 @@ class OptChat {
 			`OptChat: ${state.kind === "failed" || state.kind === "inactive" ? `${state.kind}: ${state.reason}` : state.kind}`,
 			...diagnosticStatusLines(ctx, this.lastMainCacheMode, this.lastCompressorCacheMode),
 		];
+		if (this.lastRequestRefusal) lines.push(`last OptChat request refusal: ${this.lastRequestRefusal}`);
 		if (this.config) {
 			lines.push(`directory: ${this.store?.directory ?? this.config.directory}`);
 			lines.push(`compressor: ${this.compressor ? `${this.compressor.provider}/${this.compressor.id}` : this.config.model}`);
@@ -2440,7 +2583,8 @@ export function createOptChat(options: OptChatOptions = {}): (pi: ExtensionAPI) 
 			const active = new OptChat(pi, settleTimeoutMs, observe, metricsFile, policy, judges, options.extractor ?? hostExtractor);
 			chat = active;
 			// Registered for every opted-in main session. An inactive one (startup lease conflict) passes through.
-			pi.on("before_agent_start", (event) => (active.passive ? undefined : active.beforeAgentStart(event.systemPrompt)));
+			pi.on("before_agent_start", (event, handlerCtx) => active.preparePrompt(event.systemPrompt, handlerCtx));
+			pi.on("agent_start", () => active.agentStart());
 			pi.on("context", (event, handlerCtx) => active.context(event.messages, handlerCtx));
 			pi.on("before_provider_request", (event, handlerCtx) => (active.passive ? undefined : active.beforeProviderRequest(event.payload, handlerCtx)));
 			pi.on("credential_disabled", () => active.resetCacheFence());
