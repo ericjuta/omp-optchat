@@ -83,9 +83,10 @@ function childReply(reply: ChildFixtureReply): FixtureReply {
 /**
  * Child-experiment turn. The parent delegates its task once, then relays. The view child zooms its record and answers
  * with a verbatim quote; a view child with no source record abstains without retrieval. The blind child answers uncertain.
- * A worker ends its turn with `yield`; `type: "result"` makes its last assistant text the raw final result.
+ * When advertised, `yield` with `type: "result"` makes the worker’s last assistant text the raw final result.
+ * A host without `yield` uses the same text as the final assistant message.
  */
-function childTurn(corpus: Corpus, arm: ChildArm, task: ChildTask, parent: boolean, turn: readonly unknown[]): FixtureReply {
+function childTurn(corpus: Corpus, arm: ChildArm, task: ChildTask, parent: boolean, turn: readonly unknown[], hasYield: boolean): FixtureReply {
 	const question = task.question;
 	const source = question.sources[0];
 	if (!parent && arm === "view" && source === undefined) return answerBlock([answerFor(corpus, question)]);
@@ -99,7 +100,7 @@ function childTurn(corpus: Corpus, arm: ChildArm, task: ChildTask, parent: boole
 		parentTaskResultSeen: hasToolResult(turn, TASK_CALL),
 		childZoomResultSeen: hasToolResult(turn, ZOOM_CALL),
 	});
-	if (!parent && reply.kind === "answer") {
+	if (!parent && hasYield && reply.kind === "answer") {
 		const yieldArgs = JSON.stringify({ type: "result" });
 		return { text: reply.text, toolCalls: [{ index: 0, id: YIELD_CALL, type: "function", function: { name: "yield", arguments: yieldArgs } }] };
 	}
@@ -146,7 +147,8 @@ export function fixtureReply(corpus: Corpus, fixture: FixtureState, request: Fix
 	const subject = messageText(messages[start]);
 	const turn = messages.slice(start + 1);
 	const task = fixture.childTasks.find((entry) => subject.includes(entry.task));
-	if (task !== undefined) return childTurn(corpus, fixture.childArm, task, subject.includes(parentPrompt(task)), turn);
+	if (task !== undefined) return childTurn(corpus, fixture.childArm, task, subject.includes(parentPrompt(task)), turn,
+		tools.some((tool) => field(field(tool, "function"), "name") === "yield"));
 	const questions = corpus.questions.filter((question) => subject.includes(`[${question.id}]`));
 	const onArm = tools.some((tool) => field(field(tool, "function"), "name") === "zoom");
 	if (!onArm) return answerBlock(questions.map((question) => answerFor(corpus, question)));
