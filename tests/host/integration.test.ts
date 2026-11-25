@@ -105,7 +105,7 @@ const CASE_TITLES = {
   "compressor-tool-refusal": "compressor tool calls are neither executed nor accepted as summaries",
   "compressor-refusal-main-retry": "a refused compaction retries once with the main model, which stores its summary without a stand-in",
   "compressor-refusal-standin": "a refusal by the compressor and the main model stores a bounded labelled stand-in; the next prompt is answered",
-  "compressor-error-append-retry": "a non-refusal compaction error never reaches the main model or stores anything, and the next append retries it",
+  "compressor-error-timer-retry": "a non-refusal compaction error saves no node and retries without an append",
   "compressor-refusal-same-model": "a compressor equal to the main model refuses once, stores the stand-in directly and sends no retry",
   "anthropic-refusal-main-retry": "an Anthropic compressor's wire refusal (stop_details bio) retries once with the main model, whose summary is stored under a 512-token cap",
   "anthropic-refusal-deadline-standin": "an Anthropic main-model fallback that starts and never completes is cancelled at the 30 s deadline: a labelled stand-in is stored and the next prompt is answered",
@@ -1423,7 +1423,6 @@ const REFUSAL_TEXT = "Refusal (bio): OPTCHAT_IT scripted safety refusal.";
 const COMPRESSOR_FAILURE_TEXT = "Compressor request failed upstream (OPTCHAT_IT scripted failure).";
 const STAND_IN_MARK = "[unsummarized: compressor refused] ";
 const MAIN_RETRY_NOTICE = "retrying it once with the main model";
-const DEFERRED_FAILURE = "a memory summary failed and is retried only when the next message is saved";
 
 /** Compaction requests for exactly the seeded leaf, whichever model served them. */
 function seedRequests(fixture: Fixture): Capture[] {
@@ -1481,7 +1480,7 @@ async function ordinaryTurn(ctx: CaseContext, host: Host, prompt: string, reply:
   assert.deepEqual(pairs(rows.slice(-2)), [["user", prompt], ["talk", reply]], "the ordinary prompt and its reply are durable");
   // A refused user prompt or an error; compaction fallback warnings are neither.
   const refusals = host.notices.slice(noticesBefore).filter((notice) =>
-    notice.type === "error" || /OptChat refused the request|a memory summary failed|not ready after|keeps working in the background/.test(notice.message));
+    notice.type === "error" || /OptChat refused the request|a memory summary failed|not ready after|Compression continues in the background/.test(notice.message));
   assert.deepEqual(refusals.map((notice) => notice.message), [], "the ordinary prompt is not refused, aborted or failed");
   assert.equal(fixture.chat().length, chatBefore + 1, "the ordinary prompt reaches the strict chat queue once");
   fixture.assertScriptsConsumed();
@@ -1563,10 +1562,9 @@ async function compressorRefusalStandIn(ctx: CaseContext): Promise<Evidence> {
 
 /**
  * A non-refusal compressor error: no main-model retry and no stand-in. The
- * unanswered prompt that follows is refused by settle; its logged write is the
- * append that retries the compressor, which then succeeds.
+ * scheduler retries without a prompt or append and the next turn sees the repaired view.
  */
-async function compressorErrorAppendRetry(ctx: CaseContext): Promise<Evidence> {
+async function compressorErrorTimerRetry(ctx: CaseContext): Promise<Evidence> {
   const { fixture, memory, metrics } = ctx;
   let failing = true;
   fixture.compactPolicy = (input) => (failing && input.input === SEED_SOURCE ? { error: COMPRESSOR_FAILURE_TEXT } : undefined);
@@ -1578,31 +1576,27 @@ async function compressorErrorAppendRetry(ctx: CaseContext): Promise<Evidence> {
     });
     assert.deepEqual([failed[0]!.model, failed[0]!.node, failed[0]!.attempt, failed[0]!.retry, failed[0]!.stopReason], [`${PROVIDER}/${COMPACT_MODEL}`, "leaf", 1, null, "error"], "the failed compressor attempt is metered");
     assert(String(failed[0]!.error).includes("upstream"), "the metric records the non-refusal error, not a refusal");
-    await fixture.until("compaction failure warning", () => host.notices.find((notice) =>
-      notice.message.includes("OptChat compaction failed at 0+1; retrying on the next appended message")));
+    await fixture.until("compaction pause warning", () => host.notices.find((notice) =>
+      notice.message.includes("OptChat compaction paused")));
     assert.deepEqual(seedRequests(fixture).map((capture) => capture.model), [COMPACT_MODEL], "a non-refusal error is never retried with the main model");
     assert.equal(persistedNode(memory, 0, 0), undefined, "no summary or stand-in is stored for the failed seed");
     assert(!host.notices.some((notice) => notice.message.includes("unsummarized") || notice.message.includes(MAIN_RETRY_NOTICE)), "no stand-in or main-model retry is announced");
 
     failing = false;
-    // Settle sees the failed node: this prompt is refused, and logging it is the append that retries the compressor.
-    await bounded("refused prompt", host.prompt("OPTCHAT_IT_APPEND_RETRY_FIRST: say ok."), STEP_MS, fixture.fatal);
-    await fixture.until("prompt refused until the next append", () => host.notices.find((notice) => notice.message.includes(DEFERRED_FAILURE)));
-    const node = await fixture.until("retried summary persisted", () => persistedNode(memory, 0, 0));
-    assert.equal(node.text, LEAF_SUMMARY.user, "the append's retry stores the compressor's summary");
+    const node = await fixture.until("retried summary persisted without an append", () => persistedNode(memory, 0, 0));
+    assert.equal(node.text, LEAF_SUMMARY.user, "the timer wakes a retry that stores the compressor's summary");
+    assert.equal(mainRows(memory).length, 1, "no new message triggered the retry");
     const lines = await fixture.until("retry attempt metered", () => {
       const records = metricRecords(metrics).filter((row) => row.type === "compressor");
       return records.length >= 2 ? records : undefined;
     });
-    assert.deepEqual(metricRecords(metrics).filter((row) => row.type === "request-refusal").map((row) => row.reason),
-      ["summary-failed"], "only the aborted prompt is metered as a request refusal");
     assert.deepEqual(seedRequests(fixture).map((capture) => capture.model), [COMPACT_MODEL, COMPACT_MODEL], "the retry is the compressor again, never the main model");
     assert.deepEqual([lines[1]!.model, lines[1]!.stopReason], [`${PROVIDER}/${COMPACT_MODEL}`, "stop"], "the retry is metered as a successful compressor call");
     assert(!host.notices.some((notice) => notice.message.includes("unsummarized")), "the recovered summary is not a stand-in");
 
-    const followUp = await ordinaryTurn(ctx, host, "OPTCHAT_IT_APPEND_RETRY_SECOND: say ok.", "OPTCHAT_IT_APPEND_RETRY_REPLY: ok.");
+    const followUp = await ordinaryTurn(ctx, host, "OPTCHAT_IT_TIMER_RETRY: say ok.", "OPTCHAT_IT_TIMER_RETRY_REPLY: ok.");
     assert(soleView(followUp.body, "follow-up").includes("\n0+1|user: prior turn summary\n"), "the recovered summary is settled into the next view");
-    assert(!host.notices.some((notice) => /not ready after|keeps working in the background/.test(notice.message)), "a failed summary never reports a deadline");
+    assert(!host.notices.some((notice) => /not ready after|Compression continues in the background/.test(notice.message)), "a failed summary never reports a deadline");
     return {
       compressorAttempts: seedRequests(fixture).map((capture) => capture.model),
       metrics: lines.slice(0, 2).map((line) => [line.model, line.stopReason]),
@@ -4094,7 +4088,7 @@ const CASES: Record<CaseName, (ctx: CaseContext) => Promise<Evidence>> = {
   "compressor-tool-refusal": compressorToolRefusal,
   "compressor-refusal-main-retry": compressorRefusalMainRetry,
   "compressor-refusal-standin": compressorRefusalStandIn,
-  "compressor-error-append-retry": compressorErrorAppendRetry,
+  "compressor-error-timer-retry": compressorErrorTimerRetry,
   "compressor-refusal-same-model": compressorRefusalSameModel,
   "anthropic-refusal-main-retry": anthropicRefusalMainRetry,
   "anthropic-refusal-deadline-standin": anthropicRefusalDeadlineStandIn,

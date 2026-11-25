@@ -4,7 +4,7 @@
  * a call without a reported cost is unknown, never $0.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -59,8 +59,8 @@ const USAGE: CompressorUsage = {
 };
 
 interface ChatOptions {
-  /** What the loopback compressor answers its first requests with, in arrival order; later ones get a short summary. */
-  replies?: readonly string[];
+  /** Scripted replies in arrival order. Later requests get a short summary. */
+  replies?: readonly (string | Response)[];
   /** Runs before every compressor provider attempt; the attempt is sent when it settles true. */
   admit?: (model: string) => boolean | Promise<boolean>;
 }
@@ -365,6 +365,30 @@ describe("host compaction rows", () => {
 });
 
 describe("request refusal rows", () => {
+  test("an SDK HTTP failure preserves its status and Retry-After and refuses a turn without passing through history", async () => {
+    // The SDK carries the hint beyond the first 200 diagnostic characters. No live provider or wall-clock sleep.
+    const upstream = Response.json({ error: { message: "Forbidden. " + "detail ".repeat(50) } }, {
+      status: 403, headers: { "Retry-After": "180", "x-should-retry": "false" },
+    });
+    const { host, metrics, compressor } = await openChat({ replies: [upstream] });
+    const seed = "Never pass through this long history. ".repeat(8);
+    const transcript = await talk(host, [], seed);
+    const pause = () => host.notices.find((notice) => notice.message.includes("compaction paused"))?.message;
+    await until(() => pause() !== undefined, "the Retry-After pause");
+    expect(pause()).toContain("compaction paused for at least 180 s");
+    expect(pause()).toContain("(HTTP 403)");
+    const prompt = "Please answer this new prompt.";
+    const result = await host.context([...transcript, host.user(prompt)]);
+    expect(result).toEqual({ messages: [] });
+    expect(host.aborts).toBe(1);
+    const directory = join(host.directory, "main");
+    const durable = () => readdirSync(directory).sort().flatMap((file) => rowsOf(join(directory, file)));
+    await until(() => durable().some((row) => row.text === prompt), "durable unanswered prompt");
+    expect(durable()[0]?.text).toBe(seed);
+    expect(rowsOfType(metrics, "request-refusal").map((row) => row.reason)).toEqual(["summary-failed"]);
+    expect(compressor.bodies).toHaveLength(1);
+    expect(await statusOf(host)).toContain("compressor: paused");
+  });
   test("a lost turn aborts once, but a steering batch does not; record only its fixed reason and shape", async () => {
     const { host, metrics } = await openChat();
     await host.context([host.user("private original prompt")]);

@@ -14,6 +14,10 @@ After this plan is complete, an OMP user can start `omp` with no gate flags and 
 
 ## Progress
 
+- [x] 2026-11-25: Traced compressor errors through the pinned OMP and pi-ai sources, and traced `Memory.settle` through turn refusal.
+- [x] 2026-11-25: Implemented provider backoff, timer-driven recovery, and one-call probes. Added fake-clock scheduler coverage and an HTTP 403 loopback test for Retry-After and turn refusal.
+- [x] 2026-11-25: Review capped Retry-After at ten minutes. Fake-clock cases cover both a hint above the local ceiling and a multi-hour hint. Final checks: `bun run typecheck`, `bun run test`, `bun run test:host`, and the loopback smoke.
+
 - [x] 2026-11-17: Prepared 0.16.7 with version-stamped compaction and request-refusal diagnostics, prompt-boundary recovery after startup writer contention, and a read-only compressor retry census. The residual 0.16.6 cancellation path can be replayed before an open turn has a durable recovery pointer; historical rows do not identify their writer version or establish the cause of the live burst. Compressor wording is unchanged.
 
 - [x] 2026-11-14 (Eric: "do all" of the open audit items): length-retry feedback now asks for a growing margin (`overlong` in `Memory.compact`), and the head guard takes the `⁂` label, `Msgs a–b (…):`, `to/into/one/single/result/≤N` label words and a compaction label paragraph. Release 0.16.6; effect on retries and line sizes not measured. The head retry itself stays (accepting a cleanly cut head on the first try would reverse the 0.9.3 choice and needs Eric's word). `chat_search` hyphen miss was a false alarm (the term first appeared in the call). No host-compaction rows since 0.16.5 yet, so its live check is still open.
@@ -43,6 +47,9 @@ After this plan is complete, an OMP user can start `omp` with no gate flags and 
 - [x] Pre-ratchet foundations (2026-10-12 UTC). G5 golden: `tests/system1-off.test.ts` + `tests/fixtures/system1-off.golden.json` pin the 0.7.0 memory-only bytes (system prompt, tool definitions in an encoded Anthropic request, context messages, status), with no judge resolved and no `tool_call` hook; a one-byte prompt or tool-description mutation fails it. Ticket 02: native Jev answered from the eval kernel (`typesafe/jev-1.13-20260917`, 0.33 s). Judge fallback: without a native judge candidate only the tool gate runs (on the session model); the others report `inactive: no native judge model`, and `chat_recall` stays registered (definitions unchanged) returning an inactive result. `/optchat status` prints per-gate call, failure and outcome counters (`src/system1/gates.ts`). `chat_recall` eval: `evals/recall/` (30 synthetic, 18 real cases from read-only store copies, deterministic gold-id grader, oracle 100%, null 0%), tunable surface `src/system1/recall-prompt.ts`; pilot 0/4 on 28 judge calls ($0.005). Full suite 1433/0, smoke ok. Ratchet `init`/approvals not yet run: they need Eric.
 
 ## Surprises & Discoveries
+
+- Observation: OptChat calls pi-ai `completeSimple` directly. The primary session's `turn-recovery.ts` Retry-After policy does not wrap that call. The OpenAI HTTP and Anthropic transports can retry eligible failures before the SDK returns, and the host credential resolver can refresh or rotate credentials.
+  Evidence: pinned `node_modules/@oh-my-pi/pi-coding-agent/src/session/turn-recovery.ts` and `src/config/api-key-resolver.ts`; pi-ai `src/stream.ts`, `src/utils/openai-http.ts`, and `src/providers/anthropic-client.ts`. Failed replies can expose `AssistantMessage.errorStatus`; Retry-After can arrive as a response header or as the SDK's `retry-after-ms=…` suffix in `errorMessage`. OptChat previously threw a plain `Error`, losing the structured status and any header not included in its bounded message.
 
 - Observation (2026-11-09, after 0.16.3): turn starts in the one multi-turn OptChat session still read only the host prefix. pi-ai's glyph codec (`applyGlyphCodec`, identical in 18.10.3 and 18.18.3) sends private-use characters as `⟦U…⟧` tokens and appends `\n\n<glyph-tokens>\n…\n</glyph-tokens>\n` to the first text it changed. The nextjs-ai-chatbot view held U+F0307 from a Tern tab title, so the notice landed inside a view block, `CHAT_VIEW` failed and `cacheAnthropic` returned the request unchanged.
   Evidence: a copy of the live store rendered a 171-line view. Through the 18.18.3 injector and encoder, the encoded view had five extra lines (the notice) and `applyOptChatCache` returned `unchanged`; with the fix it returned `anthropic-breakpoints`, marking `system.2`, `system.4`, `messages.0.content.42` and `messages.1.content.0`. Session log (Opus, OMP 18.18.3, 11:08–11:53 UTC): 12 turn starts read 87,995–88,012 tokens and wrote 1.94 million ($16.00 by OMP's cost fields); turn starts with OptChat inactive read 99.8% or more. Two of 14 stores used in the last seven days had a view the codec rewrites.
@@ -97,6 +104,10 @@ After this plan is complete, an OMP user can start `omp` with no gate flags and 
 - Observation (2026-10-11): `tests/cache.test.ts` is unmodified, so the cache check with extra messages is not in the suite.
 
 ## Decision Log
+
+- Decision: Pace provider failures inside each `Memory`. Requeue their nodes and let an unreferenced timer wake the scheduler. After a pause only one compressor call can probe. A successful probe restores normal concurrency. An older in-flight call cannot reopen the scheduler. Keep the local exponential delay capped at 120 seconds. A provider Retry-After can extend the pause to at most ten minutes.
+  Rationale: Appends should not amplify a provider outage. The ten-minute cap prevents a multi-hour hint from keeping the session paused long after the provider recovers. A wait for missing leaves must return false during the pause, so the main request is refused rather than sent with incomplete history. Keep local validation and terminal refusal behavior unchanged.
+  Date/Author: 2026-11-25, implementation.
 
 - Decision (2026-11-09): `leadingView` removes a trailing `\n\n<glyph-tokens>\n…\n</glyph-tokens>\n` envelope from a view block before it checks and cuts the view; on the wire the block keeps the notice.
   Rationale: the notice is host-authored and the same on every request with the same view, and it opens with a blank line, which no view text holds, so removing it cannot admit a pasted view. Escaping or dropping icons at render time would not help: pi-ai also escapes literal token text and appends the same notice.
@@ -312,6 +323,8 @@ After this plan is complete, an OMP user can start `omp` with no gate flags and 
 - Decision (2026-11-07, Eric): restore default-on Clairic in 0.16.2 despite the failed real-chat gate. This explicit policy override supersedes the 0.16.1 activation decision only; evaluation results and limitations remain unchanged. `--no-optchat-extract` still wins.
 
 ## Outcomes & Retrospective
+
+Provider backoff now runs in `Memory`, with no flags or store-format changes. The fake clock in `tests/memory.test.ts` advances the timer explicitly. The fake host in `tests/metrics.test.ts` uses the pinned SDK and a local HTTP error response to check status and retry timing. `tests/host/integration.test.ts` expects timer-only recovery instead of append-triggered recovery. No live provider calls are needed for these checks.
 
 - Release acceptance, 2026-10-23: v0.14.0 passes typecheck, 2,326 unit tests, 56 real-host tests, the generic loopback lifecycle smoke, and strict store-lease verification (32 ok, zero findings/failures). The final source-only host passes its 461-test coordination/transition suite, both package typechecks, and a fresh two-process idle/busy/duplicate delivery smoke with clean exit. Earlier six-failure results led to transition fixes, including preserving admitted messages on refused resets and avoiding remote auto-start on failed transitions; the final trust review has no remaining introduced finding. Report namespace/revival verification separately passed 78 tests and the 17-page reopen proof. Plugin release/install authority does not change the host source-only boundary. Private recall cases remain unscored; neither experimental optimization is adopted.
 
@@ -720,6 +733,8 @@ The `Turn` type in src/index.ts gains `extra: UserMessage[]`, computed when the 
 The exact field names of the judgment answers, the `tool_call` event, and `ctx.agent` must be taken from the host's type declarations, as Milestones 1 and 5 say. The names above are the plan's intent, and an implementer may rename a helper, but must keep the behaviour and the tests.
 
 ## Revision notes
+
+- 2026-11-25: recorded scheduler backoff and the distinction between OMP turn retries and provider transport retries. Review capped the provider hint so that a multi-hour outage does not prevent a probe for hours.
 
 - 2026-11-06: recorded that the six host regressions were repaired and verified source-only (focused host suite 461/0, two-process smoke passed) before the v0.14.0 release; the 2026-10-23 entries below describe the state at that time.
 

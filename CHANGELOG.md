@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Provider failures pause new compressor calls and retry queued nodes on a timer, without waiting for an append. The jittered local delay grows to at most two minutes. A provider `Retry-After` can extend the pause to at most ten minutes. One successful probe restores normal concurrency. A turn that needs missing summaries is still refused promptly and saved unanswered.
+
 ## 0.16.7 — 2026-11-17
 
 - A session that starts without memory because another writer owns its store can recover at a later fresh prompt. It stays in passthrough until it acquires the lease, never switches memory on mid-turn, and does not backfill passthrough history.

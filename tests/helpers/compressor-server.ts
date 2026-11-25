@@ -32,8 +32,8 @@ function reply(model: string, text: string): Response {
   return new Response(body, { headers: SSE_HEADERS });
 }
 
-/** `replies` answers the first requests in arrival order, one text each; every later request gets `SUMMARY`. */
-export async function startCompressorServer(replies: readonly string[] = []): Promise<CompressorServer> {
+/** `replies` scripts the first requests in arrival order. Later requests get `SUMMARY`. */
+export async function startCompressorServer(replies: readonly (string | Response)[] = []): Promise<CompressorServer> {
   const bodies: Array<Record<string, unknown>> = [];
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -46,7 +46,8 @@ export async function startCompressorServer(replies: readonly string[] = []): Pr
       }
       const body = (await request.json()) as Record<string, unknown>;
       bodies.push(body);
-      return reply(String(body.model), replies[bodies.length - 1] ?? SUMMARY);
+      const scripted = replies[bodies.length - 1] ?? SUMMARY;
+      return typeof scripted === "string" ? reply(String(body.model), scripted) : scripted;
     },
   });
   const model: Model<"openai-completions"> = {

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CompressorRefusedError, Memory, utf8Bytes, utf8Prefix, type CompactionRequest, type MemoryOptions, type Summarize } from "../src/memory.ts";
+import { CompressorLocalError, CompressorProviderError, CompressorRefusedError, Memory, utf8Bytes, utf8Prefix, type CompactionRequest, type MemoryOptions, type Summarize } from "../src/memory.ts";
 import { Store, nodeKey, type Kind } from "../src/store.ts";
 import { holdTimers } from "./helpers/held-timer.ts";
 
@@ -316,14 +316,14 @@ test("a failed leaf keeps its admission slot until a retry succeeds", async () =
   for (let i = 0; i < 10; i++) memory.append("user", `[m${i}] a long user message`);
   await until(() => model.open().length === 8, "eight admitted leaves");
 
-  model.take("[m0]").reject(new Error("offline"));
+  model.take("[m0]").reject(new CompressorLocalError("local admission denied"));
   model.take("[m1]").resolve(leafReply("s1"));
   await until(() => model.labels().includes("[m8]"), "window admits leaf 8");
   await flush();
   // Leaf 0 is still unbuilt, so leaf 9 waits behind the window.
   expect(model.labels()).toEqual(["[m2]", "[m3]", "[m4]", "[m5]", "[m6]", "[m7]", "[m8]"]);
   expect(reports).toHaveLength(1);
-  expect(reports[0]).toContain("offline");
+  expect(reports[0]).toContain("local admission denied");
 });
 
 test("the job cap bounds concurrent merges, and merges complete their parents", async () => {
@@ -1040,7 +1040,7 @@ test("a failed branch stalls only its own subtree; independent branches keep bui
   for (let i = 0; i < 4; i++) memory.append("user", `[m${i}] a long user message`);
   await until(() => model.open().length === 4, "four leaves");
 
-  model.take("[m0]").reject(new Error("provider down"));
+  model.take("[m0]").reject(new CompressorLocalError("local admission denied"));
   for (const i of [1, 2, 3]) model.take(`[m${i}]`).resolve(leafReply(`s${i}`));
   await until(() => model.labels().join() === "[s2]+[s3]", "right-branch pair");
   model.take("[s2]", "[s3]").resolve(summary("p2-3"));
@@ -1063,7 +1063,7 @@ test("a failed branch stalls only its own subtree; independent branches keep bui
   await macrotasks(3);
   expect(model.calls).toHaveLength(5);
   expect(model.open()).toEqual([]);
-  expect(reports).toEqual(["OptChat compaction failed at 0+1; retrying on the next appended message: provider down"]);
+  expect(reports).toEqual(["OptChat compaction failed at 0+1; retrying on the next appended message: local admission denied"]);
 });
 
 test("a failed call releases the only job slot to queued work without retrying until append", async () => {
@@ -1086,7 +1086,7 @@ test("a failed call releases the only job slot to queued work without retrying u
   expect(model.calls.map(label)).toEqual(["[m0]"]);
   expect(model.labels()).toEqual(["[m0]"]);
   expect(store.nodes.has(nodeKey(0, 1))).toBe(false);
-  model.take("[m0]").reject(new Error("offline"));
+  model.take("[m0]").reject(new CompressorLocalError("local admission denied"));
 
   // The failed job's own pump starts m1; no append or settle is involved.
   await until(() => model.calls.length === 2, "queued m1 starts after m0 fails");
@@ -1108,7 +1108,7 @@ test("a failed call releases the only job slot to queued work without retrying u
   expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
   expect(store.nodes.has(nodeKey(1, 0))).toBe(false);
   expect(reports).toHaveLength(1);
-  expect(reports[0]).toContain("offline");
+  expect(reports[0]).toContain("local admission denied");
 
   // Append enqueues failed m0 before admitting m2; its parent queues behind m2.
   memory.append("user", "[m2] a third long message");
@@ -1154,7 +1154,7 @@ test("repeated failures retry only on distinct appends, report once, and recover
   memory.append("user", "[m0] a long user message");
   await until(() => model.calls.length === 1, "initial m0 call");
   expect(model.calls.map(label)).toEqual(["[m0]"]);
-  model.take("[m0]").reject(new Error("offline initially"));
+  model.take("[m0]").reject(new CompressorLocalError("denied initially"));
   const initial = track(memory.settle());
   await until(() => initial.done, "initial failure settles");
   expect(initial.error).toBeUndefined();
@@ -1167,7 +1167,7 @@ test("repeated failures retry only on distinct appends, report once, and recover
   expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
   expect(store.nodes.has(nodeKey(1, 0))).toBe(false);
   expect(reports).toHaveLength(1);
-  expect(reports[0]).toContain("offline initially");
+  expect(reports[0]).toContain("denied initially");
 
   for (const { i, history } of [
     { i: 1, history: ["[m0]", "[m0]", "[m1]"] },
@@ -1177,7 +1177,7 @@ test("repeated failures retry only on distinct appends, report once, and recover
     await until(() => model.calls.length === history.length - 1, `m0 retry before m${i}`);
     expect(model.calls.map(label)).toEqual(history.slice(0, -1));
     expect(model.labels()).toEqual(["[m0]"]);
-    model.take("[m0]").reject(new Error(`offline again on append ${i}`));
+    model.take("[m0]").reject(new CompressorLocalError(`denied again on append ${i}`));
     await until(() => model.calls.length === history.length, `unrelated m${i} starts after retry failure`);
     expect(model.calls.map(label)).toEqual(history);
     expect(model.labels()).toEqual([`[m${i}]`]);
@@ -1200,7 +1200,7 @@ test("repeated failures retry only on distinct appends, report once, and recover
     expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
     expect(store.nodes.has(nodeKey(1, 0))).toBe(false);
     expect(reports).toHaveLength(1);
-    expect(reports[0]).toContain("offline initially");
+    expect(reports[0]).toContain("denied initially");
   }
 
   memory.append("talk", "[m3] a fourth long message");
@@ -1249,28 +1249,238 @@ test("repeated failures retry only on distinct appends, report once, and recover
   expect(memory.status().pending).toBe(0);
   expect(model.peak).toBe(1);
   expect(reports).toHaveLength(1);
-  expect(reports[0]).toContain("offline initially");
+  expect(reports[0]).toContain("denied initially");
 });
 
-test("an unprintable rejection is reported and retried on the next append", async () => {
+/** The scheduler's one-shot timer also works when there are no subsequent appends. */
+class BackoffClock implements NonNullable<MemoryOptions["backoffClock"]> {
+  private time = 0;
+  private readonly timers = new Map<() => void, number>();
+
+  now(): number { return this.time; }
+
+  schedule(wake: () => void, delayMs: number): () => void {
+    this.timers.set(wake, this.time + delayMs);
+    return () => this.timers.delete(wake);
+  }
+
+  get delays(): number[] { return [...this.timers.values()].map((at) => at - this.time); }
+
+  advance(ms: number): void {
+    this.time += ms;
+    for (const [wake, at] of [...this.timers]) {
+      if (at <= this.time && this.timers.delete(wake)) wake();
+    }
+  }
+}
+
+test("three provider failures pause appends and wake one probe, then restore the configured jobs cap", async () => {
   const store = await openStore();
   const model = new Model();
+  const clock = new BackoffClock();
   const reports: string[] = [];
   const memory = memoryFor(store, model, {
-    nodeBytes: 16,
+    nodeBytes: 16, jobs: 3, backoffClock: clock, backoffRandom: () => 0.5,
+    report: (message) => reports.push(message),
+  });
+  for (let i = 0; i < 3; i++) memory.append("user", `[m${i}] a long user message`);
+  const waiting = track(memory.settle());
+  await until(() => model.open().length === 3, "three initial requests");
+  expect(waiting.done).toBe(false);
+  const statuses = [429, 403, 503];
+  for (const [i, call] of model.open().entries()) {
+    call.reject(new CompressorProviderError(`HTTP ${statuses[i]}`, statuses[i]));
+  }
+  await until(() => waiting.done && memory.status().pending === 0, "waiter released and failing calls drained");
+  expect(waiting.value).toBe(false);
+  expect(waiting.error).toBeUndefined();
+  expect(memory.render()).toContain(`0+1|${PLACEHOLDER}`);
+  expect(memory.render()).not.toContain("a long user message");
+  expect(memory.zoom(0, 1).text).toBe("[m0] a long user message");
+  expect(clock.delays).toEqual([3_600]);
+  expect(reports).toEqual(["OptChat compaction paused for at least 0.9 s: HTTP 429"]);
+
+  for (let i = 3; i < 40; i++) memory.append("user", `[m${i}] a long user message`);
+  expect(await memory.settle()).toBe(false);
+  clock.advance(3_599);
+  await flush();
+  expect(model.calls).toHaveLength(3);
+  expect(clock.delays).toEqual([1]);
+  clock.advance(1);
+  await until(() => model.calls.length === 4, "timer starts the probe without another append");
+  await flush();
+  expect(model.labels()).toEqual(["[m0]"]);
+  expect(clock.delays).toEqual([]);
+  expect(store.nodes.size).toBe(0);
+
+  model.take("[m0]").resolve(leafReply("s0"));
+  await until(() => model.open().length === 3, "probe restores three slots");
+  expect(model.labels()).toEqual(["[m1]", "[m2]", "[m3]"]);
+  expect(reports).toHaveLength(1);
+});
+
+test("old in-flight pages neither reset the pause nor start a new compressor call", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const clock = new BackoffClock();
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16, pageBytes: 32, jobs: 3, backoffClock: clock, backoffRandom: () => 0,
+    report: () => {},
+  });
+  memory.append("user", "[m0] a long user message");
+  memory.append("user", "[m1] " + "paged input ".repeat(10));
+  memory.append("user", "[m2] a long user message");
+  const waiting = track(memory.settle());
+  await until(() => model.open().length === 3, "initial calls");
+  model.take("[m0]").reject(new Error("network offline"));
+  await until(() => waiting.done, "settle returns even while two older calls are held");
+  expect(waiting.value).toBe(false);
+  model.take("[m1]").resolve("page summary");
+  await flush();
+  expect(model.calls).toHaveLength(3);
+  expect(clock.delays).toEqual([800]);
+  expect(store.nodes.size).toBe(0);
+
+  clock.advance(800);
+  await flush();
+  expect(model.calls).toHaveLength(3); // the probe must wait for the last old call
+  model.take("[m2]").resolve(leafReply("s2"));
+  await until(() => model.calls.length === 4, "probe after the last old call drains");
+  await flush();
+  expect(model.labels()).toEqual(["[m0]"]);
+  model.take("[m0]").resolve(leafReply("s0"));
+  await until(() => model.open().length === 1, "paged node restarts");
+  expect(model.take("[m1]").request.instruction).toContain("part 1, source bytes 0 to 32");
+});
+
+test("a failed optional merge does not make a fully built view unsettled", async () => {
+  const store = await openStore();
+  seedTree(store, 2, (l, i) => l === 0 ? summary(`s${i}`) : undefined);
+  const model = new Model();
+  const clock = new BackoffClock();
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16, backoffClock: clock, backoffRandom: () => 1, report: () => {},
+  });
+  await until(() => model.open().length === 1, "optional merge call");
+  const before = memory.render();
+  model.take("[s0]", "[s1]").reject(new Error("provider unavailable"));
+  await until(() => clock.delays.length === 1, "optional merge pauses the compressor");
+  expect(await memory.settle()).toBe(true);
+  expect(memory.render()).toBe(before);
+  expect(clock.delays).toEqual([1_000]);
+});
+
+test("retry delays grow to the local ceiling, then start over after success", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const clock = new BackoffClock();
+  const reports: string[] = [];
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16, jobs: 1, backoffClock: clock, backoffRandom: () => 1,
     report: (message) => reports.push(message),
   });
   memory.append("user", "[m0] a long user message");
-  await until(() => model.open().length === 1, "leaf call");
-  model.take("[m0]").reject(Object.create(null)); // String() of it throws
-  await until(() => reports.length === 1, "failure report");
-  expect(reports[0]).toContain("unprintable error");
-
-  memory.append("talk", "[m1] a second long message");
-  await until(() => model.open().some((call) => label(call) === "[m0]"), "retry call");
+  await until(() => model.open().length === 1, "initial call");
+  for (const [i, delay] of [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 120_000, 120_000].entries()) {
+    model.take("[m0]").reject(i === 0 ? Object.create(null) : new DOMException("timed out", "TimeoutError"));
+    await until(() => clock.delays.length === 1, "failure sets a wakeup");
+    expect(clock.delays).toEqual([delay]);
+    expect(reports).toEqual(["OptChat compaction paused for at least 1 s: unprintable error"]);
+    clock.advance(delay - 1);
+    await flush();
+    expect(model.calls).toHaveLength(i + 1);
+    clock.advance(1);
+    await until(() => model.calls.length === i + 2, "probe after delay");
+  }
   model.take("[m0]").resolve(leafReply("s0"));
-  await until(() => store.nodes.has(nodeKey(0, 0)), "leaf saved");
-  expect(store.nodes.get(nodeKey(0, 0))?.text).toBe(leafLine("s0"));
+  expect(await memory.settle()).toBe(true);
+  expect(clock.delays).toEqual([]);
+  memory.append("user", "[m1] a second long message");
+  await until(() => model.open().length === 1, "new call after recovery");
+  model.take("[m1]").reject(new Error("offline again"));
+  await until(() => clock.delays.length === 1, "new episode");
+  expect(clock.delays).toEqual([1_000]);
+  expect(reports).toHaveLength(2);
+});
+
+test.each([
+  ["can exceed the two-minute local ceiling", 150_000, 150_000],
+  ["is capped at ten minutes even for a multi-hour hint", 6 * 60 * 60_000, 600_000],
+] as const)("Retry-After %s", async (_description, hint, expectedDelay) => {
+  const store = await openStore();
+  const model = new Model();
+  const clock = new BackoffClock();
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16, jobs: 1, backoffClock: clock, backoffRandom: () => 0,
+    report: () => {},
+  });
+  memory.append("user", "[m0] a long user message");
+  await until(() => model.open().length === 1, "initial call");
+  model.take("[m0]").reject(new CompressorProviderError("HTTP 429", 429, hint));
+  expect(await memory.settle()).toBe(false);
+  expect(clock.delays).toEqual([expectedDelay]);
+  clock.advance(expectedDelay - 1);
+  await flush();
+  expect(model.calls).toHaveLength(1);
+  clock.advance(1);
+  await until(() => model.calls.length === 2, "probe starts at the deadline without an append");
+  expect(model.labels()).toEqual(["[m0]"]);
+});
+
+test("abort and ordinary stop do not pause the scheduler", async () => {
+  const store = await openStore();
+  const model = new Model();
+  const clock = new BackoffClock();
+  const reports: string[] = [];
+  const memory = memoryFor(store, model, {
+    nodeBytes: 16, jobs: 1, backoffClock: clock,
+    report: (message) => reports.push(message),
+  });
+  memory.append("user", "[m0] a long user message");
+  memory.append("user", "[m1] a second long message");
+  await until(() => model.open().length === 1, "initial call");
+  model.take("[m0]").reject(new DOMException("cancelled", "AbortError"));
+  await until(() => model.open().some((call) => label(call) === "[m1]"), "next call without pause");
+  model.take("[m1]").resolve(leafReply("s1"));
+  expect(await memory.settle()).toBe(false); // the aborted leaf still awaits an append
+  expect(clock.delays).toEqual([]);
+  expect(reports.every((message) => !message.includes("paused"))).toBe(true);
+  expect(store.nodes.has(nodeKey(0, 1))).toBe(true);
+});
+
+test("close clears a pause timer, contains reporting failure, and ignores late provider results", async () => {
+  const store = await openStore();
+  const model = new Model({ ignoreAbort: true });
+  const clock = new BackoffClock();
+  const unhandled: unknown[] = [];
+  const listener = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", listener);
+  try {
+    const memory = memoryFor(store, model, {
+      nodeBytes: 16, jobs: 2, backoffClock: clock, backoffRandom: () => 0,
+      report: async () => { throw new Error("reporter down"); },
+    });
+    memory.append("user", "[m0] a long user message");
+    memory.append("user", "[m1] a second long message");
+    await until(() => model.open().length === 2, "initial calls");
+    model.take("[m0]").reject(new Error("offline"));
+    await until(() => clock.delays.length === 1, "timer armed");
+    const late = model.take("[m1]");
+    const closing = memory.close();
+    expect(late.signal.aborted).toBe(true);
+    expect(clock.delays).toEqual([]);
+    late.reject(new Error("provider rejected after stop"));
+    await closing;
+    clock.advance(120_000);
+    await macrotasks(2);
+    expect(clock.delays).toEqual([]);
+    expect(memory.status().backoffMs).toBe(0);
+    expect(model.calls).toHaveLength(2);
+    expect(store.nodes.size).toBe(0);
+    expect(unhandled).toEqual([]);
+  } finally {
+    process.off("unhandledRejection", listener);
+  }
 });
 
 test("an async reporter's rejection is contained and the retry proceeds", async () => {
@@ -1290,7 +1500,7 @@ test("an async reporter's rejection is contained and the retry proceeds", async 
     });
     memory.append("user", "[m0] a long user message");
     await until(() => model.open().length === 1, "leaf call");
-    model.take("[m0]").reject(new Error("offline"));
+    model.take("[m0]").reject(new CompressorLocalError("local admission denied"));
     await until(() => reported === 1, "report");
     await macrotasks(2);
     expect(unhandled).toEqual([]);
@@ -1321,7 +1531,7 @@ for (const mode of ["discards", "returns"] as const) {
     });
     memory.append("user", "[m0] a long user message");
     await until(() => model.open().length === 1, "leaf call");
-    model.take("[m0]").reject(new Error("offline"));
+    model.take("[m0]").reject(new CompressorLocalError("local admission denied"));
 
     await until(() => reporter.closing?.done === true, "close started inside the reporter");
     expect(reporter.closing?.error).toBeUndefined();
@@ -1488,7 +1698,7 @@ test("restart reproduces the compactor context of the next summary exactly", asy
   expect(contextBytes(before)).toBeLessThan(60);
 
   const calls = model.calls.length;
-  const failure = new Error("leaf 10 restart-context regression failure");
+  const failure = new CompressorLocalError("leaf 10 restart-context regression failure");
   leaf.reject(failure);
   await until(
     () => reports.some((message) => message.includes(failure.message)) && memory.status().pending === 0,
@@ -1969,6 +2179,7 @@ describe("terminal compressor refusal stand-ins", () => {
   test("leaf refusal saves a bounded UTF-8 source prefix and preserves exact zoom text", async () => {
     const store = await openStore();
     const reports: string[] = [];
+    const clock = new BackoffClock();
     const model = new Model();
     // 語 (3) + 🙂 (4) + é (2) = 9 bytes; the next 漢 spans bytes 9..12.
     // Eleven excerpt bytes must stop before 漢, not emit a replacement character.
@@ -1977,6 +2188,7 @@ describe("terminal compressor refusal stand-ins", () => {
     const memory = memoryFor(store, model, {
       nodeBytes,
       pageBytes: 1_024,
+      backoffClock: clock,
       report: (message) => reports.push(message),
     });
     const message = memory.append("user", original);
@@ -1984,6 +2196,7 @@ describe("terminal compressor refusal stand-ins", () => {
     model.take("compress message 0").reject(new CompressorRefusedError());
 
     expect(await memory.settle()).toBe(true);
+    expect(clock.delays).toEqual([]);
     expect(store.nodes.has(nodeKey(0, message.i))).toBe(true);
     const node = store.nodes.get(nodeKey(0, message.i))!;
     expect(node.text.startsWith(marker)).toBe(true);
@@ -2041,44 +2254,6 @@ describe("terminal compressor refusal stand-ins", () => {
     expect(store.nodes.size).toBe(3);
     await until(() => memory.status().pending === 0, "merge job drained");
     expect(memory.status()).toMatchObject({ messages: 2, nodes: 3, pending: 0, extractive: 1 });
-  });
-
-  test("ordinary HTTP failure saves no stand-in and recovers on the next append", async () => {
-    const store = await openStore();
-    const model = new Model();
-    const reports: string[] = [];
-    const memory = memoryFor(store, model, {
-      nodeBytes: 64,
-      pageBytes: 1_024,
-      report: (message) => reports.push(message),
-    });
-    const original = "[m0] " + "failed raw detail ".repeat(10);
-    memory.append("user", original);
-    await until(() => model.open().length === 1, "initial leaf request");
-    model.take("[m0]").reject(new Error("HTTP 500"));
-
-    expect(await memory.settle()).toBe(false);
-    expect(store.nodes.has(nodeKey(0, 0))).toBe(false);
-    expect(store.nodes.size).toBe(0);
-    expect(memory.status().extractive).toBe(0);
-    expect(reports).toEqual([
-      "OptChat compaction failed at 0+1; retrying on the next appended message: HTTP 500",
-    ]);
-    expect(model.calls).toHaveLength(1);
-
-    memory.append("user", "[m1] " + "new raw detail ".repeat(10));
-    await until(() => model.open().length === 2, "failed leaf retry and new leaf request");
-    expect(inputOf(model.take("[m0]"))).toBe(`user: ${original}`);
-    model.take("[m0]").resolve("recovered leaf");
-    model.take("[m1]").resolve("new leaf");
-    expect(await memory.settle()).toBe(true);
-    expect(store.nodes.get(nodeKey(0, 0))!.text).toBe("user: recovered leaf");
-    expect(store.nodes.get(nodeKey(0, 1))!.text).toBe("user: new leaf");
-    expect(store.nodes.get(nodeKey(1, 0))!.text).toBe("user: recovered leaf\nuser: new leaf");
-    await until(() => memory.status().pending === 0, "recovered merge job drained");
-    expect(memory.status()).toMatchObject({ messages: 2, nodes: 3, pending: 0, extractive: 0 });
-    expect(model.calls).toHaveLength(3);
-    expect(reports).toHaveLength(1);
   });
 
   test("second-page refusal excerpts the whole original rather than the first-page summary", async () => {

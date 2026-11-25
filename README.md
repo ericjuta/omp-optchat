@@ -85,7 +85,7 @@ After a startup conflict, OptChat tries the same directory again at the start of
 
 If the store cannot open for another reason, such as corruption, the session still refuses every prompt until restart. Subagents never open the store and do not conflict.
 
-Advanced overrides are `--optchat-node-bytes`, `--optchat-view-bytes`, `--optchat-jobs`, `--optchat-tries`, and `--optchat-tool-cap`. Their defaults appear below. Version 0.4.0 removed `--optchat-retry-ms` because failed summaries now retry on the next message. Keep the defaults unless measurements justify a change.
+Advanced overrides are `--optchat-node-bytes`, `--optchat-view-bytes`, `--optchat-jobs`, `--optchat-tries`, and `--optchat-tool-cap`. Their defaults appear below. Keep the defaults unless measurements justify a change.
 
 An enabled session refuses inference if `zoom`, `date`, `work`, or `chat_search` is unavailable. This includes host modes that prohibit late tool registration.
 
@@ -273,9 +273,9 @@ New tool-result records use optional strict `metadata.resultFor`, which points t
 
 Short records and child pairs that already fit are free nodes. Longer records use bounded UTF-8 pages. The compressor summarizes each page, then reduces those summaries in bounded groups to one leaf. It skips no source byte and adds no permanent ID. Page summaries are not persisted. After a restart, an unfinished long leaf is recomputed.
 
-Work uses dependency-ready queues, as the upstream specification requires. The tree is never scanned for work. A message's leaf is admitted while fewer than eight earlier leaves remain unbuilt. A merge becomes ready when both halves exist, in any order. At most eight calls run at once.
+Work uses dependency-ready queues, as the upstream specification requires. The tree is never scanned for work. A message's leaf is admitted while fewer than eight earlier leaves remain unbuilt. A merge becomes ready when both halves exist, in any order. At most eight compressor jobs run at once by default (`--optchat-jobs`).
 
-Each summary gets five shortening attempts with bounded feedback. OptChat keeps the shortest whole reply. If no attempt fits a 16 KB safety ceiling, the summary fails instead of being cut. A failed call releases its slot immediately and retries on the next appended message. There are no idle retry timers.
+Each summary gets five shortening attempts with bounded feedback. OptChat keeps the shortest whole reply. If no attempt fits a 16 KB safety ceiling, the summary fails instead of being cut. A local failure, such as an invalid summary that exhausts these attempts, retries on the next appended message.
 
 ### Refusals
 
@@ -285,9 +285,15 @@ OptChat retries that compaction once with the session's main model, under the sa
 
 If the main model also refuses, or is the compressor itself, OptChat commits a deterministic excerpt of the node's source. The excerpt starts with `[unsummarized: compressor refused]` and fits the node's byte budget. This stand-in helps navigation but is not a model summary. `zoom` returns the originals. The tree continues so later prompts are not refused.
 
-Other provider errors retain retry-on-next-message behavior: transport, HTTP, rate limit, aborts, and length errors. Each fallback is reported once. `/optchat status` counts main-model retries and stand-ins.
+`/optchat status` counts main-model retries and stand-ins. A terminal refusal or cancellation does not start a pause.
 
-A model turn waits for summaries instead of seeing partial source text. OptChat reports compression failures. Cancel a wait if the provider is unavailable. History that the plugin already accepted remains stored.
+### Provider failures
+
+HTTP, network, and timeout failures pause new compressor calls in this session. The first pause lasts 0.8–1 second. The delay doubles on consecutive provider failures, with jitter and a two-minute ceiling on the local delay. An exposed `Retry-After` can extend the pause to at most ten minutes. OptChat reports the first pause once per outage, and `/optchat status` shows the current pause.
+
+Appends remain durable but cannot start new calls during the pause. Failed nodes stay queued. A timer starts recovery without another append. After the deadline and once older jobs finish, one call probes the provider. A successful probe resets the delay and restores the configured concurrency. Closing or resetting the chat cancels the timer.
+
+If a fresh turn needs missing summaries during the pause, OptChat refuses it promptly and saves the prompt unanswered. No main-model request is sent, and no long source text, truncated history, or placeholder is sent in place of a summary. If the view is already complete, the turn can use it even if an optional merge failed.
 
 OptChat does not write reasoning/thinking to its log. Ordinary tool-result text has a 30,000-character cap that retains the head and tail. Registered memory tools enforce their own bounds and are exempt from this cap. Their citations and JSON envelopes therefore remain intact.
 

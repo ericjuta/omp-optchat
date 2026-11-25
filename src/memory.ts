@@ -34,6 +34,23 @@ export class CompressorRefusedError extends Error {
   }
 }
 
+/** A failed provider request. Some SDK paths expose neither status nor a retry hint. */
+export class CompressorProviderError extends Error {
+  constructor(message: string, readonly status?: number, readonly retryAfterMs?: number) {
+    super(message);
+    this.name = "CompressorProviderError";
+  }
+}
+
+/** No provider failure occurred: for example, local admission denied a send or the reply contained a tool. */
+export class CompressorLocalError extends Error {}
+
+interface BackoffClock {
+  now(): number;
+  /** Schedule one wakeup and return its cancellation function. */
+  schedule(wake: () => void, delayMs: number): () => void;
+}
+
 export interface MemoryOptions {
   nodeBytes?: number;
   viewBytes?: number;
@@ -51,6 +68,10 @@ export interface MemoryOptions {
   hint?: (source: { kind: Kind; text: string }, signal: AbortSignal) => Promise<string | undefined>;
   /** Bound for one hint call, in milliseconds; default 2000. */
   hintTimeoutMs?: number;
+  /** Monotonic milliseconds and wakeups for provider backoff. */
+  backoffClock?: BackoffClock;
+  /** A sample in [0, 1] for jitter; defaults to Math.random. */
+  backoffRandom?: () => number;
 }
 
 export interface ViewPart {
@@ -141,6 +162,28 @@ interface Compactor {
 /** Level-0 nodes admitted but not yet built, at most this many, regardless of `jobs`. */
 const ADMISSION_WINDOW = 8;
 const MIN_PAGE_BYTES = 4;
+const BACKOFF_BASE_MS = 1_000;
+const BACKOFF_MAX_MS = 120_000;
+const RETRY_AFTER_MAX_MS = 10 * 60_000;
+const BACKOFF_MAX_FAILURES = 1 + Math.ceil(Math.log2(BACKOFF_MAX_MS / BACKOFF_BASE_MS));
+const RETRY_AFTER_BACKOFF = Symbol("retry compaction after provider backoff");
+const BACKOFF_CLOCK: BackoffClock = {
+  now: () => performance.now(),
+  schedule(wake, delayMs) {
+    const timer = setTimeout(wake, delayMs);
+    timer.unref();
+    return () => clearTimeout(timer);
+  },
+};
+
+function failureDetail(error: unknown): string {
+  // Rejection values are arbitrary: formatting itself may throw.
+  try {
+    return String(error instanceof Error ? error.message : error);
+  } catch {
+    return "unprintable error";
+  }
+}
 /** Marks and joins a source-derived stand-in: an excerpt of the source, never a summary. */
 const EXTRACTIVE_MARK = "[unsummarized: compressor refused] ";
 const EXTRACTIVE_JOIN = " | ";
@@ -449,8 +492,8 @@ function positive(value: number | undefined, fallback: number, name: string): nu
  * Scheduling: a level-0 leaf is admitted while fewer than ADMISSION_WINDOW
  * admitted leaves are unbuilt. Higher nodes enter the ready queue when both
  * children are built, so out-of-order parents never wait on unrelated branches.
- * A failed call releases its job slot and is retried only when the next message
- * is appended; no timers are used.
+ * Provider failures pause new calls, then retry from the ready queue with one
+ * probe at a time. Failures outside the provider still wait for an append.
  */
 export class Memory {
   private readonly nodeBytes: number;
@@ -468,12 +511,17 @@ export class Memory {
   private readonly report: (message: string) => void;
   private readonly hint: MemoryOptions["hint"];
   private readonly hintTimeoutMs: number;
+  private readonly backoffClock: BackoffClock;
+  private readonly backoffRandom: () => number;
+  /** Present from the first provider failure until a successful probe. */
+  private backoff?: { failures: number; until: number; probe?: AbortSignal };
+  private cancelBackoffWake?: () => void;
   private view: ViewPart[] = [];
   private bytes = 0;
   private compacting = false;
   private compactor: Compactor = { length: 0, parts: [], bytes: 0, pending: true };
   private readonly busy = new Map<string, Job>();
-  /** Failed nodes awaiting the next append. */
+  /** Non-provider failures awaiting the next append. */
   private readonly failed = new Map<string, ViewPart>();
   private readonly reported = new Set<string>();
   /** Nodes committed as source-derived stand-ins after a terminal compressor refusal, this process. */
@@ -517,6 +565,8 @@ export class Memory {
     this.report = options.report ?? ((message) => console.error(message));
     this.hint = options.hint;
     this.hintTimeoutMs = positive(options.hintTimeoutMs, 2_000, "hintTimeoutMs");
+    this.backoffClock = options.backoffClock ?? BACKOFF_CLOCK;
+    this.backoffRandom = options.backoffRandom ?? Math.random;
 
     const snapshot = store.viewSnapshot;
     this.view = snapshot?.parts.map(([l, i]) => ({ l, i })) ?? [];
@@ -544,7 +594,7 @@ export class Memory {
   append(kind: Kind, text: string, date?: Date, metadata?: MessageMetadata): Message {
     if (this.stopped) throw new Error("Memory is closed");
     const message = this.store.append(kind, text, date, metadata);
-    // A new message is the only trigger that retries failed calls.
+    // A new message retries local failures. Provider failures already have a timer.
     for (const part of this.failed.values()) this.enqueue(part);
     this.failed.clear();
     this.commit([...this.view, { l: 0, i: message.i }]);
@@ -558,8 +608,8 @@ export class Memory {
   }
 
   /**
-   * Resolves true once every message is built, false once nothing can progress
-   * until the next append (failed calls stall their branch), or false on abort.
+   * Resolves true once every message is built, or false on abort, provider
+   * pause, or when a failed branch cannot progress until the next append.
    */
   settle(signal?: AbortSignal): Promise<boolean> {
     if (this.stopped || signal?.aborted) return Promise.resolve(false);
@@ -773,6 +823,8 @@ export class Memory {
   close(): Promise<void> {
     if (this.closing) return this.closing;
     this.stopped = true;
+    this.clearBackoffWake();
+    this.backoff = undefined;
     this.wake(false);
     const jobs = [...this.busy.values()];
     // Assign before aborting: an abort listener may synchronously call close.
@@ -785,6 +837,7 @@ export class Memory {
     messages: number;
     nodes: number;
     pending: number;
+    backoffMs: number;
     viewBytes: number;
     parts: number;
     extractive: number;
@@ -797,6 +850,7 @@ export class Memory {
       messages: this.store.messages.length,
       nodes: this.store.nodes.size,
       pending: this.busy.size,
+      backoffMs: this.backoffRemaining(),
       viewBytes: this.bytes,
       parts: this.view.length,
       extractive: this.extractiveNodes,
@@ -929,9 +983,10 @@ export class Memory {
     for (const finish of this.waiters) finish(settled);
   }
 
-  /** Settled: true when built through the end; false when nothing can run. */
+  /** Do not make a turn with unbuilt leaves wait for the backoff deadline. */
   private outcome(): boolean | undefined {
     if (this.first === this.store.messages.length) return true;
+    if (this.backoffRemaining() > 0) return false;
     if (this.busy.size === 0 && this.readyHead === this.ready.length) return false;
     return undefined;
   }
@@ -994,7 +1049,18 @@ export class Memory {
   private pump(): void {
     if (this.stopped) return;
     this.admit();
-    while (this.busy.size < this.jobs && this.readyHead < this.ready.length) {
+    const remaining = this.backoffRemaining();
+    if (remaining > 0) {
+      this.cancelBackoffWake ??= this.backoffClock.schedule(() => {
+        this.cancelBackoffWake = undefined;
+        this.pump();
+      }, remaining);
+    } else {
+      this.clearBackoffWake();
+    }
+    // Drain older in-flight jobs before the probe, even if the deadline has passed.
+    const cap = remaining > 0 ? 0 : this.backoff ? 1 : this.jobs;
+    while (this.busy.size < cap && this.readyHead < this.ready.length) {
       const part = this.ready[this.readyHead++]!;
       const key = nodeKey(part.l, part.i);
       this.queued.delete(key);
@@ -1015,6 +1081,7 @@ export class Memory {
 
   private start(part: ViewPart, key: string): void {
     const controller = new AbortController();
+    if (this.backoff) this.backoff.probe = controller.signal;
     // Defer build until job.done is published: providers may call close during
     // their synchronous preamble, and close must await their actual promise.
     const work = Promise.resolve().then(() => this.build(part, controller.signal));
@@ -1038,26 +1105,75 @@ export class Memory {
   }
 
   private fail(part: ViewPart, error: unknown): void {
+    if (error === RETRY_AFTER_BACKOFF) {
+      this.enqueue(part);
+      return;
+    }
     const key = nodeKey(part.l, part.i);
     this.failed.set(key, part);
     if (this.reported.has(key)) return;
     this.reported.add(key);
-    // Rejection values are arbitrary: formatting itself may throw.
-    let detail = "unprintable error";
-    try {
-      detail = String(error instanceof Error ? error.message : error);
-    } catch {
-      // Keep the fallback; the failure is still recorded.
-    }
     const width = 2 ** part.l;
+    this.notify(`OptChat compaction failed at ${part.i * width}+${width}; retrying on the next appended message: ${failureDetail(error)}`);
+  }
+
+  private notify(message: string): void {
     try {
-      // Detached, not awaited: a reporter may call close(), which awaits this job.
-      void Promise.resolve(
-        this.report(`OptChat compaction failed at ${part.i * width}+${width}; retrying on the next appended message: ${detail}`),
-      ).catch(() => {});
+      // Detached: a reporter may call close(), which awaits in-flight jobs.
+      void Promise.resolve(this.report(message)).catch(() => {});
     } catch {
       // Diagnostics must not break compaction or escape as unhandled work.
     }
+  }
+
+  private backoffRemaining(): number {
+    return this.backoff ? Math.max(0, Math.ceil(this.backoff.until - this.backoffClock.now())) : 0;
+  }
+
+  private clearBackoffWake(): void {
+    this.cancelBackoffWake?.();
+    this.cancelBackoffWake = undefined;
+  }
+
+  private pauseCompressor(error: unknown): void {
+    const previous = this.backoff;
+    const failures = Math.min(BACKOFF_MAX_FAILURES, (previous?.failures ?? 0) + 1);
+    const exponential = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (failures - 1));
+    // Jitter across the top 20% of the interval, including at the ceiling.
+    const jittered = exponential * (0.8 + 0.2 * this.backoffRandom());
+    const hint = error instanceof CompressorProviderError ? error.retryAfterMs : undefined;
+    // Still allow a probe during a multi-hour provider limit or after early recovery.
+    const providerDelay = hint !== undefined && Number.isFinite(hint) ? Math.min(hint, RETRY_AFTER_MAX_MS) : 0;
+    const delay = Math.ceil(Math.max(jittered, providerDelay));
+    const until = Math.max(previous?.until ?? 0, this.backoffClock.now() + delay);
+    if (until !== previous?.until) this.clearBackoffWake();
+    this.backoff = { failures, until };
+    if (!previous) {
+      this.notify(`OptChat compaction paused for at least ${delay / 1_000} s: ${failureDetail(error)}`);
+    }
+  }
+
+  private async callCompressor(request: CompactionRequest, signal: AbortSignal): Promise<string> {
+    // A page or validation retry from an older job must not send during the
+    // pause, or take the probe slot after the deadline. Retry the whole node.
+    if (this.backoff && this.backoff.probe !== signal) throw RETRY_AFTER_BACKOFF;
+    this.compressorCalls++;
+    let reply: string;
+    try {
+      reply = await this.summarize(request, signal);
+    } catch (error) {
+      if (this.stopped || signal.aborted || error instanceof CompressorRefusedError || error instanceof CompressorLocalError ||
+          (error instanceof Error && error.name === "AbortError")) throw error;
+      this.pauseCompressor(error);
+      throw RETRY_AFTER_BACKOFF;
+    }
+    // A pre-pause request that finishes late is not a probe. A successful probe
+    // can reopen the queue even if its node still has pages or retries to run.
+    if (!this.stopped && !signal.aborted && this.backoff?.probe === signal) {
+      this.backoff = undefined;
+      this.schedulePump();
+    }
+    return reply;
   }
 
   private async build(part: ViewPart, signal: AbortSignal): Promise<void> {
@@ -1081,7 +1197,7 @@ export class Memory {
       try {
         summary = await this.summarizeLong(part, input, signal);
       } catch (error) {
-        // Only a terminal compressor refusal becomes a stand-in; other failures keep the append-driven retry.
+        // Only a terminal compressor refusal becomes a stand-in.
         if (!(error instanceof CompressorRefusedError) || this.stopped || signal.aborted) throw error;
         summary = this.extractive(part, left, right);
         degraded = true;
@@ -1245,16 +1361,7 @@ export class Memory {
 
   private reportExtractive(part: ViewPart): void {
     const width = 2 ** part.l;
-    try {
-      // Detached, as failure reports are: a reporter may call close(), which awaits this job.
-      void Promise.resolve(
-        this.report(
-          `unsummarized at ${part.i * width}+${width}: the compressor refused it; stored a marked source excerpt (zoom returns the originals)`,
-        ),
-      ).catch(() => {});
-    } catch {
-      // Diagnostics must not break compaction.
-    }
+    this.notify(`unsummarized at ${part.i * width}+${width}: the compressor refused it; stored a marked source excerpt (zoom returns the originals)`);
   }
 
   /**
@@ -1289,9 +1396,8 @@ export class Memory {
     let overlong = 0;
     for (let attempt = 0; attempt < this.tries; attempt++) {
       if (this.stopped || signal.aborted) return undefined;
-      this.compressorCalls++;
       const meta: CompactionRequest["meta"] = { node: info.node, attempt: attempt + 1, retry };
-      const reply = (await this.summarize({ context, instruction, feedback, meta }, signal)).trim();
+      const reply = (await this.callCompressor({ context, instruction, feedback, meta }, signal)).trim();
       if (this.stopped || signal.aborted) return undefined;
       if (!reply) throw new Error("Compactor returned an empty summary");
       const head = replyHead(reply, own);

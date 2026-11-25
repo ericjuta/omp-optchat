@@ -64,7 +64,7 @@ import {
 } from "./metrics.js";
 import { captureWaitReports, captureWorkReports, type ArtifactPathSource, type CapturedWorkReport } from "./reports.js";
 import { parseCoordination, type ImageAttachment, type ImageMimeType, type MessageMetadata, type WorkMetadata } from "./archive.js";
-import { CompressorRefusedError, Memory, type CompactionRequest, type Summarize } from "./memory.js";
+import { CompressorLocalError, CompressorProviderError, CompressorRefusedError, Memory, type CompactionRequest, type Summarize } from "./memory.js";
 import { HOST_COMPACTION_SUMMARY, hostCompactionSummaryInTurn, VIEW_DOC } from "./prompts.js";
 import { nextArchivePath, Store, StoreLeaseConflictError, type Kind, type Message } from "./store.js";
 import { boundedGateError, hostJudge, judgeWithin, sessionFallbackOf, utf8Length, type JudgeFactory, type NamedJudge } from "./system1/judge.js";
@@ -190,6 +190,36 @@ class Refusal extends Error {
 /** pi-ai reports a provider refusal (Anthropic `stop_reason: refusal`) as stopReason "error" with an errorMessage beginning "Refusal". */
 function isProviderRefusal(reply: AssistantMessage): boolean {
 	return reply.stopReason === "error" && (reply.errorMessage ?? "").startsWith("Refusal");
+}
+
+/** Retry-After is seconds or an HTTP date. Some transports report a millisecond header instead. */
+function retryAfterHeader(headers: unknown): number {
+	if (!(headers instanceof Headers) && !wireObject(headers)) return 0;
+	let delay = 0;
+	const fields = headers instanceof Headers ? headers.entries() : Object.entries(headers);
+	for (const [key, value] of fields) {
+		if (typeof value !== "string" || !value.trim()) continue;
+		const name = key.toLowerCase();
+		if (name !== "retry-after" && name !== "retry-after-ms") continue;
+		const numeric = Number(value);
+		const ms = name === "retry-after-ms" ? numeric
+			: Number.isNaN(numeric) ? Date.parse(value) - Date.now() : numeric * 1_000;
+		if (Number.isFinite(ms)) delay = Math.max(delay, ms);
+	}
+	return delay;
+}
+
+function compressorFailure(model: Model, status: number | undefined, text: string | undefined, headerMs: number): CompressorProviderError {
+	// pi-ai may not expose failed HTTP responses through onResponse. Its error
+	// formatter can append this suffix to the unbounded errorMessage instead.
+	const hint = Number(/(?:^|\s)retry-after-ms=(\d+(?:\.\d+)?)(?=\s|$)/i.exec(text ?? "")?.[1]);
+	const retryAfterMs = Math.max(headerMs, Number.isFinite(hint) ? hint : 0);
+	const detail = boundedProviderError(text);
+	return new CompressorProviderError(
+		`${model.provider}/${model.id} request failed${status === undefined ? "" : ` (HTTP ${status})`}${detail ? `: ${detail}` : ""}`,
+		status,
+		retryAfterMs,
+	);
 }
 
 /** Keep the head and tail of a long tool result, with a note of what was cut; never longer than `cap`. */
@@ -1153,10 +1183,11 @@ class OptChat {
 	/** Compressor call: the host's shared system/tools, then its view, task and feedback. No tool executor is installed. */
 	private readonly summarize: Summarize = (request, parentSignal) => {
 		const signal = AbortSignal.any([parentSignal, this.cacheFence.signal]);
-		if (signal.aborted) return Promise.reject(new Error("Compressor call cancelled"));
+		const cancelled = () => new DOMException("Compressor call cancelled", "AbortError");
+		if (signal.aborted) return Promise.reject(cancelled());
 		const { promise, resolve: done, reject } = Promise.withResolvers<string>();
 		// Shutdown must not wait on a provider that ignores cancellation.
-		const cancel = () => reject(new Error("Compressor call cancelled"));
+		const cancel = () => reject(cancelled());
 		signal.addEventListener("abort", cancel, { once: true });
 		this.compress(request, signal)
 			.then(done, reject)
@@ -1205,8 +1236,7 @@ class OptChat {
 	private async compress(request: CompactionRequest, signal: AbortSignal): Promise<string> {
 		const compressor = this.compressor;
 		const ctx = this.ctx;
-		if (!compressor || !ctx) throw new Error("Compressor model is not configured");
-		let model = compressor;
+		if (!compressor || !ctx) throw new CompressorLocalError("Compressor model is not configured");
 		let reply = await this.compressorReply(compressor, ctx, request, signal);
 		if (isProviderRefusal(reply)) {
 			const main = this.mainFallback(compressor, ctx);
@@ -1218,13 +1248,12 @@ class OptChat {
 					`OptChat: the compressor ${compressor.provider}/${compressor.id} refused a compaction; retrying it once with the main model ${main.provider}/${main.id}.`,
 					"warning",
 				);
-				model = main;
 				reply = await this.mainFallbackReply(main, ctx, request, signal);
 			}
 			// Still refused, or no distinct main model: Memory commits a source-derived stand-in for this node.
 			if (isProviderRefusal(reply)) throw new CompressorRefusedError();
 		}
-		return this.summaryText(model, reply);
+		return this.summaryText(reply);
 	}
 
 	/**
@@ -1316,11 +1345,20 @@ class OptChat {
 		const selector = `${model.provider}/${model.id}`;
 		signal.throwIfAborted();
 		const admit = this.policy.admit?.bind(this.policy);
-		if (admit && !(await waiting(() => admit(selector)))) throw new Error("compressor call was not admitted");
+		const allowed = async () => {
+			try {
+				return !admit || await waiting(() => admit(selector));
+			} catch {
+				return false;
+			}
+		};
+		if (admit && !(await allowed())) throw new CompressorLocalError("compressor call was not admitted");
 		// Admission may have outlived a cancellation or deadline: an abandoned call sends nothing.
 		signal.throwIfAborted();
 		let admitted = true;
 		let sends = 0;
+		let retryAfterMs = 0;
+		let responseStatus: number | undefined;
 		const reply = await completeSimple(
 			model,
 			{
@@ -1339,13 +1377,15 @@ class OptChat {
 				onPayload: async (payload, payloadModel, attemptSignal) => {
 					// Auth/provider retries must release their own previous attempt before waiting.
 					finish();
+					retryAfterMs = 0;
+					responseStatus = undefined;
 					// An abandoned attempt (cancelled or lapsed) is never counted, admitted, leased, or sent.
 					signal.throwIfAborted();
 					// The first payload is the attempt admitted above; each retry is admitted before its send.
 					sends += 1;
 					if (sends > 1) {
-						admitted = admit ? await waiting(() => admit(selector)) : true;
-						if (!admitted) throw new Error("compressor call was not admitted");
+						admitted = await allowed();
+						if (!admitted) throw new CompressorLocalError("compressor call was not admitted");
 					}
 					signal.throwIfAborted();
 					const actualModel = payloadModel ?? model;
@@ -1362,24 +1402,35 @@ class OptChat {
 					}
 					return encoded;
 				},
-				onResponse: (response) => finish(response.status >= 200 && response.status < 300),
+				onResponse: (response) => {
+					const ok = response.status >= 200 && response.status < 300;
+					retryAfterMs = retryAfterHeader(response.headers);
+					responseStatus = ok ? undefined : response.status;
+					finish(ok);
+				},
 			},
-		).finally(() => finish());
+		).catch((error: unknown) => {
+			if (signal.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
+			if (!admitted) throw new CompressorLocalError("compressor call was not admitted");
+			const status = wireObject(error) && typeof error.status === "number" ? error.status : responseStatus;
+			const headers = wireObject(error) ? error.headers : undefined;
+			const text = error instanceof Error ? error.message : typeof error === "string" ? error : undefined;
+			throw compressorFailure(model, status, text, Math.max(retryAfterMs, retryAfterHeader(headers)));
+		}).finally(() => finish());
 		// A refused attempt was never sent: it is not a completed call and writes no metric line.
-		if (!admitted) throw new Error("compressor call was not admitted");
+		if (!admitted) throw new CompressorLocalError("compressor call was not admitted");
 		this.observeUsage(model, reply, request, performance.now() - started, waitMs);
+		if (reply.stopReason === "aborted") throw new DOMException(`${model.provider}/${model.id} request was aborted`, "AbortError");
+		if (reply.stopReason === "error" && !isProviderRefusal(reply)) {
+			throw compressorFailure(model, reply.errorStatus ?? responseStatus, reply.errorMessage, retryAfterMs);
+		}
 		return reply;
 	}
 
-	/** The summary text of a completed reply. Provider errors, aborts and tool calls are never summaries. */
-	private summaryText(model: Model, reply: AssistantMessage): string {
-		if (reply.stopReason === "error" || reply.stopReason === "aborted") {
-			const status = reply.errorStatus === undefined ? "" : ` (HTTP ${reply.errorStatus})`;
-			const detail = boundedProviderError(reply.errorMessage);
-			throw new Error(`${model.provider}/${model.id} request ${reply.stopReason === "error" ? "failed" : "was aborted"}${status}${detail ? `: ${detail}` : ""}`);
-		}
+	/** Compressor tool calls are never summaries. No tool calls are dispatched. */
+	private summaryText(reply: AssistantMessage): string {
 		if (reply.stopReason === "toolUse" || reply.content.some((part) => part.type === "toolCall")) {
-			throw new Error("Compressor returned a tool call instead of a summary; no tool calls were dispatched");
+			throw new CompressorLocalError("Compressor returned a tool call instead of a summary; no tool calls were dispatched");
 		}
 		return reply.content
 			.filter((part): part is TextContent => part.type === "text")
@@ -1775,19 +1826,19 @@ class OptChat {
 			this.logNew(tail);
 			if (job.abandoned) return undefined;
 			if (this.state.kind !== "ready") throw new Refusal("memory-closed", "OptChat refused the request: memory is closed.");
-			// Only the deadline aborts this wait. A false settle without it is a failed summary, retried on the next append.
+			// A failed summary ends this wait without waiting for the next compressor attempt.
 			if (!job.controller.signal.aborted) {
 				throw new Refusal(
 					"summary-failed",
-					"OptChat: a memory summary failed and is retried only when the next message is saved, so nothing was sent. " +
-						"Your message is saved in the chat log, unanswered. Send it again to retry the summary.",
+					"OptChat: a memory summary failed, so nothing was sent. Your message is saved in the chat log, unanswered. " +
+						"Resend after the summaries are ready.",
 				);
 			}
 			throw new Refusal(
 				"settle-timeout",
 				`OptChat: the memory summaries were not ready after ${Math.round(this.settleTimeoutMs / 1000)} s, so nothing was sent. ` +
-					"Your message is saved in the chat log, unanswered. The compressor keeps working in the background; " +
-					"resend once /optchat status shows no pending work.",
+					"Your message is saved in the chat log, unanswered. Compression continues in the background. " +
+					"Check /optchat status before resending.",
 			);
 		}
 		const first = tail[0];
@@ -2263,6 +2314,7 @@ class OptChat {
 				`view: ${status.parts} lines, ${status.viewBytes} of ${this.config!.viewBytes} bytes`,
 				`compressor fallbacks: ${this.mainRetries} main-model retries; ${status.extractive} unsummarized stand-ins`,
 			);
+			if (status.backoffMs > 0) lines.push(`compressor: paused (next attempt in about ${Math.ceil(status.backoffMs / 1_000)} s or later)`);
 			// Shown once the compressor has run, so an idle status stays unchanged.
 			if (status.compressorCalls > 0) {
 				lines.push(
