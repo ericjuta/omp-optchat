@@ -78,6 +78,11 @@ function content(message: ObjectValue): string {
     return typeof part.text === "string" ? part.text : "";
   }).join("\n");
 }
+// The real host may prepend its date/cwd reminder to a user turn. Strip only that exact envelope.
+const HOST_REMINDER = /^<system-reminder>\nToday: \d{4}-\d{2}-\d{2}; current working directory: '[^'\n]+'\. Do not repeat this information in your reply\.\n<\/system-reminder>\n/;
+function userText(message: ObjectValue): string {
+  return content(message).replace(/<chat>[\s\S]*?<\/chat>/g, "").trim().replace(HOST_REMINDER, "");
+}
 function view(body: ObjectValue): string {
   const found = messages(body).flatMap((message) => [...content(message).matchAll(/<chat>([\s\S]*?)<\/chat>/g)]);
   assert.equal(found.length, 1, "request must contain exactly one settled <chat> snapshot");
@@ -87,7 +92,7 @@ function assertSnapshot(body: ObjectValue, current: string, previous: readonly s
   const snapshot = view(body);
   assert(!snapshot.includes(current), "snapshot must be taken before the current user is appended");
   const requestMessages = messages(body);
-  const outside: ObjectValue[] = requestMessages.map((message) => ({ ...message, content: content(message).replace(/<chat>[\s\S]*?<\/chat>/g, "").trim() }));
+  const outside: ObjectValue[] = requestMessages.map((message) => ({ ...message, content: userText(message) }));
   assert.equal(outside.filter((message) => message.role === "user" && message.content === current).length, 1, "current user must appear exactly once");
   const snapshotIndex = requestMessages.findIndex((message) => /<chat>[\s\S]*?<\/chat>/.test(content(message)));
   const currentIndex = outside.findIndex((message) => message.role === "user" && message.content === current);
@@ -164,11 +169,11 @@ function answer(body: ObjectValue): Response {
   const current = requestMessages.filter((message) => message.role === "user").at(-1);
   assert(current, "current user required");
   // Support the host's separate snapshot message as well as prepended user-content blocks.
-  const candidates = requestMessages.filter((message) => message.role === "user").map((message) => content(message).replace(/<chat>[\s\S]*?<\/chat>/g, "").trim());
+  const candidates = requestMessages.filter((message) => message.role === "user").map(userText);
   // Tool-returned images may be encoded in a new trailing user message. The original fixture
   // request remains the last user text with an exact known runtime marker.
   const runtimePrompts = [AFTER_SIDE, WORK_READY, WORK_USER, IMAGE_USER, IMAGE_READ, CHILD_USER, EVIDENCE_SEED, EVIDENCE_USER];
-  const prompt = candidates.findLast((text) => runtimePrompts.includes(text)) ?? content(current).replace(/<chat>[\s\S]*?<\/chat>/g, "").trim();
+  const prompt = candidates.findLast((text) => runtimePrompts.includes(text)) ?? userText(current);
   if (currentPhase.startsWith("inactive ")) {
     // The real host prepends its date/cwd reminder as a separate text part.
     // Admit only that exact envelope, never arbitrary prefixes around the marker.
@@ -532,7 +537,7 @@ async function runtimeCases(executable: string, baseArgs: string[], workspace: s
   await bounded("media restoration host shutdown", restored.stop());
 
   currentPhase = "real task child memory handoff";
-  const childArgs = baseArgs.filter((arg) => arg !== "--no-tools" && arg !== "--no-optchat-child-pack");
+  const childArgs = baseArgs.filter((arg) => arg !== "--no-optchat-child-pack");
   const parent = new Host(executable, [...childArgs, "--tools", "task", "--optchat-child-view", "--optchat-dir", memory], workspace, env);
   await parent.prompt(CHILD_USER);
   assert(childRetrieved, "actual task child must execute zoom over frozen parent memory");
@@ -627,7 +632,8 @@ async function main(): Promise<void> {
     const linked = await bounded("isolated plugin link", link.exited);
     assert.equal(linked.code, 0, `isolated plugin link failed: ${link.diagnostics}`);
     const baseArgs = [
-      "--mode", "rpc", "--no-ui", "--no-title", "--no-tools", "--no-skills", "--no-rules",
+      // No --no-tools: OMP 19 rejects it with -e and it disables extensions. Built-in tools stay registered and unused.
+      "--mode", "rpc", "--no-ui", "--no-title", "--no-skills", "--no-rules",
       "--config", fixtureConfig,
       "--session-dir", join(temporary, "sessions"),
       "-e", join(ROOT, "scripts", "fixture-provider.ts"),
