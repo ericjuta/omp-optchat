@@ -885,6 +885,8 @@ class Fixture {
 /** Settings overrides: no compaction, retry, advisor, autolearn, memory backend, goal, TTSR, titles or image side calls. */
 const HOST_SETTINGS = {
   enabledModels: [`${PROVIDER}/*`, `${ANTHROPIC_PROVIDER}/*`],
+  // The session option changed type between SDK versions (boolean, then a mode name); the setting is the same in both.
+  "providers.cacheWarming": "off",
   "compaction.enabled": false,
   "compaction.midTurnEnabled": false,
   "compaction.asyncEnabled": false,
@@ -1174,7 +1176,6 @@ class Host {
         interactivePrompts: false,
         skipPythonPreflight: true,
         bindProcessState: false,
-        cacheWarming: false,
         thinkingLevel: ThinkingLevel.Low,
       });
       const notices: Notice[] = [];
