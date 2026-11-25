@@ -2,7 +2,8 @@
 
 ## 0.16.8 — 2026-11-25
 
-- The real-OMP smoke runs on OMP 19.2.0 as well as the pinned 18.10.3. OMP 19 rejects `--no-tools` together with `-e`, so the smoke no longer passes it, and it accepts the host's date and directory reminder in front of a user turn.
+- The real-OMP smoke runs on OMP 19.2.0 as well as the pinned 18.10.3. OMP 19 rejects `--no-tools` together with `-e`, so the smoke no longer passes it, and it accepts the host's date and directory reminder in front of a user turn. The host tests no longer use a session option and a setting that changed in OMP 19.
+- Known limitation: the evidence benchmark runner (`scripts/evidence`) does not launch on OMP 19, which rejects its `--no-tools` plus `-e` launch. It still runs on the pinned 18.10.3. The plugin itself is unaffected.
 
 - Provider failures pause new compressor calls and retry queued nodes on a timer, without waiting for an append. The jittered local delay grows to at most two minutes. A provider `Retry-After` can extend the pause to at most ten minutes. One successful probe restores normal concurrency. A turn that needs missing summaries is still refused promptly and saved unanswered.
 

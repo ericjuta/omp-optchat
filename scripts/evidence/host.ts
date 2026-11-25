@@ -250,7 +250,9 @@ export async function queryAvailableModels(
 	extensions: readonly string[] = [],
 ): Promise<{ provider: string; id: string }[]> {
 	const extensionFlags = extensions.flatMap((path) => ["-e", path]);
-	const child = spawn(omp, [...ISOLATION_FLAGS, ...extensionFlags, "--session-dir", sessionDir], { cwd, env: { ...env }, stdio: "pipe", detached: true });
+	// A listing sends no prompt, so it needs no tool restriction; OMP 19 rejects `--no-tools` with `-e`.
+	const listingFlags = ISOLATION_FLAGS.filter((flag) => flag !== "--no-tools");
+	const child = spawn(omp, [...listingFlags, ...extensionFlags, "--session-dir", sessionDir], { cwd, env: { ...env }, stdio: "pipe", detached: true });
 	const exit = Promise.withResolvers<number | null>();
 	child.once("exit", (code) => exit.resolve(code));
 	const exited = exit.promise;

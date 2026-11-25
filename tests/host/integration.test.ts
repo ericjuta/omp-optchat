@@ -248,6 +248,7 @@ interface Libraries {
   completeSimple: typeof completeSimple;
   clampThinkingLevelForModel: typeof clampThinkingLevelForModel;
   cfgCompactionThresholdTokens: typeof cfgCompactionThresholdTokens;
+  lookupSetting: (id: string) => unknown;
 }
 
 /**
@@ -269,11 +270,12 @@ async function loadLibraries(): Promise<Libraries> {
   const { completeSimple } = await import("@oh-my-pi/pi-ai");
   const { clampThinkingLevelForModel } = await import("@oh-my-pi/pi-catalog");
   const { cfgCompactionThresholdTokens } = await import("@oh-my-pi/pi-coding-agent/session/context-settings");
+  const { lookup: lookupSetting } = await import("@oh-my-pi/pi-coding-agent/config/registry");
   // Keep the fake-host schema dependency behind the same child-only loading boundary.
   const zod = await import("zod");
   return {
     sdk, ThinkingLevel, zod, EventBus, initializeExtensions, parseArgs, optchat, viewBlocks, getBundledModels, Store,
-    completeSimple, clampThinkingLevelForModel, cfgCompactionThresholdTokens,
+    completeSimple, clampThinkingLevelForModel, cfgCompactionThresholdTokens, lookupSetting,
   };
 }
 
@@ -902,7 +904,6 @@ const HOST_SETTINGS = {
   "ttsr.judge": "off",
   "title.refreshOnReplan": false,
   "images.describeForTextModels": false,
-  "tools.xdev": false,
   includeWorkspaceTree: false,
 };
 
@@ -1095,7 +1096,9 @@ class Host {
 
   static async start(ctx: CaseContext, options: HostOptions): Promise<Host> {
     const { sdk, ThinkingLevel, EventBus, initializeExtensions, optchat } = ctx.lib;
-    const settings = sdk.Settings.isolated({ ...HOST_SETTINGS, ...options.settings });
+    // OMP 19 removed xd:// devices and rejects the unknown key; older SDKs still need them off.
+    const xdevOff = ctx.lib.lookupSetting("tools.xdev") ? { "tools.xdev": false } : {};
+    const settings = sdk.Settings.isolated({ ...HOST_SETTINGS, ...xdevOff, ...options.settings });
     const auth = await sdk.AuthStorage.create(join(ctx.agentDir, "auth.db"));
     let host: Host | undefined;
     try {
