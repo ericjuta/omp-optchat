@@ -662,6 +662,17 @@ For each strategy, the report shows probes found, agent steps, judge calls, zoom
 
 The 0.7.0 results are in `.scratch/optchat-jev/issues/10-codemode-retrieval.md`. Every summary-navigating strategy found only facts whose topics survived in the view: 3/12 and 5/12 over two seeds. `chat_search` found 12/12. `chat_recall` reached surviving facts in one agent step instead of about 200 zoom calls.
 
+### Retention and view-size report
+
+`bun run evidence:retention <artifact.json>...` reads `evidence:recall` artifacts and prints two tables. It calls no model and starts no host.
+
+- **Retention** is the view arm's correct answers as a share of the whole-history arm's, on the same questions. The whole-history arm is `--arms off` on a main model whose context holds every seeded record. A run whose off arm compacted is left out, because that arm did not read the whole history. There is one row per chat length and view budget, pooled over seeds.
+- **View size** compares two `--view-bytes` budgets over the same corpora, on arm against on arm. It shows correct answers, cost, main prompt tokens and view lines.
+
+The two arms may come from one artifact or from separate runs over the same corpus. Each row gives the per-question split and an exact two-sided sign test. A cost that was not observed prints as `unknown`. Arms pair only when the corpus, main model, turn mode and provider mode match. `--out` writes the report as JSON.
+
+`evals/retention/run.sh <budget> <out-dir> <seed>...` runs the preregistered cells in order under one total dollar budget. A cell starts only when its whole worst-case cap fits what is left. The plan, limits and decision rules are in `evals/retention/prereg-20261125.md`. The corpus is synthetic, and both arms run without the System One gates, so the report says nothing about prefetch or real chats.
+
 ### Experiment options
 
 `--arms on,off` pairs OptChat with plain OMP over the same corpus and questions. The off arm resumes a seeded session with OptChat disabled. It receives no memory tools, and its prompt never mentions them. Native compaction may run inside that session.

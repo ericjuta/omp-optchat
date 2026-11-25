@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validateArtifact } from "../../scripts/evidence/artifact.ts";
+import { readArtifact, retentionReport } from "../../scripts/evidence/retention.ts";
 import { runRecall } from "../helpers/run-recall.ts";
 
 /**
@@ -74,6 +75,15 @@ describe.skipIf(OMP === null)("evidence recall end to end (fixture provider)", (
 
 			const arms = [...new Set(artifact.scenarios.flatMap((scenario: { phases: { arm: string }[] }) => scenario.phases.map((phase) => phase.arm)))].sort();
 			expect(arms).toEqual(["off", "on"]);
+
+			// The offline retention report reads this artifact shape: each compressor's view arm at 4/4 of the one whole-history arm.
+			const read = readArtifact(artifact, out);
+			expect(read.incomplete).toEqual([]);
+			const retention = retentionReport(read.sides);
+			expect(retention.retention.map((row) => [row.baselineRuns, row.on.correct, row.off.correct, row.retention, row.onCostUsd, row.offCostUsd])).toEqual([
+				[1, 4, 4, 1, { lowUsd: 0, highUsd: 0 }, { lowUsd: 0, highUsd: 0 }],
+				[1, 4, 4, 1, { lowUsd: 0, highUsd: 0 }, { lowUsd: 0, highUsd: 0 }],
+			]);
 
 			expect(artifact.paired).toHaveLength(2);
 			for (const pair of artifact.paired) {

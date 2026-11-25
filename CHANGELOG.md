@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added `bun run evidence:retention`, an offline report over `evidence:recall` artifacts. It gives retention (the view arm's correct answers as a share of a whole-history arm's, on the same questions, by chat length) and a comparison of two view budgets over the same corpora, each with a per-question sign test. It calls no model. `evals/retention/run.sh` runs the preregistered cells under one total dollar budget. No measurement is reported yet, and the plugin itself is unchanged.
 - The evidence benchmark runner launches on OMP 19. Its hosts pass an empty `--tools` instead of `--no-tools`, which OMP 19 rejects together with `-e`, and turn off OMP 19's default-on Auto-QA tool. A benchmark host again exposes no built-in tool on both 18.10.3 and 19.2.0, and the real-OMP smoke uses the same launch. The plugin itself is unchanged.
 
 ## 0.16.8 — 2026-11-25
