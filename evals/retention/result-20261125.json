@@ -1,0 +1,309 @@
+{
+  "schema": "optchat-evidence-retention/1",
+  "sides": 21,
+  "retention": [
+    {
+      "providerMode": "live",
+      "main": "anthropic/claude-sonnet-5-5",
+      "compressor": "anthropic/claude-haiku-5-5",
+      "turnMode": "per-question",
+      "sources": 48,
+      "minSourceBytes": 1024,
+      "seeds": [
+        1,
+        2,
+        3
+      ],
+      "historyBytes": {
+        "min": 50368,
+        "max": 50630
+      },
+      "hosts": [
+        "omp/19.2.1"
+      ],
+      "pluginCommits": [
+        "c4030c5a6c235d5bf099b875c4416cb1e234b09b"
+      ],
+      "viewBytes": 128000,
+      "baselineRuns": 3,
+      "excluded": [],
+      "on": {
+        "judged": 72,
+        "correct": 69,
+        "valueCorrect": 69,
+        "grounded": 72,
+        "hallucinated": 0
+      },
+      "off": {
+        "judged": 72,
+        "correct": 69,
+        "valueCorrect": 69,
+        "grounded": 72,
+        "hallucinated": 0
+      },
+      "retention": 1,
+      "valueRetention": 1,
+      "paired": {
+        "both": 69,
+        "firstOnly": 0,
+        "secondOnly": 0,
+        "neither": 3,
+        "unpaired": 0,
+        "signP": null
+      },
+      "onCostUsd": {
+        "lowUsd": 1.39433423,
+        "highUsd": 1.39433423
+      },
+      "offCostUsd": {
+        "lowUsd": 0.5537715,
+        "highUsd": 0.5537715
+      }
+    },
+    {
+      "providerMode": "live",
+      "main": "anthropic/claude-sonnet-5-5",
+      "compressor": "anthropic/claude-haiku-5-5",
+      "turnMode": "per-question",
+      "sources": 128,
+      "minSourceBytes": 1024,
+      "seeds": [
+        1,
+        2,
+        3
+      ],
+      "historyBytes": {
+        "min": 134244,
+        "max": 135098
+      },
+      "hosts": [
+        "omp/19.2.1"
+      ],
+      "pluginCommits": [
+        "c4030c5a6c235d5bf099b875c4416cb1e234b09b"
+      ],
+      "viewBytes": 128000,
+      "baselineRuns": 3,
+      "excluded": [],
+      "on": {
+        "judged": 72,
+        "correct": 68,
+        "valueCorrect": 70,
+        "grounded": 72,
+        "hallucinated": 2
+      },
+      "off": {
+        "judged": 72,
+        "correct": 67,
+        "valueCorrect": 69,
+        "grounded": 70,
+        "hallucinated": 0
+      },
+      "retention": 1.0149253731343284,
+      "valueRetention": 1.0144927536231885,
+      "paired": {
+        "both": 65,
+        "firstOnly": 3,
+        "secondOnly": 2,
+        "neither": 2,
+        "unpaired": 0,
+        "signP": 0.9999999999999999
+      },
+      "onCostUsd": {
+        "lowUsd": 1.9797004900000004,
+        "highUsd": 1.9797004900000004
+      },
+      "offCostUsd": {
+        "lowUsd": 1.0796402,
+        "highUsd": 1.0796402
+      }
+    },
+    {
+      "providerMode": "live",
+      "main": "anthropic/claude-sonnet-5-5",
+      "compressor": "anthropic/claude-haiku-5-5",
+      "turnMode": "per-question",
+      "sources": 512,
+      "minSourceBytes": 1024,
+      "seeds": [
+        1,
+        2,
+        3
+      ],
+      "historyBytes": {
+        "min": 538320,
+        "max": 539579
+      },
+      "hosts": [
+        "omp/19.2.1"
+      ],
+      "pluginCommits": [
+        "5773a3a2b7b6ba2ac535c0cb1a08fc7370513e1d",
+        "c4030c5a6c235d5bf099b875c4416cb1e234b09b"
+      ],
+      "viewBytes": 128000,
+      "baselineRuns": 3,
+      "excluded": [],
+      "on": {
+        "judged": 72,
+        "correct": 63,
+        "valueCorrect": 69,
+        "grounded": 68,
+        "hallucinated": 6
+      },
+      "off": {
+        "judged": 72,
+        "correct": 70,
+        "valueCorrect": 70,
+        "grounded": 72,
+        "hallucinated": 0
+      },
+      "retention": 0.9,
+      "valueRetention": 0.9857142857142858,
+      "paired": {
+        "both": 63,
+        "firstOnly": 0,
+        "secondOnly": 7,
+        "neither": 2,
+        "unpaired": 0,
+        "signP": 0.015625000000000003
+      },
+      "onCostUsd": {
+        "lowUsd": 3.90712423,
+        "highUsd": 3.90712423
+      },
+      "offCostUsd": {
+        "lowUsd": 3.5309323000000004,
+        "highUsd": 3.5309323000000004
+      }
+    },
+    {
+      "providerMode": "live",
+      "main": "anthropic/claude-sonnet-5-5",
+      "compressor": "anthropic/claude-haiku-5-5",
+      "turnMode": "per-question",
+      "sources": 512,
+      "minSourceBytes": 1024,
+      "seeds": [
+        1,
+        2,
+        3
+      ],
+      "historyBytes": {
+        "min": 538320,
+        "max": 539579
+      },
+      "hosts": [
+        "omp/19.2.1"
+      ],
+      "pluginCommits": [
+        "5773a3a2b7b6ba2ac535c0cb1a08fc7370513e1d",
+        "c4030c5a6c235d5bf099b875c4416cb1e234b09b"
+      ],
+      "viewBytes": 64000,
+      "baselineRuns": 3,
+      "excluded": [],
+      "on": {
+        "judged": 72,
+        "correct": 54,
+        "valueCorrect": 69,
+        "grounded": 60,
+        "hallucinated": 15
+      },
+      "off": {
+        "judged": 72,
+        "correct": 70,
+        "valueCorrect": 70,
+        "grounded": 72,
+        "hallucinated": 0
+      },
+      "retention": 0.7714285714285715,
+      "valueRetention": 0.9857142857142858,
+      "paired": {
+        "both": 54,
+        "firstOnly": 0,
+        "secondOnly": 16,
+        "neither": 2,
+        "unpaired": 0,
+        "signP": 0.000030517578125000014
+      },
+      "onCostUsd": {
+        "lowUsd": 3.4935277900000004,
+        "highUsd": 3.4935277900000004
+      },
+      "offCostUsd": {
+        "lowUsd": 3.5309323000000004,
+        "highUsd": 3.5309323000000004
+      }
+    }
+  ],
+  "viewSize": [
+    {
+      "providerMode": "live",
+      "main": "anthropic/claude-sonnet-5-5",
+      "compressor": "anthropic/claude-haiku-5-5",
+      "turnMode": "per-question",
+      "sources": 512,
+      "minSourceBytes": 1024,
+      "seeds": [
+        1,
+        2,
+        3
+      ],
+      "historyBytes": {
+        "min": 538320,
+        "max": 539579
+      },
+      "hosts": [
+        "omp/19.2.1"
+      ],
+      "pluginCommits": [
+        "c4030c5a6c235d5bf099b875c4416cb1e234b09b"
+      ],
+      "larger": {
+        "judged": 72,
+        "correct": 63,
+        "valueCorrect": 69,
+        "grounded": 68,
+        "hallucinated": 6,
+        "viewBytes": 128000,
+        "costUsd": {
+          "lowUsd": 3.90712423,
+          "highUsd": 3.90712423
+        },
+        "mainPromptTokens": 6615090,
+        "viewLines": [
+          336,
+          313,
+          333
+        ]
+      },
+      "smaller": {
+        "judged": 72,
+        "correct": 54,
+        "valueCorrect": 69,
+        "grounded": 60,
+        "hallucinated": 15,
+        "viewBytes": 64000,
+        "costUsd": {
+          "lowUsd": 3.4935277900000004,
+          "highUsd": 3.4935277900000004
+        },
+        "mainPromptTokens": 4369787,
+        "viewLines": [
+          230,
+          116,
+          133
+        ]
+      },
+      "paired": {
+        "both": 51,
+        "firstOnly": 12,
+        "secondOnly": 3,
+        "neither": 6,
+        "unpaired": 0,
+        "signP": 0.03515625000000004
+      }
+    }
+  ]
+}
