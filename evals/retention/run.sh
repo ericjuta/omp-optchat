@@ -48,19 +48,19 @@ cell() {
 	bun run "$root/scripts/evidence-recall.ts" "${models[@]}" --max-cost-usd "$cap" \
 		--turn-mode per-question --question-emphasis adversarial --projects 6 --questions 24 \
 		--min-source-bytes 1024 --sources "$records" --seed "$seed" \
-		--max-calls 2000 --deadline-ms 1800000 --compressor-share 0.25 --out "$file" "$@" >"$out/cell-$name.log" 2>&1
+		--max-calls 2000 --deadline-ms 1800000 --compressor-share 0.4 --out "$file" "$@" >"$out/cell-$name.log" 2>&1
 	rm "$file.started"
 }
 
 for seed in "$@"; do
 	# The largest cap goes first, so a budget that cannot finish the seed stops before it spends on the seed's other cells.
 	cell "s$seed-512-off" 12 512 --arms off
-	cell "s$seed-512-on-128000" 8 512 --arms on --view-bytes 128000
-	cell "s$seed-512-on-64000" 8 512 --arms on --view-bytes 64000
+	cell "s$seed-512-on-128000" 12 512 --arms on --view-bytes 128000
+	cell "s$seed-512-on-64000" 12 512 --arms on --view-bytes 64000
 	cell "s$seed-128-off" 5 128 --arms off
-	cell "s$seed-128-on-128000" 8 128 --arms on --view-bytes 128000
+	cell "s$seed-128-on-128000" 12 128 --arms on --view-bytes 128000
 	cell "s$seed-48-off" 3 48 --arms off
-	cell "s$seed-48-on-128000" 8 48 --arms on --view-bytes 128000
+	cell "s$seed-48-on-128000" 12 48 --arms on --view-bytes 128000
 done
 
 bun run "$root/scripts/evidence-retention.ts" --out "$out/report.json" --force "$out"/cell-*.json | tee "$out/report.md"
