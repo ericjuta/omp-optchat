@@ -15,6 +15,7 @@ After this plan is complete, an OMP user can start `omp` with no gate flags and 
 ## Progress
 
 - [x] 2026-11-25: Prepared 0.16.8 with the provider backoff. The real-OMP smoke failed on OMP 19.2.0 before any model request: that host rejects `--no-tools` with `-e`, and it prepends its date and directory reminder to an active user turn. The smoke now omits `--no-tools` and strips only that exact reminder; it passes on 18.10.3 and 19.2.0.
+- [x] 2026-11-25: After 0.16.8, made the evidence runner launch on OMP 19. An empty `--tools` exposes no built-in tool and keeps the `-e` extension on 18.10.3 and 19.2.0, and `PI_AUTO_QA=0` removes OMP 19's default `report_issue` tool. A probe of the active tools showed only the extension's tools on both versions. Host tests pass 57/57 on 19.2.0, and the smoke passes.
 - [x] 2026-11-25: Traced compressor errors through the pinned OMP and pi-ai sources, and traced `Memory.settle` through turn refusal.
 - [x] 2026-11-25: Implemented provider backoff, timer-driven recovery, and one-call probes. Added fake-clock scheduler coverage and an HTTP 403 loopback test for Retry-After and turn refusal.
 - [x] 2026-11-25: Review capped Retry-After at ten minutes. Fake-clock cases cover both a hint above the local ceiling and a multi-hour hint. Final checks: `bun run typecheck`, `bun run test`, `bun run test:host`, and the loopback smoke.

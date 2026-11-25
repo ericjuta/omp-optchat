@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The evidence benchmark runner launches on OMP 19. Its hosts pass an empty `--tools` instead of `--no-tools`, which OMP 19 rejects together with `-e`, and turn off OMP 19's default-on Auto-QA tool. A benchmark host again exposes no built-in tool on both 18.10.3 and 19.2.0, and the real-OMP smoke uses the same launch. The plugin itself is unchanged.
+
 ## 0.16.8 — 2026-11-25
 
 - The real-OMP smoke runs on OMP 19.2.0 as well as the pinned 18.10.3. OMP 19 rejects `--no-tools` together with `-e`, so the smoke no longer passes it, and it accepts the host's date and directory reminder in front of a user turn. The host tests no longer use a session option and a setting that changed in OMP 19.

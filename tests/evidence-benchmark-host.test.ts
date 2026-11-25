@@ -33,15 +33,20 @@ describe("host launch contract", () => {
 		expect(args.slice(args.indexOf("-e"), args.indexOf("-e") + 2)).toEqual(["-e", EXTENSION]);
 	});
 
-	test("a tool list replaces --no-tools in place with --tools <csv>", () => {
-		const args = launchArgs({ ...LAUNCH, tools: ["task", "work"] }, EXTENSION);
+	// OMP 19 rejects --no-tools together with -e, so it must never appear in a launch.
+	test("null tools exposes no built-in tool through an empty --tools value", () => {
+		const args = launchArgs(LAUNCH, EXTENSION);
 		expect(args).not.toContain("--no-tools");
-		const at = args.indexOf("--tools");
-		expect(at).toBeGreaterThanOrEqual(0);
-		expect(args[at + 1]).toBe("task,work");
+		expect(args.slice(args.indexOf("--tools"), args.indexOf("--tools") + 2)).toEqual(["--tools", ""]);
 	});
 
-	test("an empty tool list is rejected rather than launching with --tools \"\"", () => {
+	test("a tool list names the built-in tools to expose", () => {
+		const args = launchArgs({ ...LAUNCH, tools: ["task", "work"] }, EXTENSION);
+		expect(args).not.toContain("--no-tools");
+		expect(args.slice(args.indexOf("--tools"), args.indexOf("--tools") + 2)).toEqual(["--tools", "task,work"]);
+	});
+
+	test("an empty tool list is rejected: null is the only way to expose no built-in tool", () => {
 		expect(() => launchArgs({ ...LAUNCH, tools: [] }, EXTENSION)).toThrow(RangeError);
 	});
 });

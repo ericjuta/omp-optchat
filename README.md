@@ -41,7 +41,7 @@ PI_OPENAI_STATEFUL=0 omp
 
 Restart existing OMP sessions after an upgrade. They retain the previously loaded plugin.
 
-Local 0.16.8 verification passed typecheck, 2,633 unit tests, 57 host tests, and a real-OMP smoke with a synthetic model on OMP 18.10.3 and 19.2.0. The smoke exercised ten host processes and 38 main chat requests. The lease code is unchanged since 0.16.7, when strict lease verification passed 32 checks and the deep model suite passed 18, including all five three-session guarantees. Release CI also checks the pinned SDK and Linux/macOS leases. Against the latest SDK (OMP 19.2.0) typecheck, the unit tests, the smoke, and 56 of 57 host tests pass; the evidence benchmark runner does not launch on OMP 19 yet, because it relies on `--no-tools` together with `-e`.
+Local 0.16.8 verification passed typecheck, 2,633 unit tests, 57 host tests, and a real-OMP smoke with a synthetic model on OMP 18.10.3 and 19.2.0. The smoke exercised ten host processes and 38 main chat requests. The lease code is unchanged since 0.16.7, when strict lease verification passed 32 checks and the deep model suite passed 18, including all five three-session guarantees. Release CI also checks the pinned SDK and Linux/macOS leases. Against the latest SDK (OMP 19.2.0), 0.16.8 passed typecheck, the unit tests, the smoke, and 56 of 57 host tests; the evidence benchmark runner did not launch there. On `main` the runner launches on OMP 19 and all 57 host tests pass.
 
 These are software checks, not proof of live-model answer accuracy.
 

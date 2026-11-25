@@ -124,6 +124,8 @@ export function childEnvironment(parent: Readonly<Record<string, string | undefi
 		XDG_DATA_HOME: dirs.xdgData,
 		XDG_STATE_HOME: dirs.xdgState,
 		TMPDIR: dirs.tmp,
+		// OMP 19 turns Auto-QA on by default, which adds the built-in `report_issue` tool and its prompt text to every host.
+		PI_AUTO_QA: "0",
 	};
 }
 

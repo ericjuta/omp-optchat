@@ -35,20 +35,22 @@ export interface HostLaunch {
 	readonly optchat: boolean;
 	/** Appended after the standard arguments. */
 	readonly extraArgs: readonly string[];
-	/** null keeps `--no-tools`; a list replaces it with `--tools <csv>`. */
+	/** Built-in tools to expose (`--tools <csv>`); null exposes none. The extension's own tools load either way. */
 	readonly tools: readonly string[] | null;
 }
 
-/** Common no-ambient-state flags: no tools, skills, rules, or discovered extensions. */
-const ISOLATION_FLAGS = ["--mode", "rpc", "--no-ui", "--no-title", "--no-tools", "--no-skills", "--no-rules", "--no-extensions"];
+/** Common no-ambient-state flags: no skills, rules, or discovered extensions. Built-in tools are set per launch. */
+const ISOLATION_FLAGS = ["--mode", "rpc", "--no-ui", "--no-title", "--no-skills", "--no-rules", "--no-extensions"];
 const SYSTEM_ONE_OPTOUTS = ["--no-optchat-rules", "--no-optchat-prefetch", "--no-optchat-value-score", "--no-optchat-recall", "--no-optchat-extract", "--no-optchat-decisions", "--no-optchat-work-discovery", "--no-optchat-child-pack"] as const;
 
-/** Isolation flags for one launch: `--no-tools` unless a tool list names the tools to expose instead. */
+/**
+ * Isolation flags for one launch. `--tools` lists the built-in tools to expose, and an empty list exposes
+ * none while the `-e` extension and its tools still load. `--no-tools` is not that switch: from OMP 19 it
+ * also drops extensions and is rejected together with `-e`.
+ */
 function isolationFlags(tools: readonly string[] | null): string[] {
-	if (tools === null) return [...ISOLATION_FLAGS];
-	if (tools.length === 0) throw new RangeError("tools must name at least one tool; use null to disable tools");
-	const at = ISOLATION_FLAGS.indexOf("--no-tools");
-	return [...ISOLATION_FLAGS.slice(0, at), "--tools", tools.join(","), ...ISOLATION_FLAGS.slice(at + 1)];
+	if (tools !== null && tools.length === 0) throw new RangeError("tools must name at least one tool; use null to disable tools");
+	return [...ISOLATION_FLAGS, "--tools", tools === null ? "" : tools.join(",")];
 }
 
 /**
@@ -250,9 +252,7 @@ export async function queryAvailableModels(
 	extensions: readonly string[] = [],
 ): Promise<{ provider: string; id: string }[]> {
 	const extensionFlags = extensions.flatMap((path) => ["-e", path]);
-	// A listing sends no prompt, so it needs no tool restriction; OMP 19 rejects `--no-tools` with `-e`.
-	const listingFlags = ISOLATION_FLAGS.filter((flag) => flag !== "--no-tools");
-	const child = spawn(omp, [...listingFlags, ...extensionFlags, "--session-dir", sessionDir], { cwd, env: { ...env }, stdio: "pipe", detached: true });
+	const child = spawn(omp, [...isolationFlags(null), ...extensionFlags, "--session-dir", sessionDir], { cwd, env: { ...env }, stdio: "pipe", detached: true });
 	const exit = Promise.withResolvers<number | null>();
 	child.once("exit", (code) => exit.resolve(code));
 	const exited = exit.promise;

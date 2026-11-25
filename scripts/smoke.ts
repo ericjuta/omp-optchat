@@ -623,6 +623,8 @@ async function main(): Promise<void> {
       XDG_CACHE_HOME: join(home, ".cache"),
       XDG_DATA_HOME: join(home, ".local", "share"),
       OPTCHAT_SMOKE_BASE_URL: `http://127.0.0.1:${server.port}/v1`,
+      // OMP 19 turns Auto-QA on by default, which adds the built-in `report_issue` tool.
+      PI_AUTO_QA: "0",
     };
     // Link only inside this fresh synthetic HOME. The subsequent CLI launches must
     // discover the installed package; only the synthetic provider uses explicit -e.
@@ -632,8 +634,9 @@ async function main(): Promise<void> {
     const linked = await bounded("isolated plugin link", link.exited);
     assert.equal(linked.code, 0, `isolated plugin link failed: ${link.diagnostics}`);
     const baseArgs = [
-      // No --no-tools: OMP 19 rejects it with -e and it disables extensions. Built-in tools stay registered and unused.
-      "--mode", "rpc", "--no-ui", "--no-title", "--no-skills", "--no-rules",
+      // An empty --tools exposes no built-in tool and keeps extension tools. --no-tools is not that switch:
+      // from OMP 19 it also drops extensions and is rejected together with -e.
+      "--mode", "rpc", "--no-ui", "--no-title", "--tools", "", "--no-skills", "--no-rules",
       "--config", fixtureConfig,
       "--session-dir", join(temporary, "sessions"),
       "-e", join(ROOT, "scripts", "fixture-provider.ts"),
