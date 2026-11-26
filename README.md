@@ -32,16 +32,16 @@ When history still fits the model's context, OptChat costs more than plain OMP f
 - OMP **18.10.3 or newer**, Bun, and Linux. CI checks every push and runs a weekly check against the latest published OMP SDK.
 - An authenticated model for the main chat and an authenticated compressor model. Compression uses OMP's `@smol` role by default. Choose a competent, inexpensive model explicitly if that role is unsuitable.
 
-Install the current release, **0.16.8**:
+Install the current release, **0.16.9**:
 
 ```sh
-omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.16.8'
+omp plugin install 'git+https://github.com/ericjuta/omp-optchat.git#v0.16.9'
 PI_OPENAI_STATEFUL=0 omp
 ```
 
 Restart existing OMP sessions after an upgrade. They retain the previously loaded plugin.
 
-Local 0.16.8 verification passed typecheck, 2,633 unit tests, 57 host tests, and a real-OMP smoke with a synthetic model on OMP 18.10.3 and 19.2.0. The smoke exercised ten host processes and 38 main chat requests. The lease code is unchanged since 0.16.7, when strict lease verification passed 32 checks and the deep model suite passed 18, including all five three-session guarantees. Release CI also checks the pinned SDK and Linux/macOS leases. Against the latest SDK (OMP 19.2.0), 0.16.8 passed typecheck, the unit tests, the smoke, and 56 of 57 host tests; the evidence benchmark runner did not launch there. On `main` the runner launches on OMP 19 and all 57 host tests pass.
+Local 0.16.9 verification passed typecheck, 2,648 unit tests, 57 host tests, and a real-OMP smoke with a synthetic model. The lease code is unchanged since 0.16.7, when strict lease verification passed 32 checks and the deep model suite passed 18, including all five three-session guarantees. Release CI also checks the pinned SDK and Linux/macOS leases. Against the latest SDK (OMP 19.2.0), 0.16.8 passed typecheck, the unit tests, the smoke, and 56 of 57 host tests; the evidence benchmark runner did not launch there. On `main` the runner launches on OMP 19 and all 57 host tests pass.
 
 These are software checks, not proof of live-model answer accuracy.
 

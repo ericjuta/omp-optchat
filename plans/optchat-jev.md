@@ -14,6 +14,7 @@ After this plan is complete, an OMP user can start `omp` with no gate flags and 
 
 ## Progress
 
+- [x] 2026-11-26: Released 0.16.9 with the length-retry feedback that names the amount to remove (`length-20261126`, 60 real merge nodes, one model). Local gates on the same source: typecheck, 2,648 unit tests, 57 host tests, real-OMP smoke.
 - [x] 2026-11-25: Prepared 0.16.8 with the provider backoff. The real-OMP smoke failed on OMP 19.2.0 before any model request: that host rejects `--no-tools` with `-e`, and it prepends its date and directory reminder to an active user turn. The smoke now omits `--no-tools` and strips only that exact reminder; it passes on 18.10.3 and 19.2.0.
 - [x] 2026-11-25: After 0.16.8, made the evidence runner launch on OMP 19. An empty `--tools` exposes no built-in tool and keeps the `-e` extension on 18.10.3 and 19.2.0, and `PI_AUTO_QA=0` removes OMP 19's default `report_issue` tool. A probe of the active tools showed only the extension's tools on both versions. Host tests pass 57/57 on 19.2.0, and the smoke passes.
 - [x] 2026-11-25: Traced compressor errors through the pinned OMP and pi-ai sources, and traced `Memory.settle` through turn refusal.

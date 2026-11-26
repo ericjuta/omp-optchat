@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.16.9 — 2026-11-26
 - The compressor's "Too long" feedback now also names the amount to remove ("Remove at least N bytes (about W words)"). On 60 real merge nodes with `gpt-6.1-terra` (`length-20261126`, pre-registered in `plans/optchat-jev.md`), 6 of 29 retries missed the byte limit again, against 15 of 33 before; no stored line was over 512 bytes, against 2; the median stored line was 466 bytes against 474. One sample per arm on one model; the first-reply miss rate (about a third of merges) is unchanged.
 
 - Added `bun run evidence:retention`, an offline report over `evidence:recall` artifacts. It gives retention (the view arm's correct answers as a share of a whole-history arm's, on the same questions, by chat length) and a comparison of two view budgets over the same corpora, each with a per-question sign test. It calls no model. `evals/retention/run.sh` runs the preregistered cells under one total dollar budget. The plugin itself is unchanged.
