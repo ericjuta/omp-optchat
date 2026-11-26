@@ -81,11 +81,11 @@ function pick(pool: Candidate[], count: number, perStore: number, userMin: numbe
 		return true;
 	};
 	for (const candidate of order) {
-		if (taken.length >= userMin) break;
+		if (taken.length >= Math.min(userMin, count)) break;
 		if (candidate.user) take(candidate);
 	}
 	for (const candidate of order) {
-		if (taken.length === count) break;
+		if (taken.length >= count) break;
 		if (!taken.includes(candidate)) take(candidate);
 	}
 	return taken;
@@ -133,10 +133,13 @@ async function main(args: string[]): Promise<void> {
 		const nodes = nodesBefore(store, row);
 		let captured: { context: string; instruction: string } | undefined;
 		const stop = new Error("captured");
+		// Memory reports a thrown compressor error as a provider failure unless its job was cancelled.
+		const capture = new AbortController();
 		await compactNode(snapshot, store, nodes, { l, i, start, end }, async (request) => {
 			captured = { context: request.context, instruction: request.instruction };
+			capture.abort();
 			throw stop;
-		}, new AbortController().signal).catch((error: unknown) => {
+		}, capture.signal).catch((error: unknown) => {
 			if (error !== stop) throw error;
 		});
 		if (!captured) throw new Error(`no request captured for ${basename(store.directory)} ${l}+${i}`);

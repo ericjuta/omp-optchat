@@ -79,7 +79,7 @@ export interface ArmResult {
 	readonly error?: string;
 }
 
-interface HostPrefix {
+export interface HostPrefix {
 	readonly model: string;
 	readonly systemPrompt: string[];
 	readonly system: Array<{ text?: string }>;
@@ -106,7 +106,7 @@ interface Arms {
 	readonly C: { systemPrompt: string[]; tools: undefined };
 }
 
-function buildArms(snapshot: Snapshot, host: HostPrefix, models: Models): { arms: Arms; toolsShared: boolean } {
+export function buildArms(snapshot: Snapshot, host: HostPrefix, models: Models): { arms: Arms; toolsShared: boolean } {
 	const block = snapshot.SYSTEM_BLOCK;
 	// Same as `beforeAgentStart`: appended once, never twice.
 	const systemPrompt = host.systemPrompt.includes(block) ? host.systemPrompt : [...host.systemPrompt, block];
