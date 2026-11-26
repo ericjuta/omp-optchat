@@ -37,6 +37,8 @@ export interface HostLaunch {
 	readonly extraArgs: readonly string[];
 	/** Built-in tools to expose (`--tools <csv>`); null exposes none. The extension's own tools load either way. */
 	readonly tools: readonly string[] | null;
+	/** System One and evidence opt-out flags to pass. Unset: every one, the memory-only host the synthetic runs use. */
+	readonly optOuts?: readonly string[];
 }
 
 /** Common no-ambient-state flags: no skills, rules, or discovered extensions. Built-in tools are set per launch. */
@@ -68,7 +70,7 @@ export function launchArgs(launch: HostLaunch, extension: string): string[] {
 		// Runner-only: a view budget small enough that the saved tree coarsens within the call budget.
 		"--optchat-view-bytes", String(launch.viewBytes),
 		// The benchmark measures memory recall: System One gates (on by default) would add judge calls and block headless tools.
-		...SYSTEM_ONE_OPTOUTS,
+		...(launch.optOuts ?? SYSTEM_ONE_OPTOUTS),
 		...(launch.optchat ? [] : ["--no-optchat"]),
 		...launch.extraArgs,
 	];

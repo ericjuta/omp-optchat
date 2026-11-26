@@ -13,6 +13,8 @@
  *   OPTCHAT_EVIDENCE_USD_PER_FALLBACK_CALL  decimal worst-case dollars charged per call sent by any other model
  *   OPTCHAT_EVIDENCE_COMPRESSOR_MAX_TOKENS  integer 1..512 output cap per compressor call
  *   OPTCHAT_EVIDENCE_PARENT_PATHS    optional JSON string array of runner host paths that must not appear in the prompt
+ *   OPTCHAT_EVIDENCE_JUDGE_FILE      optional per-host judge counter file; set only by runs that leave a System One gate on
+ *   OPTCHAT_EVIDENCE_JUDGE_ALLOWANCE integer judge calls this host may send; required with the counter file
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -20,6 +22,8 @@ import { createOptChat } from "../src/index.ts";
 import { isCompressorRow } from "../src/metrics.ts";
 import { admitCompressorCall, committedUsd, parseAdmissionState, parseUsdDecimal } from "./evidence/admission.ts";
 import { findPrivateContextMarkers, parseParentSubstrings } from "./evidence/preflight.ts";
+import { cappedJudge } from "./evidence/judge-cap.ts";
+import { hostJudge } from "../src/system1/judge.ts";
 
 const MAX_OUTPUT = 512;
 
@@ -49,6 +53,9 @@ export default function evidenceExtension(pi: ExtensionAPI): void {
 	const parentPaths = parseParentSubstrings(process.env.OPTCHAT_EVIDENCE_PARENT_PATHS);
 	const metricsFile = required("OPTCHAT_METRICS_FILE");
 	const worstPerCall = Math.max(perCallUsd, perFallbackUsd);
+	const judgeFile = process.env.OPTCHAT_EVIDENCE_JUDGE_FILE;
+	const judgeAllowance = judgeFile === undefined ? 0 : Number(required("OPTCHAT_EVIDENCE_JUDGE_ALLOWANCE"));
+	if (!Number.isSafeInteger(judgeAllowance) || judgeAllowance < 0) throw new Error("OPTCHAT_EVIDENCE_JUDGE_ALLOWANCE must be a nonnegative integer");
 	// Completed compressor calls at their reported cost; the metric sink is written by OptChat after every reply.
 	const completedCosts = (): (number | null)[] => {
 		if (!existsSync(metricsFile)) return [];
@@ -64,6 +71,13 @@ export default function evidenceExtension(pi: ExtensionAPI): void {
 	});
 	createOptChat({
 		compressorMaxTokens: maxTokens,
+		// Judge spend is not observable, so a run with gates on bounds the judge by call count.
+		...(judgeFile === undefined ? {} : {
+			judge: (ctx, purpose) => {
+				const judge = hostJudge(ctx, purpose);
+				return judge === undefined ? undefined : cappedJudge(judge, judgeFile, judgeAllowance);
+			},
+		}),
 		admitCompressorCall: (model) => {
 			const price = model === compressor ? perCallUsd : perFallbackUsd;
 			const state = parseAdmissionState(JSON.parse(readFileSync(file, "utf8")));
