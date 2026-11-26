@@ -1433,7 +1433,9 @@ export class Memory {
         // Replies that miss the limit tend to miss it again by a few bytes, so each miss asks for more room.
         const target = this.nodeBytes - Math.min(Math.floor(this.nodeBytes / 2), Math.ceil(this.nodeBytes / 16) * ++overlong);
         const label = added > 0 ? ` (code puts a ${added}-byte kind label in front of it)` : "";
-        notes.push(`${utf8Bytes(body) > this.summaryLimit ? "Previous reply excerpt only; omitted bytes are not a complete summary. " : ""}Too long: your line is ${size} bytes${label}, over the ${this.nodeBytes}-byte limit. Leave room: write\nthe whole line again for the same <input>, dropping the least valuable\nitems until it ends before this cut:\n${utf8Prefix(excerpt, Math.max(0, target - added))}| ← CUT`);
+        // A cut mark alone is read as a hint: replies shrink by about their overage and miss again. Name the amount.
+        const excess = size - target;
+        notes.push(`${utf8Bytes(body) > this.summaryLimit ? "Previous reply excerpt only; omitted bytes are not a complete summary. " : ""}Too long: your line is ${size} bytes${label}, over the ${this.nodeBytes}-byte limit. Remove at least ${excess} bytes (about ${Math.ceil(excess / 6)} words). Write\nthe whole line again for the same <input>, dropping the least valuable\nitems until it ends before this cut:\n${utf8Prefix(excerpt, Math.max(0, target - added))}| ← CUT`);
       }
       // Keep one bounded feedback turn, not an ever-growing history of full
       // provider replies. The original input stays unchanged on every attempt.
