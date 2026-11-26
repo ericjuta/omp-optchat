@@ -516,6 +516,11 @@ function validateQuestion(node: unknown, path: string, errors: string[]): void {
 	if (!QUESTION_KINDS.includes(node.kind as QuestionKind)) errors.push(`${path}.kind is not a known question kind`);
 	if (node.status !== "judged" && node.status !== "unavailable") errors.push(`${path}.status must be judged or unavailable`);
 	if (!isNullableString(node.reason) || !isNullableString(node.answerPreview)) errors.push(`${path}.reason and answerPreview must be strings or null`);
+	// Artifacts written before these fields existed lack them.
+	if (node.answer !== undefined && !isNullableString(node.answer)) errors.push(`${path}.answer must be a string or null`);
+	if (node.tools !== undefined && node.tools !== null && !(Array.isArray(node.tools) && node.tools.every((name) => typeof name === "string"))) {
+		errors.push(`${path}.tools must be an array of tool names or null`);
+	}
 	for (const key of ["correct", "valueCorrect", "grounded", "hallucinated", "abstained", "zoomedSourceRecord"]) {
 		if (node[key] !== null && typeof node[key] !== "boolean") errors.push(`${path}.${key} must be a boolean or null`);
 	}

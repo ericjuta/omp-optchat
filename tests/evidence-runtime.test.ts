@@ -92,8 +92,31 @@ describe("original retrieval pages", () => {
 			{ recordId: 7, text: "W-1 result" },
 		]);
 		expect(observed.zoomCalls.map((call) => call.n)).toEqual([1, 2, 1]);
+		expect(observed.tools).toEqual(["zoom", "zoom", "zoom", "work"]);
 		expect(observed.assistantMessages).toBe(5);
 		expect(observed.answer).toBe("{\"answers\":[]}");
+	});
+});
+
+describe("search and evidence results", () => {
+	test("search snippets and evidence passages are original text of the record they name", () => {
+		const events: Frame[] = [
+			assistantCall("s1", { text: "vendor" }, "chat_search"),
+			toolResult("s1", '[optchat search] 2 hits for "vendor" (newest first)\n30|user|…the late review rejected vendor Glyph…\n12|echo|vendor Ferrox was chosen\n[no older hits]'),
+			assistantCall("e1", { question: "which vendor" }, "chat_evidence"),
+			toolResult("e1", "passage 1: message 41 (user), bytes 0-20 of 20; zoom(41, 1, 0) reopens it\nfirst line\nsecond line\npassage 2: message 9 (echo), bytes 4-9 of 30; zoom(9, 1, 4) reopens it\nother"),
+			assistantCall("s2", { text: "x" }, "chat_search"),
+			toolResult("s2", "5|user|must not count", { isError: true }),
+		];
+		const observed = observeTurn(events, null);
+		expect(observed.pages).toEqual([
+			{ recordId: 30, text: "the late review rejected vendor Glyph" },
+			{ recordId: 12, text: "vendor Ferrox was chosen" },
+			{ recordId: 41, text: "first line\nsecond line" },
+			{ recordId: 9, text: "other" },
+		]);
+		expect(observed.tools).toEqual(["chat_search", "chat_evidence", "chat_search"]);
+		expect(observed.zoomCalls).toEqual([]);
 	});
 });
 

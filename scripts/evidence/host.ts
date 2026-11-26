@@ -291,8 +291,13 @@ export interface TurnObservation {
 	/** Final assistant text of the turn: the structured answer set for batch prompts. */
 	readonly answer: string;
 	readonly zoomCalls: ReadonlyArray<{ id: number | null; n: number | null; offset: number | null }>;
-	/** Original record text the model actually received: only n=1 zoom results and non-error work results. */
+	/**
+	 * Original record text the model actually received: n=1 zoom results, work results, chat_search snippets and
+	 * chat_evidence passages, each keyed by the record it came from. Results marked as errors are left out.
+	 */
 	readonly pages: RetrievedPage[];
+	/** Name of every tool the model called in the turn, in call order. */
+	readonly tools: string[];
 	readonly usage: UsageRecord[];
 	readonly assistantMessages: number;
 	/** stopReason of the last finalized assistant message: "aborted" or "error" means the host did not complete the turn. */
@@ -322,6 +327,27 @@ export function hostStopReason(observation: Pick<TurnObservation, "assistantMess
 }
 
 interface ToolCallRef { readonly name: string; readonly args: Frame }
+
+/** `chat_search` hit lines are `id|kind|snippet`; a snippet is the record's text on one line, with "…" where it was cut. */
+function searchPages(text: string): RetrievedPage[] {
+	const pages: RetrievedPage[] = [];
+	for (const line of text.split("\n")) {
+		const hit = /^(\d+)\|[a-z]+\|(.*)$/.exec(line);
+		if (hit) pages.push({ recordId: Number(hit[1]), text: (hit[2] as string).replace(/^…|…$/g, "") });
+	}
+	return pages;
+}
+
+/** `chat_evidence` prints each passage as a `passage N: message ID (...)` line followed by the passage's exact text. */
+function evidencePages(text: string): RetrievedPage[] {
+	const pages: { recordId: number; lines: string[] }[] = [];
+	for (const line of text.split("\n")) {
+		const header = /^passage \d+: message (\d+) \(/.exec(line);
+		if (header) pages.push({ recordId: Number(header[1]), lines: [] });
+		else pages.at(-1)?.lines.push(line);
+	}
+	return pages.map((page) => ({ recordId: page.recordId, text: page.lines.join("\n") }));
+}
 
 function numberOrNull(value: unknown): number | null {
 	return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -362,14 +388,15 @@ export function isOriginalPage(toolName: string, args: Frame, message: Frame): b
 
 /**
  * Main-model usage and retrieved pages from one prompt's events. Only finalized assistant
- * messages count; a missing counter stays null. Pages are the original text returned by zoom (n=1)
- * or work, keyed by the record id the tool addressed.
+ * messages count; a missing counter stays null. Pages are the original text returned by zoom (n=1),
+ * work, chat_search or chat_evidence, keyed by the record id the text came from.
  */
 export function observeTurn(events: readonly Frame[], price: { input: number; output: number; cacheRead: number; cacheWrite: number } | null): TurnObservation {
 	let answer = "";
 	const zoomCalls: { id: number | null; n: number | null; offset: number | null }[] = [];
 	const calls = new Map<string, ToolCallRef>();
 	const pages: RetrievedPage[] = [];
+	const tools: string[] = [];
 	const usage: UsageRecord[] = [];
 	let assistantMessages = 0;
 	let stopReason: string | null = null;
@@ -390,6 +417,7 @@ export function observeTurn(events: readonly Frame[], price: { input: number; ou
 				const args = asFrame(call.arguments) ?? {};
 				const name = typeof call.name === "string" ? call.name : "";
 				calls.set(call.id, { name, args });
+				tools.push(name);
 				if (name === "zoom") {
 					zoomCalls.push({ id: numberOrNull(args.id), n: numberOrNull(args.n), offset: numberOrNull(args.offset) });
 				}
@@ -397,7 +425,15 @@ export function observeTurn(events: readonly Frame[], price: { input: number; ou
 			usage.push(mainUsage(message, price));
 		} else if (message.role === "toolResult" && typeof message.toolCallId === "string") {
 			const ref = calls.get(message.toolCallId);
-			if (!ref || (ref.name !== "zoom" && ref.name !== "work")) continue;
+			if (!ref || message.isError === true) continue;
+			if (ref.name === "chat_search") {
+				pages.push(...searchPages(firstText(message)));
+				continue;
+			}
+			if (ref.name === "chat_evidence") {
+				pages.push(...evidencePages(firstText(message)));
+				continue;
+			}
 			if (!isOriginalPage(ref.name, ref.args, message)) continue;
 			const details = asFrame(message.details) ?? {};
 			// Work addresses records by name; its details name the message id the store resolved.
@@ -406,7 +442,7 @@ export function observeTurn(events: readonly Frame[], price: { input: number; ou
 			pages.push({ recordId, text: firstText(message) });
 		}
 	}
-	return { answer, zoomCalls, pages, usage, assistantMessages, stopReason, errorMessage };
+	return { answer, zoomCalls, pages, tools, usage, assistantMessages, stopReason, errorMessage };
 }
 
 /**

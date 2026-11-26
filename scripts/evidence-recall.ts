@@ -115,6 +115,8 @@ const MIN_PARENT_PATH_LENGTH = 8;
 /** Memory counts as stalled once no compressor call, dispatch, or tree change is observed for this long. */
 const SETTLE_STALL_MS = 120_000;
 const ANSWER_PREVIEW_CHARS = 240;
+/** The most characters of a turn's final text an artifact keeps, so its citations can be regraded offline. */
+const ANSWER_CHARS = 16_384;
 /** Stand-in ceiling for a host whose dollar cap is not enforced (no --max-cost-usd): effectively unbounded. */
 const UNBOUNDED_USD = 1e12;
 
@@ -165,6 +167,10 @@ interface QuestionReport {
 	readonly zoomedSourceRecord: boolean | null;
 	readonly latencyMs: number | null;
 	readonly answerPreview: string | null;
+	/** The turn's final text, bounded: what the citations were graded from, unless it was cut. */
+	readonly answer: string | null;
+	/** Every tool the model called in the turn, in call order. */
+	readonly tools: readonly string[] | null;
 }
 
 interface TreeReport {
@@ -907,6 +913,8 @@ function unavailableQuestion(question: Question, reason: string): QuestionReport
 		zoomedSourceRecord: null,
 		latencyMs: null,
 		answerPreview: null,
+		answer: null,
+		tools: null,
 	};
 }
 
@@ -958,6 +966,8 @@ function judge(
 			zoomedSourceRecord: observation.pages.some((page) => sourceIds.has(page.recordId)),
 			latencyMs,
 			answerPreview: preview,
+			answer: trimmed === "" ? null : trimmed.slice(0, ANSWER_CHARS),
+			tools: observation.tools,
 		};
 	});
 	return { reports, judgements: score.judgements.filter((judgement) => questions.some((question) => question.id === judgement.questionId)) };

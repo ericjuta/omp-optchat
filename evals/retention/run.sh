@@ -6,6 +6,7 @@
 # A cell starts only when its whole worst-case cap (the runner's --max-cost-usd) fits what is left of the budget, so
 # observed spend cannot pass the budget. A failed or stopped cell ends the script. Finished cells are kept and skipped
 # on a rerun. RETENTION_FIXTURE=1 runs the same cells on the loopback fixture models: no provider call, no spend.
+# RETENTION_ONLY=<regex> runs only the cells whose name matches it; cells already in <out-dir> still count as spend.
 set -euo pipefail
 shopt -s nullglob
 
@@ -27,6 +28,9 @@ cell() {
 	local name=$1 cap=$2 records=$3
 	shift 3
 	local file="$out/cell-$name.json"
+	if [[ -n ${RETENTION_ONLY:-} && ! $name =~ $RETENTION_ONLY ]]; then
+		return
+	fi
 	if [[ -e $file ]]; then
 		echo "kept $name"
 		return
