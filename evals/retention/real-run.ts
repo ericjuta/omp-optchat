@@ -255,7 +255,9 @@ async function main(): Promise<void> {
 				blockers.push(`model discovery failed: ${error instanceof Error ? error.message.slice(0, 200) : "unknown"}`);
 				return [];
 			});
-			for (const selector of selectors) if (!isAvailable(available, selector)) blockers.push(`${selector} is not available in the isolated host (stored credential missing for: ${copied.missing.join(", ") || "none"})`);
+			// The host lists chat models only; a judge model is not among them, so the judge is checked by its credential here and by its answers in the first trial.
+			for (const selector of [options.main, options.compressor]) if (!isAvailable(available, selector)) blockers.push(`${selector} is not available in the isolated host (stored credential missing for: ${copied.missing.join(", ") || "none"})`);
+			if (judge !== null && !copied.copied.includes(providerOf(judge))) blockers.push(`no stored credential for the judge role's provider ${providerOf(judge)}`);
 		}
 		const provenance = {
 			host: await hostVersion(options.omp, env, dirs.workspace),
@@ -362,6 +364,7 @@ async function main(): Promise<void> {
 					failures = row.status === "failed" ? failures + 1 : 0;
 					console.log(`run ${row.key.replace(/^[^|]*/, `case-${index + 1}/${cases.length}`)} ${row.status} main=$${row.main.costUsd?.toFixed(4) ?? "unknown"} judge=${row.judge.dispatched} tools=${row.tools.length} charged=$${charged?.toFixed(4) ?? "unknown"}`);
 					if (row.main.costUsd !== null && row.main.costUsd > MAIN_RESERVE_USD) { stopReason = "a trial's main-model cost exceeded its reserve"; break outer; }
+					if (!options.fixture && row.status === "ok" && row.judge.returned === 0) { stopReason = "the judge answered no call in a trial: the gates did not run as preregistered"; break outer; }
 				}
 				if (failures >= 6) { stopReason = "six trials failed in a row"; break outer; }
 			}
