@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "packets": 112,
+  "reviewers": 2,
+  "disagreements": 2,
+  "adjudicated": 2,
+  "arms": [
+    {
+      "viewBytes": 128000,
+      "trials": 56,
+      "failed": 0,
+      "correct": 56,
+      "misleading": 0,
+      "correctBySource": {
+        "source-01": "20/20",
+        "source-03": "22/22",
+        "source-04": "14/14"
+      },
+      "mainCostUsd": 2.1345155000000005,
+      "compressorCostUsd": 0.19157061000000003,
+      "judgeCalls": 134,
+      "judgeRefused": 0,
+      "judgeDiagnosticUsd": 0.16636511999999998,
+      "mainCalls": 112,
+      "promptTokens": 5712740,
+      "toolCalls": 88,
+      "medianViewLines": 331,
+      "medianLatencyMs": 8888
+    },
+    {
+      "viewBytes": 64000,
+      "trials": 56,
+      "failed": 0,
+      "correct": 55,
+      "misleading": 2,
+      "correctBySource": {
+        "source-01": "20/20",
+        "source-03": "21/22",
+        "source-04": "14/14"
+      },
+      "mainCostUsd": 1.8419423,
+      "compressorCostUsd": 0.23373151999999997,
+      "judgeCalls": 112,
+      "judgeRefused": 0,
+      "judgeDiagnosticUsd": 0.09537839999999997,
+      "mainCalls": 145,
+      "promptTokens": 3723580,
+      "toolCalls": 140,
+      "medianViewLines": 85,
+      "medianLatencyMs": 9514
+    }
+  ],
+  "chargedUsd": 6.861759930000002,
+  "comparison": {
+    "large": 128000,
+    "small": 64000,
+    "caseWins": {
+      "large": 1,
+      "small": 0,
+      "ties": 27
+    },
+    "signTestP": 1,
+    "correctLostBySmall": 1,
+    "misleadingAddedBySmall": 2,
+    "mainCostSaving": 0.13706773270093398,
+    "passes": false
+  }
+}
