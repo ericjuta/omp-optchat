@@ -71,6 +71,16 @@ describe("Memory.search", () => {
     expect(memory.search("  build \t ").hits.map((hit) => hit.id)).toEqual([3, 1, 0]);
   });
 
+  test("a hyphenated or punctuated term matches as written, not split into its words", async () => {
+    const store = await openStore();
+    store.append("echo", "function get-key-string(key) returns src/app_v2.ts:41");
+    store.append("talk", "get the key as a string");
+    const memory = memoryOver(store);
+    expect(memory.search("get-key-string").hits.map((hit) => hit.id)).toEqual([0]);
+    expect(memory.search("GET-KEY-STRING src/app_v2.ts:41").hits.map((hit) => hit.id)).toEqual([0]);
+    expect(memory.search("get-key-strings").hits).toEqual([]);
+  });
+
   test("the kind filter keeps only that kind", async () => {
     const store = await openStore();
     store.append("user", "build it");
